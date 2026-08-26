@@ -1,0 +1,20 @@
+[package]
+name = "hk-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Adapters — enable as they're implemented against the vendored trees:
+slhdsa = ["dep:fips205"]   # roots: SLH-DSA-SHAKE-192s/128s (plan §3.2)
+lms = ["dep:hbs-lms"]      # agent operational keys until Rust XMSS lands
+mlkem = ["dep:ml-kem"]     # P2: note encryption / KEM stealth (plan §3.4)
+
+[dependencies]
+sha3 = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
+fips205 = { workspace = true, optional = true }
+hbs-lms = { workspace = true, optional = true }
+ml-kem = { workspace = true, optional = true }

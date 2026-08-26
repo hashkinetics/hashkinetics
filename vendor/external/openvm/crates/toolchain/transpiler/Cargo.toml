@@ -1,0 +1,24 @@
+[package]
+name = "openvm-transpiler"
+description = "OpenVM transpiler from custom RISC-V ELFs to VM executables."
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+openvm-stark-backend.workspace = true
+openvm-platform.workspace = true
+openvm-instructions.workspace = true
+
+eyre.workspace = true
+thiserror.workspace = true
+elf = "0.7.4"
+rrs-lib.workspace = true
+rustc-demangle = { version = "0.1.24", optional = true }
+
+[features]
+function-span = ["dep:rustc-demangle"]

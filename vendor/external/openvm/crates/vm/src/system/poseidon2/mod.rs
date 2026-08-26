@@ -1,0 +1,100 @@
+//! Chip to handle **native kernel** instructions for Poseidon2 `compress` and `permute`.
+//! This chip is put in `intrinsics` for organizational convenience, but
+//! it is used as a system chip for the memory merkle tree and as a native kernel chip for
+//! aggregation.
+//!
+//! Note that neither `compress` nor `permute` on its own
+//! is a cryptographic hash. `permute` is a cryptographic permutation, which can be made
+//! into a hash by applying a sponge construction. `compress` can be used as a hash in the
+//! internal leaves of a Merkle tree but **not** as the leaf hash because `compress` does not
+//! add any padding.
+
+use std::sync::Arc;
+
+use openvm_circuit_primitives::Chip;
+use openvm_poseidon2_air::{Poseidon2Config, Poseidon2SubAir};
+use openvm_stark_backend::{interaction::LookupBus, StarkProtocolConfig, Val};
+
+#[cfg(test)]
+pub mod tests;
+
+pub mod air;
+mod chip;
+pub use chip::*;
+
+use crate::{
+    arch::{
+        hasher::{Hasher, HasherChip},
+        AirRefWithColumns, VmField,
+    },
+    system::poseidon2::air::Poseidon2PeripheryAir,
+};
+pub mod columns;
+pub mod trace;
+
+pub const PERIPHERY_POSEIDON2_WIDTH: usize = 16;
+pub const PERIPHERY_POSEIDON2_CHUNK_SIZE: usize = 8;
+
+#[derive(Chip)]
+#[chip(where = "F: VmField")]
+pub enum Poseidon2PeripheryChip<F: VmField> {
+    Register0(Poseidon2PeripheryBaseChip<F, 0>),
+    Register1(Poseidon2PeripheryBaseChip<F, 1>),
+}
+impl<F: VmField> Poseidon2PeripheryChip<F> {
+    pub fn new(poseidon2_config: Poseidon2Config<F>, max_constraint_degree: usize) -> Self {
+        if max_constraint_degree >= 7 {
+            Self::Register0(Poseidon2PeripheryBaseChip::new(poseidon2_config))
+        } else {
+            Self::Register1(Poseidon2PeripheryBaseChip::new(poseidon2_config))
+        }
+    }
+}
+
+pub fn new_poseidon2_periphery_air<SC>(
+    poseidon2_config: Poseidon2Config<Val<SC>>,
+    direct_bus: LookupBus,
+    max_constraint_degree: usize,
+) -> AirRefWithColumns<SC>
+where
+    SC: StarkProtocolConfig,
+    Val<SC>: VmField,
+{
+    if max_constraint_degree >= 7 {
+        Arc::new(Poseidon2PeripheryAir::<Val<SC>, 0>::new(
+            Arc::new(Poseidon2SubAir::new(poseidon2_config.constants.into())),
+            direct_bus,
+        ))
+    } else {
+        Arc::new(Poseidon2PeripheryAir::<Val<SC>, 1>::new(
+            Arc::new(Poseidon2SubAir::new(poseidon2_config.constants.into())),
+            direct_bus,
+        ))
+    }
+}
+
+impl<F: VmField> Hasher<PERIPHERY_POSEIDON2_CHUNK_SIZE, F> for Poseidon2PeripheryChip<F> {
+    fn compress(
+        &self,
+        lhs: &[F; PERIPHERY_POSEIDON2_CHUNK_SIZE],
+        rhs: &[F; PERIPHERY_POSEIDON2_CHUNK_SIZE],
+    ) -> [F; PERIPHERY_POSEIDON2_CHUNK_SIZE] {
+        match self {
+            Poseidon2PeripheryChip::Register0(chip) => chip.compress(lhs, rhs),
+            Poseidon2PeripheryChip::Register1(chip) => chip.compress(lhs, rhs),
+        }
+    }
+}
+
+impl<F: VmField> HasherChip<PERIPHERY_POSEIDON2_CHUNK_SIZE, F> for Poseidon2PeripheryChip<F> {
+    fn compress_and_record(
+        &self,
+        lhs: &[F; PERIPHERY_POSEIDON2_CHUNK_SIZE],
+        rhs: &[F; PERIPHERY_POSEIDON2_CHUNK_SIZE],
+    ) -> [F; PERIPHERY_POSEIDON2_CHUNK_SIZE] {
+        match self {
+            Poseidon2PeripheryChip::Register0(chip) => chip.compress_and_record(lhs, rhs),
+            Poseidon2PeripheryChip::Register1(chip) => chip.compress_and_record(lhs, rhs),
+        }
+    }
+}

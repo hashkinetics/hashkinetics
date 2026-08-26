@@ -1,0 +1,84 @@
+name: Extension Tests (CUDA)
+
+on:
+  workflow_call:
+  push:
+    branches: ["main"]
+    paths: &extension_cuda_test_paths
+      - "crates/circuits/**"
+      - "crates/vm/**"
+      - "crates/toolchain/**"
+      - "crates/sdk/**"
+      - "crates/sdk-config/**"
+      - "extensions/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".cargo/config.toml"
+      - ".github/actions/sccache/**"
+      - ".github/actions/rust-cache-cuda/**"
+      - ".github/filters/extension-tests.yml"
+      - ".github/workflows/extension-tests.group.yml"
+      - ".github/workflows/extension-tests.cuda.yml"
+      - "scripts/gpu_driver_setup.sh"
+  pull_request:
+    branches: ["**"]
+    paths: *extension_cuda_test_paths
+  workflow_dispatch:
+    inputs:
+      machine_type:
+        description: "Runner label fragment (e.g. image=ubuntu24-gpu-x64/family=g7.2xlarge+g6.2xlarge+g5.2xlarge/volume=40gb/spot=price-capacity-optimized)"
+        required: false
+        default: image=ubuntu24-gpu-x64/family=g7.2xlarge+g6.2xlarge+g5.2xlarge/volume=40gb/spot=price-capacity-optimized
+
+concurrency:
+  group: ${{ github.workflow_ref }}-extension-tests-cuda-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  OPENVM_SKIP_DEBUG: "1"
+
+jobs:
+  changes:
+    name: Select affected groups
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      extensions: ${{ steps.tests.outputs.changes }}
+      cuda: ${{ steps.tests.outputs.cuda }}
+      rv32im: ${{ steps.tests.outputs.rv32im }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dorny/paths-filter@v3
+        id: tests
+        with:
+          filters: .github/filters/extension-tests.yml
+
+  rv32im-cuda:
+    name: RV32IM
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.cuda == 'true' || needs.changes.outputs.rv32im == 'true'
+    uses: ./.github/workflows/extension-tests.group.yml
+    with:
+      runner_id: cuda-rv32im
+      machine_type: ${{ inputs.machine_type || 'image=ubuntu24-gpu-x64/family=g7.2xlarge+g6.2xlarge+g5.2xlarge/volume=40gb/spot=price-capacity-optimized' }}
+      extensions: ${{ (github.event_name == 'workflow_dispatch' || needs.changes.outputs.cuda == 'true') && 'all' || join(fromJSON(needs.changes.outputs.extensions), ' ') }}
+      mode: cuda
+      cuda_group: rv32im
+    secrets: inherit
+
+  extensions-cuda:
+    name: non-RV32
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.cuda == 'true' || needs.changes.outputs.extensions != '[]'
+    uses: ./.github/workflows/extension-tests.group.yml
+    with:
+      runner_id: cuda-extensions
+      machine_type: ${{ inputs.machine_type || 'image=ubuntu24-gpu-x64/family=g7.2xlarge+g6.2xlarge+g5.2xlarge/volume=40gb/spot=price-capacity-optimized' }}
+      extensions: ${{ (github.event_name == 'workflow_dispatch' || needs.changes.outputs.cuda == 'true') && 'all' || join(fromJSON(needs.changes.outputs.extensions), ' ') }}
+      mode: cuda
+      cuda_group: extensions
+    secrets: inherit

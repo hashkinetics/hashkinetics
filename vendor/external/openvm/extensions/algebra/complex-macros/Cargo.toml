@@ -1,0 +1,18 @@
+[package]
+name = "openvm-algebra-complex-macros"
+description = "OpenVM algebra macros for complex ring extensions"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+syn = { version = "2.0", features = ["full"] }
+quote = "1.0"
+openvm-macros-common = { workspace = true, default-features = false }
+
+[lib]
+proc-macro = true

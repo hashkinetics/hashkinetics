@@ -1,0 +1,87 @@
+name: Base Tests (CUDA)
+# Consolidate non-extension tests to use fewer CUDA runners
+
+on:
+  workflow_call:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["**"]
+    paths:
+      - "crates/circuits/**"
+      - "crates/toolchain/instructions/**"
+      - "crates/toolchain/platform/**"
+      - "crates/vm/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/base-tests.cuda.yml"
+
+concurrency:
+  group: ${{ github.workflow_ref }}-base-tests-cuda-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  OPENVM_SKIP_DEBUG: "1"
+
+jobs:
+  tests-cuda:
+    name: Primitives, Poseidon2, and VM
+    runs-on:
+      - runs-on=${{ github.run_id }}-base-tests-cuda-${{ github.run_attempt }}/image=ubuntu24-gpu-x64/family=g7.2xlarge+g6.2xlarge+g5.2xlarge/volume=40gb/spot=price-capacity-optimized/extras=s3-cache # ensure 24G vram for async test
+
+    steps:
+      - uses: runs-on/action@v2
+        with:
+          sccache: s3
+      - name: Load SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: |
+            ${{ secrets.GH_ACTIONS_DEPLOY_PRIVATE_KEY }}
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        env:
+          RUSTUP_PERMIT_COPY_RENAME: "1"
+      - uses: ./.github/actions/sccache
+
+      # TODO: remove once https://github.com/runs-on/runner-images-for-aws/issues/55 is fixed
+      - name: Setup GPU driver
+        run: bash ./scripts/gpu_driver_setup.sh
+
+      - uses: ./.github/actions/rust-cache-cuda
+        with:
+          cache-on-failure: true
+      - uses: taiki-e/install-action@nextest
+
+      - name: Check CUDA status and set environment variables
+        run: |
+          nvidia-smi
+          nvidia-smi -L
+          nvcc --version
+          echo "CUDA_ARCH=86,89,120" >> $GITHUB_ENV
+          echo "NEXTEST_ARGS=cuda --features parallel,cuda,touchemall --test-threads=1" >> $GITHUB_ENV
+
+      - name: Run tests for primitives
+        working-directory: crates/circuits/primitives
+        run: |
+          cargo nextest run ${{ env.NEXTEST_ARGS }}
+
+      - name: Run tests for poseidon2-air
+        working-directory: crates/circuits/poseidon2-air
+        run: |
+          cargo nextest run ${{ env.NEXTEST_ARGS }}
+
+      - name: Run vm crate tests
+        working-directory: crates/vm
+        run: |
+          cargo nextest run ${{ env.NEXTEST_ARGS }}
+
+      # - name: Run async concurrency test
+      #   working-directory: benchmarks/prove
+      #   run: |
+      #     CUDA_OPT_LEVEL=3 MAX_CONCURRENCY=5 cargo run --bin async_regex --features cuda,async -- --segment-max-memory 16106127360
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true

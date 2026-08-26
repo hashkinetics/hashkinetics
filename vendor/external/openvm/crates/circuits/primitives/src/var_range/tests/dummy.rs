@@ -1,0 +1,132 @@
+use openvm_stark_backend::{
+    interaction::InteractionBuilder,
+    p3_air::{Air, AirBuilder, BaseAir},
+    p3_field::{Field, PrimeCharacteristicRing},
+    p3_matrix::{dense::RowMajorMatrix, Matrix},
+    BaseAirWithPublicValues, PartitionedBaseAir,
+};
+
+use crate::{var_range::bus::VariableRangeCheckerBus, ColumnsAir};
+
+// dummy AIR for testing VariableRangeCheckerBus::send
+pub struct TestSendAir {
+    bus: VariableRangeCheckerBus,
+}
+// No columns provided: test dummy whose 2-element row `[value, max_bits]` has no `Cols` struct.
+impl ColumnsAir for TestSendAir {}
+
+impl TestSendAir {
+    pub fn new(bus: VariableRangeCheckerBus) -> Self {
+        Self { bus }
+    }
+}
+
+impl<F: Field> BaseAirWithPublicValues<F> for TestSendAir {}
+impl<F: Field> PartitionedBaseAir<F> for TestSendAir {}
+impl<F: Field> BaseAir<F> for TestSendAir {
+    fn width(&self) -> usize {
+        2
+    }
+
+    fn preprocessed_trace(&self) -> Option<RowMajorMatrix<F>> {
+        None
+    }
+}
+
+impl<AB: InteractionBuilder + AirBuilder> Air<AB> for TestSendAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        // local = [value, max_bits]
+        let local = main.row_slice(0).expect("window should have two elements");
+        self.bus.send(local[0], local[1]).eval(builder, AB::F::ONE);
+    }
+}
+
+// dummy AIR for testing VariableRangeCheckerBus::range_check
+pub struct TestRangeCheckAir {
+    bus: VariableRangeCheckerBus,
+    max_bits: usize,
+}
+// No columns provided: test dummy whose single-column row `[value]` has no `Cols` struct.
+impl ColumnsAir for TestRangeCheckAir {}
+
+impl TestRangeCheckAir {
+    pub fn new(bus: VariableRangeCheckerBus, max_bits: usize) -> Self {
+        Self { bus, max_bits }
+    }
+}
+
+impl<F: Field> BaseAirWithPublicValues<F> for TestRangeCheckAir {}
+impl<F: Field> PartitionedBaseAir<F> for TestRangeCheckAir {}
+impl<F: Field> BaseAir<F> for TestRangeCheckAir {
+    fn width(&self) -> usize {
+        1
+    }
+
+    fn preprocessed_trace(&self) -> Option<RowMajorMatrix<F>> {
+        None
+    }
+}
+
+impl<AB: InteractionBuilder + AirBuilder> Air<AB> for TestRangeCheckAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        // local = [value]
+        let local = main.row_slice(0).expect("window should have two elements");
+        self.bus
+            .range_check(local[0], self.max_bits)
+            .eval(builder, AB::F::ONE);
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub mod cuda {
+    use std::sync::Arc;
+
+    use openvm_cuda_backend::{base::DeviceMatrix, prelude::F, GpuBackend};
+    use openvm_cuda_common::{copy::MemCopyH2D as _, d_buffer::DeviceBuffer};
+    use openvm_stark_backend::prover::AirProvingContext;
+
+    use crate::{
+        cuda_abi::var_range::dummy_tracegen, var_range::VariableRangeCheckerChipGPU, Chip,
+    };
+
+    /// Width of the dummy trace: [count, value, bits] = 3 columns
+    /// Define the width of the dummy instead of using constant from var_range
+    const DUMMY_TRACE_WIDTH: usize = 3;
+
+    pub struct DummyInteractionChipGPU {
+        pub range_checker: Arc<VariableRangeCheckerChipGPU>,
+        pub data: DeviceBuffer<u32>,
+    }
+
+    /// Expects trace to be: [1, value, bits]
+    impl DummyInteractionChipGPU {
+        pub fn new(range_checker: Arc<VariableRangeCheckerChipGPU>, data: Vec<u32>) -> Self {
+            assert!(!data.is_empty());
+            let data = data.to_device_on(&range_checker.device_ctx).unwrap();
+            Self {
+                range_checker,
+                data,
+            }
+        }
+    }
+
+    impl<RA> Chip<RA, GpuBackend> for DummyInteractionChipGPU {
+        fn generate_proving_ctx(&self, _: RA) -> AirProvingContext<GpuBackend> {
+            let height = self.data.len();
+            let device_ctx = &self.range_checker.device_ctx;
+            let trace = DeviceMatrix::<F>::with_capacity_on(height, DUMMY_TRACE_WIDTH, device_ctx);
+            unsafe {
+                dummy_tracegen(
+                    &self.data,
+                    trace.buffer(),
+                    &self.range_checker.count,
+                    device_ctx.stream.as_raw(),
+                )
+                .unwrap();
+            }
+            AirProvingContext::simple_no_pis(trace)
+        }
+    }
+}

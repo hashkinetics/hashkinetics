@@ -1,0 +1,110 @@
+use std::borrow::{Borrow, BorrowMut};
+
+use openvm_cpu_backend::CpuBackend;
+use openvm_instructions::{
+    exe::VmExe, instruction::Instruction, program::Program, LocalOpcode, SystemOpcode::TERMINATE,
+};
+use openvm_stark_backend::{
+    p3_field::PrimeCharacteristicRing, prover::AirProvingContext, verifier::VerifierError,
+    StarkEngine,
+};
+use openvm_stark_sdk::{
+    config::baby_bear_poseidon2::BabyBearPoseidon2Config, p3_baby_bear::BabyBear,
+};
+
+use super::VmConnectorPvs;
+use crate::{
+    arch::{
+        PreflightExecutionOutput, Streams, SystemConfig, VirtualMachine, VmState, CONNECTOR_AIR_ID,
+    },
+    system::{
+        memory::{online::GuestMemory, AddressMap},
+        SystemCpuBuilder,
+    },
+    utils::test_cpu_engine,
+};
+
+type F = BabyBear;
+type SC = BabyBearPoseidon2Config;
+type PB = CpuBackend<SC>;
+
+#[test]
+fn test_vm_connector_happy_path() {
+    let exit_code = 1789;
+    test_impl(true, exit_code, |air_ctx| {
+        let pvs: &VmConnectorPvs<F> = air_ctx.public_values.as_slice().borrow();
+        assert_eq!(pvs.is_terminate, F::ONE);
+        assert_eq!(pvs.exit_code, F::from_u32(exit_code));
+    });
+}
+
+#[test]
+fn test_vm_connector_wrong_exit_code() {
+    let exit_code = 1789;
+    test_impl(false, exit_code, |air_ctx| {
+        let pvs: &mut VmConnectorPvs<F> = air_ctx.public_values.as_mut_slice().borrow_mut();
+        pvs.exit_code = F::from_u32(exit_code + 1);
+    });
+}
+
+#[test]
+fn test_vm_connector_wrong_is_terminate() {
+    let exit_code = 1789;
+    test_impl(false, exit_code, |air_ctx| {
+        let pvs: &mut VmConnectorPvs<F> = air_ctx.public_values.as_mut_slice().borrow_mut();
+        pvs.is_terminate = F::ZERO;
+    });
+}
+
+fn test_impl(should_pass: bool, exit_code: u32, f: impl FnOnce(&mut AirProvingContext<PB>)) {
+    let vm_config = SystemConfig::default();
+    let engine = test_cpu_engine();
+    let (mut vm, pk) =
+        VirtualMachine::new_with_keygen(engine, SystemCpuBuilder, vm_config.clone()).unwrap();
+    let vk = pk.get_vk();
+
+    let instructions = vec![Instruction::<F>::from_isize(
+        TERMINATE.global_opcode(),
+        0,
+        0,
+        exit_code as isize,
+        0,
+        0,
+    )];
+
+    let program = Program::from_instructions(&instructions);
+    let vm_exe: VmExe<F> = program.into();
+    let max_trace_heights = vec![0; vk.inner.per_air.len()];
+    let memory = GuestMemory::new(AddressMap::from_mem_config(&vm_config.memory_config));
+    vm.transport_init_memory_to_device(&memory);
+    vm.load_program(vm.commit_program_on_device(&vm_exe.program));
+    let from_state = VmState::new_with_defaults(0, memory, Streams::default(), 0);
+    let mut interpreter = vm.preflight_interpreter(&vm_exe).unwrap();
+    let PreflightExecutionOutput {
+        system_records,
+        record_arenas,
+        ..
+    } = vm
+        .execute_preflight(&mut interpreter, from_state, None, &max_trace_heights)
+        .unwrap();
+    let mut ctx = vm
+        .generate_proving_ctx(system_records, record_arenas)
+        .unwrap();
+    let connector_air_ctx = &mut ctx
+        .per_trace
+        .iter_mut()
+        .find(|(air_id, _)| *air_id == CONNECTOR_AIR_ID)
+        .unwrap()
+        .1;
+    f(connector_air_ctx);
+    let proof = vm.engine.prove(vm.pk(), ctx).unwrap();
+    if should_pass {
+        vm.engine.verify(&vk, &proof).expect("Verification failed");
+    } else {
+        let result = vm.engine.verify(&vk, &proof);
+        assert!(matches!(
+            result,
+            Err(VerifierError::BatchConstraintError(_))
+        ));
+    }
+}

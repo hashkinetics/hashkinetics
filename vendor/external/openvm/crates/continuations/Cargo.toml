@@ -1,0 +1,73 @@
+[package]
+name = "openvm-continuations"
+description = "Continuation AIRs and utilities"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+p3-air = { workspace = true }
+p3-bn254 = { workspace = true, optional = true }
+p3-field = { workspace = true }
+p3-matrix = { workspace = true }
+openvm-recursion-circuit = { workspace = true }
+openvm-recursion-circuit-derive = { workspace = true }
+openvm-verify-stark-host = { workspace = true }
+openvm-stark-backend = { workspace = true }
+openvm-stark-sdk = { workspace = true, features = ["cpu-backend"] }
+openvm-cpu-backend = { workspace = true }
+openvm-circuit-primitives = { workspace = true }
+openvm-circuit = { workspace = true }
+openvm-poseidon2-air = { workspace = true }
+
+itertools.workspace = true
+tracing.workspace = true
+eyre.workspace = true
+derive-new.workspace = true
+derivative.workspace = true
+cfg-if.workspace = true
+num-bigint.workspace = true
+hex.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+openvm-cuda-common = { workspace = true, optional = true }
+openvm-cuda-backend = { workspace = true, optional = true }
+
+[dev-dependencies]
+openvm-rv32im-circuit = { path = "../../extensions/rv32im/circuit", default-features = false, features = ["test-utils"] }
+openvm-rv32im-transpiler = { path = "../../extensions/rv32im/transpiler", default-features = false }
+openvm-deferral-circuit = { path = "../../extensions/deferral/circuit", default-features = false }
+openvm-deferral-transpiler = { path = "../../extensions/deferral/transpiler", default-features = false }
+openvm-transpiler = { path = "../toolchain/transpiler", default-features = false }
+test-case = { workspace = true }
+
+[features]
+default = ["parallel"]
+root-prover = [
+    "dep:p3-bn254",
+    "openvm-stark-sdk/baby-bear-bn254-poseidon2",
+    "openvm-cuda-backend?/baby-bear-bn254-poseidon2",
+]
+parallel = ["openvm-circuit/parallel", "openvm-recursion-circuit/parallel"]
+metrics = ["openvm-circuit/metrics"]
+
+cuda = [
+    "dep:openvm-cuda-common",
+    "dep:openvm-cuda-backend",
+    "openvm-circuit-primitives/cuda",
+    "openvm-circuit/cuda",
+    "openvm-rv32im-circuit/cuda",
+    "openvm-deferral-circuit/cuda",
+    "openvm-recursion-circuit/cuda",
+]
+touchemall = [
+    "cuda",
+    "openvm-cuda-common/touchemall",
+    "openvm-cuda-backend/touchemall",
+    "openvm-circuit/touchemall",
+]

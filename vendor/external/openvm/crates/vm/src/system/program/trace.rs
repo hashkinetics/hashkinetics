@@ -1,0 +1,148 @@
+use std::borrow::BorrowMut;
+
+use itertools::Itertools;
+use openvm_circuit::{arch::hasher::poseidon2::Poseidon2Hasher, primitives::Chip};
+use openvm_cpu_backend::CpuBackend;
+use openvm_instructions::{
+    exe::VmExe,
+    program::{Program, DEFAULT_PC_STEP},
+    LocalOpcode, SystemOpcode,
+};
+use openvm_stark_backend::{
+    p3_field::{Field, PrimeCharacteristicRing, PrimeField32},
+    p3_matrix::dense::RowMajorMatrix,
+    p3_maybe_rayon::prelude::*,
+    prover::AirProvingContext,
+    StarkProtocolConfig, Val,
+};
+
+use super::{Instruction, ProgramExecutionCols, EXIT_CODE_FAIL};
+use crate::{
+    arch::{
+        hasher::{poseidon2::vm_poseidon2_hasher, Hasher},
+        MemoryConfig,
+    },
+    system::{
+        memory::{merkle::MerkleTree, AddressMap, CHUNK},
+        program::ProgramChip,
+    },
+};
+
+impl<SC: StarkProtocolConfig> Chip<(), CpuBackend<SC>> for ProgramChip<SC> {
+    /// The cached program trace is cloned and left for future use. The clone is cheap because the
+    /// cached trace is behind smart pointers. The execution frequencies are left unchanged.
+    fn generate_proving_ctx(&self, _: ()) -> AirProvingContext<CpuBackend<SC>> {
+        let cached = self
+            .cached
+            .clone()
+            .expect("cached program trace must be loaded");
+        assert!(self.filtered_exec_frequencies.len() <= cached.height());
+        let mut freqs = Val::<SC>::zero_vec(cached.height());
+        freqs
+            .par_iter_mut()
+            .zip(self.filtered_exec_frequencies.par_iter())
+            .for_each(|(f, x)| *f = Val::<SC>::from_u32(*x));
+        let common_trace = RowMajorMatrix::new(freqs, 1);
+        AirProvingContext {
+            cached_mains: vec![cached],
+            common_main: common_trace,
+            public_values: vec![],
+        }
+    }
+}
+
+/// Computes a commitment to a VM executable. This is a Merklelized hash of:
+/// - Program code commitment (commitment of the cached trace)
+/// - Merkle root of the initial memory
+/// - Starting program counter (`pc_start`)
+///
+/// The program code commitment is itself a commitment (via the proof system PCS) to
+/// the program code.
+///
+/// The Merklelization uses Poseidon2 as a cryptographic hash function (for the leaves)
+/// and a cryptographic compression function (for internal nodes).
+///
+/// **Note**: This function recomputes the Merkle tree for the initial memory image.
+pub fn compute_exe_commit_from_mem_config<F: PrimeField32>(
+    program_commitment: &[F; CHUNK],
+    exe: &VmExe<F>,
+    memory_config: &MemoryConfig,
+) -> [F; CHUNK] {
+    let hasher = vm_poseidon2_hasher();
+    let memory_dimensions = memory_config.memory_dimensions();
+    let mut memory_image = AddressMap::new(memory_config.addr_spaces.clone());
+    memory_image.set_from_sparse(&exe.init_memory);
+    let init_memory_commit =
+        MerkleTree::from_memory(&memory_image, &memory_dimensions, &hasher).root();
+    compute_exe_commit(
+        &hasher,
+        program_commitment,
+        &init_memory_commit,
+        F::from_u32(exe.pc_start),
+    )
+}
+
+/// Computes a Merklelized hash of:
+/// - Program code commitment (commitment of the cached trace)
+/// - Merkle root of the initial memory
+/// - Starting program counter (`pc_start`)
+///
+/// The Merklelization uses [Poseidon2Hasher] as a cryptographic hash function (for the leaves)
+/// and a cryptographic compression function (for internal nodes).
+pub fn compute_exe_commit<F: PrimeField32>(
+    hasher: &Poseidon2Hasher<F>,
+    program_commit: &[F; CHUNK],
+    init_memory_root: &[F; CHUNK],
+    pc_start: F,
+) -> [F; CHUNK] {
+    let mut padded_pc_start = [F::ZERO; CHUNK];
+    padded_pc_start[0] = pc_start;
+    let program_hash = hasher.hash(program_commit);
+    let memory_hash = hasher.hash(init_memory_root);
+    let pc_hash = hasher.hash(&padded_pc_start);
+    hasher.compress(&hasher.compress(&program_hash, &memory_hash), &pc_hash)
+}
+
+pub(crate) fn generate_cached_trace<F: Field>(program: &Program<F>) -> RowMajorMatrix<F> {
+    let width = ProgramExecutionCols::<F>::width();
+    let mut instructions = program
+        .enumerate_by_pc()
+        .into_iter()
+        .map(|(pc, instruction, _)| (pc, instruction))
+        .collect_vec();
+
+    let padding = padding_instruction();
+    while !instructions.len().is_power_of_two() {
+        instructions.push((
+            program.pc_base + instructions.len() as u32 * DEFAULT_PC_STEP,
+            padding.clone(),
+        ));
+    }
+
+    let mut rows = F::zero_vec(instructions.len() * width);
+    rows.par_chunks_mut(width)
+        .zip(instructions)
+        .for_each(|(row, (pc, instruction))| {
+            let row: &mut ProgramExecutionCols<F> = row.borrow_mut();
+            *row = ProgramExecutionCols {
+                pc: F::from_u32(pc),
+                opcode: instruction.opcode.to_field(),
+                a: instruction.a,
+                b: instruction.b,
+                c: instruction.c,
+                d: instruction.d,
+                e: instruction.e,
+                f: instruction.f,
+                g: instruction.g,
+            };
+        });
+
+    RowMajorMatrix::new(rows, width)
+}
+
+pub(super) fn padding_instruction<F: Field>() -> Instruction<F> {
+    Instruction::from_usize(
+        SystemOpcode::TERMINATE.global_opcode(),
+        [0, 0, EXIT_CODE_FAIL],
+    )
+}

@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hk-primitives",
+    "crates/hk-crypto",
+    "crates/hk-mandate",
+    "crates/hk-state",
+    "crates/hk-wallet",
+    "crates/hk-consensus",
+    "crates/hk-rpc",
+    "crates/hk-node",
+    "crates/hk-facilitator",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Yaduvendra Mukherjee <yadu@hashkinetics.org>"]
+repository = ""
+
+[workspace.dependencies]
+# Core, kept minimal so the default build works with just crates.io:
+sha3 = "0.10"            # SHAKE-256 — the external hash everywhere (plan §3.1)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+hex = "0.4"
+bytes = "1"
+async-trait = "0.1"
+
+# Feature-gated crypto adapters (enable per-crate features to pull these).
+# hbs-lms and ml-kem point at the VENDORED trees (crates.io versions lag; pins in vendor/external/PINS.md):
+fips205 = "0.4"                                                    # pure-Rust SLH-DSA (roots, 192s default)
+hbs-lms = { path = "../vendor/external/hbs-lms-rust" }             # LMS/HSS (RFC 8554) agent keys
+ml-kem = { path = "../vendor/external/rustcrypto-kems/ml-kem" }    # ML-KEM-768 note encryption (P2)
+
+# Consensus engine (uncomment when hk-consensus implementation starts; trees are vendored):
+# informalsystems-malachitebft-core-consensus = { path = "../vendor/external/malachite/code/crates/core-consensus" }
+# informalsystems-malachitebft-core-types     = { path = "../vendor/external/malachite/code/crates/core-types" }
+# informalsystems-malachitebft-app-channel    = { path = "../vendor/external/malachite/code/crates/app-channel" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# The hash-based crypto crates are compute-heavy (SLH-DSA hypertrees, LMS/HSS Merkle
+# trees). Optimize just these even in dev/test so `cargo test` doesn't crawl — correctness
+# is unaffected, only speed. (LMS tests were ~60–140 s unoptimized; SLH-DSA signing is
+# far worse unoptimized.)
+[profile.dev.package.fips205]
+opt-level = 3
+[profile.dev.package.hbs-lms]
+opt-level = 3
+[profile.dev.package.sha3]
+opt-level = 3

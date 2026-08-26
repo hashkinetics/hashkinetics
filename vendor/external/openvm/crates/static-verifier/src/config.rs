@@ -1,0 +1,50 @@
+use halo2_base::gates::circuit::BaseCircuitParams;
+use serde::{Deserialize, Serialize};
+
+pub const STATIC_VERIFIER_NUM_ADVICE_COLS: usize = 1;
+pub const STATIC_VERIFIER_LOOKUP_ADVICE_COLS: usize = 1;
+
+pub const DEFAULT_HALO2_VERIFIER_K: usize = 23;
+pub const ONCHAIN_VERIFIER_NUM_INSTANCE_COLS: usize = 1;
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct StaticVerifierShape {
+    pub k: usize,
+    pub lookup_bits: usize,
+    pub minimum_rows: usize,
+    pub instance_columns: usize,
+}
+
+impl Default for StaticVerifierShape {
+    fn default() -> Self {
+        Self {
+            k: DEFAULT_HALO2_VERIFIER_K,
+            lookup_bits: DEFAULT_HALO2_VERIFIER_K - 1,
+            minimum_rows: 20,
+            instance_columns: 1,
+        }
+    }
+}
+
+impl StaticVerifierShape {
+    /// OpenVM's EVM/on-chain proof format exposes all public values in one instance column.
+    /// Other static verifier uses may choose a different instance-column shape.
+    pub fn assert_onchain_verifier_supported(&self) {
+        assert_eq!(
+            self.instance_columns, ONCHAIN_VERIFIER_NUM_INSTANCE_COLS,
+            "OpenVM on-chain verifier supports exactly {ONCHAIN_VERIFIER_NUM_INSTANCE_COLS} instance column, got {}",
+            self.instance_columns
+        );
+    }
+
+    pub fn expected_phase0_params(&self) -> BaseCircuitParams {
+        BaseCircuitParams {
+            k: self.k,
+            num_advice_per_phase: vec![STATIC_VERIFIER_NUM_ADVICE_COLS],
+            num_fixed: 1,
+            num_lookup_advice_per_phase: vec![STATIC_VERIFIER_LOOKUP_ADVICE_COLS],
+            lookup_bits: Some(self.lookup_bits),
+            num_instance_columns: self.instance_columns,
+        }
+    }
+}

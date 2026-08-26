@@ -1,0 +1,46 @@
+[package]
+name = "openvm-mod-circuit-builder"
+description = "Modular arithmetic framework for building OpenVM circuits."
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+openvm-stark-backend = { workspace = true }
+openvm-circuit-primitives = { workspace = true }
+openvm-stark-sdk = { workspace = true, features = ["cpu-backend"] }
+openvm-circuit = { workspace = true }
+openvm-instructions = { workspace = true }
+halo2curves-axiom = { workspace = true, optional = true }
+openvm-pairing-guest = { workspace = true, optional = true }
+
+rand.workspace = true
+rand08 = { package = "rand", version = "0.8.5", features = ["std_rng"] }
+num-bigint.workspace = true
+num-traits.workspace = true
+tracing.workspace = true
+itertools.workspace = true
+
+[dev-dependencies]
+openvm-circuit-primitives = { path = "../primitives", default-features = false }
+openvm-pairing-guest = { path = "../../../extensions/pairing/guest", default-features = false, features = ["halo2curves"] }
+halo2curves-axiom = { workspace = true }
+openvm-circuit = { path = "../../vm", default-features = false, features = ["test-utils"] }
+rand08 = { package = "rand", version = "0.8.5", features = ["std_rng"] }
+
+[features]
+default = []
+cuda = [
+    "openvm-circuit-primitives/cuda",
+]
+aot = ["openvm-circuit/aot"]
+parallel = ["openvm-stark-backend/parallel", "openvm-circuit/parallel"]
+test-utils = [
+    "dep:halo2curves-axiom",
+    "dep:openvm-pairing-guest",
+    "openvm-circuit/test-utils",
+]

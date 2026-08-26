@@ -1,0 +1,97 @@
+name: frodo-kem
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/frodo-kem.yml"
+      - "frodo-kem/**"
+      - "Cargo.*"
+  push:
+    branches: master
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  RUST_LOG_STYLE: always
+  RUSTFLAGS: "-Dwarnings"
+  RUSTDOCFLAGS: "-Dwarnings"
+
+defaults:
+  run:
+    working-directory: frodo-kem
+    shell: bash
+
+# Cancels CI jobs when new commits are pushed to a PR branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  set-msrv:
+    uses: RustCrypto/actions/.github/workflows/set-msrv.yml@master
+    with:
+      msrv: 1.85.0
+
+  build:
+    needs: set-msrv
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rust:
+          - ${{ needs.set-msrv.outputs.msrv }}
+          - stable
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - run: cargo build --no-default-features --features=frodo
+      - run: cargo build --no-default-features --features=efrodo
+      - run: cargo build --no-default-features || [ $? -eq 101 ]
+      - run: cargo build --all-features
+
+  test:
+    needs: set-msrv
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rust:
+          - ${{ needs.set-msrv.outputs.msrv }}
+          - stable
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - run: cargo build --all-features --benches --release --keep-going
+      - run: cargo test --all-features --release
+      - run: cargo test --no-default-features --features=frodo,efrodo,serde --release
+
+  careful:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-careful
+      - run: cargo careful test tests
+      - run: cargo careful test test_vector --release
+
+# TODO(tarcieri): needs `set-msrv`
+#  cross:
+#    needs: set-msrv
+#    strategy:
+#      matrix:
+#        include:
+#          - target: powerpc-unknown-linux-gnu
+#            rust: ${{needs.set-msrv.outputs.msrv}}
+#          - target: powerpc-unknown-linux-gnu
+#            rust: stable
+#    runs-on: ubuntu-latest
+#    steps:
+#      - uses: actions/checkout@v7
+#      - uses: dtolnay/rust-toolchain@master
+#        with:
+#          toolchain: ${{ matrix.rust }}
+#          targets: ${{ matrix.target }}
+#      - uses: RustCrypto/actions/cross-install@master
+#      - run: cross test --release --target ${{ matrix.target }} --all-features

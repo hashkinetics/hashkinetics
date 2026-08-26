@@ -1,0 +1,1382 @@
+//! [VmExecutor] is the struct that can execute an _arbitrary_ program, provided in the form of a
+//! [VmExe](openvm_instructions::exe::VmExe), for a fixed set of OpenVM instructions
+//! corresponding to a [VmExecutionConfig].
+//! Internally once it is given a program, it will preprocess the program to rewrite it into a more
+//! optimized format for runtime execution. This **instance** of the executor will be a separate
+//! struct specialized to running a _fixed_ program on different program inputs.
+//!
+//! [VirtualMachine] will similarly be the struct that has done all the setup so it can
+//! execute+prove an arbitrary program for a fixed config - it will internally still hold VmExecutor
+use std::{any::TypeId, borrow::Borrow, collections::VecDeque, marker::PhantomData, sync::Arc};
+
+use getset::{Getters, MutGetters, Setters, WithSetters};
+use itertools::{zip_eq, Itertools};
+use openvm_circuit::system::program::trace::compute_exe_commit;
+use openvm_instructions::{
+    exe::{SparseMemoryImage, VmExe},
+    program::Program,
+};
+#[cfg(any(debug_assertions, feature = "test-utils", feature = "stark-debug"))]
+use openvm_stark_backend::AirRef;
+use openvm_stark_backend::{
+    keygen::types::{MultiStarkProvingKey, MultiStarkVerifyingKey},
+    memory_metering::ProvingMemoryConfig,
+    p3_field::{InjectiveMonomial, PrimeCharacteristicRing, PrimeField32, TwoAdicField},
+    p3_util::log2_ceil_usize,
+    proof::Proof,
+    prover::{
+        ColMajorMatrix, CommittedTraceData, DeviceDataTransporter, DeviceMultiStarkProvingKey,
+        MatrixDimensions, ProverBackend, ProverDevice, ProvingContext, TraceCommitter,
+    },
+    verifier::VerifierError,
+    Com, StarkEngine, StarkProtocolConfig, Val,
+};
+use p3_baby_bear::BabyBear;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tracing::{info_span, instrument};
+
+#[cfg(feature = "aot")]
+use super::aot::AotInstance;
+use super::{
+    execution_mode::{
+        ExecutionCtx, MeteredCostCtx, MeteredCtx, MeteredCtxInputs, PreflightCtx, Segment,
+        SegmentationLimits,
+    },
+    hasher::poseidon2::vm_poseidon2_hasher,
+    interpreter::InterpretedInstance,
+    interpreter_preflight::PreflightInterpretedInstance,
+    AirInventoryError, ChipInventoryError, ExecutionError, ExecutionState, Executor,
+    ExecutorInventory, ExecutorInventoryError, MemoryConfig, MeteredExecutor, PreflightExecutor,
+    StaticProgramError, SystemConfig, VmBuilder, VmChipComplex, VmCircuitConfig, VmExecState,
+    VmExecutionConfig, VmState, BOUNDARY_AIR_ID, CONNECTOR_AIR_ID, MERKLE_AIR_ID, PROGRAM_AIR_ID,
+    PROGRAM_CACHED_TRACE_INDEX,
+};
+#[cfg(feature = "metrics")]
+use crate::metrics::emit_opcode_counts;
+#[cfg(feature = "perf-metrics")]
+use crate::metrics::end_segment_metrics;
+use crate::{
+    arch::deferral::DeferralState,
+    execute_spanned,
+    system::{
+        connector::{VmConnectorPvs, DEFAULT_SUSPEND_EXIT_CODE},
+        memory::{
+            merkle::{
+                public_values::{UserPublicValuesProof, UserPublicValuesProofError},
+                MemoryMerklePvs,
+            },
+            online::{GuestMemory, TracingMemory},
+            AddressMap, CHUNK,
+        },
+        program::trace::generate_cached_trace,
+        SystemChipComplex, SystemRecords, SystemWithFixedTraceHeights,
+    },
+};
+
+/// Canonical field bound for VM execution/circuit code.
+pub const BABYBEAR_S_BOX_DEGREE: u64 = 7;
+
+pub trait VmField: PrimeField32 + InjectiveMonomial<BABYBEAR_S_BOX_DEGREE> {}
+impl<T> VmField for T where T: PrimeField32 + InjectiveMonomial<BABYBEAR_S_BOX_DEGREE> {}
+
+#[derive(Error, Debug)]
+pub enum GenerationError {
+    #[error("unexpected number of arenas: {actual} (expected num_airs={expected})")]
+    UnexpectedNumArenas { actual: usize, expected: usize },
+    #[error("trace height for air_idx={air_idx} must be fixed to {expected}, actual={actual}")]
+    ForceTraceHeightIncorrect {
+        air_idx: usize,
+        actual: usize,
+        expected: usize,
+    },
+    #[error("trace height of air {air_idx} has height {height} greater than maximum {max_height}")]
+    TraceHeightsLimitExceeded {
+        air_idx: usize,
+        height: usize,
+        max_height: usize,
+    },
+    #[error("trace heights violate linear constraint {constraint_idx} ({value} >= {threshold})")]
+    LinearTraceHeightConstraintExceeded {
+        constraint_idx: usize,
+        value: u64,
+        threshold: u32,
+    },
+}
+
+#[derive(Clone)]
+pub struct Streams<F> {
+    pub input_stream: VecDeque<Vec<F>>,
+    pub hint_stream: VecDeque<F>,
+    /// Stores cached deferred operation inputs and outputs. Each idx corresponds to a
+    /// unique function that is constrained outside the VM in its own deferral circuit.
+    pub deferrals: Vec<DeferralState>,
+}
+
+impl<F> Streams<F> {
+    pub fn new(input_stream: impl Into<VecDeque<Vec<F>>>) -> Self {
+        Self {
+            input_stream: input_stream.into(),
+            hint_stream: VecDeque::default(),
+            deferrals: Vec::default(),
+        }
+    }
+}
+
+impl<F> Default for Streams<F> {
+    fn default() -> Self {
+        Self::new(VecDeque::default())
+    }
+}
+
+impl<F> From<VecDeque<Vec<F>>> for Streams<F> {
+    fn from(value: VecDeque<Vec<F>>) -> Self {
+        Streams::new(value)
+    }
+}
+
+impl<F> From<Vec<Vec<F>>> for Streams<F> {
+    fn from(value: Vec<Vec<F>>) -> Self {
+        Streams::new(value)
+    }
+}
+
+/// Typedef for [PreflightInterpretedInstance] that is generic in `VC: VmExecutionConfig<F>`
+type PreflightInterpretedInstance2<F, VC> =
+    PreflightInterpretedInstance<F, <VC as VmExecutionConfig<F>>::Executor>;
+
+/// [VmExecutor] is the struct that can execute an _arbitrary_ program, provided in the form of a
+/// [VmExe], for a fixed set of OpenVM instructions corresponding to a [VmExecutionConfig].
+/// Internally once it is given a program, it will preprocess the program to rewrite it into a more
+/// optimized format for runtime execution. This **instance** of the executor will be a separate
+/// struct specialized to running a _fixed_ program on different program inputs.
+#[derive(Clone)]
+pub struct VmExecutor<F, VC>
+where
+    VC: VmExecutionConfig<F>,
+{
+    pub config: VC,
+    inventory: Arc<ExecutorInventory<VC::Executor>>,
+    phantom: PhantomData<F>,
+}
+
+#[repr(i32)]
+pub enum ExitCode {
+    Success = 0,
+    Error = 1,
+    Suspended = -1, // Continuations
+}
+
+pub struct PreflightExecutionOutput<F, RA> {
+    pub system_records: SystemRecords<F>,
+    pub record_arenas: Vec<RA>,
+    pub to_state: VmState<F, GuestMemory>,
+}
+
+impl<F, VC> VmExecutor<F, VC>
+where
+    VC: VmExecutionConfig<F>,
+{
+    /// Create a new VM executor with a given config.
+    ///
+    /// The VM will start with a single segment, which is created from the initial state.
+    pub fn new(config: VC) -> Result<Self, ExecutorInventoryError> {
+        let inventory = config.create_executors()?;
+        Ok(Self {
+            config,
+            inventory: Arc::new(inventory),
+            phantom: PhantomData,
+        })
+    }
+}
+
+impl<F, VC> VmExecutor<F, VC>
+where
+    VC: VmExecutionConfig<F> + AsRef<SystemConfig>,
+{
+    pub fn build_metered_ctx(
+        &self,
+        inputs: MeteredCtxInputs<'_>,
+        memory_config: ProvingMemoryConfig,
+    ) -> MeteredCtx {
+        MeteredCtx::new(inputs, self.config.as_ref(), memory_config)
+    }
+
+    pub fn build_metered_cost_ctx(&self, widths: &[usize]) -> MeteredCostCtx {
+        MeteredCostCtx::new(widths.to_vec())
+    }
+}
+
+impl<F, VC> VmExecutor<F, VC>
+where
+    F: PrimeField32,
+    VC: VmExecutionConfig<F>,
+    VC::Executor: Executor<F>,
+{
+    /// Creates an instance of the interpreter specialized for pure execution, without metering, of
+    /// the given `exe`.
+    ///
+    /// For metered execution, use the [`metered_instance`](Self::metered_instance) constructor.
+    #[cfg(not(feature = "aot"))]
+    pub fn instance(
+        &self,
+        exe: &VmExe<F>,
+    ) -> Result<InterpretedInstance<'_, F, ExecutionCtx>, StaticProgramError> {
+        InterpretedInstance::new(&self.inventory, exe)
+    }
+
+    #[cfg(feature = "aot")]
+    pub fn interpreter_instance(
+        &self,
+        exe: &VmExe<F>,
+    ) -> Result<InterpretedInstance<'_, F, ExecutionCtx>, StaticProgramError> {
+        InterpretedInstance::new(&self.inventory, exe)
+    }
+
+    #[cfg(feature = "aot")]
+    pub fn instance(
+        &self,
+        exe: &VmExe<F>,
+    ) -> Result<AotInstance<'_, F, ExecutionCtx>, StaticProgramError> {
+        Self::aot_instance(self, exe)
+    }
+}
+#[cfg(feature = "aot")]
+impl<F, VC> VmExecutor<F, VC>
+where
+    F: PrimeField32,
+    VC: VmExecutionConfig<F>,
+    VC::Executor: Executor<F>,
+{
+    pub fn aot_instance(
+        &self,
+        exe: &VmExe<F>,
+    ) -> Result<AotInstance<'_, F, ExecutionCtx>, StaticProgramError> {
+        AotInstance::new(&self.inventory, exe)
+    }
+}
+
+impl<F, VC> VmExecutor<F, VC>
+where
+    F: PrimeField32,
+    VC: VmExecutionConfig<F>,
+    VC::Executor: MeteredExecutor<F>,
+{
+    /// Creates an instance of the interpreter specialized for metered execution of the given `exe`.
+    #[cfg(not(feature = "aot"))]
+    pub fn metered_instance(
+        &self,
+        exe: &VmExe<F>,
+        executor_idx_to_air_idx: &[usize],
+    ) -> Result<InterpretedInstance<'_, F, MeteredCtx>, StaticProgramError> {
+        InterpretedInstance::new_metered(&self.inventory, exe, executor_idx_to_air_idx)
+    }
+
+    #[cfg(feature = "aot")]
+    pub fn metered_interpreter_instance(
+        &self,
+        exe: &VmExe<F>,
+        executor_idx_to_air_idx: &[usize],
+    ) -> Result<InterpretedInstance<'_, F, MeteredCtx>, StaticProgramError> {
+        InterpretedInstance::new_metered(&self.inventory, exe, executor_idx_to_air_idx)
+    }
+
+    #[cfg(feature = "aot")]
+    pub fn metered_instance(
+        &self,
+        exe: &VmExe<F>,
+        executor_idx_to_air_idx: &[usize],
+    ) -> Result<AotInstance<'_, F, MeteredCtx>, StaticProgramError> {
+        Self::metered_aot_instance(self, exe, executor_idx_to_air_idx)
+    }
+
+    // Crates an AOT instance for metered execution of the given `exe`.
+    #[cfg(feature = "aot")]
+    pub fn metered_aot_instance(
+        &self,
+        exe: &VmExe<F>,
+        executor_idx_to_air_idx: &[usize],
+    ) -> Result<AotInstance<'_, F, MeteredCtx>, StaticProgramError> {
+        AotInstance::new_metered(&self.inventory, exe, executor_idx_to_air_idx)
+    }
+
+    /// Creates an instance of the interpreter specialized for cost metering execution of the given
+    /// `exe`.
+    pub fn metered_cost_instance(
+        &self,
+        exe: &VmExe<F>,
+        executor_idx_to_air_idx: &[usize],
+    ) -> Result<InterpretedInstance<'_, F, MeteredCostCtx>, StaticProgramError> {
+        InterpretedInstance::new_metered(&self.inventory, exe, executor_idx_to_air_idx)
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum VmVerificationError<SC: StarkProtocolConfig> {
+    #[error("no proof is provided")]
+    ProofNotFound,
+
+    #[error("program commit mismatch (index of mismatch proof: {index}")]
+    ProgramCommitMismatch { index: usize },
+
+    #[error("exe commit mismatch (expected: {expected:?}, actual: {actual:?})")]
+    ExeCommitMismatch {
+        expected: [u32; CHUNK],
+        actual: [u32; CHUNK],
+    },
+
+    #[error("initial pc mismatch (initial: {initial}, prev_final: {prev_final})")]
+    InitialPcMismatch { initial: u32, prev_final: u32 },
+
+    #[error("initial memory root mismatch")]
+    InitialMemoryRootMismatch,
+
+    #[error("is terminate mismatch (expected: {expected}, actual: {actual})")]
+    IsTerminateMismatch { expected: bool, actual: bool },
+
+    #[error("exit code mismatch")]
+    ExitCodeMismatch { expected: u32, actual: u32 },
+
+    #[error("AIR has unexpected public values (expected: {expected}, actual: {actual})")]
+    UnexpectedPvs { expected: usize, actual: usize },
+
+    #[error("Invalid number of AIRs: expected at least 3, got {0}")]
+    NotEnoughAirs(usize),
+
+    #[error("missing system AIR with ID {air_id}")]
+    SystemAirMissing { air_id: usize },
+
+    #[error("stark verification error: {0}")]
+    StarkError(#[from] VerifierError<SC::EF>),
+
+    #[error("user public values proof error: {0}")]
+    UserPublicValuesError(#[from] UserPublicValuesProofError),
+}
+
+#[derive(Error, Debug)]
+pub enum VirtualMachineError {
+    #[error("executor inventory error: {0}")]
+    ExecutorInventory(#[from] ExecutorInventoryError),
+    #[error("air inventory error: {0}")]
+    AirInventory(#[from] AirInventoryError),
+    #[error("chip inventory error: {0}")]
+    ChipInventory(#[from] ChipInventoryError),
+    #[error("static program error: {0}")]
+    StaticProgram(#[from] StaticProgramError),
+    #[error("execution error: {0}")]
+    Execution(#[from] ExecutionError),
+    #[error("trace generation error: {0}")]
+    Generation(#[from] GenerationError),
+    #[error("program committed trade data not loaded")]
+    ProgramIsNotCommitted,
+}
+
+/// The [VirtualMachine] struct contains the API to generate proofs for _arbitrary_ programs for a
+/// fixed set of OpenVM instructions and a fixed VM circuit corresponding to those instructions. The
+/// API is specific to a particular [StarkEngine], which specifies a fixed [StarkProtocolConfig] and
+/// [ProverBackend] via associated types. The [VmBuilder] also fixes the choice of
+/// `RecordArena` associated to the prover backend via an associated type.
+///
+/// In other words, this struct _is_ the zkVM.
+#[derive(Getters, MutGetters, Setters, WithSetters)]
+pub struct VirtualMachine<E, VB>
+where
+    E: StarkEngine,
+    VB: VmBuilder<E>,
+{
+    /// Proving engine
+    pub engine: E,
+    /// Runtime executor
+    #[getset(get = "pub")]
+    executor: VmExecutor<Val<E::SC>, VB::VmConfig>,
+    #[getset(get = "pub", get_mut = "pub")]
+    pk: DeviceMultiStarkProvingKey<E::PB>,
+    chip_complex: VmChipComplex<E::SC, VB::RecordArena, E::PB, VB::SystemChipInventory>,
+}
+
+impl<E, VB> VirtualMachine<E, VB>
+where
+    E: StarkEngine,
+    VB: VmBuilder<E>,
+{
+    pub fn new(
+        engine: E,
+        builder: VB,
+        config: VB::VmConfig,
+        d_pk: DeviceMultiStarkProvingKey<E::PB>,
+    ) -> Result<Self, VirtualMachineError> {
+        let circuit = config.create_airs()?;
+        let chip_complex =
+            builder.create_chip_complex(&config, circuit, engine.device().device_ctx())?;
+        let executor = VmExecutor::<Val<E::SC>, _>::new(config)?;
+        Ok(Self {
+            engine,
+            executor,
+            pk: d_pk,
+            chip_complex,
+        })
+    }
+
+    pub fn new_with_keygen(
+        engine: E,
+        builder: VB,
+        config: VB::VmConfig,
+    ) -> Result<(Self, MultiStarkProvingKey<E::SC>), VirtualMachineError> {
+        let circuit = config.create_airs()?;
+        let pk = circuit.keygen(engine.config());
+        let _vk = pk.get_vk();
+        let d_pk = engine.device().transport_pk_to_device(&pk);
+        let vm = Self::new(engine, builder, config, d_pk)?;
+        Ok((vm, pk))
+    }
+
+    pub fn config(&self) -> &VB::VmConfig {
+        &self.executor.config
+    }
+
+    /// Pure interpreter.
+    #[cfg(not(feature = "aot"))]
+    pub fn interpreter(
+        &self,
+        exe: &VmExe<Val<E::SC>>,
+    ) -> Result<InterpretedInstance<'_, Val<E::SC>, ExecutionCtx>, StaticProgramError>
+    where
+        Val<E::SC>: PrimeField32,
+        <VB::VmConfig as VmExecutionConfig<Val<E::SC>>>::Executor: Executor<Val<E::SC>>,
+    {
+        self.executor().instance(exe)
+    }
+
+    // Pure AOT execution
+    #[cfg(feature = "aot")]
+    pub fn naive_interpreter(
+        &self,
+        exe: &VmExe<Val<E::SC>>,
+    ) -> Result<InterpretedInstance<'_, Val<E::SC>, ExecutionCtx>, StaticProgramError>
+    where
+        Val<E::SC>: PrimeField32,
+        <VB::VmConfig as VmExecutionConfig<Val<E::SC>>>::Executor: Executor<Val<E::SC>>,
+    {
+        self.executor().interpreter_instance(exe)
+    }
+
+    // Pure AOT execution
+    #[cfg(feature = "aot")]
+    pub fn interpreter(
+        &self,
+        exe: &VmExe<Val<E::SC>>,
+    ) -> Result<AotInstance<'_, Val<E::SC>, ExecutionCtx>, StaticProgramError>
+    where
+        Val<E::SC>: PrimeField32,
+        <VB::VmConfig as VmExecutionConfig<Val<E::SC>>>::Executor: Executor<Val<E::SC>>,
+    {
+        Self::get_aot_instance(self, exe)
+    }
+
+    #[cfg(feature = "aot")]
+    pub fn get_aot_instance(
+        &self,
+        exe: &VmExe<Val<E::SC>>,
+    ) -> Result<AotInstance<'_, Val<E::SC>, ExecutionCtx>, StaticProgramError>
+    where
+        Val<E::SC>: PrimeField32,
+        <VB::VmConfig as VmExecutionConfig<Val<E::SC>>>::Executor: Executor<Val<E::SC>>,
+    {
+        self.executor().aot_instance(exe)
+    }
+
+    #[cfg(not(feature = "aot"))]
+    pub fn metered_interpreter(
+        &self,
+        exe: &VmExe<Val<E::SC>>,
+    ) -> Result<InterpretedInstance<'_, Val<E::SC>, MeteredCtx>, StaticProgramError>
+    where
+        Val<E::SC>: PrimeField32,
+        <VB::VmConfig as VmExecutionConfig<Val<E::SC>>>::Executor: MeteredExecutor<Val<E::SC>>,
+    {
+        let executor_idx_to_air_idx = self.executor_idx_to_air_idx();
+        self.executor()
+            .metered_instance(exe, &executor_idx_to_air_idx)
+    }
+
+    #[cfg(feature = "aot")]
+    pub fn metered_interpreter(
+        &self,
+        exe: &VmExe<Val<E::SC>>,
+    ) -> Result<AotInstance<'_, Val<E::SC>, MeteredCtx>, StaticProgramError>
+    where
+        Val<E::SC>: PrimeField32,
+        <VB::VmConfig as VmExecutionConfig<Val<E::SC>>>::Executor: MeteredExecutor<Val<E::SC>>,
+    {
+        let executor_idx_to_air_idx = self.executor_idx_to_air_idx();
+        self.executor()
+            .metered_instance(exe, &executor_idx_to_air_idx)
+    }
+
+    // Metered AOT execution
+    #[cfg(feature = "aot")]
+    pub fn get_metered_aot_instance(
+        &self,
+        exe: &VmExe<Val<E::SC>>,
+    ) -> Result<AotInstance<'_, Val<E::SC>, MeteredCtx>, StaticProgramError>
+    where
+        Val<E::SC>: PrimeField32,
+        <VB::VmConfig as VmExecutionConfig<Val<E::SC>>>::Executor: MeteredExecutor<Val<E::SC>>,
+    {
+        let executor_idx_to_air_idx = self.executor_idx_to_air_idx();
+        self.executor()
+            .metered_aot_instance(exe, &executor_idx_to_air_idx)
+    }
+
+    #[cfg(feature = "aot")]
+    pub fn naive_metered_interpreter(
+        &self,
+        exe: &VmExe<Val<E::SC>>,
+    ) -> Result<InterpretedInstance<'_, Val<E::SC>, MeteredCtx>, StaticProgramError>
+    where
+        Val<E::SC>: PrimeField32,
+        <VB::VmConfig as VmExecutionConfig<Val<E::SC>>>::Executor: MeteredExecutor<Val<E::SC>>,
+    {
+        let executor_idx_to_air_idx = self.executor_idx_to_air_idx();
+        self.executor()
+            .metered_interpreter_instance(exe, &executor_idx_to_air_idx)
+    }
+
+    pub fn metered_cost_interpreter(
+        &self,
+        exe: &VmExe<Val<E::SC>>,
+    ) -> Result<InterpretedInstance<'_, Val<E::SC>, MeteredCostCtx>, StaticProgramError>
+    where
+        Val<E::SC>: PrimeField32,
+        <VB::VmConfig as VmExecutionConfig<Val<E::SC>>>::Executor: MeteredExecutor<Val<E::SC>>,
+    {
+        let executor_idx_to_air_idx = self.executor_idx_to_air_idx();
+        self.executor()
+            .metered_cost_instance(exe, &executor_idx_to_air_idx)
+    }
+
+    pub fn preflight_interpreter(
+        &self,
+        exe: &VmExe<Val<E::SC>>,
+    ) -> Result<PreflightInterpretedInstance2<Val<E::SC>, VB::VmConfig>, StaticProgramError> {
+        PreflightInterpretedInstance::new(
+            &exe.program,
+            self.executor.inventory.clone(),
+            self.executor_idx_to_air_idx(),
+        )
+    }
+
+    /// Preflight execution for a single segment. Executes for exactly `num_insns` instructions
+    /// using an interpreter. Preflight execution must be provided with `trace_heights`
+    /// instrumentation data that was collected from a previous run of metered execution so that the
+    /// preflight execution knows how much memory to allocate for record arenas.
+    ///
+    /// This function should rarely be called on its own. Users are advised to call
+    /// [`prove`](Self::prove) directly.
+    #[instrument(name = "execute_preflight", skip_all)]
+    pub fn execute_preflight(
+        &self,
+        interpreter: &mut PreflightInterpretedInstance2<Val<E::SC>, VB::VmConfig>,
+        state: VmState<Val<E::SC>, GuestMemory>,
+        num_insns: Option<u64>,
+        trace_heights: &[u32],
+    ) -> Result<PreflightExecutionOutput<Val<E::SC>, VB::RecordArena>, ExecutionError>
+    where
+        Val<E::SC>: PrimeField32,
+        <VB::VmConfig as VmExecutionConfig<Val<E::SC>>>::Executor:
+            PreflightExecutor<Val<E::SC>, VB::RecordArena>,
+    {
+        debug_assert!(interpreter
+            .executor_idx_to_air_idx
+            .iter()
+            .all(|&air_idx| air_idx < trace_heights.len()));
+
+        // TODO[jpw]: figure out how to compute RA specific main_widths
+        let main_widths = self
+            .pk
+            .per_air
+            .iter()
+            .map(|pk| pk.vk.params.width.main_width())
+            .collect_vec();
+        let capacities = zip_eq(trace_heights, main_widths)
+            .map(|(&h, w)| (h as usize, w))
+            .collect::<Vec<_>>();
+        let ctx = PreflightCtx::new_with_capacity(&capacities, num_insns);
+
+        let pc = state.pc();
+        let memory = TracingMemory::from_image(state.memory);
+        let from_state = ExecutionState::new(pc, memory.timestamp());
+        let vm_state = VmState::new(
+            pc,
+            memory,
+            state.streams,
+            state.rng,
+            #[cfg(feature = "metrics")]
+            state.metrics,
+        );
+        let mut exec_state = VmExecState::new(vm_state, ctx);
+        interpreter.reset_execution_frequencies();
+        execute_spanned!("execute_preflight", interpreter, &mut exec_state)?;
+        let filtered_exec_frequencies = interpreter.filtered_execution_frequencies();
+        #[cfg(feature = "metrics")]
+        emit_opcode_counts(
+            &exec_state.vm_state.metrics,
+            interpreter.opcode_counts_by_air::<VB::RecordArena>(),
+        );
+        let touched_memory = exec_state.vm_state.memory.finalize::<Val<E::SC>>();
+        #[cfg(feature = "perf-metrics")]
+        end_segment_metrics(&mut exec_state);
+
+        let pc = exec_state.vm_state.pc();
+        let memory = exec_state.vm_state.memory;
+        let to_state = ExecutionState::new(pc, memory.timestamp());
+        let exit_code = exec_state.exit_code?;
+        let system_records = SystemRecords {
+            from_state,
+            to_state,
+            exit_code,
+            filtered_exec_frequencies,
+            touched_memory,
+        };
+        let record_arenas = exec_state.ctx.arenas;
+        let to_state = VmState::new(
+            pc,
+            memory.data,
+            exec_state.vm_state.streams,
+            exec_state.vm_state.rng,
+            #[cfg(feature = "metrics")]
+            exec_state.vm_state.metrics,
+        );
+        Ok(PreflightExecutionOutput {
+            system_records,
+            record_arenas,
+            to_state,
+        })
+    }
+
+    /// Calls [`VmState::initial`] but sets more information for
+    /// performance metrics when feature "perf-metrics" is enabled.
+    #[instrument(name = "vm.create_initial_state", level = "debug", skip_all)]
+    pub fn create_initial_state(
+        &self,
+        exe: &VmExe<Val<E::SC>>,
+        inputs: impl Into<Streams<Val<E::SC>>>,
+    ) -> VmState<Val<E::SC>, GuestMemory> {
+        #[allow(unused_mut)]
+        let mut state = VmState::initial(
+            self.config().as_ref(),
+            &exe.init_memory,
+            exe.pc_start,
+            inputs,
+        );
+        // Add backtrace information for either:
+        // - debugging
+        // - performance metrics
+        #[cfg(all(feature = "metrics", any(feature = "perf-metrics", debug_assertions)))]
+        {
+            state.metrics.fn_bounds = exe.fn_bounds.clone();
+            state.metrics.debug_infos = exe.program.debug_infos();
+        }
+        #[cfg(feature = "metrics")]
+        {
+            state.metrics.set_pk_air_names(&self.pk);
+        }
+        #[cfg(feature = "perf-metrics")]
+        {
+            state.metrics.set_pk_trace_info(&self.pk);
+            state.metrics.num_sys_airs = self.config().as_ref().num_airs();
+        }
+        state
+    }
+
+    /// This function mutates `self` but should only depend on internal state in the sense that:
+    /// - program must already be loaded as cached trace via [`load_program`](Self::load_program).
+    /// - initial memory image was already sent to device via
+    ///   [`transport_init_memory_to_device`](Self::transport_init_memory_to_device).
+    /// - all other state should be given by `system_records` and `record_arenas`
+    #[instrument(name = "trace_gen", skip_all)]
+    pub fn generate_proving_ctx(
+        &mut self,
+        system_records: SystemRecords<Val<E::SC>>,
+        record_arenas: Vec<VB::RecordArena>,
+    ) -> Result<ProvingContext<E::PB>, GenerationError> {
+        // main tracegen call:
+        let ctx = self
+            .chip_complex
+            .generate_proving_ctx(system_records, record_arenas)?;
+
+        // ==== Defensive checks that the trace heights satisfy the linear constraints: ====
+        let idx_trace_heights = ctx
+            .per_trace
+            .iter()
+            .map(|(air_idx, ctx)| (*air_idx, ctx.common_main.height()))
+            .collect_vec();
+        // 1. check max trace height isn't exceeded
+        let max_trace_height = if TypeId::of::<Val<E::SC>>() == TypeId::of::<BabyBear>() {
+            let min_log_blowup = log2_ceil_usize(self.config().as_ref().max_constraint_degree - 1);
+            1 << (BabyBear::TWO_ADICITY - min_log_blowup)
+        } else {
+            tracing::warn!(
+                "constructing VirtualMachine for unrecognized field; using max_trace_height=2^30"
+            );
+            1 << 30
+        };
+        if let Some(&(air_idx, height)) = idx_trace_heights
+            .iter()
+            .find(|(_, height)| *height > max_trace_height)
+        {
+            return Err(GenerationError::TraceHeightsLimitExceeded {
+                air_idx,
+                height,
+                max_height: max_trace_height,
+            });
+        }
+        // 2. check linear constraints on trace heights are satisfied
+        let trace_height_constraints = &self.pk.trace_height_constraints;
+        if trace_height_constraints.is_empty() {
+            tracing::warn!("generating proving context without trace height constraints");
+        }
+        for (i, constraint) in trace_height_constraints.iter().enumerate() {
+            let value = idx_trace_heights
+                .iter()
+                .map(|&(air_idx, h)| constraint.coefficients[air_idx] as u64 * h as u64)
+                .sum::<u64>();
+
+            if value >= constraint.threshold as u64 {
+                tracing::info!(
+                    "trace heights {:?} violate linear constraint {} ({} >= {})",
+                    idx_trace_heights,
+                    i,
+                    value,
+                    constraint.threshold
+                );
+                return Err(GenerationError::LinearTraceHeightConstraintExceeded {
+                    constraint_idx: i,
+                    value,
+                    threshold: constraint.threshold,
+                });
+            }
+        }
+        #[cfg(feature = "stark-debug")]
+        self.debug_proving_ctx(&ctx);
+
+        Ok(ctx)
+    }
+
+    /// Generates proof for zkVM execution for exactly `num_insns` instructions for a given program
+    /// and a given starting state.
+    ///
+    /// **Note**: The cached program trace must be loaded via [`load_program`](Self::load_program)
+    /// before calling this function.
+    ///
+    /// Returns:
+    /// - proof for the execution segment
+    /// - final memory state only if execution ends in successful termination (exit code 0). This
+    ///   final memory state may be used to extract user public values afterwards.
+    pub fn prove(
+        &mut self,
+        interpreter: &mut PreflightInterpretedInstance2<Val<E::SC>, VB::VmConfig>,
+        state: VmState<Val<E::SC>, GuestMemory>,
+        num_insns: Option<u64>,
+        trace_heights: &[u32],
+    ) -> Result<(Proof<E::SC>, Option<GuestMemory>), VirtualMachineError>
+    where
+        Val<E::SC>: PrimeField32,
+        <VB::VmConfig as VmExecutionConfig<Val<E::SC>>>::Executor:
+            PreflightExecutor<Val<E::SC>, VB::RecordArena>,
+    {
+        self.transport_init_memory_to_device(&state.memory);
+
+        let PreflightExecutionOutput {
+            system_records,
+            record_arenas,
+            to_state,
+        } = self.execute_preflight(interpreter, state, num_insns, trace_heights)?;
+        // drop final memory unless this is a terminal segment and the exit code is success
+        let final_memory =
+            (system_records.exit_code == Some(ExitCode::Success as u32)).then_some(to_state.memory);
+        let ctx = self.generate_proving_ctx(system_records, record_arenas)?;
+        let proof = self.engine.prove(&self.pk, ctx).unwrap();
+
+        Ok((proof, final_memory))
+    }
+
+    /// Transforms the program into a cached trace and commits it _on device_ using the proof system
+    /// polynomial commitment scheme.
+    ///
+    /// Returns the cached program trace.
+    /// Note that [`load_program`](Self::load_program) must be called separately to load the cached
+    /// program trace into the VM itself.
+    pub fn commit_program_on_device(
+        &self,
+        program: &Program<Val<E::SC>>,
+    ) -> CommittedTraceData<E::PB> {
+        let rm_trace = generate_cached_trace(program);
+        let cm_trace = ColMajorMatrix::from_row_major(&rm_trace);
+        let d_trace = self.engine.device().transport_matrix_to_device(&cm_trace);
+        let (commitment, pcs) = self
+            .engine
+            .device()
+            .commit(std::slice::from_ref(&&d_trace))
+            .unwrap();
+        CommittedTraceData {
+            commitment,
+            trace: d_trace,
+            data: Arc::new(pcs),
+        }
+    }
+
+    /// Loads cached program trace into the VM.
+    pub fn load_program(&mut self, cached_program_trace: CommittedTraceData<E::PB>) {
+        self.chip_complex.system.load_program(cached_program_trace);
+    }
+
+    #[instrument(name = "vm.transport_init_memory", skip_all)]
+    pub fn transport_init_memory_to_device(&mut self, memory: &GuestMemory) {
+        self.chip_complex
+            .system
+            .transport_init_memory_to_device(memory);
+    }
+
+    /// See [`SystemChipComplex::memory_top_tree`].
+    pub fn memory_top_tree(&self) -> Option<&[[Val<E::SC>; CHUNK]]> {
+        self.chip_complex.system.memory_top_tree()
+    }
+
+    pub fn executor_idx_to_air_idx(&self) -> Vec<usize> {
+        let ret = self.chip_complex.inventory.executor_idx_to_air_idx();
+        tracing::debug!("executor_idx_to_air_idx: {:?}", ret);
+        assert_eq!(self.executor().inventory.executors().len(), ret.len());
+        ret
+    }
+
+    /// Convenience method to construct a [MeteredCtx] using data from the stored proving key.
+    pub fn build_metered_ctx(&self, exe: &VmExe<Val<E::SC>>) -> MeteredCtx
+    where
+        Val<E::SC>: PrimeField32,
+    {
+        let program_len = exe.program.num_defined_instructions();
+
+        let (
+            mut constant_trace_heights,
+            air_names,
+            widths,
+            interactions,
+            need_rot,
+            constraint_eval_buffers,
+        ): (Vec<_>, Vec<_>, Vec<_>, Vec<_>, Vec<_>, Vec<_>) = self
+            .pk
+            .per_air
+            .iter()
+            .map(|pk| {
+                let constant_trace_height = pk.preprocessed_data.as_ref().map(|cd| cd.height());
+                let air_names = pk.air_name.clone();
+                let width = pk.vk.params.width.total_width();
+                let num_interactions = pk.vk.symbolic_constraints.interactions.len();
+                let need_rot = pk.vk.params.need_rot;
+                let constraint_eval_buffer = E::PB::constraint_eval_buffer_size(pk);
+                (
+                    constant_trace_height,
+                    air_names,
+                    width,
+                    num_interactions,
+                    need_rot,
+                    constraint_eval_buffer,
+                )
+            })
+            .multiunzip();
+
+        // Program trace is the same for all segments
+        constant_trace_heights[PROGRAM_AIR_ID] = Some(program_len);
+        // VmConnectorAir always has a constant trace height of 2
+        constant_trace_heights[CONNECTOR_AIR_ID] = Some(2);
+        // Merge in constant heights reported by chips (e.g., lookup table chips).
+        for (air_id, chip_height) in self
+            .chip_complex
+            .inventory
+            .constant_trace_heights()
+            .into_iter()
+            .enumerate()
+        {
+            if constant_trace_heights[air_id].is_none() {
+                constant_trace_heights[air_id] = chip_height;
+            }
+        }
+
+        let log_stacked_height = self
+            .engine
+            .params()
+            .log_stacked_height()
+            .try_into()
+            .expect("log_stacked_height must fit in u8");
+        self.executor().build_metered_ctx(
+            MeteredCtxInputs {
+                constant_trace_heights: &constant_trace_heights,
+                air_names: &air_names,
+                widths: &widths,
+                interactions: &interactions,
+                need_rot: &need_rot,
+                constraint_eval_buffers: &constraint_eval_buffers,
+                segmentation_limits: SegmentationLimits {
+                    max_trace_height_bits: log_stacked_height,
+                    max_memory: self.config().as_ref().segmentation_max_memory,
+                    max_interactions: <Val<E::SC> as PrimeField32>::ORDER_U32,
+                },
+            },
+            self.engine.proving_memory_config(),
+        )
+    }
+
+    /// Convenience method to construct a [MeteredCostCtx] using data from the stored proving key.
+    pub fn build_metered_cost_ctx(&self) -> MeteredCostCtx {
+        let widths: Vec<_> = self
+            .pk
+            .per_air
+            .iter()
+            .map(|pk| pk.vk.params.width.total_width())
+            .collect();
+
+        self.executor().build_metered_cost_ctx(&widths)
+    }
+
+    pub fn num_airs(&self) -> usize {
+        let num_airs = self.pk.per_air.len();
+        debug_assert_eq!(num_airs, self.chip_complex.inventory.airs().num_airs());
+        num_airs
+    }
+
+    pub fn air_names(&self) -> impl Iterator<Item = &'_ str> {
+        self.pk.per_air.iter().map(|pk| pk.air_name.as_str())
+    }
+
+    /// See [`debug_proving_ctx`].
+    #[cfg(feature = "stark-debug")]
+    pub fn debug_proving_ctx(&mut self, ctx: &ProvingContext<E::PB>) {
+        debug_proving_ctx(self, ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SystemConfig, VirtualMachine, CONNECTOR_AIR_ID, PROGRAM_AIR_ID};
+    use crate::{system::SystemCpuBuilder, utils::test_cpu_engine};
+
+    #[test]
+    fn keygen_marks_required_airs_for_continuations() {
+        let engine = test_cpu_engine();
+        let config = SystemConfig::default();
+        let merkle_air_id = config.memory_merkle_air_id();
+        let boundary_air_id = config.memory_boundary_air_id();
+
+        let (_vm, pk) = VirtualMachine::new_with_keygen(engine, SystemCpuBuilder, config).unwrap();
+
+        assert!(pk.per_air[PROGRAM_AIR_ID].vk.is_required);
+        assert!(pk.per_air[CONNECTOR_AIR_ID].vk.is_required);
+        assert!(pk.per_air[merkle_air_id].vk.is_required);
+        assert!(pk.per_air[boundary_air_id].vk.is_required);
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(bound(
+    serialize = "Com<SC>: Serialize",
+    deserialize = "Com<SC>: Deserialize<'de>"
+))]
+pub struct ContinuationVmProof<SC: StarkProtocolConfig> {
+    pub per_segment: Vec<Proof<SC>>,
+    pub user_public_values: UserPublicValuesProof<{ CHUNK }, Val<SC>>,
+}
+
+/// Prover for a specific exe in a specific continuation VM using a specific Stark config.
+pub trait ContinuationVmProver<SC: StarkProtocolConfig> {
+    fn prove(
+        &mut self,
+        input: impl Into<Streams<Val<SC>>>,
+    ) -> Result<ContinuationVmProof<SC>, VirtualMachineError>;
+}
+
+/// Virtual machine prover instance for a fixed VM config and a fixed program. For use in proving a
+/// program directly on bare metal.
+///
+/// This struct contains the [VmState] itself to avoid re-allocating guest memory. The memory is
+/// reset with zeros before execution.
+#[derive(Getters, MutGetters)]
+pub struct VmInstance<E, VB>
+where
+    E: StarkEngine,
+    VB: VmBuilder<E>,
+{
+    pub vm: VirtualMachine<E, VB>,
+    pub interpreter: PreflightInterpretedInstance2<Val<E::SC>, VB::VmConfig>,
+    #[getset(get = "pub")]
+    program_commitment: <E::PB as ProverBackend>::Commitment,
+    #[getset(get = "pub")]
+    exe: Arc<VmExe<Val<E::SC>>>,
+    #[getset(get = "pub", get_mut = "pub")]
+    state: Option<VmState<Val<E::SC>, GuestMemory>>,
+}
+
+impl<E, VB> VmInstance<E, VB>
+where
+    E: StarkEngine,
+    VB: VmBuilder<E>,
+{
+    pub fn new(
+        mut vm: VirtualMachine<E, VB>,
+        exe: Arc<VmExe<Val<E::SC>>>,
+        cached_program_trace: CommittedTraceData<E::PB>,
+    ) -> Result<Self, StaticProgramError> {
+        let program_commitment = cached_program_trace.commitment;
+        vm.load_program(cached_program_trace);
+        let interpreter = vm.preflight_interpreter(&exe)?;
+        let state = vm.create_initial_state(&exe, vec![]);
+        Ok(Self {
+            vm,
+            interpreter,
+            program_commitment,
+            exe,
+            state: Some(state),
+        })
+    }
+
+    #[instrument(name = "vm.reset_state", level = "debug", skip_all)]
+    pub fn reset_state(&mut self, inputs: impl Into<Streams<Val<E::SC>>>) {
+        let state = self.state.as_mut().unwrap();
+        state.reset(&self.exe.init_memory, self.exe.pc_start, inputs);
+
+        #[cfg(all(feature = "metrics", any(feature = "perf-metrics", debug_assertions)))]
+        {
+            state.metrics.fn_bounds = self.exe.fn_bounds.clone();
+            state.metrics.debug_infos = self.exe.program.debug_infos();
+        }
+    }
+}
+
+impl<E, VB> ContinuationVmProver<E::SC> for VmInstance<E, VB>
+where
+    E: StarkEngine,
+    Val<E::SC>: PrimeField32,
+    VB: VmBuilder<E>,
+    <VB::VmConfig as VmExecutionConfig<Val<E::SC>>>::Executor: Executor<Val<E::SC>>
+        + MeteredExecutor<Val<E::SC>>
+        + PreflightExecutor<Val<E::SC>, VB::RecordArena>,
+{
+    /// First performs metered execution (E2) to determine segments. Then sequentially proves each
+    /// segment. The proof for each segment uses the specified [ProverBackend], but the proof for
+    /// the next segment does not start before the current proof finishes.
+    fn prove(
+        &mut self,
+        input: impl Into<Streams<Val<E::SC>>>,
+    ) -> Result<ContinuationVmProof<E::SC>, VirtualMachineError> {
+        self.prove_continuations(input, |_, _| {})
+    }
+}
+
+impl<E, VB> VmInstance<E, VB>
+where
+    E: StarkEngine,
+    Val<E::SC>: PrimeField32,
+    VB: VmBuilder<E>,
+    <VB::VmConfig as VmExecutionConfig<Val<E::SC>>>::Executor: Executor<Val<E::SC>>
+        + MeteredExecutor<Val<E::SC>>
+        + PreflightExecutor<Val<E::SC>, VB::RecordArena>,
+{
+    /// For internal use to resize trace matrices before proving.
+    ///
+    /// The closure `modify_ctx(seg_idx, &mut ctx)` is called sequentially for each segment.
+    pub fn prove_continuations(
+        &mut self,
+        input: impl Into<Streams<Val<E::SC>>>,
+        mut modify_ctx: impl FnMut(usize, &mut ProvingContext<E::PB>),
+    ) -> Result<ContinuationVmProof<E::SC>, VirtualMachineError> {
+        let input = input.into();
+        self.reset_state(input.clone());
+        let vm = &mut self.vm;
+        let metered_ctx = vm.build_metered_ctx(&self.exe);
+        let metered_interpreter = vm.metered_interpreter(&self.exe)?;
+        let (segments, _) = metered_interpreter.execute_metered(input, metered_ctx)?;
+        let mut proofs = Vec::with_capacity(segments.len());
+        let mut state = self.state.take();
+        for (seg_idx, segment) in segments.into_iter().enumerate() {
+            let _segment_span = info_span!("prove_segment", segment = seg_idx).entered();
+            // We need a separate span so the metric label includes "segment" from _segment_span
+            let _prove_span = info_span!("total_proof").entered();
+            let Segment {
+                num_insns,
+                trace_heights,
+                ..
+            } = segment;
+            let from_state = Option::take(&mut state).unwrap();
+            vm.transport_init_memory_to_device(&from_state.memory);
+            let PreflightExecutionOutput {
+                system_records,
+                record_arenas,
+                to_state,
+            } = vm.execute_preflight(
+                &mut self.interpreter,
+                from_state,
+                Some(num_insns),
+                &trace_heights,
+            )?;
+            state = Some(to_state);
+
+            let mut ctx = vm.generate_proving_ctx(system_records, record_arenas)?;
+            modify_ctx(seg_idx, &mut ctx);
+            let proof = vm.engine.prove(vm.pk(), ctx).unwrap();
+            proofs.push(proof);
+        }
+        let to_state = state.unwrap();
+        let final_memory = &to_state.memory.memory;
+        let final_memory_top_tree = vm.memory_top_tree().expect("memory top tree should exist");
+        let user_public_values = UserPublicValuesProof::compute(
+            vm.config().as_ref().memory_config.memory_dimensions(),
+            vm.config().as_ref().num_public_values,
+            &vm_poseidon2_hasher(),
+            final_memory,
+            final_memory_top_tree,
+        );
+        self.state = Some(to_state);
+        Ok(ContinuationVmProof {
+            per_segment: proofs,
+            user_public_values,
+        })
+    }
+}
+
+/// The payload of a verified guest VM execution.
+pub struct VerifiedExecutionPayload<F> {
+    /// The Merklelized hash of:
+    /// - Program code commitment (commitment of the cached trace)
+    /// - Merkle root of the initial memory
+    /// - Starting program counter (`pc_start`)
+    ///
+    /// The Merklelization uses Poseidon2 as a cryptographic hash function (for the leaves)
+    /// and a cryptographic compression function (for internal nodes).
+    pub exe_commit: [F; CHUNK],
+    /// The Merkle root of the final memory state.
+    pub final_memory_root: [F; CHUNK],
+}
+
+/// Verify segment proofs with boundary condition checks for continuation between segments.
+///
+/// Assumption:
+/// - `vk` is a valid verifying key of a VM circuit.
+///
+/// Returns:
+/// - The commitment to the VM executable extracted from `proofs`. It is the responsibility of the
+///   caller to check that the returned commitment matches the VM executable that the VM was
+///   supposed to execute.
+/// - The Merkle root of the final memory state.
+///
+/// ## Note
+/// This function does not extract or verify any user public values from the final memory state.
+/// This verification requires an additional Merkle proof with respect to the Merkle root of
+/// the final memory state.
+// @dev: This function doesn't need to be generic in `VC`.
+pub fn verify_segments<E>(
+    engine: &E,
+    vk: &MultiStarkVerifyingKey<E::SC>,
+    proofs: &[Proof<E::SC>],
+) -> Result<VerifiedExecutionPayload<Val<E::SC>>, VmVerificationError<E::SC>>
+where
+    E: StarkEngine,
+    Val<E::SC>: PrimeField32,
+    Com<E::SC>: Into<[Val<E::SC>; CHUNK]>,
+{
+    if proofs.is_empty() {
+        return Err(VmVerificationError::ProofNotFound);
+    }
+    let mut prev_final_memory_root = None;
+    let mut prev_final_pc = None;
+    let mut start_pc = None;
+    let mut initial_memory_root = None;
+    let mut program_commit = None;
+
+    for (i, proof) in proofs.iter().enumerate() {
+        let res = engine.verify(vk, proof);
+        match res {
+            Ok(_) => (),
+            Err(e) => return Err(VmVerificationError::StarkError(e)),
+        };
+
+        let mut program_air_present = false;
+        let mut connector_air_present = false;
+        let mut boundary_air_present = false;
+        let mut merkle_air_present = false;
+
+        // Check public values.
+        for (air_idx, (vdata, pvs)) in proof
+            .trace_vdata
+            .iter()
+            .zip(proof.public_values.iter())
+            .enumerate()
+        {
+            let air_vk = &vk.inner.per_air[air_idx];
+            if air_idx == PROGRAM_AIR_ID {
+                program_air_present = true;
+                let vdata = vdata.as_ref().unwrap();
+                if i == 0 {
+                    program_commit = Some(vdata.cached_commitments[PROGRAM_CACHED_TRACE_INDEX]);
+                } else if program_commit.unwrap()
+                    != vdata.cached_commitments[PROGRAM_CACHED_TRACE_INDEX]
+                {
+                    return Err(VmVerificationError::ProgramCommitMismatch { index: i });
+                }
+            } else if air_idx == CONNECTOR_AIR_ID {
+                connector_air_present = true;
+                let pvs: &VmConnectorPvs<_> = pvs.as_slice().borrow();
+
+                if i != 0 {
+                    // Check initial pc matches the previous final pc.
+                    if pvs.initial_pc != prev_final_pc.unwrap() {
+                        return Err(VmVerificationError::InitialPcMismatch {
+                            initial: pvs.initial_pc.as_canonical_u32(),
+                            prev_final: prev_final_pc.unwrap().as_canonical_u32(),
+                        });
+                    }
+                } else {
+                    start_pc = Some(pvs.initial_pc);
+                }
+                prev_final_pc = Some(pvs.final_pc);
+
+                let expected_is_terminate = i == proofs.len() - 1;
+                if pvs.is_terminate != PrimeCharacteristicRing::from_bool(expected_is_terminate) {
+                    return Err(VmVerificationError::IsTerminateMismatch {
+                        expected: expected_is_terminate,
+                        actual: pvs.is_terminate.as_canonical_u32() != 0,
+                    });
+                }
+
+                let expected_exit_code = if expected_is_terminate {
+                    ExitCode::Success as u32
+                } else {
+                    DEFAULT_SUSPEND_EXIT_CODE
+                };
+                if pvs.exit_code != PrimeCharacteristicRing::from_u32(expected_exit_code) {
+                    return Err(VmVerificationError::ExitCodeMismatch {
+                        expected: expected_exit_code,
+                        actual: pvs.exit_code.as_canonical_u32(),
+                    });
+                }
+            } else if air_idx == BOUNDARY_AIR_ID {
+                boundary_air_present = vdata.is_some();
+                if !pvs.is_empty() {
+                    return Err(VmVerificationError::UnexpectedPvs {
+                        expected: 0,
+                        actual: pvs.len(),
+                    });
+                }
+            } else if air_idx == MERKLE_AIR_ID {
+                merkle_air_present = true;
+                let pvs: &MemoryMerklePvs<_, CHUNK> = pvs.as_slice().borrow();
+
+                // Check that initial root matches the previous final root.
+                if i != 0 {
+                    if pvs.initial_root != prev_final_memory_root.unwrap() {
+                        return Err(VmVerificationError::InitialMemoryRootMismatch);
+                    }
+                } else {
+                    initial_memory_root = Some(pvs.initial_root);
+                }
+                prev_final_memory_root = Some(pvs.final_root);
+            } else {
+                if !pvs.is_empty() {
+                    return Err(VmVerificationError::UnexpectedPvs {
+                        expected: 0,
+                        actual: pvs.len(),
+                    });
+                }
+                // We assume the vk is valid, so this is only a debug assert.
+                debug_assert_eq!(air_vk.params.num_public_values, 0);
+            }
+        }
+        if !program_air_present {
+            return Err(VmVerificationError::SystemAirMissing {
+                air_id: PROGRAM_AIR_ID,
+            });
+        }
+        if !connector_air_present {
+            return Err(VmVerificationError::SystemAirMissing {
+                air_id: CONNECTOR_AIR_ID,
+            });
+        }
+        if !boundary_air_present {
+            return Err(VmVerificationError::SystemAirMissing {
+                air_id: BOUNDARY_AIR_ID,
+            });
+        }
+        if !merkle_air_present {
+            return Err(VmVerificationError::SystemAirMissing {
+                air_id: MERKLE_AIR_ID,
+            });
+        }
+    }
+    let exe_commit = compute_exe_commit(
+        &vm_poseidon2_hasher(),
+        &program_commit.unwrap().into(),
+        initial_memory_root.as_ref().unwrap(),
+        start_pc.unwrap(),
+    );
+    Ok(VerifiedExecutionPayload {
+        exe_commit,
+        final_memory_root: prev_final_memory_root.unwrap(),
+    })
+}
+
+impl<SC: StarkProtocolConfig> Clone for ContinuationVmProof<SC>
+where
+    Com<SC>: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            per_segment: self.per_segment.clone(),
+            user_public_values: self.user_public_values.clone(),
+        }
+    }
+}
+
+pub(super) fn create_memory_image(
+    memory_config: &MemoryConfig,
+    init_memory: &SparseMemoryImage,
+) -> GuestMemory {
+    let mut inner = AddressMap::new(memory_config.addr_spaces.clone());
+    inner.set_from_sparse(init_memory);
+    GuestMemory::new(inner)
+}
+
+impl<E, VC> VirtualMachine<E, VC>
+where
+    E: StarkEngine,
+    VC: VmBuilder<E>,
+    VC::SystemChipInventory: SystemWithFixedTraceHeights,
+{
+    /// Sets fixed trace heights for the system AIRs' trace matrices.
+    pub fn override_system_trace_heights(&mut self, heights: &[u32]) {
+        let num_sys_airs = self.config().as_ref().num_airs();
+        assert!(heights.len() >= num_sys_airs);
+        self.chip_complex
+            .system
+            .override_trace_heights(&heights[..num_sys_airs]);
+    }
+}
+
+/// Runs the STARK backend debugger to check the constraints against the trace matrices
+/// logically, instead of cryptographically. This will panic if any constraint is violated, and
+/// using `RUST_BACKTRACE=1` can be used to read the stack backtrace of where the constraint
+/// failed in the code (this requires the code to be compiled with debug=true). Using lower
+/// optimization levels like -O0 will prevent the compiler from inlining and give better
+/// debugging information.
+// @dev The debugger needs the host proving key.
+//      This function is used both by VirtualMachine::debug_proving_ctx and by
+// stark_utils::air_test_impl
+#[cfg(any(debug_assertions, feature = "test-utils", feature = "stark-debug"))]
+#[tracing::instrument(level = "debug", skip_all)]
+pub fn debug_proving_ctx<E, VB>(vm: &VirtualMachine<E, VB>, ctx: &ProvingContext<E::PB>)
+where
+    E: StarkEngine,
+    VB: VmBuilder<E>,
+{
+    let air_inv = vm.config().create_airs().unwrap();
+    let global_airs: Vec<AirRef<E::SC>> = air_inv.into_airs().map(|a| a as AirRef<_>).collect();
+    vm.engine.debug(&global_airs, ctx);
+}

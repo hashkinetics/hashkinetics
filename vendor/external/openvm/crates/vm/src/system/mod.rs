@@ -1,0 +1,454 @@
+use std::sync::Arc;
+
+use derive_more::derive::From;
+use openvm_circuit_derive::{AnyEnum, Executor, MeteredExecutor, PreflightExecutor};
+#[cfg(feature = "aot")]
+use openvm_circuit_derive::{AotExecutor, AotMeteredExecutor};
+use openvm_circuit_primitives::{
+    var_range::{
+        SharedVariableRangeCheckerChip, VariableRangeCheckerAir, VariableRangeCheckerBus,
+        VariableRangeCheckerChip,
+    },
+    Chip,
+};
+use openvm_cpu_backend::{CpuBackend, CpuDevice};
+use openvm_instructions::{LocalOpcode, PhantomDiscriminant, SysPhantom, SystemOpcode};
+use openvm_stark_backend::{
+    interaction::{LookupBus, PermutationCheckBus},
+    p3_field::{Field, PrimeField32},
+    prover::{AirProvingContext, CommittedTraceData, ProverBackend},
+    StarkEngine, StarkProtocolConfig, Val,
+};
+use rustc_hash::FxHashMap;
+
+use self::{connector::VmConnectorAir, program::ProgramAir};
+use crate::{
+    arch::{
+        vm_poseidon2_config, AirInventory, AirInventoryError, AirRefWithColumns, BusIndexManager,
+        ChipInventory, ChipInventoryError, ExecutionBridge, ExecutionBus, ExecutionState,
+        ExecutorInventory, ExecutorInventoryError, MatrixRecordArena, PhantomSubExecutor,
+        RowMajorMatrixArena, SystemConfig, VmBuilder, VmChipComplex, VmCircuitConfig,
+        VmExecutionConfig, VmField, BOUNDARY_AIR_ID, CONNECTOR_AIR_ID, DEFAULT_BLOCK_SIZE,
+        PROGRAM_AIR_ID,
+    },
+    system::{
+        connector::VmConnectorChip,
+        memory::{
+            offline_checker::{MemoryBridge, MemoryBus},
+            online::GuestMemory,
+            MemoryAirInventory, MemoryController, TimestampedEquipartition, CHUNK,
+        },
+        phantom::{
+            CycleEndPhantomExecutor, CycleStartPhantomExecutor, NopPhantomExecutor, PhantomAir,
+            PhantomChip, PhantomExecutor, PhantomFiller,
+        },
+        poseidon2::{
+            air::Poseidon2PeripheryAir, new_poseidon2_periphery_air, Poseidon2PeripheryChip,
+        },
+        program::{ProgramBus, ProgramChip},
+    },
+};
+
+pub mod connector;
+#[cfg(feature = "cuda")]
+pub mod cuda;
+pub mod memory;
+pub mod phantom;
+pub mod poseidon2;
+pub mod program;
+
+/// **If** internal poseidon2 chip exists, then its insertion index is 1.
+const POSEIDON2_INSERTION_IDX: usize = 1;
+
+/// Trait for trace generation of all system AIRs. The system chip complex is special because we may
+/// not exactly following the exact matching between `Air` and `Chip`. Moreover we may require more
+/// flexibility than what is provided through the trait object
+/// [`AnyChip`](openvm_circuit_primitives::AnyChip).
+///
+/// The [SystemChipComplex] is meant to be constructible once the VM configuration is known, and it
+/// can be loaded with arbitrary programs supported by the instruction set available to its
+/// configuration. The [SystemChipComplex] is meant to persist between instances of proof
+/// generation.
+pub trait SystemChipComplex<RA, PB: ProverBackend> {
+    /// Loads the program in the form of a cached trace with prover data.
+    fn load_program(&mut self, cached_program_trace: CommittedTraceData<PB>);
+
+    /// Transport the initial memory state to device. This may be called before preflight execution
+    /// begins and start async device processes in parallel to execution.
+    fn transport_init_memory_to_device(&mut self, memory: &GuestMemory);
+
+    /// The caller must guarantee that `record_arenas` has length equal to the number of system
+    /// AIRs, although some arenas may be empty if they are unused.
+    fn generate_proving_ctx(
+        &mut self,
+        system_records: SystemRecords<PB::Val>,
+        record_arenas: Vec<RA>,
+    ) -> Vec<AirProvingContext<PB>>;
+
+    /// Returns the top merkle sub-tree of the memory merkle tree
+    /// as a segment tree with `2 * (2^addr_space_height) - 1` nodes, representing the Merkle
+    /// tree formed from the roots of the sub-trees for each address space.
+    ///
+    /// This function **must** return `Some` if called after
+    /// [`generate_proving_ctx`](Self::generate_proving_ctx) and may return `None` if called before
+    /// that.
+    fn memory_top_tree(&self) -> Option<&[[PB::Val; CHUNK]]>;
+}
+
+/// Trait meant to be implemented on a SystemChipComplex.
+pub trait SystemWithFixedTraceHeights {
+    /// `heights` will have length equal to number of system AIRs, in AIR ID order. This function
+    /// must guarantee that the system trace matrices generated have the required heights.
+    fn override_trace_heights(&mut self, heights: &[u32]);
+}
+
+pub struct SystemRecords<F> {
+    pub from_state: ExecutionState<u32>,
+    pub to_state: ExecutionState<u32>,
+    pub exit_code: Option<u32>,
+    /// `i` -> frequency of instruction in `i`th row of trace matrix. This requires filtering
+    /// `program.instructions_and_debug_infos` to remove gaps.
+    pub filtered_exec_frequencies: Vec<u32>,
+    // Perf[jpw]: this should be computed on-device and changed to just touched blocks
+    pub touched_memory: TouchedMemory<F>,
+}
+
+pub type TouchedMemory<F> = TimestampedEquipartition<F, DEFAULT_BLOCK_SIZE>;
+
+#[derive(Clone, AnyEnum, Executor, MeteredExecutor, PreflightExecutor, From)]
+#[cfg_attr(feature = "aot", derive(AotExecutor, AotMeteredExecutor))]
+pub enum SystemExecutor<F: Field> {
+    Phantom(PhantomExecutor<F>),
+}
+
+/// SystemPort combines system resources needed by most extensions
+#[derive(Clone, Copy)]
+pub struct SystemPort {
+    pub execution_bus: ExecutionBus,
+    pub program_bus: ProgramBus,
+    pub memory_bridge: MemoryBridge,
+}
+
+#[derive(Clone)]
+pub struct SystemAirInventory {
+    pub program: ProgramAir,
+    pub connector: VmConnectorAir,
+    pub memory: MemoryAirInventory,
+}
+
+impl SystemAirInventory {
+    pub fn new(
+        config: &SystemConfig,
+        port: SystemPort,
+        merkle_bus: PermutationCheckBus,
+        compression_bus: PermutationCheckBus,
+    ) -> Self {
+        let SystemPort {
+            execution_bus,
+            program_bus,
+            memory_bridge,
+        } = port;
+        let range_bus = memory_bridge.range_bus();
+        let program = ProgramAir::new(program_bus);
+        let connector = VmConnectorAir::new(
+            execution_bus,
+            program_bus,
+            range_bus,
+            config.memory_config.timestamp_max_bits,
+        );
+        let memory = MemoryAirInventory::new(
+            memory_bridge,
+            &config.memory_config,
+            merkle_bus,
+            compression_bus,
+        );
+
+        Self {
+            program,
+            connector,
+            memory,
+        }
+    }
+
+    pub fn port(&self) -> SystemPort {
+        SystemPort {
+            memory_bridge: self.memory.bridge,
+            program_bus: self.program.bus,
+            execution_bus: self.connector.execution_bus,
+        }
+    }
+
+    pub fn into_airs<SC: StarkProtocolConfig>(self) -> Vec<AirRefWithColumns<SC>> {
+        let mut airs: Vec<AirRefWithColumns<SC>> = Vec::new();
+        airs.push(Arc::new(self.program));
+        airs.push(Arc::new(self.connector));
+        airs.extend(self.memory.into_airs());
+        airs
+    }
+}
+
+impl<F: PrimeField32> VmExecutionConfig<F> for SystemConfig {
+    type Executor = SystemExecutor<F>;
+
+    /// The only way to create an [ExecutorInventory] is from a [SystemConfig]. This will always
+    /// add an executor for [PhantomChip], which handles all phantom sub-executors.
+    fn create_executors(
+        &self,
+    ) -> Result<ExecutorInventory<Self::Executor>, ExecutorInventoryError> {
+        let mut inventory = ExecutorInventory::new(self.clone());
+        let phantom_opcode = SystemOpcode::PHANTOM.global_opcode();
+        let mut phantom_executors: FxHashMap<PhantomDiscriminant, Arc<dyn PhantomSubExecutor<F>>> =
+            FxHashMap::default();
+        // Use NopPhantomExecutor so the discriminant is set but `DebugPanic` is handled specially.
+        phantom_executors.insert(
+            PhantomDiscriminant(SysPhantom::DebugPanic as u16),
+            Arc::new(NopPhantomExecutor),
+        );
+        phantom_executors.insert(
+            PhantomDiscriminant(SysPhantom::Nop as u16),
+            Arc::new(NopPhantomExecutor),
+        );
+        phantom_executors.insert(
+            PhantomDiscriminant(SysPhantom::CtStart as u16),
+            Arc::new(CycleStartPhantomExecutor),
+        );
+        phantom_executors.insert(
+            PhantomDiscriminant(SysPhantom::CtEnd as u16),
+            Arc::new(CycleEndPhantomExecutor),
+        );
+        let phantom = PhantomExecutor::new(phantom_executors, phantom_opcode);
+        inventory.add_executor(phantom, [phantom_opcode])?;
+
+        Ok(inventory)
+    }
+}
+
+impl<SC> VmCircuitConfig<SC> for SystemConfig
+where
+    SC: StarkProtocolConfig,
+    Val<SC>: VmField,
+{
+    /// Every VM circuit within the OpenVM circuit architecture **must** be initialized from the
+    /// [SystemConfig].
+    fn create_airs(&self) -> Result<AirInventory<SC>, AirInventoryError> {
+        let mut bus_idx_mgr = BusIndexManager::new();
+        let execution_bus = ExecutionBus::new(bus_idx_mgr.new_bus_idx());
+        let memory_bus = MemoryBus::new(bus_idx_mgr.new_bus_idx());
+        let program_bus = ProgramBus::new(bus_idx_mgr.new_bus_idx());
+        let range_bus =
+            VariableRangeCheckerBus::new(bus_idx_mgr.new_bus_idx(), self.memory_config.decomp);
+
+        let merkle_bus = PermutationCheckBus::new(bus_idx_mgr.new_bus_idx());
+        let compression_bus = PermutationCheckBus::new(bus_idx_mgr.new_bus_idx());
+        let direct_bus_idx = compression_bus.index;
+        let memory_bridge =
+            MemoryBridge::new(memory_bus, self.memory_config.timestamp_max_bits, range_bus);
+        let system_port = SystemPort {
+            execution_bus,
+            program_bus,
+            memory_bridge,
+        };
+        let system = SystemAirInventory::new(self, system_port, merkle_bus, compression_bus);
+
+        let mut inventory = AirInventory::new(self.clone(), system, bus_idx_mgr);
+
+        let range_checker = VariableRangeCheckerAir::new(range_bus);
+        // Range checker is always the first AIR in the inventory
+        inventory.add_air(range_checker);
+
+        assert_eq!(inventory.ext_airs().len(), POSEIDON2_INSERTION_IDX);
+        // Add direct poseidon2 AIR for memory merkle tree.
+        // Currently we never use poseidon2 opcodes directly: we will need
+        // special handling when that happens
+        let air = new_poseidon2_periphery_air(
+            vm_poseidon2_config(),
+            LookupBus::new(direct_bus_idx),
+            self.max_constraint_degree,
+        );
+        inventory.add_air_ref(air);
+        let execution_bridge = ExecutionBridge::new(execution_bus, program_bus);
+        let phantom = PhantomAir {
+            execution_bridge,
+            phantom_opcode: SystemOpcode::PHANTOM.global_opcode(),
+        };
+        inventory.add_air(phantom);
+
+        Ok(inventory)
+    }
+}
+
+// =================== CPU Backend Specific System Chip Complex Constructor ==================
+
+/// Base system chips for CPU backend. These chips must exactly correspond to the AIRs in
+/// [SystemAirInventory].
+pub struct SystemChipInventory<SC: StarkProtocolConfig>
+where
+    Val<SC>: VmField,
+{
+    pub program_chip: ProgramChip<SC>,
+    pub connector_chip: VmConnectorChip<Val<SC>>,
+    /// Contains all memory chips
+    pub memory_controller: MemoryController<Val<SC>>,
+}
+
+// Note[jpw]: We could get rid of the `mem_inventory` input because `MemoryController` doesn't need
+// the buses for tracegen. We leave it to use old interfaces.
+impl<SC: StarkProtocolConfig> SystemChipInventory<SC>
+where
+    Val<SC>: VmField,
+{
+    pub fn new(
+        config: &SystemConfig,
+        mem_inventory: &MemoryAirInventory,
+        range_checker: SharedVariableRangeCheckerChip,
+        hasher_chip: Arc<Poseidon2PeripheryChip<Val<SC>>>,
+    ) -> Self {
+        // We create an empty program chip: the program should be loaded later (and can be swapped
+        // out). The execution frequencies are supplied only after execution.
+        let program_chip = ProgramChip::unloaded();
+        let connector_chip = VmConnectorChip::<Val<SC>>::new(
+            range_checker.clone(),
+            config.memory_config.timestamp_max_bits,
+        );
+        let memory_bus = mem_inventory.bridge.memory_bus();
+        let memory_controller = MemoryController::<Val<SC>>::with_persistent_memory(
+            memory_bus,
+            config.memory_config.clone(),
+            range_checker.clone(),
+            mem_inventory.interface.merkle.merkle_bus,
+            mem_inventory.interface.merkle.compression_bus,
+            hasher_chip,
+        );
+
+        Self {
+            program_chip,
+            connector_chip,
+            memory_controller,
+        }
+    }
+}
+
+impl<RA, SC> SystemChipComplex<RA, CpuBackend<SC>> for SystemChipInventory<SC>
+where
+    RA: RowMajorMatrixArena<Val<SC>>,
+    SC: StarkProtocolConfig,
+    Val<SC>: VmField,
+{
+    fn load_program(&mut self, cached_program_trace: CommittedTraceData<CpuBackend<SC>>) {
+        let _ = self.program_chip.cached.replace(cached_program_trace);
+    }
+
+    fn transport_init_memory_to_device(&mut self, memory: &GuestMemory) {
+        self.memory_controller
+            .set_initial_memory(memory.memory.clone());
+    }
+
+    fn generate_proving_ctx(
+        &mut self,
+        system_records: SystemRecords<Val<SC>>,
+        _record_arenas: Vec<RA>,
+    ) -> Vec<AirProvingContext<CpuBackend<SC>>> {
+        let SystemRecords {
+            from_state,
+            to_state,
+            exit_code,
+            filtered_exec_frequencies,
+            touched_memory,
+        } = system_records;
+
+        self.program_chip.filtered_exec_frequencies = filtered_exec_frequencies;
+        let program_ctx = self.program_chip.generate_proving_ctx(());
+        self.connector_chip.begin(from_state);
+        self.connector_chip.end(to_state, exit_code);
+        let connector_ctx = self.connector_chip.generate_proving_ctx(());
+
+        let memory_ctxs = self.memory_controller.generate_proving_ctx(touched_memory);
+
+        [program_ctx, connector_ctx]
+            .into_iter()
+            .chain(memory_ctxs)
+            .collect()
+    }
+
+    fn memory_top_tree(&self) -> Option<&[[Val<SC>; CHUNK]]> {
+        let top_tree = &self.memory_controller.interface_chip.merkle_chip.top_tree;
+        (!top_tree.is_empty()).then_some(top_tree.as_slice())
+    }
+}
+
+#[derive(Clone)]
+pub struct SystemCpuBuilder;
+
+impl<SC, E> VmBuilder<E> for SystemCpuBuilder
+where
+    SC: StarkProtocolConfig,
+    E: StarkEngine<SC = SC, PB = CpuBackend<SC>, PD = CpuDevice<SC>>,
+    Val<SC>: VmField,
+    SC::EF: Ord,
+{
+    type VmConfig = SystemConfig;
+    type RecordArena = MatrixRecordArena<Val<SC>>;
+    type SystemChipInventory = SystemChipInventory<SC>;
+
+    fn create_chip_complex(
+        &self,
+        config: &SystemConfig,
+        airs: AirInventory<SC>,
+        _device_ctx: &openvm_stark_backend::EngineDeviceCtx<E>,
+    ) -> Result<
+        VmChipComplex<SC, MatrixRecordArena<Val<SC>>, CpuBackend<SC>, SystemChipInventory<SC>>,
+        ChipInventoryError,
+    > {
+        let range_bus = airs.range_checker().bus;
+        let range_checker = Arc::new(VariableRangeCheckerChip::new(range_bus));
+
+        let mut inventory = ChipInventory::new(airs);
+        inventory.next_air::<VariableRangeCheckerAir>()?;
+        inventory.add_periphery_chip(range_checker.clone());
+
+        assert_eq!(inventory.chips().len(), POSEIDON2_INSERTION_IDX);
+        // ATTENTION: The threshold 7 here must match the one in `new_poseidon2_periphery_air`
+        if config.max_constraint_degree >= 7 {
+            inventory.next_air::<Poseidon2PeripheryAir<Val<SC>, 0>>()?;
+        } else {
+            inventory.next_air::<Poseidon2PeripheryAir<Val<SC>, 1>>()?;
+        };
+        let hasher_chip = Arc::new(Poseidon2PeripheryChip::new(
+            vm_poseidon2_config(),
+            config.max_constraint_degree,
+        ));
+        inventory.add_periphery_chip(hasher_chip.clone());
+        let system = SystemChipInventory::new(
+            config,
+            &inventory.airs().system().memory,
+            range_checker,
+            hasher_chip,
+        );
+
+        let phantom_chip = PhantomChip::new(PhantomFiller, system.memory_controller.helper());
+        inventory.add_executor_chip(phantom_chip);
+
+        Ok(VmChipComplex { system, inventory })
+    }
+}
+
+impl<SC: StarkProtocolConfig> SystemWithFixedTraceHeights for SystemChipInventory<SC>
+where
+    Val<SC>: VmField,
+{
+    /// Warning: this does not set the override for the program chip. The program chip
+    /// override must be set via the RecordArena.
+    fn override_trace_heights(&mut self, heights: &[u32]) {
+        assert_eq!(
+            heights[PROGRAM_AIR_ID] as usize,
+            self.program_chip
+                .cached
+                .as_ref()
+                .expect("program not loaded")
+                .height()
+        );
+        assert_eq!(heights[CONNECTOR_AIR_ID], 2);
+        self.memory_controller
+            .set_override_trace_heights(&heights[BOUNDARY_AIR_ID..]);
+    }
+}

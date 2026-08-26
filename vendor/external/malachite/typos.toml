@@ -1,0 +1,16 @@
+[default]
+extend-ignore-identifiers-re = []
+
+[default.extend-identifiers]
+
+[default.extend-words]
+crate = "crate"
+manuel = "manuel"
+numer = "numer"
+ser = "ser"
+shs = "shs"
+widder = "widder"
+typ = "typ"
+
+[files]
+extend-exclude = ["code/crates/starknet/p2p-proto/proto/*"]

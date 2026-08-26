@@ -1,0 +1,12 @@
+[package]
+name = "openvm-regex-program"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+openvm = { workspace = true, features = ["std"] }
+openvm-keccak256.workspace = true
+regex = { version = "1.11.1", default-features = false }
+
+[features]
+default = []

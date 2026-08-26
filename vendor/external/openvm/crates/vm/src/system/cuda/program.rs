@@ -1,0 +1,229 @@
+use std::{mem::size_of, sync::Arc};
+
+use openvm_circuit::{primitives::Chip, system::program::ProgramExecutionCols};
+use openvm_cuda_backend::{base::DeviceMatrix, prelude::F, GpuBackend, GpuDevice};
+use openvm_cuda_common::{copy::MemCopyH2D, d_buffer::DeviceBuffer, stream::GpuDeviceCtx};
+use openvm_instructions::{
+    program::{Program, DEFAULT_PC_STEP},
+    LocalOpcode, SystemOpcode,
+};
+use openvm_stark_backend::prover::{
+    AirProvingContext, CommittedTraceData, MatrixDimensions, TraceCommitter,
+};
+use p3_field::PrimeCharacteristicRing;
+
+use crate::cuda_abi::program;
+
+pub struct ProgramChipGPU {
+    pub cached: Option<CommittedTraceData<GpuBackend>>,
+    pub device_ctx: GpuDeviceCtx,
+}
+
+impl ProgramChipGPU {
+    pub fn new(device_ctx: GpuDeviceCtx) -> Self {
+        Self {
+            cached: None,
+            device_ctx,
+        }
+    }
+
+    pub fn generate_cached_trace(
+        program: Program<F>,
+        device_ctx: &GpuDeviceCtx,
+    ) -> DeviceMatrix<F> {
+        let instructions = program
+            .enumerate_by_pc()
+            .into_iter()
+            .map(|(pc, instruction, _)| {
+                [
+                    F::from_u32(pc),
+                    instruction.opcode.to_field(),
+                    instruction.a,
+                    instruction.b,
+                    instruction.c,
+                    instruction.d,
+                    instruction.e,
+                    instruction.f,
+                    instruction.g,
+                ]
+            })
+            .collect::<Vec<_>>();
+
+        let num_records = instructions.len();
+        let height = num_records.next_power_of_two();
+        let records = instructions
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .to_device_on(device_ctx)
+            .unwrap();
+
+        let trace = DeviceMatrix::<F>::with_capacity_on(
+            height,
+            size_of::<ProgramExecutionCols<u8>>(),
+            device_ctx,
+        );
+        trace.buffer().fill_zero_on(device_ctx).unwrap();
+        unsafe {
+            program::cached_tracegen(
+                trace.buffer(),
+                trace.height(),
+                trace.width(),
+                &records,
+                program.pc_base,
+                DEFAULT_PC_STEP,
+                SystemOpcode::TERMINATE.global_opcode().as_usize(),
+                device_ctx.stream.as_raw(),
+            )
+            .expect("Failed to generate cached trace");
+        }
+        trace
+    }
+
+    pub fn get_committed_trace(
+        trace: DeviceMatrix<F>,
+        device: &GpuDevice,
+    ) -> CommittedTraceData<GpuBackend> {
+        let (commitment, data) = TraceCommitter::<GpuBackend>::commit(device, &[&trace]).unwrap();
+        CommittedTraceData {
+            commitment,
+            data: Arc::new(data),
+            trace,
+        }
+    }
+}
+
+impl Default for ProgramChipGPU {
+    fn default() -> Self {
+        panic!("ProgramChipGPU requires an explicit GpuDeviceCtx")
+    }
+}
+
+impl Chip<Vec<u32>, GpuBackend> for ProgramChipGPU {
+    fn generate_proving_ctx(&self, filtered_exec_freqs: Vec<u32>) -> AirProvingContext<GpuBackend> {
+        let cached = self.cached.clone().expect("Cached program must be loaded");
+        let height = cached.height();
+        let filtered_len = filtered_exec_freqs.len();
+        assert!(
+            filtered_len <= height,
+            "filtered_exec_freqs len={filtered_len} > cached trace height={height}"
+        );
+        let mut buffer: DeviceBuffer<F> = DeviceBuffer::with_capacity_on(height, &self.device_ctx);
+
+        filtered_exec_freqs
+            .into_iter()
+            .map(F::from_u32)
+            .collect::<Vec<_>>()
+            .copy_to_on(&mut buffer, &self.device_ctx)
+            .unwrap();
+        // Making sure to zero-out the untouched part of the buffer.
+        if filtered_len < height {
+            buffer
+                .fill_zero_suffix_on(filtered_len, &self.device_ctx)
+                .unwrap();
+        }
+
+        let common_main = DeviceMatrix::new(Arc::new(buffer), height, 1);
+
+        AirProvingContext {
+            cached_mains: vec![cached],
+            common_main,
+            public_values: vec![],
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use openvm_cuda_backend::{data_transporter::assert_eq_host_and_device_matrix, prelude::F};
+    use openvm_instructions::{
+        instruction::Instruction,
+        program::{Program, DEFAULT_PC_STEP},
+        LocalOpcode,
+        SystemOpcode::*,
+    };
+    use openvm_stark_backend::{prover::TraceCommitter, StarkEngine};
+
+    use super::ProgramChipGPU;
+    use crate::{
+        system::program::{
+            tests::{BEQ, BNE, JAL, STOREW, SUB},
+            trace::generate_cached_trace,
+        },
+        utils::{test_cpu_engine, test_gpu_engine},
+    };
+
+    fn test_cached_committed_trace_data(program: Program<F>) {
+        let gpu_engine = test_gpu_engine();
+        let gpu_device = gpu_engine.device();
+        let gpu_trace =
+            ProgramChipGPU::generate_cached_trace(program.clone(), &gpu_device.device_ctx);
+        let gpu_cached = ProgramChipGPU::get_committed_trace(gpu_trace, gpu_device);
+
+        let cpu_engine = test_cpu_engine();
+        let cpu_device = cpu_engine.device();
+        let cpu_trace = Arc::new(generate_cached_trace(&program));
+        let (cpu_commit, _) = cpu_device.commit(&[&cpu_trace]).unwrap();
+
+        // NOTE: This compares the stacked matrices, not the original cached trace
+        assert_eq_host_and_device_matrix(cpu_trace, &gpu_cached.trace, &gpu_device.device_ctx);
+        assert_eq!(gpu_cached.commitment, cpu_commit);
+    }
+
+    #[test]
+    fn test_cuda_program_cached_tracegen_1() {
+        let instructions = vec![
+            Instruction::large_from_isize(STOREW, 2, 0, 0, 0, 1, 0, 1),
+            Instruction::large_from_isize(STOREW, 1, 1, 0, 0, 1, 0, 1),
+            Instruction::from_isize(BEQ, 0, 0, 3 * DEFAULT_PC_STEP as isize, 1, 0),
+            Instruction::from_isize(SUB, 0, 0, 1, 1, 1),
+            Instruction::from_isize(JAL, 2, -2 * (DEFAULT_PC_STEP as isize), 0, 1, 0),
+            Instruction::from_isize(TERMINATE.global_opcode(), 0, 0, 0, 0, 0),
+        ];
+        let program = Program::from_instructions(&instructions);
+        test_cached_committed_trace_data(program);
+    }
+
+    #[test]
+    fn test_cuda_program_cached_tracegen_2() {
+        let instructions = vec![
+            Instruction::large_from_isize(STOREW, 5, 0, 0, 0, 1, 0, 1),
+            Instruction::from_isize(BNE, 0, 4, 3 * DEFAULT_PC_STEP as isize, 1, 0),
+            Instruction::from_isize(JAL, 2, -2 * DEFAULT_PC_STEP as isize, 0, 1, 0),
+            Instruction::from_isize(TERMINATE.global_opcode(), 0, 0, 0, 0, 0),
+            Instruction::from_isize(BEQ, 0, 5, -(DEFAULT_PC_STEP as isize), 1, 0),
+        ];
+        let program = Program::from_instructions(&instructions);
+        test_cached_committed_trace_data(program);
+    }
+
+    #[test]
+    fn test_cuda_program_cached_tracegen_undefined_instructions() {
+        let instructions = vec![
+            Some(Instruction::large_from_isize(STOREW, 2, 0, 0, 0, 1, 0, 1)),
+            Some(Instruction::large_from_isize(STOREW, 1, 1, 0, 0, 1, 0, 1)),
+            Some(Instruction::from_isize(
+                BEQ,
+                0,
+                2,
+                3 * DEFAULT_PC_STEP as isize,
+                1,
+                0,
+            )),
+            None,
+            None,
+            Some(Instruction::from_isize(
+                TERMINATE.global_opcode(),
+                0,
+                0,
+                0,
+                0,
+                0,
+            )),
+        ];
+        let program = Program::new_without_debug_infos_with_option(&instructions, 0);
+        test_cached_committed_trace_data(program);
+    }
+}

@@ -1,0 +1,156 @@
+use itertools::zip_eq;
+use openvm_stark_backend::{
+    p3_air::{AirBuilder, VirtualPairCol},
+    p3_field::{Field, PrimeCharacteristicRing},
+};
+
+/// Return either 0 if n is zero or the next power of two of n.
+/// Used to resize the number of rows in a trace matrix.
+pub const fn next_power_of_two_or_zero(n: usize) -> usize {
+    if n == 0 {
+        0
+    } else {
+        n.next_power_of_two()
+    }
+}
+
+pub fn not<F: PrimeCharacteristicRing>(a: impl Into<F>) -> F {
+    F::ONE - a.into()
+}
+
+pub fn and<F: PrimeCharacteristicRing>(a: impl Into<F>, b: impl Into<F>) -> F {
+    a.into() * b.into()
+}
+
+/// Assumes that a and b are boolean
+pub fn or<F: PrimeCharacteristicRing>(a: impl Into<F>, b: impl Into<F>) -> F {
+    let a = a.into();
+    let b = b.into();
+    a.clone() + b.clone() - and(a, b)
+}
+
+/// Assumes that a and b are boolean
+pub fn implies<F: PrimeCharacteristicRing>(a: impl Into<F>, b: impl Into<F>) -> F {
+    or(F::ONE - a.into(), b.into())
+}
+
+/// Assumes that `cond` is boolean. Returns `a` if `cond` is true, otherwise returns `b`.
+pub fn select<F: PrimeCharacteristicRing>(
+    cond: impl Into<F>,
+    a: impl Into<F>,
+    b: impl Into<F>,
+) -> F {
+    let cond = cond.into();
+    cond.clone() * a.into() + (F::ONE - cond) * b.into()
+}
+
+pub fn to_vcols<F: Field>(cols: &[usize]) -> Vec<VirtualPairCol<F>> {
+    cols.iter()
+        .copied()
+        .map(VirtualPairCol::single_main)
+        .collect()
+}
+
+pub fn fill_slc_to_f<F: Field>(dest: &mut [F], src: &[u32]) {
+    dest.iter_mut()
+        .zip(src.iter())
+        .for_each(|(d, s)| *d = F::from_u32(*s));
+}
+
+pub fn to_field_vec<F: Field>(src: &[u32]) -> Vec<F> {
+    src.iter().map(|s| F::from_u32(*s)).collect()
+}
+
+pub fn assert_array_eq<AB: AirBuilder, I1: Into<AB::Expr>, I2: Into<AB::Expr>, const N: usize>(
+    builder: &mut AB,
+    x: [I1; N],
+    y: [I2; N],
+) {
+    for (x, y) in zip_eq(x, y) {
+        builder.assert_eq(x, y);
+    }
+}
+
+/// Composes a list of limb values into a single field element
+#[inline]
+pub fn compose<F: PrimeCharacteristicRing>(a: &[impl Into<F> + Clone], limb_size: usize) -> F {
+    a.iter().enumerate().fold(F::ZERO, |acc, (i, x)| {
+        acc + x.clone().into() * F::from_usize(1 << (i * limb_size))
+    })
+}
+
+#[cfg(test)]
+pub use test_utils::*;
+#[cfg(test)]
+mod test_utils {
+    #[cfg(feature = "cuda")]
+    use openvm_cuda_backend::BabyBearPoseidon2GpuEngine;
+    #[cfg(feature = "cuda")]
+    use openvm_cuda_common::{
+        common::get_device,
+        stream::{CudaStream, GpuDeviceCtx, StreamGuard},
+    };
+    use openvm_stark_backend::{test_utils::test_system_params_small, StarkEngine};
+    use openvm_stark_sdk::{config::baby_bear_poseidon2::*, utils::setup_tracing};
+
+    pub fn test_engine_small() -> BabyBearPoseidon2CpuEngine<DuplexSponge> {
+        setup_tracing();
+        // l_skip + n_stack must be >= chip trace heights in tests
+        BabyBearPoseidon2CpuEngine::new(test_system_params_small(3, 9, 3))
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn test_gpu_engine_small() -> BabyBearPoseidon2GpuEngine {
+        setup_tracing();
+        BabyBearPoseidon2GpuEngine::new(test_system_params_small(4, 12, 4))
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn test_device_ctx() -> GpuDeviceCtx {
+        GpuDeviceCtx {
+            device_id: get_device().unwrap() as u32,
+            stream: StreamGuard::new(CudaStream::new_non_blocking().unwrap()),
+        }
+    }
+}
+
+#[cfg(all(feature = "touchemall", feature = "cuda"))]
+pub use touchemall::*;
+#[cfg(all(feature = "touchemall", feature = "cuda"))]
+mod touchemall {
+    use openvm_cuda_backend::{prelude::F, GpuBackend};
+    use openvm_cuda_common::{
+        common::get_device,
+        stream::{CudaStream, GpuDeviceCtx, StreamGuard},
+    };
+    use openvm_stark_backend::prover::AirProvingContext;
+
+    fn touchemall_device_ctx() -> GpuDeviceCtx {
+        GpuDeviceCtx {
+            device_id: get_device().unwrap() as u32,
+            stream: StreamGuard::new(CudaStream::new_non_blocking().unwrap()),
+        }
+    }
+
+    pub fn check_trace_validity(proving_ctx: &AirProvingContext<GpuBackend>, name: &str) {
+        use openvm_cuda_common::{copy::MemCopyD2H, stream::device_synchronize};
+        use openvm_stark_backend::prover::MatrixDimensions;
+
+        // Synchronize all GPU work before reading the trace on a different stream.
+        device_synchronize().unwrap();
+        let trace = &proving_ctx.common_main;
+        let height = trace.height();
+        let width = trace.width();
+        let trace = trace.to_host_on(&touchemall_device_ctx()).unwrap();
+        for r in 0..height {
+            for c in 0..width {
+                let value = trace[c * height + r];
+                let value_u32 = unsafe { *(&value as *const F as *const u32) };
+                assert!(
+                    value_u32 != 0xffffffff,
+                    "potentially untouched value at ({r}, {c}) of a trace of size {height}x{width} for air {name}"
+                    );
+            }
+        }
+    }
+}

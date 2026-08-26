@@ -1,0 +1,62 @@
+name: Static Verifier Tests
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["**"]
+    paths:
+      - "crates/static-verifier/**"
+      - "Cargo.toml"
+      - ".github/workflows/static-verifier.yml"
+
+concurrency:
+  group: ${{ github.workflow_ref }}-static-verifier-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  tests:
+    name: Default tests and prover roundtrip
+    runs-on:
+      - runs-on=${{ github.run_id }}-static-verifier-${{ github.run_attempt }}/family=c8i-flex.16xlarge+c8i.16xlarge+c8a.16xlarge+c7i.16xlarge+c7a.16xlarge/image=ubuntu24-full-x64/volume=80gb/extras=s3-cache
+
+    steps:
+      - uses: runs-on/action@v2
+        with:
+          sccache: s3
+      - name: Load SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: |
+            ${{ secrets.GH_ACTIONS_DEPLOY_PRIVATE_KEY }}
+      - uses: actions/checkout@v5
+      - run: | # avoid cross-device link error
+          rustup component remove clippy || true
+          rm -rf ~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu || true
+      - name: Configure sccache startup timeout
+        run: |
+          mkdir -p ~/.config/sccache
+          echo "server_startup_timeout_ms = 60000" > ~/.config/sccache/config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/sccache
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: taiki-e/install-action@nextest
+
+      - name: Run static verifier tests
+        working-directory: crates/static-verifier
+        run: |
+          cargo nextest run --cargo-profile fast
+
+      - name: Run ignored roundtrip test
+        working-directory: crates/static-verifier
+        run: |
+          cargo nextest run --release --run-ignored=only real_prover_keygen_prove_verify_roundtrip
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true

@@ -1,0 +1,3 @@
+# No EOL conversion: this tree is edited on Windows but executed in WSL/Linux
+# (devnet.sh, cargo builds). Byte-exact storage and checkout, everywhere.
+* -text

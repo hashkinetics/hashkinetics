@@ -1,0 +1,23 @@
+# build artifacts
+target/
+**/target/
+node_modules/
+
+# node state & key material (never in git — regenerate via devnet.sh / keygen)
+**/devnet/
+**/priv_validator_key.json
+**/consensus_state*.bin
+**/snapshot.bin
+**/*.wal
+**/blocks/
+wallet.json
+
+# demo artifacts & local files
+disclosure-*.json
+*.log
+*.mp4
+
+# OS noise
+.DS_Store
+Thumbs.db
+desktop.ini

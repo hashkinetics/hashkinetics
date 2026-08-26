@@ -1,0 +1,19 @@
+[package]
+name = "hk-state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hk-primitives = { path = "../hk-primitives" }
+hk-crypto = { path = "../hk-crypto" }
+hk-mandate = { path = "../hk-mandate" }
+# The shielded spend/mint statement — the SAME crate every zkVM guest compiles (one
+# hashing source of truth; see src/pool.rs for why this matters).
+hk-spend-circuit = { path = "../../../zkvm-bakeoff/circuit" }
+# Public bytes of expected statements (must match the guests' commit encoding) — P2.3.
+bincode = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }

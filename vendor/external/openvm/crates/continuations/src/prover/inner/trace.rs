@@ -1,0 +1,100 @@
+use itertools::Itertools;
+use openvm_recursion_circuit::system::{
+    AggregationSubCircuit, CachedTraceCtx, VerifierExternalData, VerifierTraceGen,
+};
+use openvm_stark_backend::{
+    proof::Proof,
+    prover::{ProverBackend, ProvingContext},
+};
+use openvm_stark_sdk::config::baby_bear_poseidon2::{
+    default_duplex_sponge_recorder, Digest, EF, F,
+};
+use openvm_verify_stark_host::pvs::{DeferralPvs, VkCommit};
+use tracing::instrument;
+
+use super::{ChildVkKind, InnerAggregationProver};
+use crate::{
+    circuit::inner::{InnerTraceGen, ProofsType},
+    SC,
+};
+
+impl<PB, S, T> InnerAggregationProver<PB, S, T>
+where
+    PB: ProverBackend<Val = F, Challenge = EF, Commitment = Digest>,
+    S: AggregationSubCircuit,
+    PB::Matrix: Clone,
+{
+    #[instrument(name = "trace_gen", skip_all)]
+    pub fn generate_proving_ctx<DC>(
+        &self,
+        proofs: &[Proof<SC>],
+        child_vk_kind: ChildVkKind,
+        proofs_type: ProofsType,
+        absent_trace_pvs: Option<(DeferralPvs<F>, bool)>,
+        device_ctx: &DC,
+    ) -> ProvingContext<PB>
+    where
+        S: VerifierTraceGen<PB, SC, DC>,
+        T: InnerTraceGen<PB, DC>,
+        DC: Clone + Send + Sync,
+    {
+        assert!(proofs.len() <= self.circuit.verifier_circuit.max_num_proofs());
+
+        let (child_vk, child_vk_pcs_data) = match child_vk_kind {
+            ChildVkKind::RecursiveSelf => (&self.vk, self.self_vk_pcs_data.clone().unwrap()),
+            _ => (&self.child_vk, self.child_vk_pcs_data.clone()),
+        };
+        let child_is_app = matches!(child_vk_kind, ChildVkKind::App);
+        let child_vk_commit = VkCommit {
+            cached_commit: child_vk_pcs_data.commitment,
+            vk_pre_hash: child_vk.pre_hash,
+        };
+
+        let pre_data = self
+            .agg_node_tracegen
+            .generate_pre_verifier_subcircuit_ctxs(
+                proofs,
+                proofs_type,
+                absent_trace_pvs,
+                child_is_app,
+                child_vk_commit,
+                device_ctx,
+            );
+
+        let power_check_inputs = vec![];
+        let mut external_data = VerifierExternalData {
+            poseidon2_compress_inputs: &pre_data.poseidon2_compress_inputs,
+            poseidon2_permute_inputs: &pre_data.poseidon2_permute_inputs,
+            range_check_inputs: &pre_data.range_check_inputs,
+            power_check_inputs: &power_check_inputs,
+            required_heights: None,
+            final_transcript_state: None,
+        };
+
+        let subcircuit_ctxs = self
+            .circuit
+            .verifier_circuit
+            .generate_proving_ctxs(
+                child_vk,
+                CachedTraceCtx::PcsData(child_vk_pcs_data),
+                proofs,
+                &mut external_data,
+                device_ctx,
+                default_duplex_sponge_recorder(),
+            )
+            .unwrap();
+        let post_ctxs = self
+            .agg_node_tracegen
+            .generate_post_verifier_subcircuit_ctxs(proofs, proofs_type, child_is_app, device_ctx);
+
+        ProvingContext {
+            per_trace: pre_data
+                .air_proving_ctxs
+                .into_iter()
+                .chain(subcircuit_ctxs)
+                .chain(post_ctxs)
+                .enumerate()
+                .collect_vec(),
+        }
+    }
+}

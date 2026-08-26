@@ -1,0 +1,17 @@
+[package]
+name = "openvm-deferral-guest"
+description = "OpenVM guest library for deferral call and output instructions."
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+openvm-custom-insn = { workspace = true }
+strum_macros = { workspace = true }
+
+[features]
+default = []

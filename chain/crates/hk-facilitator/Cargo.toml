@@ -1,0 +1,24 @@
+[package]
+name = "hk-facilitator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Agentic-layer service (not part of the chain): a paid search "merchant" that meters
+# access with PayWord micropayments settled on the HashKinetics chain — RAG-as-a-merchant.
+# The keyword index here is a dependency-free stand-in; agentic/turbovec is the drop-in
+# upgrade (documented in README).
+
+[[bin]]
+name = "hk-facilitator"
+path = "src/main.rs"
+
+[dependencies]
+hk-primitives = { path = "../hk-primitives" }
+hk-crypto = { path = "../hk-crypto" }
+hk-state = { path = "../hk-state" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+eyre = "0.6"

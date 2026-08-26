@@ -1,0 +1,24 @@
+[package]
+name = "algebra-example"
+version = "0.0.0"
+edition = "2021"
+
+[workspace]
+members = []
+
+[dependencies]
+openvm = { git = "https://github.com/openvm-org/openvm.git", features = [
+    "std",
+] }
+openvm-algebra-guest = { git = "https://github.com/openvm-org/openvm.git" }
+
+serde = { version = "1.0.216" }
+num-bigint = { version = "0.4.6", features = ["serde"] }
+
+[features]
+default = []
+
+# remove this if copying example outside of monorepo
+[patch."https://github.com/openvm-org/openvm.git"]
+openvm = { path = "../../crates/toolchain/openvm" }
+openvm-algebra-guest = { path = "../../extensions/algebra/guest" }

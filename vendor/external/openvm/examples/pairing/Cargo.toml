@@ -1,0 +1,30 @@
+[package]
+name = "pairing-example"
+version = "0.0.0"
+edition = "2021"
+
+[workspace]
+members = []
+
+[dependencies]
+
+openvm = { git = "https://github.com/openvm-org/openvm.git", features = [
+    "std",
+] }
+openvm-algebra-guest = { git = "https://github.com/openvm-org/openvm.git" }
+openvm-ecc-guest = { git = "https://github.com/openvm-org/openvm.git" }
+openvm-pairing = { git = "https://github.com/openvm-org/openvm.git", features = [
+    "bls12_381",
+] }
+
+hex-literal = { version = "0.4.1", default-features = false }
+
+[features]
+default = []
+
+# remove this if copying example outside of monorepo
+[patch."https://github.com/openvm-org/openvm.git"]
+openvm = { path = "../../crates/toolchain/openvm" }
+openvm-algebra-guest = { path = "../../extensions/algebra/guest" }
+openvm-ecc-guest = { path = "../../extensions/ecc/guest" }
+openvm-pairing = { path = "../../guest-libs/pairing" }

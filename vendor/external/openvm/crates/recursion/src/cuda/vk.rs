@@ -1,0 +1,46 @@
+use itertools::Itertools;
+use openvm_cuda_common::{copy::MemCopyH2D, d_buffer::DeviceBuffer, stream::GpuDeviceCtx};
+use openvm_stark_backend::{keygen::types::MultiStarkVerifyingKey, SystemParams};
+use openvm_stark_sdk::config::baby_bear_poseidon2::{BabyBearPoseidon2Config, Digest};
+
+use crate::cuda::types::AirData;
+
+/*
+ * Tracegen information (i.e. records) on a GPU device. Each field should
+ * be computable as soon as the verifier circuit has access to the child
+ * proof's verifying key. Only one of these will be generated per verifier
+ * circuit, i.e. regardless of the number of proofs.
+ */
+pub struct VerifyingKeyGpu {
+    pub cpu: MultiStarkVerifyingKey<BabyBearPoseidon2Config>,
+    pub per_air: DeviceBuffer<AirData>,
+    pub system_params: SystemParams,
+    pub pre_hash: Digest,
+}
+
+impl VerifyingKeyGpu {
+    pub fn new(
+        vk: &MultiStarkVerifyingKey<BabyBearPoseidon2Config>,
+        device_ctx: &GpuDeviceCtx,
+    ) -> Self {
+        let per_air = vk
+            .inner
+            .per_air
+            .iter()
+            .map(|vk| AirData {
+                num_cached: vk.num_cached_mains(),
+                num_interactions_per_row: vk.num_interactions(),
+                total_width: vk.params.width.total_width(),
+                has_preprocessed: vk.preprocessed_data.is_some(),
+            })
+            .collect_vec()
+            .to_device_on(device_ctx)
+            .unwrap();
+        Self {
+            cpu: vk.clone(),
+            per_air,
+            system_params: vk.inner.params.clone(),
+            pre_hash: vk.pre_hash,
+        }
+    }
+}

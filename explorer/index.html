@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>HashKinetics Explorer — the scanner that can't dox you</title>
+<style>
+  /* ── Liquid Glass, dark quantum. Perf doctrine: pre-blurred gradient orbs (no live
+     blur filters on animated elements), backdrop-filter ≤ 10px, transform-only motion. ── */
+  :root{
+    --bg:#06080F; --panel:rgba(255,255,255,0.035); --panel2:rgba(255,255,255,0.06);
+    --line:rgba(255,255,255,0.09); --text:#E8ECF4; --muted:#8B93A7;
+    --cyan:#4EF0D0; --violet:#8B7BFF; --gold:#F5C518; --danger:#FF5D7A; --ok:#43E08C;
+    --mono:'SFMono-Regular',ui-monospace,'Cascadia Code',Consolas,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{background:var(--bg);color:var(--text);font:15px/1.6 -apple-system,'Segoe UI',Inter,Roboto,sans-serif;min-height:100vh;overflow-x:hidden}
+  /* orbs: radial gradients ARE the blur — cheap, GPU-friendly */
+  .orbs{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden}
+  .orb{position:absolute;border-radius:50%;will-change:transform}
+  .orb-a{width:55vw;height:55vw;left:-18vw;top:-22vw;background:radial-gradient(circle,rgba(78,240,208,0.14) 0%,rgba(78,240,208,0.05) 40%,transparent 70%);animation:drift 26s ease-in-out infinite alternate}
+  .orb-b{width:48vw;height:48vw;right:-16vw;top:18vh;background:radial-gradient(circle,rgba(139,123,255,0.13) 0%,rgba(139,123,255,0.04) 45%,transparent 70%);animation:drift 32s ease-in-out infinite alternate-reverse}
+  .orb-c{width:40vw;height:40vw;left:28vw;bottom:-24vw;background:radial-gradient(circle,rgba(245,197,24,0.07) 0%,transparent 65%);animation:drift 38s ease-in-out infinite alternate}
+  @keyframes drift{from{transform:translate3d(0,0,0) scale(1)}to{transform:translate3d(4vw,3vh,0) scale(1.08)}}
+  @media (prefers-reduced-motion:reduce){.orb{animation:none}}
+
+  .wrap{position:relative;z-index:1;max-width:1180px;margin:0 auto;padding:28px 22px 80px}
+  header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:6px}
+  .logo{font-size:21px;font-weight:800;letter-spacing:.2px}
+  .logo b{color:var(--cyan)}
+  .beta{font-size:10.5px;color:var(--gold);border:1px solid rgba(245,197,24,.4);border-radius:20px;padding:2px 10px;letter-spacing:.12em;text-transform:uppercase}
+  .conn{margin-left:auto;display:flex;gap:8px;align-items:center}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--danger);box-shadow:0 0 8px var(--danger)}
+  .dot.on{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+  input,select{background:rgba(255,255,255,.05);border:1px solid var(--line);border-radius:10px;color:var(--text);padding:8px 12px;font-size:13px;outline:none}
+  input:focus{border-color:rgba(78,240,208,.5)}
+  .tagline{color:var(--muted);font-size:13.5px;margin:2px 0 22px}
+  .tagline b{color:var(--cyan);font-weight:600}
+
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:22px}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:14px 16px;backdrop-filter:blur(8px)}
+  .stat .k{font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+  .stat .v{font-size:20px;font-weight:750;margin-top:3px;font-variant-numeric:tabular-nums}
+  .stat .v.mono{font-family:var(--mono);font-size:13px;font-weight:600;word-break:break-all;color:var(--cyan)}
+  .stat .sub{font-size:11px;color:var(--muted);margin-top:2px}
+
+  .cols{display:grid;grid-template-columns:1.5fr 1fr;gap:16px;align-items:start}
+  @media(max-width:900px){.cols{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:18px 18px 14px;backdrop-filter:blur(8px);margin-bottom:16px}
+  .card h2{font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);font-weight:700;margin-bottom:12px;display:flex;align-items:center;gap:8px}
+  .card h2 .spark{color:var(--cyan)}
+  table{width:100%;border-collapse:collapse;font-size:13.5px}
+  th{text-align:left;color:var(--muted);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;padding:4px 8px;border-bottom:1px solid var(--line)}
+  td{padding:7px 8px;border-bottom:1px solid rgba(255,255,255,.045);font-variant-numeric:tabular-nums;vertical-align:top}
+  tr.rowlink{cursor:pointer;transition:background .12s}
+  tr.rowlink:hover{background:rgba(78,240,208,.05)}
+  .mono{font-family:var(--mono);font-size:12px}
+  .muted{color:var(--muted)}
+  .right{text-align:right}
+  .badge{display:inline-block;font-size:10px;font-weight:700;letter-spacing:.06em;border-radius:6px;padding:1.5px 7px;text-transform:uppercase}
+  .b-agg{background:rgba(139,123,255,.14);color:var(--violet);border:1px solid rgba(139,123,255,.35)}
+  .b-rot{background:rgba(245,197,24,.12);color:var(--gold);border:1px solid rgba(245,197,24,.35)}
+  .b-ok{background:rgba(67,224,140,.12);color:var(--ok);border:1px solid rgba(67,224,140,.35)}
+  .b-rej{background:rgba(255,93,122,.12);color:var(--danger);border:1px solid rgba(255,93,122,.35)}
+  .b-kind{background:rgba(78,240,208,.1);color:var(--cyan);border:1px solid rgba(78,240,208,.3)}
+  .b-kind.shield,.b-kind.shielded_spend{background:rgba(139,123,255,.12);color:var(--violet);border-color:rgba(139,123,255,.35)}
+
+  .privnote{font-size:12px;color:var(--muted);border-left:2px solid var(--violet);padding:6px 12px;margin:10px 0 4px;line-height:1.55}
+  .privnote b{color:var(--violet)}
+
+  /* block detail overlay */
+  .detail{position:fixed;inset:0;z-index:50;display:none;align-items:flex-start;justify-content:center;padding:5vh 16px;background:rgba(4,6,12,.72);backdrop-filter:blur(6px);overflow-y:auto}
+  .detail.open{display:flex}
+  .sheet{background:#0B0F1A;border:1px solid var(--line);border-radius:20px;max-width:860px;width:100%;padding:24px;box-shadow:0 30px 80px rgba(0,0,0,.6)}
+  .sheet h3{font-size:19px;margin-bottom:4px}
+  .sheet .close{float:right;cursor:pointer;color:var(--muted);font-size:22px;line-height:1;padding:2px 8px;border-radius:8px}
+  .sheet .close:hover{color:var(--text);background:rgba(255,255,255,.06)}
+  .kv{display:grid;grid-template-columns:150px 1fr;gap:4px 14px;font-size:13px;margin:12px 0}
+  .kv .k{color:var(--muted)}
+  .tx{border:1px solid var(--line);border-radius:12px;padding:11px 13px;margin:9px 0;background:rgba(255,255,255,.025)}
+  .tx .h{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:5px}
+  .fields{font-family:var(--mono);font-size:11.5px;color:var(--muted);word-break:break-all;line-height:1.7}
+  .fields b{color:var(--text);font-weight:600}
+  .rej-detail{color:var(--danger);font-family:var(--mono);font-size:11.5px;margin-top:4px;word-break:break-all}
+
+  .foot{margin-top:26px;font-size:11.5px;color:var(--muted);text-align:center;line-height:1.7}
+  .foot a{color:var(--cyan);text-decoration:none}
+  .pager{display:flex;gap:8px;justify-content:flex-end;margin-top:8px}
+  .btn{background:rgba(255,255,255,.05);border:1px solid var(--line);border-radius:9px;color:var(--text);padding:5px 13px;font-size:12px;cursor:pointer}
+  .btn:hover{border-color:rgba(78,240,208,.45)}
+  .btn:disabled{opacity:.35;cursor:default}
+  #searchbox{width:min(420px,100%)}
+  .err{color:var(--danger);font-size:12.5px;margin-top:6px;display:none}
+</style>
+</head>
+<body>
+<div class="orbs" aria-hidden="true"><div class="orb orb-a"></div><div class="orb orb-b"></div><div class="orb orb-c"></div></div>
+<div class="wrap">
+
+  <header>
+    <div class="logo">Hash<b>Kinetics</b> <span class="muted" style="font-weight:400">Explorer</span></div>
+    <span class="beta">devnet</span>
+    <div class="conn">
+      <input id="rpcurl" value="http://127.0.0.1:26000" size="24" title="node RPC endpoint"/>
+      <span class="dot" id="conndot"></span>
+    </div>
+  </header>
+  <p class="tagline">The scanner that can't dox you — <b>no amounts, no parties, by construction.</b> Everything below is the transparent skeleton consensus already made public.</p>
+
+  <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px">
+    <input id="searchbox" placeholder="Search: block height · 64-hex txid"/>
+    <button class="btn" onclick="doSearch()">Search</button>
+    <span class="err" id="searcherr"></span>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><div class="k">Height</div><div class="v" id="s-height">—</div><div class="sub" id="s-time"></div></div>
+    <div class="stat"><div class="k">State commitment</div><div class="v mono" id="s-apphash">—</div><div class="sub">SHAKE-256 over all of Σ</div></div>
+    <div class="stat"><div class="k">Shielded pool</div><div class="v" id="s-shielded">—</div><div class="sub" id="s-poolsub">value hidden inside</div></div>
+    <div class="stat"><div class="k">Nullifiers</div><div class="v" id="s-nulls">—</div><div class="sub">spends nobody can trace</div></div>
+    <div class="stat"><div class="k">Validators</div><div class="v" id="s-vals">—</div><div class="sub" id="s-power"></div></div>
+    <div class="stat"><div class="k">Mempool</div><div class="v" id="s-mempool">—</div><div class="sub">pending admissions</div></div>
+  </div>
+
+  <div class="cols">
+    <div>
+      <div class="card">
+        <h2><span class="spark">▮</span> Latest blocks</h2>
+        <table id="blocks">
+          <thead><tr><th>Height</th><th>Txs</th><th></th><th class="right">Value id</th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <div class="pager">
+          <button class="btn" id="newerbtn" onclick="pageNewer()" disabled>← newer</button>
+          <button class="btn" id="olderbtn" onclick="pageOlder()">older →</button>
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="card">
+        <h2><span class="spark">◆</span> Shielded pool</h2>
+        <div class="kv" id="poolkv"></div>
+        <div class="privnote"><b>What you are NOT seeing:</b> who paid whom, how much, which note was spent. The pool publishes commitments, nullifiers and one running total — compliance visibility exists, but only as scoped, holder-initiated disclosure. No master key exists structurally.</div>
+      </div>
+      <div class="card">
+        <h2><span class="spark">⬢</span> Validators</h2>
+        <table id="vals"><thead><tr><th>Address</th><th class="right">Power</th><th class="right">Epoch</th></tr></thead><tbody></tbody></table>
+        <div class="privnote" style="border-color:var(--cyan)"><b style="color:var(--cyan)">Every vote is hash-based</b> (LMS/HSS over SHAKE-256) under an SLH-DSA root — the consensus itself is post-quantum, not just the wallets.</div>
+      </div>
+    </div>
+  </div>
+
+  <p class="foot">HashKinetics devnet explorer · reads only the public transparent skeleton via node RPC · <a href="https://hashkinetics.org" target="_blank" rel="noopener">hashkinetics.org</a></p>
+</div>
+
+<!-- block detail sheet -->
+<div class="detail" id="detail" onclick="if(event.target===this)closeDetail()">
+  <div class="sheet">
+    <span class="close" onclick="closeDetail()">×</span>
+    <h3 id="d-title">Block</h3>
+    <div class="kv" id="d-kv"></div>
+    <div id="d-txs"></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $=id=>document.getElementById(id);
+let RPC=()=> $('rpcurl').value.replace(/\/+$/,'');
+let latestHeight=0, pageBefore=null; // null = live tip page
+let genesisTime=null;
+
+async function rpc(method, params){
+  const r=await fetch(RPC(),{method:'POST',body:JSON.stringify({method,params:params||{}})});
+  const j=await r.json();
+  if(j.error) throw new Error(j.error);
+  return j.result;
+}
+const short=(h,n=10)=>h?h.slice(0,n)+'…':'—';
+const usd=v=>{const n=Number(v);return isFinite(n)?('$'+(n/1e6).toLocaleString(undefined,{maximumFractionDigits:2})):v};
+
+/* ── pollers ── */
+async function pollInfo(){
+  try{
+    const info=await rpc('hk_chainInfo');
+    $('conndot').classList.add('on');
+    latestHeight=info.height;
+    $('s-height').textContent=info.height.toLocaleString();
+    $('s-apphash').textContent=short(info.app_hash,18);
+    $('s-time').textContent=info.chain_id;
+    if(pageBefore===null) loadBlocks();
+  }catch(e){ $('conndot').classList.remove('on'); }
+}
+async function pollPanels(){
+  try{
+    const p=await rpc('hk_getPoolInfo');
+    $('s-shielded').textContent=usd(p.total_shielded);
+    $('s-nulls').textContent=p.nullifiers;
+    $('poolkv').innerHTML=
+      kv('total shielded',`<b style="color:var(--cyan)">${usd(p.total_shielded)}</b> <span class="muted">(Σ minted − Σ unshielded)</span>`)+
+      kv('commitments',p.next_index)+
+      kv('nullifiers',p.nullifiers)+
+      kv('tree root',`<span class="mono">${short(p.root,22)}</span>`)+
+      kv('latest anchor',`<span class="mono">${short(p.latest_anchor,22)}</span>`)+
+      kv('pool version',p.version);
+  }catch(e){}
+  try{
+    const v=await rpc('hk_getValidators');
+    $('s-vals').textContent=v.count;
+    $('s-power').textContent='total power '+v.total_power;
+    const tb=$('vals').querySelector('tbody');
+    tb.innerHTML=v.validators.map(x=>
+      `<tr><td class="mono">${short(x.address,16)}</td><td class="right">${x.voting_power}</td><td class="right">${x.epoch===0?'<span class="muted">genesis</span>':'<span class="badge b-rot">e'+x.epoch+'</span>'}</td></tr>`).join('');
+  }catch(e){}
+  try{
+    const m=await rpc('hk_getMempool');
+    $('s-mempool').textContent=m.count;
+  }catch(e){}
+}
+function kv(k,v){return `<div class="k">${k}</div><div>${v}</div>`}
+
+/* ── blocks table ── */
+async function loadBlocks(){
+  try{
+    const params = pageBefore===null? {limit:14} : {before:pageBefore, limit:14};
+    const res=await rpc('hk_getBlocks',params);
+    const tb=$('blocks').querySelector('tbody');
+    tb.innerHTML=res.blocks.map(b=>{
+      const badges=(b.tx_count>0?'':'')+(b.aggregate?' <span class="badge b-agg" title="ONE aggregate STARK covered this block’s shielded txs">agg</span>':'')+(b.rotations>0?' <span class="badge b-rot">rotation</span>':'');
+      return `<tr class="rowlink" onclick="openBlock(${b.height})">
+        <td><b>${b.height.toLocaleString()}</b></td>
+        <td>${b.tx_count>0?b.tx_count:'<span class="muted">0</span>'}</td>
+        <td>${badges}</td>
+        <td class="right mono muted">${b.value_id}…</td></tr>`;
+    }).join('');
+    const earliest=res.earliest??0;
+    const oldest=res.blocks.length?res.blocks[res.blocks.length-1].height:0;
+    $('olderbtn').disabled = !res.blocks.length || oldest<=earliest;
+    $('newerbtn').disabled = pageBefore===null;
+    window._oldest=oldest;
+  }catch(e){}
+}
+function pageOlder(){ pageBefore=window._oldest; loadBlocks(); }
+function pageNewer(){ pageBefore=null; loadBlocks(); }
+
+/* ── block detail ── */
+async function openBlock(h){
+  try{
+    const b=await rpc('hk_getBlock',{height:h});
+    if(!b.found) return;
+    $('d-title').textContent='Block '+b.height.toLocaleString();
+    $('d-kv').innerHTML=
+      kv('txs',b.tx_count)+
+      kv('aggregate',b.aggregate.present?(b.aggregate.verified?'<span class="badge b-ok">verified — one STARK for the whole block</span>':'<span class="badge b-rej">present, INVALID</span>'):'<span class="muted">—</span>')+
+      kv('rotations',b.rotations||'<span class="muted">—</span>')+
+      kv('consensus',`round ${b.certificate.round} · ${b.certificate.signatures} commit signatures (hash-based)`)+
+      kv('value id',`<span class="mono">${short(b.certificate.value_id,26)}</span>`)+
+      kv('parent C(Σ)',`<span class="mono">${short(b.parent_app_hash||'',26)}</span>`);
+    $('d-txs').innerHTML = b.txs.length? b.txs.map(txHtml).join('') : '<p class="muted" style="font-size:13px">Empty block — consensus heartbeat.</p>';
+    $('detail').classList.add('open');
+  }catch(e){}
+}
+function txHtml(t){
+  const r=t.receipt||{};
+  const rb = r.found? (r.ok?'<span class="badge b-ok">ok</span>':'<span class="badge b-rej">rejected</span>') : '<span class="badge" style="color:var(--muted);border:1px solid var(--line)">receipt evicted</span>';
+  const f=Object.entries(t.fields||{}).filter(([k,v])=>v!==null&&v!==undefined)
+    .map(([k,v])=>{
+      let val=v;
+      if(k==='amount'||k==='value'||k==='fee'||k==='unit_price') val=usd(v)+` <span class="muted">(${v} µ)</span>`;
+      return `<b>${k}</b> ${val}`;
+    }).join(' · ');
+  const rej = (r.found&&!r.ok)? `<div class="rej-detail">⛔ ${r.detail}</div>`:'';
+  return `<div class="tx">
+    <div class="h"><span class="badge b-kind ${t.kind}">${t.kind.replace(/_/g,' ')}</span> ${rb}
+      <span class="mono muted">tx ${short(t.txid,14)}</span>
+      <span class="mono muted" style="margin-left:auto">sender ${short(t.sender,12)} · n${t.nonce}</span></div>
+    <div class="fields">${f||'<span class="muted">—</span>'}</div>${rej}</div>`;
+}
+function closeDetail(){ $('detail').classList.remove('open'); }
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeDetail()});
+
+/* ── search ── */
+async function doSearch(){
+  const q=$('searchbox').value.trim();
+  const err=$('searcherr'); err.style.display='none';
+  if(/^\d+$/.test(q)){ openBlock(parseInt(q,10)); return; }
+  if(/^[0-9a-fA-F]{64}$/.test(q)){
+    try{
+      const r=await rpc('hk_getReceipt',{txid:q.toLowerCase()});
+      if(r.found){
+        $('d-title').textContent='Transaction receipt';
+        $('d-kv').innerHTML=kv('txid',`<span class="mono">${q.toLowerCase()}</span>`)+kv('consensus verdict', r.detail.startsWith('ok')?`<span class="badge b-ok">ok</span> <span class="mono muted">${r.detail}</span>`:`<span class="badge b-rej">rejected</span>`)+(r.detail.startsWith('ok')?'':kv('receipt',`<span class="rej-detail">⛔ ${r.detail}</span>`));
+        $('d-txs').innerHTML='';
+        $('detail').classList.add('open');
+      } else { err.textContent='txid not found (or receipt evicted)'; err.style.display='inline'; }
+    }catch(e){ err.textContent=String(e.message||e); err.style.display='inline'; }
+    return;
+  }
+  err.textContent='enter a block height or a 64-hex txid'; err.style.display='inline';
+}
+$('searchbox').addEventListener('keydown',e=>{if(e.key==='Enter')doSearch()});
+
+/* ── boot ── */
+pollInfo(); pollPanels();
+setInterval(pollInfo,1500);
+setInterval(pollPanels,4000);
+$('rpcurl').addEventListener('change',()=>{pageBefore=null;pollInfo();pollPanels();});
+</script>
+</body>
+</html>

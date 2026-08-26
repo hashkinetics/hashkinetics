@@ -1,0 +1,19 @@
+[package]
+name = "openvm-ecdsa-recover-key-program"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+openvm = { workspace = true, features = ["std"] }
+openvm-algebra-guest.workspace = true
+openvm-ecc-guest.workspace = true
+openvm-keccak256.workspace = true
+revm-precompile = { git = "https://github.com/bluealloy/revm.git", tag = "v75", default-features = false }
+# IMPORTANT: must be same version as used by revm; revm does not re-export this feature so we enable it here
+alloy-primitives = { version = "1.2.0", default-features = false, features = [
+    "native-keccak",
+] }
+k256 = { version = "0.13.3", default-features = false }
+
+[features]
+default = []

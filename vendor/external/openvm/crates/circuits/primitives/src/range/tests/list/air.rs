@@ -1,0 +1,37 @@
+use std::borrow::Borrow;
+
+use openvm_stark_backend::{
+    interaction::InteractionBuilder,
+    p3_air::{Air, BaseAir},
+    p3_field::{Field, PrimeCharacteristicRing},
+    p3_matrix::Matrix,
+    BaseAirWithPublicValues, PartitionedBaseAir,
+};
+
+use super::columns::{ListCols, NUM_LIST_COLS};
+use crate::{range::bus::RangeCheckBus, ColumnsAir};
+
+#[derive(Copy, Clone, Debug, derive_new::new, ColumnsAir)]
+#[columns_via(ListCols<u8>)]
+pub struct ListAir {
+    /// The index for the Range Checker bus.
+    pub bus: RangeCheckBus,
+}
+impl<F: Field> BaseAirWithPublicValues<F> for ListAir {}
+impl<F: Field> PartitionedBaseAir<F> for ListAir {}
+impl<F: Field> BaseAir<F> for ListAir {
+    fn width(&self) -> usize {
+        NUM_LIST_COLS
+    }
+}
+
+impl<AB: InteractionBuilder> Air<AB> for ListAir {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let local = main.row_slice(0).expect("window should have two elements");
+        let local: &ListCols<AB::Var> = (*local).borrow();
+
+        // We do not implement SubAirBridge trait for brevity
+        self.bus.send(local.val).eval(builder, AB::F::ONE);
+    }
+}

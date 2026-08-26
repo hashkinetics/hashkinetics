@@ -1,0 +1,227 @@
+# Workflow to verify versioning compatibility between base branch and patch versions
+name: Verify Versioning Compatibility
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag to compare (e.g., v2.0.0)"
+        required: true
+        default: "v2.0.0"
+        type: string
+
+jobs:
+  verify-versioning:
+    name: Compare base and tagged artifacts
+    runs-on:
+      - runs-on=${{ github.run_id }}/family=c8i-flex.16xlarge+c8i.16xlarge+c8a.16xlarge+c7i.16xlarge+c7a.16xlarge/extras=s3-cache/volume=80gb
+    steps:
+      - uses: runs-on/action@v2
+        with:
+          sccache: s3
+      - name: Load SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: |
+            ${{ secrets.GH_ACTIONS_DEPLOY_PRIVATE_KEY }}
+      - name: Checkout base branch
+        uses: actions/checkout@v5
+
+      - name: Set version fallback
+        run: echo "version=${{ github.event.inputs.version || 'v2.0.0' }}" >> $GITHUB_ENV
+
+      - name: Install solc # svm should support arm64 linux
+        run: (hash svm 2>/dev/null || cargo install --locked --version 0.2.23 svm-rs) && svm install 0.8.19 && solc --version
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - name: Configure sccache
+        run: |
+          printf 'server_startup_timeout_ms = 60000\n' > "$RUNNER_TEMP/sccache.conf"
+          echo "SCCACHE_CONF=$RUNNER_TEMP/sccache.conf" >> "$GITHUB_ENV"
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      # Build and test from base branch
+      - name: Build base branch CLI
+        run: |
+          cargo build --release --locked -p cargo-openvm
+          echo "${{ github.workspace }}/target/release" >> $GITHUB_PATH
+
+      - name: Run setup from base branch and snapshot ~/.openvm
+        run: |
+          cargo openvm setup --evm
+          rm -rf ~/.openvm-base
+          mv ~/.openvm ~/.openvm-base
+
+      - name: Build and keygen examples from base branch
+        run: |
+          mkdir -p ./base-outputs/examples
+          for example in examples/*/; do
+            if [ -f "$example/Cargo.toml" ]; then
+              example_name=$(basename "$example")
+              echo "Building and generating keys for example: $example_name"
+              cd "$example"
+              cargo openvm build --no-transpile
+              cargo openvm keygen --output-dir "../../base-outputs/examples/$example_name"
+              cd ../..
+            fi
+          done
+
+      - name: Build and keygen benchmarks from base branch
+        run: |
+          mkdir -p ./base-outputs/benchmarks
+          for benchmark in benchmarks/guest/*/; do
+            if [ -f "$benchmark/Cargo.toml" ]; then
+              benchmark_name=$(basename "$benchmark")
+              echo "Building and generating keys for benchmark: $benchmark_name"
+              cd "$benchmark"
+              cargo openvm build --no-transpile
+              cargo openvm keygen --output-dir "../../../base-outputs/benchmarks/$benchmark_name"
+              cd ../../..
+            fi
+          done
+
+      # Checkout and test tagged version
+      - name: Checkout tagged version
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.version }}
+          clean: false
+
+      - name: Build tagged CLI
+        run: cargo build --release --locked -p cargo-openvm
+
+      - name: Run setup from tagged version
+        run: |
+          cargo openvm setup --evm
+
+      - name: Build and keygen examples from tagged version
+        run: |
+          mkdir -p ./tagged-outputs/examples
+          for example in examples/*/; do
+            if [ -f "$example/Cargo.toml" ]; then
+              example_name=$(basename "$example")
+              echo "Building and generating keys for example: $example_name"
+              cd "$example"
+              cargo openvm build --no-transpile
+              mkdir -p "../../tagged-outputs/examples/$example_name"
+              cargo openvm keygen --output-dir "../../tagged-outputs/examples/$example_name"
+              cd ../..
+            fi
+          done
+
+      - name: Build and keygen benchmarks from tagged version
+        run: |
+          mkdir -p ./tagged-outputs/benchmarks
+          for benchmark in benchmarks/guest/*/; do
+            if [ -f "$benchmark/Cargo.toml" ]; then
+              benchmark_name=$(basename "$benchmark")
+              echo "Building and generating keys for benchmark: $benchmark_name"
+              cd "$benchmark"
+              cargo openvm build --no-transpile
+              mkdir -p "../../../tagged-outputs/benchmarks/$benchmark_name"
+              cargo openvm keygen --output-dir "../../../tagged-outputs/benchmarks/$benchmark_name"
+              cd ../../..
+            fi
+          done
+
+      - name: Compare example verification keys
+        run: |
+          echo "Comparing example verification keys between base branch and ${{ env.version }}..."
+          failed=0
+          for example in examples/*/; do
+            if [ -f "$example/Cargo.toml" ]; then
+              example_name=$(basename "$example")
+              echo "Checking example: $example_name"
+              if cmp "./base-outputs/examples/$example_name/app.vk" "./tagged-outputs/examples/$example_name/app.vk"; then
+                echo "✅ $example_name verification keys are identical"
+              else
+                echo "❌ $example_name verification keys differ"
+                failed=1
+              fi
+            fi
+          done
+          if [ $failed -eq 1 ]; then
+            echo "❌ Some example verification keys differ - versioning policy violated"
+            exit 1
+          else
+            echo "✅ All example verification keys are identical"
+          fi
+
+      - name: Compare benchmark verification keys
+        run: |
+          echo "Comparing benchmark verification keys between base branch and ${{ env.version }}..."
+          failed=0
+          for benchmark in benchmarks/guest/*/; do
+            if [ -f "$benchmark/Cargo.toml" ]; then
+              benchmark_name=$(basename "$benchmark")
+              echo "Checking benchmark: $benchmark_name"
+              if cmp "./base-outputs/benchmarks/$benchmark_name/app.vk" "./tagged-outputs/benchmarks/$benchmark_name/app.vk"; then
+                echo "✅ $benchmark_name verification keys are identical"
+              else
+                echo "❌ $benchmark_name verification keys differ"
+                failed=1
+              fi
+            fi
+          done
+          if [ $failed -eq 1 ]; then
+            echo "❌ Some benchmark verification keys differ - versioning policy violated"
+            exit 1
+          else
+            echo "✅ All benchmark verification keys are identical"
+          fi
+
+      # Compare all outputs
+      - name: Compare ~/.openvm contents
+        run: |
+          echo "🔍 Comparing ~/.openvm agg and halo2 outputs between base branch and ${{ env.version }}..."
+
+          failed=0
+
+          # Compare agg_stark.pk
+          if cmp ~/.openvm-base/agg_stark.pk ~/.openvm/agg_stark.pk; then
+            echo "✅ agg_stark.pk are identical"
+          else
+            echo "❌ agg_stark.pk differ"
+            failed=1
+          fi
+
+          # Compare agg_halo2.pk
+          if cmp ~/.openvm-base/agg_halo2.pk ~/.openvm/agg_halo2.pk; then
+            echo "✅ agg_halo2.pk are identical"
+          else
+            echo "❌ agg_halo2.pk differ"
+            failed=1
+          fi
+
+          # Compare halo2 directories recursively
+          if diff -r ~/.openvm-base/halo2 ~/.openvm/halo2; then
+            echo "✅ halo2 directories are identical"
+          else
+            echo "❌ halo2 directories differ"
+            failed=1
+          fi
+
+          if [ $failed -eq 1 ]; then
+            echo "❌ ~/.openvm outputs differ"
+            exit 1
+          else
+            echo "✅ All checked ~/.openvm outputs are identical"
+          fi
+
+      - name: Final summary
+        run: |
+          echo "🎉 Versioning compatibility verification completed successfully!"
+          echo "✅ Setup outputs are identical between base branch and ${{ env.version }}"
+          echo "✅ All example verification keys are identical"
+          echo "✅ All benchmark verification keys are identical"
+          echo "✅ Versioning policy maintained - patch upgrade is backward compatible"
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true

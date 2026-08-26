@@ -1,0 +1,28 @@
+[package]
+name = "hk-spend-circuit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "HashKinetics shielded-spend statement — the shared circuit benchmarked across SP1/RISC0/OpenVM (gate G2)."
+
+# no_std so the exact same crate compiles inside every zkVM guest; std only during tests.
+[dependencies]
+# Loose req on purpose: each prover's GUEST steers the exact version so its accelerator
+# patch applies (SP1's patch = 0.10.8 → the sp1 program adds a `=0.10.8` constraint dep;
+# RISC0's patch = 0.10.9 → matches the resolver's natural pick). A version the resolver
+# picks that the patch doesn't provide is SILENTLY unpatched — verify via the cycle count.
+sha2 = { version = "0.10", default-features = false }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+# OpenVM accelerates SHA-256 via its own drop-in guest lib (same `Digest` API), not a
+# crates.io patch — enable the `openvm-accel` feature in the OpenVM guest only.
+openvm-sha2 = { path = "../../vendor/external/openvm/guest-libs/sha2", optional = true }
+
+[features]
+openvm-accel = ["dep:openvm-sha2"]
+
+[dev-dependencies]
+# (tests run with std via cfg_attr; nothing extra needed)
+
+# Standalone root: this crate is path-depended from THREE places (each zkVM guest's own
+# workspace + the chain workspace via hk-state) — never let an ancestor workspace claim it.
+[workspace]

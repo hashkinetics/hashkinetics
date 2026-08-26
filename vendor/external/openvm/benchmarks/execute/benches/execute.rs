@@ -1,0 +1,441 @@
+#[cfg(feature = "aot")]
+use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashSet,
+    io,
+    path::Path,
+    sync::{Mutex, OnceLock},
+};
+
+use divan::Bencher;
+use eyre::Result;
+use openvm_algebra_circuit::{
+    AlgebraCpuProverExt, Fp2Extension, Fp2ExtensionExecutor, ModularExtension,
+    ModularExtensionExecutor,
+};
+use openvm_algebra_transpiler::{Fp2TranspilerExtension, ModularTranspilerExtension};
+use openvm_benchmarks_utils::{get_programs_dir, read_elf_file};
+use openvm_bigint_circuit::{Int256, Int256CpuProverExt, Int256Executor};
+use openvm_bigint_transpiler::Int256TranspilerExtension;
+#[cfg(feature = "aot")]
+use openvm_circuit::arch::execution_mode::{ExecutionCtx, MeteredCtx};
+use openvm_circuit::{
+    arch::{execution_mode::MeteredCostCtx, instructions::exe::VmExe, *},
+    derive::VmConfig,
+    system::*,
+};
+use openvm_ecc_circuit::{EccCpuProverExt, WeierstrassExtension, WeierstrassExtensionExecutor};
+use openvm_ecc_transpiler::EccTranspilerExtension;
+use openvm_keccak256_circuit::{Keccak256, Keccak256CpuProverExt, Keccak256Executor};
+use openvm_keccak256_transpiler::Keccak256TranspilerExtension;
+use openvm_pairing_circuit::{
+    PairingCurve, PairingExtension, PairingExtensionExecutor, PairingProverExt,
+};
+use openvm_pairing_guest::bn254::BN254_COMPLEX_STRUCT_NAME;
+use openvm_pairing_transpiler::PairingTranspilerExtension;
+use openvm_rv32im_circuit::{
+    Rv32I, Rv32IExecutor, Rv32ImCpuProverExt, Rv32Io, Rv32IoExecutor, Rv32M, Rv32MExecutor,
+};
+use openvm_rv32im_transpiler::{
+    Rv32ITranspilerExtension, Rv32IoTranspilerExtension, Rv32MTranspilerExtension,
+};
+use openvm_sha2_circuit::{Sha2, Sha2CpuProverExt, Sha2Executor};
+use openvm_sha2_transpiler::Sha2TranspilerExtension;
+use openvm_stark_sdk::{
+    config::baby_bear_poseidon2::BabyBearPoseidon2CpuEngine,
+    openvm_cpu_backend::{CpuBackend, CpuDevice},
+    openvm_stark_backend::{
+        self, keygen::types::MultiStarkProvingKey, prover::DeviceDataTransporter, EngineDeviceCtx,
+        StarkEngine, StarkProtocolConfig, SystemParams, Val,
+    },
+    p3_baby_bear::BabyBear,
+};
+use openvm_transpiler::{transpiler::Transpiler, FromElf};
+use serde::{Deserialize, Serialize};
+
+const APP_PROGRAMS: &[&str] = &[
+    "fibonacci_recursive",
+    "fibonacci_iterative",
+    "quicksort",
+    "bubblesort",
+    "revm_snailtracer",
+    "keccak256",
+    "keccak256_iter",
+    "sha256",
+    "sha256_iter",
+    "revm_transfer",
+    "pairing",
+];
+
+type SC = openvm_stark_sdk::config::baby_bear_poseidon2::BabyBearPoseidon2Config;
+type Engine = BabyBearPoseidon2CpuEngine;
+
+static VM_PROVING_KEY: OnceLock<MultiStarkProvingKey<SC>> = OnceLock::new();
+static METERED_COST_CTX: OnceLock<(MeteredCostCtx, Vec<usize>)> = OnceLock::new();
+static EXECUTOR: OnceLock<VmExecutor<BabyBear, ExecuteConfig>> = OnceLock::new();
+static SUCCESSFUL_EXECUTIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+#[cfg(feature = "aot")]
+static AOT_CACHE: OnceLock<Mutex<HashMap<String, Arc<AotInstance<BabyBear, ExecutionCtx>>>>> =
+    OnceLock::new();
+#[cfg(feature = "aot")]
+static METERED_AOT_CACHE: OnceLock<
+    Mutex<HashMap<String, Arc<(AotInstance<BabyBear, MeteredCtx>, MeteredCtx)>>>,
+> = OnceLock::new();
+
+fn report_program_success(mode: &str, program: &str) {
+    let successes = SUCCESSFUL_EXECUTIONS.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut successes = successes
+        .lock()
+        .expect("Failed to access successful execution log");
+    let key = format!("{mode}:{program}");
+    if successes.insert(key) {
+        println!("Successfully executed {mode} for program `{program}`");
+    }
+}
+
+fn expect_execution<T, E>(
+    result: std::result::Result<T, E>,
+    mode: &str,
+    program: &str,
+    context: &str,
+) -> T
+where
+    E: std::fmt::Debug,
+{
+    match result {
+        Ok(value) => {
+            report_program_success(mode, program);
+            value
+        }
+        Err(err) => panic!("{context}: {err:?}"),
+    }
+}
+
+#[derive(Clone, Debug, VmConfig, Serialize, Deserialize)]
+pub struct ExecuteConfig {
+    #[config(executor = "SystemExecutor<F>")]
+    pub system: SystemConfig,
+    #[extension]
+    pub rv32i: Rv32I,
+    #[extension]
+    pub rv32m: Rv32M,
+    #[extension]
+    pub io: Rv32Io,
+    #[extension]
+    pub bigint: Int256,
+    #[extension]
+    pub keccak: Keccak256,
+    #[extension]
+    pub sha2: Sha2,
+    #[extension]
+    pub modular: ModularExtension,
+    #[extension]
+    pub fp2: Fp2Extension,
+    #[extension]
+    pub weierstrass: WeierstrassExtension,
+    #[extension(generics = true)]
+    pub pairing: PairingExtension,
+}
+
+impl Default for ExecuteConfig {
+    fn default() -> Self {
+        let bn_config = PairingCurve::Bn254.curve_config();
+        Self {
+            system: SystemConfig::default(),
+            rv32i: Rv32I,
+            rv32m: Rv32M::default(),
+            io: Rv32Io,
+            bigint: Int256::default(),
+            keccak: Keccak256,
+            sha2: Sha2,
+            modular: ModularExtension::new(vec![
+                bn_config.modulus.clone(),
+                bn_config.scalar.clone(),
+            ]),
+            fp2: Fp2Extension::new(vec![(
+                BN254_COMPLEX_STRUCT_NAME.to_string(),
+                bn_config.modulus.clone(),
+            )]),
+            weierstrass: WeierstrassExtension::new(vec![bn_config.clone()]),
+            pairing: PairingExtension::new(vec![PairingCurve::Bn254]),
+        }
+    }
+}
+
+impl InitFileGenerator for ExecuteConfig {
+    fn write_to_init_file(
+        &self,
+        _manifest_dir: &Path,
+        _init_file_name: Option<&str>,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+pub struct ExecuteBuilder;
+impl<E, SC> VmBuilder<E> for ExecuteBuilder
+where
+    SC: StarkProtocolConfig,
+    E: StarkEngine<SC = SC, PB = CpuBackend<SC>, PD = CpuDevice<SC>>,
+    Val<SC>: VmField,
+    SC::EF: Ord,
+{
+    type VmConfig = ExecuteConfig;
+    type SystemChipInventory = SystemChipInventory<SC>;
+    type RecordArena = MatrixRecordArena<Val<SC>>;
+
+    fn create_chip_complex(
+        &self,
+        config: &ExecuteConfig,
+        circuit: AirInventory<SC>,
+        device_ctx: &EngineDeviceCtx<E>,
+    ) -> Result<
+        VmChipComplex<SC, Self::RecordArena, E::PB, Self::SystemChipInventory>,
+        ChipInventoryError,
+    > {
+        let mut chip_complex = VmBuilder::<E>::create_chip_complex(
+            &SystemCpuBuilder,
+            &config.system,
+            circuit,
+            device_ctx,
+        )?;
+        let inventory = &mut chip_complex.inventory;
+        VmProverExtension::<E, _, _>::extend_prover(&Rv32ImCpuProverExt, &config.rv32i, inventory)?;
+        VmProverExtension::<E, _, _>::extend_prover(&Rv32ImCpuProverExt, &config.rv32m, inventory)?;
+        VmProverExtension::<E, _, _>::extend_prover(&Rv32ImCpuProverExt, &config.io, inventory)?;
+        VmProverExtension::<E, _, _>::extend_prover(
+            &Int256CpuProverExt,
+            &config.bigint,
+            inventory,
+        )?;
+        VmProverExtension::<E, _, _>::extend_prover(
+            &Keccak256CpuProverExt,
+            &config.keccak,
+            inventory,
+        )?;
+        VmProverExtension::<E, _, _>::extend_prover(&Sha2CpuProverExt, &config.sha2, inventory)?;
+        VmProverExtension::<E, _, _>::extend_prover(
+            &AlgebraCpuProverExt,
+            &config.modular,
+            inventory,
+        )?;
+        VmProverExtension::<E, _, _>::extend_prover(&AlgebraCpuProverExt, &config.fp2, inventory)?;
+        VmProverExtension::<E, _, _>::extend_prover(
+            &EccCpuProverExt,
+            &config.weierstrass,
+            inventory,
+        )?;
+        VmProverExtension::<E, _, _>::extend_prover(&PairingProverExt, &config.pairing, inventory)?;
+        Ok(chip_complex)
+    }
+}
+
+fn main() {
+    divan::main();
+}
+
+fn create_default_transpiler() -> Transpiler<BabyBear> {
+    Transpiler::<BabyBear>::default()
+        .with_extension(Rv32ITranspilerExtension)
+        .with_extension(Rv32IoTranspilerExtension)
+        .with_extension(Rv32MTranspilerExtension)
+        .with_extension(Int256TranspilerExtension)
+        .with_extension(Keccak256TranspilerExtension)
+        .with_extension(Sha2TranspilerExtension)
+        .with_extension(ModularTranspilerExtension)
+        .with_extension(Fp2TranspilerExtension)
+        .with_extension(EccTranspilerExtension)
+        .with_extension(PairingTranspilerExtension)
+}
+
+fn load_program_executable(program: &str) -> Result<VmExe<BabyBear>> {
+    let transpiler = create_default_transpiler();
+    let program_dir = get_programs_dir().join(program);
+    let elf_path = openvm_benchmarks_utils::get_elf_path(&program_dir);
+    let elf = read_elf_file(&elf_path)?;
+    Ok(VmExe::from_elf(elf, transpiler)?)
+}
+
+fn vm_proving_key() -> &'static MultiStarkProvingKey<SC> {
+    VM_PROVING_KEY.get_or_init(|| {
+        let config = ExecuteConfig::default();
+        let engine = Engine::new(SystemParams::new_for_testing(21));
+        let (_vm, pk) = VirtualMachine::new_with_keygen(engine, ExecuteBuilder, config).unwrap();
+        pk
+    })
+}
+
+fn metered_cost_setup() -> &'static (MeteredCostCtx, Vec<usize>) {
+    METERED_COST_CTX.get_or_init(|| {
+        let config = ExecuteConfig::default();
+        let engine = Engine::new(SystemParams::new_for_testing(21));
+        let pk = vm_proving_key();
+        let d_pk = engine.device().transport_pk_to_device(pk);
+        let vm = VirtualMachine::new(engine, ExecuteBuilder, config, d_pk).unwrap();
+        let ctx = vm.build_metered_cost_ctx();
+        let executor_idx_to_air_idx = vm.executor_idx_to_air_idx();
+        (ctx, executor_idx_to_air_idx)
+    })
+}
+
+fn executor() -> &'static VmExecutor<BabyBear, ExecuteConfig> {
+    EXECUTOR.get_or_init(|| {
+        let vm_config = ExecuteConfig::default();
+        VmExecutor::<BabyBear, _>::new(vm_config).unwrap()
+    })
+}
+
+#[divan::bench(args = APP_PROGRAMS, sample_count=10)]
+fn benchmark_execute(bencher: Bencher, program: &str) {
+    #[cfg(feature = "aot")]
+    {
+        let program_name = program.to_string();
+        let aot_instance = create_aot_instance(&program_name);
+        bencher
+            .with_inputs(Vec::<Vec<BabyBear>>::new)
+            .bench_values(|input| {
+                expect_execution(
+                    aot_instance.execute(input, None),
+                    "AOT benchmark",
+                    program,
+                    "Failed to execute program in AOT mode",
+                );
+            });
+    }
+
+    #[cfg(not(feature = "aot"))]
+    {
+        bencher
+            .with_inputs(|| {
+                let exe =
+                    load_program_executable(program).expect("Failed to load program executable");
+                let interpreter = executor().instance(&exe).unwrap();
+                (interpreter, vec![])
+            })
+            .bench_values(|(interpreter, input)| {
+                expect_execution(
+                    interpreter.execute(input, None),
+                    "interpreted benchmark",
+                    program,
+                    "Failed to execute program in interpreted mode",
+                );
+            });
+    }
+}
+
+#[cfg(feature = "aot")]
+fn create_aot_instance(program: &str) -> Arc<AotInstance<BabyBear, ExecutionCtx>> {
+    let cache = AOT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().unwrap();
+    cache
+        .entry(program.to_string())
+        .or_insert_with(|| {
+            let exe = load_program_executable(program)
+                .expect("Failed to load program executable for AOT cache");
+            Arc::new(
+                executor().instance(&exe).unwrap_or_else(|err| {
+                    panic!("Failed to create AOT instance for {program}: {err}")
+                }),
+            )
+        })
+        .clone()
+}
+
+#[cfg(feature = "aot")]
+fn create_metered_aot_instance(
+    program: &str,
+) -> Arc<(AotInstance<BabyBear, MeteredCtx>, MeteredCtx)> {
+    let cache = METERED_AOT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().unwrap();
+    cache
+        .entry(program.to_string())
+        .or_insert_with(|| {
+            let exe = load_program_executable(program)
+                .expect("Failed to load program executable for metered AOT cache");
+            let config = ExecuteConfig::default();
+            let engine = Engine::new(SystemParams::new_for_testing(21));
+            let pk = vm_proving_key();
+            let d_pk = engine.device().transport_pk_to_device(pk);
+            let vm = VirtualMachine::new(engine, ExecuteBuilder, config, d_pk)
+                .expect("Failed to create VM for metered AOT setup");
+            let executor_idx_to_air_idx = vm.executor_idx_to_air_idx();
+            let ctx = vm.build_metered_ctx(&exe);
+
+            let instance = executor()
+                .metered_instance(&exe, &executor_idx_to_air_idx)
+                .unwrap_or_else(|err| {
+                    panic!("Failed to create metered AOT instance for {program}: {err}")
+                });
+            Arc::new((instance, ctx))
+        })
+        .clone()
+}
+
+#[divan::bench(args = APP_PROGRAMS, sample_count=5)]
+fn benchmark_execute_metered(bencher: Bencher, program: &str) {
+    #[cfg(feature = "aot")]
+    {
+        let program_name = program.to_string();
+        let metered = create_metered_aot_instance(&program_name);
+        bencher
+            .with_inputs(Vec::<Vec<BabyBear>>::new)
+            .bench_values(|input| {
+                expect_execution(
+                    metered.0.execute_metered(input, metered.1.clone()),
+                    "metered benchmark",
+                    program,
+                    "Failed to execute program",
+                );
+            });
+    }
+
+    #[cfg(not(feature = "aot"))]
+    {
+        bencher
+            .with_inputs(|| {
+                let exe =
+                    load_program_executable(program).expect("Failed to load program executable");
+                let config = ExecuteConfig::default();
+                let engine = Engine::new(SystemParams::new_for_testing(21));
+                let pk = vm_proving_key();
+                let d_pk = engine.device().transport_pk_to_device(pk);
+                let vm = VirtualMachine::new(engine, ExecuteBuilder, config, d_pk).unwrap();
+                let executor_idx_to_air_idx = vm.executor_idx_to_air_idx();
+
+                let ctx = vm.build_metered_ctx(&exe);
+                let interpreter = executor()
+                    .metered_instance(&exe, &executor_idx_to_air_idx)
+                    .unwrap();
+                (interpreter, vec![], ctx.clone())
+            })
+            .bench_values(|(interpreter, input, ctx)| {
+                expect_execution(
+                    interpreter.execute_metered(input, ctx),
+                    "metered benchmark",
+                    program,
+                    "Failed to execute program",
+                );
+            });
+    }
+}
+
+#[divan::bench(ignore = true, args = APP_PROGRAMS, sample_count=5)]
+fn benchmark_execute_metered_cost(bencher: Bencher, program: &str) {
+    bencher
+        .with_inputs(|| {
+            let exe = load_program_executable(program).expect("Failed to load program executable");
+            let (ctx, executor_idx_to_air_idx) = metered_cost_setup();
+            let interpreter = executor()
+                .metered_cost_instance(&exe, executor_idx_to_air_idx)
+                .unwrap();
+            (interpreter, vec![], ctx.clone())
+        })
+        .bench_values(|(interpreter, input, ctx)| {
+            expect_execution(
+                interpreter.execute_metered_cost(input, ctx),
+                "metered cost benchmark",
+                program,
+                "Failed to execute program with metered cost",
+            );
+        });
+}

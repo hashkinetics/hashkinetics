@@ -1,0 +1,86 @@
+# Workflow to upload setup artifacts such as proving keys.
+name: Upload Setup Artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag (e.g., v2.0.0)"
+        required: true
+        default: "v2.0.0"
+        type: string
+  release:
+    types: [released]
+
+env:
+  S3_BUCKET: ${{ vars.OPENVM_S3_ARTIFACTS_BUCKET }}
+
+jobs:
+  upload-setup:
+    name: Generate and upload artifacts
+    runs-on:
+      - runs-on=${{ github.run_id }}/family=c8i-flex.16xlarge+c8i.16xlarge+c8a.16xlarge+c7i.16xlarge+c7a.16xlarge/extras=s3-cache/volume=80gb
+    steps:
+      - uses: runs-on/action@v2
+        with:
+          sccache: s3
+      - name: Load SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: |
+            ${{ secrets.GH_ACTIONS_DEPLOY_PRIVATE_KEY }}
+      - name: Checkout base branch
+        uses: actions/checkout@v5
+
+      - name: Set version
+        run: echo "version=${{ github.event.inputs.version || github.event.release.tag_name }}" >> $GITHUB_ENV
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - name: Configure sccache
+        run: |
+          printf 'server_startup_timeout_ms = 60000\n' > "$RUNNER_TEMP/sccache.conf"
+          echo "SCCACHE_CONF=$RUNNER_TEMP/sccache.conf" >> "$GITHUB_ENV"
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install solc # svm should support arm64 linux
+        run: (hash svm 2>/dev/null || cargo install --locked --version 0.2.23 svm-rs) && svm install 0.8.19 && solc --version
+
+      # Checkout and test tagged version
+      - name: Checkout tagged version
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.version }}
+
+      - name: Build tagged CLI
+        run: |
+          cargo build --release --locked -p cargo-openvm
+          echo "${{ github.workspace }}/target/release" >> $GITHUB_PATH
+
+      - name: Run setup from tagged version
+        run: |
+          cargo openvm setup --evm
+
+      - name: Install s5cmd
+        run: |
+          source ci/scripts/utils.sh
+          install_s5cmd
+
+      - name: Sync ~/.openvm with S3 bucket in tagged dir
+        run: s5cmd sync ~/.openvm/ s3://${S3_BUCKET%/}/${{ env.version }}/
+
+      - name: Check uploaded artifacts via CLI download
+        run: |
+          generated_openvm="$(mktemp -d)"
+          cp -a ~/.openvm/. "${generated_openvm}/"
+          cargo openvm setup --evm --download --force
+          diff -r "${generated_openvm}" ~/.openvm
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true

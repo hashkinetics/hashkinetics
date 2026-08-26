@@ -1,0 +1,112 @@
+[package]
+name = "openvm-circuit"
+description = "OpenVM circuits"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+p3-baby-bear = { workspace = true }
+p3-field = { workspace = true }
+
+openvm-poseidon2-air = { workspace = true }
+openvm-circuit-primitives = { workspace = true }
+openvm-circuit-primitives-derive = { workspace = true }
+openvm-circuit-derive = { workspace = true }
+openvm-instructions = { workspace = true }
+
+openvm-stark-backend = { workspace = true }
+openvm-stark-sdk = { workspace = true, optional = true, features = ["cpu-backend"] }
+openvm-cpu-backend = { workspace = true }
+openvm-cuda-common = { workspace = true, optional = true }
+openvm-cuda-backend = { workspace = true, optional = true }
+
+itertools.workspace = true
+tracing.workspace = true
+derive-new.workspace = true
+derive_more = { workspace = true, features = ["from"] }
+backtrace.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde-big-array.workspace = true
+metrics = { workspace = true, optional = true }
+thiserror.workspace = true
+rustc-hash.workspace = true
+eyre.workspace = true
+static_assertions.workspace = true
+getset.workspace = true
+dashmap.workspace = true
+cfg-if.workspace = true
+libloading = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
+abi_stable.workspace = true
+bytesize.workspace = true
+
+[build-dependencies]
+openvm-cuda-builder = { workspace = true, optional = true }
+
+[target.'cfg(any(unix, windows))'.dependencies]
+memmap2.workspace = true
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+test-case.workspace = true
+
+openvm-stark-backend = { workspace = true, features = ["test-utils"] }
+openvm-stark-sdk = { workspace = true, features = ["cpu-backend"] }
+openvm-circuit = { path = ".", default-features = false, features = ["test-utils"] }
+
+[features]
+default = ["parallel", "jemalloc"]
+parallel = [
+    "openvm-stark-backend/parallel",
+    "dashmap/rayon",
+    "openvm-stark-sdk?/parallel",
+    "openvm-cpu-backend/parallel",
+    "openvm-circuit-primitives/parallel"
+]
+metrics = [
+    "dep:metrics",
+    "openvm-stark-backend/metrics",
+    "openvm-stark-sdk?/metrics",
+]
+# turns on more invasive profiling for fine-grained guest metrics
+perf-metrics = ["metrics"]
+# use basic memory instead of mmap:
+basic-memory = []
+# turns on stark-backend debugger in all proofs
+stark-debug = []
+test-utils = ["dep:openvm-stark-sdk", "openvm-stark-backend/test-utils"]
+# Tail call optimizations. This requires nightly for the `become` keyword (https://github.com/rust-lang/rust/pull/144232).
+# However tail call elimination is still an incomplete feature in Rust, so the `tco` feature remains experimental until then.
+tco = ["openvm-circuit-derive/tco"]
+# Ahead-of-time execution
+aot = [
+    "dep:libloading",
+    "openvm-circuit-derive/aot",
+    "dep:tempfile",
+]
+# Disable bounds checking in memory operations for performance
+unprotected = []
+# performance features:
+mimalloc = ["openvm-stark-backend/mimalloc"]
+jemalloc = ["openvm-stark-backend/jemalloc"]
+jemalloc-prof = ["openvm-stark-backend/jemalloc-prof"]
+cuda = [
+    "dep:openvm-stark-sdk",           # for BabyBearPoseidon2Config
+    "openvm-circuit-primitives/cuda",
+    "dep:openvm-cuda-common",
+    "dep:openvm-cuda-backend",
+    "dep:openvm-cuda-builder",
+]
+touchemall = [
+    "cuda",
+    "openvm-circuit-primitives/touchemall",
+    "openvm-cuda-backend/touchemall",
+    "openvm-cuda-common/touchemall",
+]

@@ -1,0 +1,63 @@
+name: VM STARK and Compiler Tests
+
+on:
+  workflow_call:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["**"]
+    paths:
+      - "crates/circuits/**"
+      - "crates/toolchain/instructions/**"
+      - "crates/toolchain/platform/**"
+      - "crates/vm/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/vm.yml"
+
+concurrency:
+  group: ${{ github.workflow_ref }}-vm-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  OPENVM_SKIP_DEBUG: "1"
+
+jobs:
+  tests:
+    name: CPU (parallel, basic-memory)
+
+    runs-on:
+      - runs-on=${{ github.run_id }}-vm-tests-${{ github.run_attempt }}/family=c9g.8xlarge+c8g.8xlarge+m9g.8xlarge+m8g.8xlarge/image=ubuntu24-full-arm64/volume=80gb/extras=s3-cache
+
+    steps:
+      - uses: runs-on/action@v2
+        with:
+          sccache: s3
+      - name: Load SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: |
+            ${{ secrets.GH_ACTIONS_DEPLOY_PRIVATE_KEY }}
+      - uses: actions/checkout@v5
+      - run: | # avoid cross-device link error
+          rustup component remove clippy || true
+          rm -rf ~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu || true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/sccache
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: taiki-e/install-action@nextest
+
+      - name: Run vm crate tests
+        working-directory: crates/vm
+        run: cargo nextest run --cargo-profile fast --features parallel
+
+      - name: Run vm crate tests with basic memory
+        working-directory: crates/vm
+        run: cargo nextest run --cargo-profile=fast --features parallel,basic-memory
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true

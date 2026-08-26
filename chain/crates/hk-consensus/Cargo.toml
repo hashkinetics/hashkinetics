@@ -1,0 +1,20 @@
+[package]
+name = "hk-consensus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hk-crypto = { path = "../hk-crypto", features = ["lms", "slhdsa"] }
+hk-primitives = { path = "../hk-primitives" }
+bytes = { workspace = true, features = ["serde"] }
+async-trait = { workspace = true }
+serde = { workspace = true }
+hex = { workspace = true }
+
+# The vendored Malachite BFT engine (Apache-2.0; pinned in vendor/external/PINS.md).
+# Consensus-crypto is a generic type parameter — the seam for hash-based votes later.
+# Renamed (package = ...) so import paths match the engine's own convention:
+malachitebft-core-types = { package = "informalsystems-malachitebft-core-types", path = "../../../vendor/external/malachite/code/crates/core-types", features = ["serde"] }
+malachitebft-signing = { package = "informalsystems-malachitebft-signing", path = "../../../vendor/external/malachite/code/crates/signing" }
+malachitebft-signing-ed25519 = { package = "informalsystems-malachitebft-signing-ed25519", path = "../../../vendor/external/malachite/code/crates/signing-ed25519", features = ["serde"] }

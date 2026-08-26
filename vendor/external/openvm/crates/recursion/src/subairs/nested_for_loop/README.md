@@ -1,0 +1,364 @@
+# NestedForLoopSubAir
+
+## Overview
+
+This SubAir ensures that the first row of each loop iteration at each nesting level is properly marked with the `is_first` flag. It is parameterized by a const generic `DEPTH_MINUS_ONE` (e.g., `NestedForLoopSubAir<1>` for a single nested loop, `NestedForLoopSubAir<2>` for two nested loops). It also enforces that `is_enabled` is boolean, that disabled rows only appear after all enabled rows, and that each tracked loop counter starts at `0` on the first row of its scope at the corresponding level.
+
+## Columns
+
+For a nested loop with `DEPTH` levels (numbered 0 to `DEPTH-1`), where level 0 is the outermost and level `DEPTH-1` is the innermost:
+
+**I/O columns (`NestedForLoopIoCols`):**
+- **is_enabled**: Flag indicating whether the row is enabled
+- **counter**: Array of loop counters for all parent loops (excludes innermost loop, levels 0 to `DEPTH-2`)
+- **is_first**: Array of flags indicating the first row of each loop iteration (excludes outermost loop, levels 1 to `DEPTH-1`)
+
+**Note:** The current (innermost) level (level `DEPTH-1`) does not have `counter` columns. The caller should add these columns if needed.
+
+**Scope at level `level` (for a trace satisfying this SubAir):**
+- A scope at level `level` starts on row 0 if `level = 0`.
+- For `level > 0`, a scope at level `level` starts on any enabled row with
+  `is_first[level - 1] = 1`.
+- A scope at level `level` consists of the rows from one such start row up to, but not including, the
+  next start row for the same level; if there is no later start row, it continues until the first
+  disabled row or the end of the trace.
+
+### Behavior
+
+- Within a scope at level `level`, each `counter[level]` either stays the same or increases by 1 from
+  one enabled row to the next.
+- Each tracked `counter[level]` is forced to start at `0` on the first row of each scope at level
+  `level`.
+- Enabled rows must be contiguous and once `is_enabled = 0`, all later rows must also be disabled.
+- Disabled rows must have all tracked `is_first[level]` flags equal to `0`.
+- Padding-row counters are otherwise unconstrained except for any first-row constraints that also apply.
+
+## Usage
+
+**What this SubAir constrains:**
+- `is_enabled` is boolean and once it becomes `0`, it stays `0` for all subsequent rows
+- `counter[level]` is `0` on the first row of each scope at level `level`
+- `counter[level]` increments by 0 or 1 for all parent loops (excludes innermost loop, levels
+  0 to `DEPTH-2`) within the corresponding scope at level `level`
+- `is_first[level]` flags for all loops (excludes outermost loop, levels 1 to `DEPTH-1`) are set correctly at loop iteration boundaries (on enabled rows only)
+- `!is_enabled => is_first[level] = 0` for every tracked `is_first` flag
+  (equivalently, in callers that name the flag `is_valid`, `!is_valid => all is_first` flags are `0`)
+
+**What the caller must constrain:**
+- Final values of `counter[level]` (for all parent loops, excludes innermost loop)
+- Any non-zero-based interpretation of a tracked loop index
+- Any additional semantics on disabled rows beyond the enforced invariant
+  `!is_enabled => is_first[level] = 0`
+- Innermost loop counter and its behavior (see example below)
+
+**Example:**
+
+For `DEPTH=3` loops like:
+```rust
+for i in 0..N {
+    for j in 0..M {
+        for k in START..END.step_by(STEP) {
+            // ...
+        }
+    }
+}
+```
+
+Add columns:
+- **counter**: `T` - counter for current (innermost) loop
+- **loop_io**: `NestedForLoopIoCols<T, 2>` - I/O loop columns
+
+Example constraint code:
+```rust
+// Constrain loop_io.counter columns using builder.when().assert_eq() or interactions
+
+// loop starts at START
+builder
+    .when(local_io.loop_io.is_first[1])
+    .assert_eq(local_io.counter, AB::Expr::from_canonical_u32(START));
+
+// loop increments by STEP
+let is_inner_transition = NestedForLoopSubAir::local_is_transition(
+    next_io.loop_io.is_enabled,
+    next_io.loop_io.is_first[1],
+);
+builder
+    .when(is_inner_transition.clone())
+    .assert_eq(next_io.counter, local_io.counter + AB::Expr::from_canonical_u32(STEP));
+
+// loop ends at END
+let is_inner_last = NestedForLoopSubAir::local_is_last(
+    local_io.loop_io.is_enabled,
+    next_io.loop_io.is_enabled,
+    next_io.loop_io.is_first[1],
+);
+builder
+    .when(is_inner_last)
+    .assert_eq(local_io.counter, AB::Expr::from_canonical_u32(END));
+```
+
+## Constraints
+
+The same constraint pattern applies at each loop level.
+
+- For level 0 (outermost parent loop), constraints use `builder.when_first_row()` and `builder.when_transition()`.
+- For level > 0 (nested within parent loops), constraints use `builder.when(parent_is_first)` and `builder.when(parent_is_transition)` where parent refers to `level - 1`.
+
+At a given level, let $\Delta\text{counter} = \text{counter}\_{\text{next}} - \text{counter}\_{\text{local}}$
+```rust
+let counter_diff = next_io.counter[level] - local_io.counter[level];
+```
+
+### 1. Base Constraints
+
+#### `counter[level]` increments by 0 or 1 within a scope at level `level`
+
+For `level > 0`, staying in the same scope at level `level` is equivalent to staying in the same
+parent-loop iteration. Let `parent_level = level - 1` and define
+
+```rust
+let parent_is_transition =
+    next_io.is_enabled.clone() - next_io.is_first[parent_level].clone();
+```
+
+This equals `1` exactly when the next row is enabled and does not begin a new iteration of the
+parent loop.
+
+$$
+\text{level 0: } \text{is\\_enabled}\_{\text{next}} \Rightarrow \Delta\text{counter} \in \\\{0, 1\\\}
+$$
+
+$$
+\text{level > 0: } \text{parent\\_is\\_transition} \land \text{is\\_enabled}\_{\text{next}}
+\Rightarrow \Delta\text{counter} \in \\\{0, 1\\\}\qquad (1)
+$$
+```rust
+// Level 0
+builder
+    .when_transition()
+    .when(next_io.is_enabled.clone())
+    .assert_bool(counter_diff.clone());
+
+// Level > 0
+builder
+    .when(parent_is_transition)
+    .when(next_io.is_enabled.clone())
+    .assert_bool(counter_diff.clone());
+```
+
+When the next row leaves the current scope at level `level`, a nested counter is not constrained by
+this transition rule; instead, the corresponding scope-start constraint resets it to `0`.
+
+### 2. Contiguous Enabled Rows
+
+Disabled rows can only appear once all enabled rows have finished.
+
+$$
+\neg \text{is\\_enabled}\_{\text{local}} \Rightarrow \neg \text{is\\_enabled}\_{\text{next}} \qquad (2)
+$$
+```rust
+builder
+    .when_transition()
+    .when_ne(local_io.is_enabled.clone(), AB::Expr::ONE)
+    .assert_zero(next_io.is_enabled.clone());
+```
+
+### 3. Boundary Constraints
+
+#### First row enabled sets `is_first`
+
+$$
+\text{is\\_enabled} \Rightarrow \text{is\\_first} = 1\quad \text{(first row of level)} \qquad (3)
+$$
+```rust
+// Level 0 (outermost parent loop)
+builder.when_first_row().when(local_io.is_enabled).assert_one(local_io.is_first[0]);
+
+// Level > 0 (nested within parent loops)
+builder.when(parent_is_first).when(local_io.is_enabled).assert_one(local_io.is_first[level]);
+```
+
+#### Disabled rows clear all `is_first` flags
+
+For every tracked boundary flag, the AIR enforces `is_first[level] => is_enabled` together with
+booleanity of `is_first[level]`. Therefore every row satisfies:
+
+$$
+\neg \text{is\\_enabled} \Rightarrow \text{is\\_first[level]} = 0
+$$
+
+Equivalently, in AIRs that name the row-enable flag `is_valid`,
+`!is_valid => all is_first` flags are `0`.
+
+```rust
+builder.assert_bool(local_io.is_first[level].clone());
+builder
+    .when(local_io.is_first[level].clone())
+    .assert_one(local_io.is_enabled.clone());
+```
+
+#### First enabled row resets `counter[level]` to `0`
+
+For `level = 0`, this happens on the first row of the trace. For deeper tracked counters, it
+happens on the first row of a scope at level `level`.
+
+$$
+\text{is\\_enabled} \Rightarrow \text{counter[level]} = 0\quad \text{(first row of a scope at level `level`)} \qquad (3a)
+$$
+```rust
+// Level 0 (outermost tracked counter)
+builder
+    .when_first_row()
+    .assert_zero(local_io.counter[0]);
+
+// Level > 0 (tracked counter on the first row of its scope)
+builder
+    .when(parent_is_first)
+    .assert_zero(local_io.counter[level]);
+```
+
+### 4. Loop Constraints
+
+#### 4.1. Within Loop Iteration ($\Delta\text{counter} \neq 1$)
+
+At transition rows within a level, $\Delta\text{counter} \neq 1 \iff \Delta\text{counter} = 0$ by (1), indicating we are within the same loop iteration.
+
+##### `is_first` not set within iteration
+
+$$
+\text{is\\_enabled}\_{\text{local}} \Rightarrow \text{is\\_first}\_{\text{next}} = 0\quad (\Delta\text{counter} \neq 1,\ \text{transition within level}) \qquad (4)
+$$
+```rust
+builder_transition
+    .when(local_io.is_enabled.clone())
+    .when_ne(counter_diff.clone(), AB::Expr::ONE)
+    .assert_zero(next_io.is_first[level]);
+```
+
+#### 4.2. At Loop Iteration Boundaries ($\Delta\text{counter} \neq 0$)
+
+When $\Delta\text{counter} \neq 0$, we are at a loop iteration boundary.
+
+##### Enabled next row sets `is_first`
+
+$$
+\text{is\\_enabled}\_{\text{next}} \Rightarrow \text{is\\_first}\_{\text{next}} = 1\quad (\Delta\text{counter} \neq 0) \qquad (5)
+$$
+```rust
+builder
+    .when(next_io.is_enabled)
+    .when(counter_diff)
+    .assert_one(next_io.is_first[level]);
+```
+
+## Case Analysis
+
+These cases apply at each loop level independently.
+
+### 1. Single Row ($\text{is\\_enabled} = 1$)
+
+- By (3): $\text{is\\_first} = 1$
+- By (3a): the tracked counter starts at `0` on the first row of its scope at level `level`
+
+Single enabled row has `is_first` set.
+
+### 2. Single Loop Iteration ($\Delta\text{counter} \neq 1$ for all transition rows, $\text{is\\_enabled} = 1$)
+
+- By (3): $\text{is\\_first} = 1$ on first row
+- By (4): $\text{is\\_first} = 0$ on all interior rows
+
+Loop iteration has `is_first` set on first row only.
+
+### 3. Multiple Loop Iterations
+
+#### 3.1. Within Loop Iteration ($\Delta\text{counter} \neq 1$, $\text{is\\_enabled}\_{\text{local}} = 1$)
+
+- By (4): $\text{is\\_first}\_{\text{next}} = 0$
+- By (2): once a row disables the loop, later rows stay disabled
+
+Interior enabled rows keep `is_first` unset, and once disabled the loop cannot resume.
+
+#### 3.2. At Loop Iteration Boundaries ($\Delta\text{counter} \neq 0$, $\text{is\\_enabled}\_{\text{next}} = 1$)
+
+- By (5): $\text{is\\_first}\_{\text{next}} = 1$
+
+Any transition to a new iteration has `is_first` set.
+
+## Parent Loop Context
+
+For loops nested within parent loops (`level > 0`), the constraints use the parent loop's
+(`level - 1`) `is_first` flag and a derived transition predicate.
+
+That predicate is computed inline as `next_is_enabled - parent_next_is_first`, which is a linear
+expression. This ensures child-loop constraints are only enforced when transitioning within the
+same parent-loop iteration.
+
+```rust
+let parent_is_transition = Self::local_is_transition(next_io.is_enabled, next_io.is_first[parent_level]);
+builder.when(parent_is_transition)
+```
+
+## Example Traces
+
+### DEPTH=2: Two nested loops
+
+```rust
+for i in 0..2 {       // level 0 (outermost), tracked by counter[0]
+    for j in 0..M {    // level 1 (innermost), not tracked by this SubAir
+        // ...
+    }
+}
+```
+
+Columns: `[is_enabled, counter[0], is_first[0]]`
+
+| is\_enabled | counter[0] (i) | is\_first[0] (j\_first) | Description |
+|:-----------:|:---------------:|:-----------------------:|-------------|
+| 1           | 0               | 1                       | i=0; j start |
+| 1           | 0               | 0                       | i=0; j continue |
+| 1           | 1               | 1                       | i=1; j restart |
+| 1           | 1               | 0                       | i=1; j continue |
+
+### DEPTH=3: Three nested loops
+
+```rust
+for i in 0..2 {          // level 0 (outermost), tracked by counter[0]
+    for j in 0..2 {       // level 1 (middle), tracked by counter[1]
+        for k in 0..M {   // level 2 (innermost), not tracked by this SubAir
+            // ...
+        }
+    }
+}
+```
+
+Columns: `[is_enabled, counter[0], counter[1], is_first[0], is_first[1]]`
+
+| is\_enabled | counter[0] (i) | counter[1] (j) | is\_first[0] (j\_first) | is\_first[1] (k\_first) | Description |
+|:-----------:|:---------------:|:---------------:|:-----------------------:|:-----------------------:|-------------|
+| 1           | 0               | 0               | 1                       | 1                       | i=0, j=0; start |
+| 1           | 0               | 0               | 0                       | 0                       | i=0, j=0; continue |
+| 1           | 0               | 1               | 0                       | 1                       | i=0, j=1; k restart |
+| 1           | 0               | 1               | 0                       | 0                       | i=0, j=1; continue |
+| 1           | 1               | 0               | 1                       | 1                       | i=1, j=0; j+k restart |
+| 1           | 1               | 0               | 0                       | 0                       | i=1, j=0; continue |
+| 1           | 1               | 1               | 0                       | 1                       | i=1, j=1; k restart |
+
+### With disabled padding
+
+Enabled rows are contiguous. Once `is_enabled` becomes 0, all subsequent rows must remain disabled.
+On those disabled rows, all tracked `is_first` flags must be `0`. Counter values on disabled rows
+are otherwise unconstrained, except that first-row counter constraints still apply on row 0.
+
+| is\_enabled | counter[0] (i) | is\_first[0] (j\_first) | Description |
+|:-----------:|:---------------:|:-----------------------:|-------------|
+| 1           | 0               | 1                       | i=0; j start |
+| 1           | 0               | 0                       | i=0; j continue |
+| 0           | 1               | 0                       | disabled padding |
+| 0           | 1               | 0                       | disabled padding |
+
+All rows disabled (first row forces `counter[0] = 0` by constraint 3a):
+
+| is\_enabled | counter[0] (i) | is\_first[0] (j\_first) |
+|:-----------:|:---------------:|:-----------------------:|
+| 0           | 0               | 0                       |
+| 0           | 0               | 0                       |

@@ -1,0 +1,303 @@
+name: Release Cargo OpenVM Binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag to build"
+        required: true
+        type: string
+      dry_run:
+        description: "Build and package binaries without uploading to the GitHub release"
+        required: true
+        default: true
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow_ref }}-release-binaries-${{ inputs.version }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: cargo-openvm
+
+jobs:
+  build-linux-release:
+    name: Build ${{ matrix.target }}
+    runs-on:
+      - runs-on=${{ github.run_id }}-${{ github.run_attempt }}-cargo-openvm-${{ matrix.arch }}/family=${{ matrix.family }}/image=${{ matrix.image }}/volume=80gb/extras=s3-cache
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: linux-x64
+            family: c8i-flex.16xlarge+c8i.16xlarge+c8a.16xlarge+c7i.16xlarge+c7a.16xlarge
+            image: ubuntu24-full-x64
+          - target: aarch64-unknown-linux-gnu
+            arch: linux-arm64
+            family: c9g.4xlarge+c8g.4xlarge
+            image: ubuntu24-full-arm64
+    steps:
+      - uses: runs-on/action@v2
+        with:
+          sccache: s3
+      - name: Load SSH key
+        uses: webfactory/ssh-agent@v0.10.0
+        with:
+          ssh-private-key: |
+            ${{ secrets.GH_ACTIONS_DEPLOY_PRIVATE_KEY }}
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.version }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: ./.github/actions/sccache
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Set package version
+        id: meta
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Build cargo-openvm
+        run: cargo build --release --locked -p cargo-openvm --target "${{ matrix.target }}"
+
+      - name: Smoke test binary
+        run: ./target/${{ matrix.target }}/release/${BINARY_NAME} openvm --version
+
+      - name: Package binary
+        id: package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          artifact="${BINARY_NAME}-${VERSION}-${TARGET}.tar.gz"
+          mkdir -p package artifacts
+          cp "target/${TARGET}/release/${BINARY_NAME}" "package/${BINARY_NAME}"
+          chmod +x "package/${BINARY_NAME}"
+          tar -czf "artifacts/${artifact}" -C package "${BINARY_NAME}"
+          (cd artifacts && shasum -a 256 "${artifact}" > "${artifact}.sha256")
+          echo "artifact=${artifact}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload packaged binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.artifact }}
+          path: artifacts/*
+          if-no-files-found: error
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
+  build-linux-cuda-release:
+    name: Build x86_64-unknown-linux-gnu CUDA ${{ matrix.cuda_version }}
+    runs-on:
+      - runs-on=${{ github.run_id }}-${{ github.run_attempt }}-cargo-openvm-linux-x64-cuda-${{ matrix.cuda_package_version }}/image=ubuntu24-gpu-x64/family=g7.2xlarge+g6.2xlarge+g5.2xlarge/volume=80gb/spot=price-capacity-optimized/extras=s3-cache
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cuda_version: "12.9"
+            cuda_package_version: "12-9"
+          - cuda_version: "13.0"
+            cuda_package_version: "13-0"
+    steps:
+      - uses: runs-on/action@v2
+        with:
+          sccache: s3
+      - name: Load SSH key
+        uses: webfactory/ssh-agent@v0.10.0
+        with:
+          ssh-private-key: |
+            ${{ secrets.GH_ACTIONS_DEPLOY_PRIVATE_KEY }}
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.version }}
+      - name: Check out release workflow tooling
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-workflow
+          sparse-checkout: |
+            .github/actions
+            scripts
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: ./.ci-workflow/.github/actions/sccache
+      # TODO: remove once https://github.com/runs-on/runner-images-for-aws/issues/55 is fixed
+      - name: Setup GPU driver
+        run: bash ./.ci-workflow/scripts/gpu_driver_setup.sh
+
+      - uses: ./.ci-workflow/.github/actions/rust-cache-cuda
+        with:
+          cache-on-failure: true
+          key: release-cuda-${{ matrix.cuda_version }}
+
+      - name: Set package version
+        id: meta
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Select CUDA toolkit
+        shell: bash
+        env:
+          CUDA_VERSION: ${{ matrix.cuda_version }}
+          CUDA_PACKAGE_VERSION: ${{ matrix.cuda_package_version }}
+        run: |
+          cuda_dir="/usr/local/cuda-${CUDA_VERSION}"
+          if [ ! -x "${cuda_dir}/bin/nvcc" ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends "cuda-toolkit-${CUDA_PACKAGE_VERSION}"
+          fi
+          echo "${cuda_dir}/bin" >> "$GITHUB_PATH"
+          echo "CUDA_PATH=${cuda_dir}" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=${cuda_dir}/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" >> "$GITHUB_ENV"
+          echo "CUDA_LIB_DIR=${cuda_dir}/lib64" >> "$GITHUB_ENV"
+          echo "CUDA_ARCH=86,89,120" >> "$GITHUB_ENV"
+          "${cuda_dir}/bin/nvcc" --version
+
+      - name: Build cargo-openvm
+        run: cargo build --release --locked -p cargo-openvm --target x86_64-unknown-linux-gnu --features cuda,halo2-gpu
+
+      - name: Smoke test binary
+        run: ./target/x86_64-unknown-linux-gnu/release/${BINARY_NAME} openvm --version
+
+      - name: Install guest rust-src
+        run: rustup component add rust-src --toolchain nightly-2026-01-18
+
+      - name: Smoke test CUDA proving
+        working-directory: crates/cli
+        run: |
+          export PATH="$GITHUB_WORKSPACE/target/x86_64-unknown-linux-gnu/release:$PATH"
+          cargo openvm build \
+            --manifest-path tests/programs/fibonacci/Cargo.toml \
+            --config tests/programs/fibonacci/openvm.toml
+          EXE_PATH=tests/programs/fibonacci/openvm/release/openvm-cli-example-test.vmexe \
+            bash tests/scripts/cli_app_e2e.sh
+
+      - name: Package binary
+        id: package
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          CUDA_VERSION: ${{ matrix.cuda_version }}
+        run: |
+          artifact="${BINARY_NAME}-${VERSION}-x86_64-unknown-linux-gnu-cuda-${CUDA_VERSION}.tar.gz"
+          mkdir -p package artifacts
+          cp "target/x86_64-unknown-linux-gnu/release/${BINARY_NAME}" "package/${BINARY_NAME}"
+          chmod +x "package/${BINARY_NAME}"
+          tar -czf "artifacts/${artifact}" -C package "${BINARY_NAME}"
+          (cd artifacts && shasum -a 256 "${artifact}" > "${artifact}.sha256")
+          echo "artifact=${artifact}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload packaged binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.artifact }}
+          path: artifacts/*
+          if-no-files-found: error
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
+  build-macos-release:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+    steps:
+      - name: Load SSH key
+        uses: webfactory/ssh-agent@v0.10.0
+        with:
+          ssh-private-key: |
+            ${{ secrets.GH_ACTIONS_DEPLOY_PRIVATE_KEY }}
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.version }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Set package version
+        id: meta
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Build cargo-openvm
+        run: cargo build --release --locked -p cargo-openvm --target "${{ matrix.target }}"
+
+      - name: Smoke test binary
+        run: ./target/${{ matrix.target }}/release/${BINARY_NAME} openvm --version
+
+      - name: Package binary
+        id: package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          artifact="${BINARY_NAME}-${VERSION}-${TARGET}.tar.gz"
+          mkdir -p package artifacts
+          cp "target/${TARGET}/release/${BINARY_NAME}" "package/${BINARY_NAME}"
+          chmod +x "package/${BINARY_NAME}"
+          tar -czf "artifacts/${artifact}" -C package "${BINARY_NAME}"
+          (cd artifacts && shasum -a 256 "${artifact}" > "${artifact}.sha256")
+          echo "artifact=${artifact}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload packaged binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.artifact }}
+          path: artifacts/*
+          if-no-files-found: error
+
+  upload-release-assets:
+    name: Upload release assets
+    if: ${{ !inputs.dry_run }}
+    needs:
+      - build-linux-release
+      - build-linux-cuda-release
+      - build-macos-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download packaged binaries
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Upload binaries to GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ inputs.version }}
+        run: gh release upload "${TAG_NAME}" dist/* --clobber

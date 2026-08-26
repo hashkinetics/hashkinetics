@@ -1,0 +1,390 @@
+use std::{array::from_fn, borrow::Borrow};
+
+use openvm_circuit_primitives::{
+    utils::{and, not},
+    ColumnsAir, StructReflection, StructReflectionHelper,
+};
+use openvm_recursion_circuit::{
+    bus::{
+        CachedCommitBus, CachedCommitBusMessage, PreHashBus, PreHashMessage, PublicValuesBus,
+        PublicValuesBusMessage,
+    },
+    primitives::bus::{RangeCheckerBus, RangeCheckerBusMessage},
+};
+use openvm_recursion_circuit_derive::AlignedBorrow;
+use openvm_stark_backend::{
+    interaction::InteractionBuilder, BaseAirWithPublicValues, PartitionedBaseAir,
+};
+use openvm_verify_stark_host::pvs::{
+    VerifierBasePvs, CONSTRAINT_EVAL_AIR_ID, CONSTRAINT_EVAL_CACHED_INDEX, LOG_MAX_RECURSION_DEPTH,
+    VERIFIER_PVS_AIR_ID,
+};
+use p3_air::{Air, AirBuilder, AirBuilderWithPublicValues, BaseAir};
+use p3_field::{Field, PrimeCharacteristicRing};
+use p3_matrix::Matrix;
+
+use crate::circuit::{
+    deferral::inner::bus::{DefPvsConsistencyBus, DefPvsConsistencyMessage},
+    utils::{assert_vk_commit_eq, assert_vk_commit_unset},
+};
+
+#[repr(C)]
+#[derive(AlignedBorrow, StructReflection)]
+pub struct DeferralVerifierPvsCols<F> {
+    pub proof_idx: F,
+    pub is_valid: F,
+    pub has_verifier_pvs: F,
+
+    pub recursion_flag: F,
+    pub depth_inv: F,
+
+    pub child_pvs: VerifierBasePvs<F>,
+}
+
+pub enum DeferralChildLevel {
+    App,
+    Leaf,
+    InternalForLeaf,
+    InternalRecursive,
+}
+
+#[derive(ColumnsAir)]
+#[columns_via(DeferralVerifierPvsCols<u8>)]
+pub struct DeferralVerifierPvsAir {
+    pub public_values_bus: PublicValuesBus,
+    pub cached_commit_bus: CachedCommitBus,
+    pub pre_hash_bus: PreHashBus,
+    pub range_bus: RangeCheckerBus,
+    pub def_pvs_consistency_bus: DefPvsConsistencyBus,
+}
+
+impl<F> BaseAir<F> for DeferralVerifierPvsAir {
+    fn width(&self) -> usize {
+        DeferralVerifierPvsCols::<u8>::width()
+    }
+}
+impl<F> BaseAirWithPublicValues<F> for DeferralVerifierPvsAir {
+    fn num_public_values(&self) -> usize {
+        VerifierBasePvs::<u8>::width()
+    }
+}
+impl<F> PartitionedBaseAir<F> for DeferralVerifierPvsAir {}
+
+impl<AB: AirBuilder + InteractionBuilder + AirBuilderWithPublicValues> Air<AB>
+    for DeferralVerifierPvsAir
+{
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let (local, next) = (
+            main.row_slice(0).expect("window should have two elements"),
+            main.row_slice(1).expect("window should have two elements"),
+        );
+        let local: &DeferralVerifierPvsCols<AB::Var> = (*local).borrow();
+        let next: &DeferralVerifierPvsCols<AB::Var> = (*next).borrow();
+
+        builder.assert_bool(local.is_valid);
+        builder.when_first_row().assert_one(local.is_valid);
+        builder
+            .when_transition()
+            .assert_bool(local.is_valid - next.is_valid);
+
+        builder.when_first_row().assert_zero(local.proof_idx);
+        builder
+            .when_transition()
+            .when(and(local.is_valid, next.is_valid))
+            .assert_eq(local.proof_idx + AB::F::ONE, next.proof_idx);
+
+        builder.assert_bool(local.has_verifier_pvs);
+        builder
+            .when(local.has_verifier_pvs)
+            .assert_one(local.is_valid);
+
+        /*
+         * We constrain the consistency of verifier-specific public values. We can determine
+         * what layer a verifier is at using the has_verifier_pvs and internal_flag columns. If
+         * has_verifier_pvs is 0, then we have a leaf verifier that is verifying a deferral
+         * circuit proof. If has_verifier_pvs is 1 and internal_flag is 0, then
+         * we have an internal verifier that has leaf children, and if internal_flag is 1 then
+         * we have internal_for_leaf children. Finally, if internal_flag is 2 then we are
+         * verifying internal_recursive children.
+         *
+         * The recursion_flag column is a saturated selector derived from the child
+         * recursion_depth.
+         */
+        // constrain verifier pvs columns are the same across all rows (note app_vk_commit is
+        // def_vk_commit here)
+        let mut when_both = builder.when(and(local.is_valid, next.is_valid));
+        let is_leaf = not(local.has_verifier_pvs);
+        let is_internal = local.has_verifier_pvs;
+
+        when_both.assert_eq(local.has_verifier_pvs, next.has_verifier_pvs);
+        when_both.assert_eq(local.recursion_flag, next.recursion_flag);
+        when_both.assert_eq(local.child_pvs.internal_flag, next.child_pvs.internal_flag);
+        when_both.assert_eq(
+            local.child_pvs.recursion_depth,
+            next.child_pvs.recursion_depth,
+        );
+        assert_vk_commit_eq(
+            &mut when_both,
+            local.child_pvs.app_vk_commit,
+            next.child_pvs.app_vk_commit,
+        );
+        assert_vk_commit_eq(
+            &mut when_both,
+            local.child_pvs.leaf_vk_commit,
+            next.child_pvs.leaf_vk_commit,
+        );
+        assert_vk_commit_eq(
+            &mut when_both,
+            local.child_pvs.internal_for_leaf_vk_commit,
+            next.child_pvs.internal_for_leaf_vk_commit,
+        );
+        assert_vk_commit_eq(
+            &mut when_both,
+            local.child_pvs.internal_recursive_vk_commit,
+            next.child_pvs.internal_recursive_vk_commit,
+        );
+
+        // constrain that the flags are ternary
+        builder.assert_tern(local.child_pvs.internal_flag);
+        builder.assert_tern(local.recursion_flag);
+
+        // constrain that recursion_flag is 0 iff recursion_depth == 0, recursion_flag == 1
+        // if recursion_depth == 1, and recursion_flag == 2 iff recursion_depth >= 2
+        let half = AB::F::TWO.inverse();
+        let is_recursion_flag_two =
+            (local.recursion_flag - AB::F::ONE) * local.recursion_flag * half;
+
+        builder
+            .when_ne(local.recursion_flag, AB::F::TWO)
+            .assert_eq(local.child_pvs.recursion_depth, local.recursion_flag);
+        builder
+            .when_ne(local.child_pvs.recursion_depth, AB::F::ZERO)
+            .when_ne(local.child_pvs.recursion_depth, AB::F::ONE)
+            .assert_eq(local.recursion_flag, AB::F::TWO);
+        builder.assert_eq(
+            is_recursion_flag_two.clone(),
+            local.child_pvs.recursion_depth
+                * (local.child_pvs.recursion_depth - AB::F::ONE)
+                * local.depth_inv,
+        );
+
+        // constrain recursion_depth is 0 when internal_flag is 0 or 1
+        builder
+            .when_ne(local.child_pvs.internal_flag, AB::F::TWO)
+            .assert_zero(local.child_pvs.recursion_depth);
+
+        // range check child recursion_depth to be in [0, MAX_RECURSION_DEPTH)
+        self.range_bus.lookup_key(
+            builder,
+            RangeCheckerBusMessage {
+                value: local.child_pvs.recursion_depth.into(),
+                max_bits: AB::Expr::from_u8(LOG_MAX_RECURSION_DEPTH),
+            },
+            local.is_valid,
+        );
+
+        // constrain that internal_flag is 2 when recursion_flag is set, and not 2 otherwise
+        builder
+            .when(local.recursion_flag)
+            .assert_eq(local.child_pvs.internal_flag, AB::F::TWO);
+        builder
+            .when_ne(local.recursion_flag, AB::F::ONE)
+            .when_ne(local.recursion_flag, AB::F::TWO)
+            .assert_bool(local.child_pvs.internal_flag);
+
+        // constrain that child commits are 0 when they shouldn't be defined
+        builder
+            .when(is_leaf.clone())
+            .assert_zero(local.child_pvs.internal_flag);
+
+        assert_vk_commit_unset(
+            &mut builder.when(is_leaf.clone()),
+            local.child_pvs.app_vk_commit,
+        );
+        assert_vk_commit_unset(
+            &mut builder.when(
+                (local.child_pvs.internal_flag - AB::F::ONE)
+                    * (local.child_pvs.internal_flag - AB::F::TWO),
+            ),
+            local.child_pvs.leaf_vk_commit,
+        );
+        assert_vk_commit_unset(
+            &mut builder.when(local.child_pvs.internal_flag - AB::F::TWO),
+            local.child_pvs.internal_for_leaf_vk_commit,
+        );
+        assert_vk_commit_unset(
+            &mut builder.when(local.recursion_flag - AB::F::TWO),
+            local.child_pvs.internal_recursive_vk_commit,
+        );
+
+        /*
+         * If has_verifier_pvs is true (i.e. we are on some internal level) we need to receive
+         * public values from ProofShapeModule to ensure the values being read here are correct.
+         * Each inner public value should have air_idx VERIFIER_PVS_AIR_ID.
+         */
+        let verifier_pvs_id = AB::Expr::from_usize(VERIFIER_PVS_AIR_ID);
+
+        for (pv_idx, value) in local.child_pvs.as_slice().iter().enumerate() {
+            self.public_values_bus.receive(
+                builder,
+                local.proof_idx,
+                PublicValuesBusMessage {
+                    air_idx: verifier_pvs_id.clone(),
+                    pv_idx: AB::Expr::from_usize(pv_idx),
+                    value: (*value).into(),
+                },
+                local.is_valid * is_internal,
+            );
+        }
+
+        /*
+         * We want to ensure consistency between AIRs that process public values, and we do so
+         * using the def_pvs_consistency_bus.
+         */
+        self.def_pvs_consistency_bus.send(
+            builder,
+            local.proof_idx,
+            DefPvsConsistencyMessage {
+                has_verifier_pvs: local.has_verifier_pvs,
+            },
+            local.is_valid,
+        );
+
+        /*
+         * Finally, we need to constrain that the public values this AIR produces are consistent
+         * with the child's. Note that we only impose constraints for layers below the current
+         * one - it is impossible for the current layer to know its own commit, and future layers
+         * will catch if we preemptively define a current or future verifier commit.
+         */
+        let &VerifierBasePvs::<_> {
+            internal_flag,
+            app_vk_commit: def_vk_commit,
+            leaf_vk_commit,
+            internal_for_leaf_vk_commit,
+            recursion_depth,
+            internal_recursive_vk_commit,
+        } = builder.public_values().borrow();
+
+        // constrain internal_flag is 0 at the leaf level
+        builder
+            .when(and(local.is_valid, is_leaf.clone()))
+            .assert_zero(internal_flag);
+
+        // constrain recursion_depth is 0 at the leaf and internal_for_leaf levels
+        builder
+            .when(
+                local.is_valid
+                    * (local.child_pvs.internal_flag - AB::F::ONE)
+                    * (local.child_pvs.internal_flag - AB::F::TWO),
+            )
+            .assert_zero(recursion_depth);
+
+        // constraint internal_flag is incremented properly at internal levels
+        builder
+            .when(is_internal)
+            .when_ne(local.child_pvs.internal_flag, AB::F::TWO)
+            .assert_eq(internal_flag, local.child_pvs.internal_flag + AB::F::ONE);
+
+        // constrain def_vk_commit is set at all internal levels
+        assert_vk_commit_eq(
+            &mut builder.when(is_internal),
+            local.child_pvs.app_vk_commit,
+            def_vk_commit,
+        );
+
+        // constrain verifier-specific pvs at all internal_recursive levels
+        builder
+            .when(local.child_pvs.internal_flag)
+            .assert_zero(internal_flag.into() - AB::F::TWO);
+        assert_vk_commit_eq(
+            &mut builder.when(local.child_pvs.internal_flag),
+            local.child_pvs.leaf_vk_commit,
+            leaf_vk_commit,
+        );
+
+        // constrain recursion_depth increments at each internal_recursive level
+        builder
+            .when(local.child_pvs.internal_flag)
+            .assert_one(recursion_depth.into() - local.child_pvs.recursion_depth);
+
+        // constrain internal_for_leaf_vk_commit is set at internal_recursive levels after
+        // the first and matches the output public value
+        assert_vk_commit_eq(
+            &mut builder.when(local.recursion_flag),
+            local.child_pvs.internal_for_leaf_vk_commit,
+            internal_for_leaf_vk_commit,
+        );
+
+        // constrain internal_recursive_vk_commit is set at internal_recursive levels after
+        // the second and matches the output public value
+        assert_vk_commit_eq(
+            &mut builder.when(local.recursion_flag * (local.recursion_flag - AB::F::ONE)),
+            local.child_pvs.internal_recursive_vk_commit,
+            internal_recursive_vk_commit,
+        );
+
+        /*
+         * We also need to receive cached commits from ProofShapeModule. Note that the deferral
+         * circuit cached commits are received in another AIR, so only the internal verifier will
+         * receive them here.
+         */
+        let is_internal_flag_zero = (local.child_pvs.internal_flag - AB::F::ONE)
+            * (local.child_pvs.internal_flag - AB::F::TWO)
+            * AB::F::TWO.inverse();
+        let is_internal_flag_one =
+            (AB::Expr::TWO - local.child_pvs.internal_flag) * local.child_pvs.internal_flag;
+        let is_recursion_flag_one = (AB::Expr::TWO - local.recursion_flag) * local.recursion_flag;
+        let cached_commit = from_fn(|i| {
+            is_internal_flag_zero.clone() * local.child_pvs.app_vk_commit.cached_commit[i]
+                + is_internal_flag_one.clone() * local.child_pvs.leaf_vk_commit.cached_commit[i]
+                + is_recursion_flag_one.clone()
+                    * local.child_pvs.internal_for_leaf_vk_commit.cached_commit[i]
+                + is_recursion_flag_two.clone()
+                    * local.child_pvs.internal_recursive_vk_commit.cached_commit[i]
+        });
+
+        self.cached_commit_bus.receive(
+            builder,
+            local.proof_idx,
+            CachedCommitBusMessage {
+                air_idx: AB::Expr::from_usize(CONSTRAINT_EVAL_AIR_ID),
+                cached_idx: AB::Expr::from_usize(CONSTRAINT_EVAL_CACHED_INDEX),
+                global_cached_idx: AB::Expr::ZERO,
+                cached_commit,
+            },
+            local.is_valid * is_internal,
+        );
+
+        /*
+         * Unlike the cached commits, we receive the pre-hash on the same layer that it's
+         * observed. We receive it from ProofShapeModule also.
+         *
+         * By the constraints above, the output recursion_depth is 1 iff the child internal_flag
+         * is 1, and is at least 2 iff the child internal_flag is 2.
+         */
+        let internal_flag = internal_flag.into();
+
+        let is_pvs_internal_flag_zero = (internal_flag.clone() - AB::Expr::ONE)
+            * (internal_flag.clone() - AB::Expr::TWO)
+            * half;
+        let is_pvs_internal_flag_one =
+            (AB::Expr::TWO - internal_flag.clone()) * internal_flag.clone();
+        let is_internal_flag_two =
+            (local.child_pvs.internal_flag - AB::Expr::ONE) * local.child_pvs.internal_flag * half;
+
+        let vk_pre_hash = from_fn(|i| {
+            is_pvs_internal_flag_zero.clone() * def_vk_commit.vk_pre_hash[i].into()
+                + is_pvs_internal_flag_one.clone() * leaf_vk_commit.vk_pre_hash[i].into()
+                + is_internal_flag_one.clone() * internal_for_leaf_vk_commit.vk_pre_hash[i].into()
+                + is_internal_flag_two.clone() * internal_recursive_vk_commit.vk_pre_hash[i].into()
+        });
+
+        self.pre_hash_bus.receive(
+            builder,
+            local.proof_idx,
+            PreHashMessage { vk_pre_hash },
+            local.is_valid,
+        );
+    }
+}

@@ -1,0 +1,10 @@
+[package]
+name = "hk-primitives"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }

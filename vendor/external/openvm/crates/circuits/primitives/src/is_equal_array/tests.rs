@@ -1,0 +1,318 @@
+use std::{
+    array::from_fn,
+    borrow::{Borrow, BorrowMut},
+};
+
+use openvm_circuit_primitives_derive::AlignedBorrow;
+use openvm_stark_backend::{
+    any_air_arc_vec,
+    p3_air::{Air, AirBuilder, BaseAir},
+    p3_field::{Field, PrimeCharacteristicRing},
+    p3_matrix::{dense::RowMajorMatrix, Matrix},
+    p3_maybe_rayon::prelude::*,
+    prover::AirProvingContext,
+    utils::disable_debug_builder,
+    BaseAirWithPublicValues, PartitionedBaseAir, StarkEngine, StarkTestError,
+};
+#[cfg(not(feature = "cuda"))]
+use openvm_stark_sdk::config::baby_bear_poseidon2::F;
+use openvm_stark_sdk::utils::create_seeded_rng;
+use rand::Rng;
+use test_case::test_case;
+#[cfg(feature = "cuda")]
+use {
+    crate::cuda_abi::is_equal,
+    openvm_cuda_backend::{
+        base::DeviceMatrix, data_transporter::assert_eq_host_and_device_matrix, prelude::F,
+    },
+    openvm_cuda_common::copy::MemCopyH2D as _,
+    openvm_stark_backend::p3_field::PrimeField32,
+    std::sync::Arc,
+};
+
+use super::{IsEqArrayAuxCols, IsEqArrayIo, IsEqArraySubAir};
+use crate::{
+    utils::test_engine_small, ColumnsAir, StructReflection, StructReflectionHelper, SubAir,
+    TraceSubRowGenerator,
+};
+
+#[repr(C)]
+#[derive(AlignedBorrow, StructReflection)]
+pub struct IsEqArrayCols<T, const N: usize> {
+    x: [T; N],
+    y: [T; N],
+    out: T,
+    aux: IsEqArrayAuxCols<T, N>,
+}
+
+#[derive(Clone, Copy, ColumnsAir)]
+#[columns_via(IsEqArrayCols<u8, N>)]
+pub struct IsEqArrayTestAir<const N: usize>(IsEqArraySubAir<N>);
+
+impl<F: Field, const N: usize> BaseAirWithPublicValues<F> for IsEqArrayTestAir<N> {}
+impl<F: Field, const N: usize> PartitionedBaseAir<F> for IsEqArrayTestAir<N> {}
+impl<F: Field, const N: usize> BaseAir<F> for IsEqArrayTestAir<N> {
+    fn width(&self) -> usize {
+        IsEqArrayCols::<F, N>::width()
+    }
+}
+impl<AB: AirBuilder, const N: usize> Air<AB> for IsEqArrayTestAir<N>
+where
+    AB::Var: Copy,
+    AB::F: Field,
+{
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let local = main.row_slice(0).expect("window should have two elements");
+        let local: &IsEqArrayCols<AB::Var, N> = (*local).borrow();
+        let io = IsEqArrayIo {
+            x: local.x.map(Into::into),
+            y: local.y.map(Into::into),
+            out: local.out.into(),
+            condition: AB::Expr::ONE,
+        };
+        self.0.eval(builder, (io, local.aux.diff_inv_marker));
+    }
+}
+
+pub struct IsEqArrayChip<F, const N: usize> {
+    air: IsEqArrayTestAir<N>,
+    pairs: Vec<([F; N], [F; N])>,
+}
+
+impl<F: Field, const N: usize> IsEqArrayChip<F, N> {
+    pub fn new(pairs: Vec<([F; N], [F; N])>) -> Self {
+        let air = IsEqArrayTestAir(IsEqArraySubAir);
+        Self { air, pairs }
+    }
+    pub fn generate_trace(self) -> RowMajorMatrix<F> {
+        let air: IsEqArraySubAir<N> = IsEqArraySubAir;
+        assert!(self.pairs.len().is_power_of_two());
+        let width = IsEqArrayCols::<F, N>::width();
+        let mut rows = F::zero_vec(width * self.pairs.len());
+        rows.par_chunks_mut(width)
+            .zip(self.pairs)
+            .for_each(|(row, (x, y))| {
+                let row: &mut IsEqArrayCols<F, N> = row.borrow_mut();
+                air.generate_subrow((&x, &y), (&mut row.aux.diff_inv_marker, &mut row.out));
+                row.x = x;
+                row.y = y;
+            });
+
+        RowMajorMatrix::new(rows, width)
+    }
+}
+
+#[test_case([1, 2, 3], [1, 2, 3], 1; "1, 2, 3 == 1, 2, 3")]
+#[test_case([1, 2, 3], [1, 2, 1], 0; "1, 2, 3 != 1, 2, 1")]
+#[test_case([2, 2, 7], [3, 5, 1], 0; "2, 2, 7 != 3, 5, 1")]
+#[test_case([17, 23, 4], [17, 23, 4], 1; "17, 23, 4 == 17, 23, 4")]
+#[test_case([92, 27, 32], [92, 27, 32], 1; "92, 27, 32 == 92, 27, 32")]
+#[test_case([1, 27, 4], [1, 2, 43], 0; "1, 27, 4 != 1, 2, 43")]
+fn test_is_eq_array_single_row(x: [u32; 3], y: [u32; 3], is_equal: u32) {
+    let x = x.map(PrimeCharacteristicRing::from_u32);
+    let y = y.map(PrimeCharacteristicRing::from_u32);
+
+    let chip = IsEqArrayChip::new(vec![(x, y)]);
+    let air = chip.air;
+    let trace = chip.generate_trace();
+    let row: &IsEqArrayCols<F, 3> = trace.values.as_slice().borrow();
+
+    assert_eq!(row.out, PrimeCharacteristicRing::from_u32(is_equal));
+
+    let traces = [trace]
+        .into_iter()
+        .map(AirProvingContext::simple_no_pis)
+        .collect::<Vec<_>>();
+    test_engine_small()
+        .run_test(any_air_arc_vec![air], traces)
+        .expect("Verification failed");
+}
+
+#[test]
+fn test_is_eq_array_multi_rows() {
+    let pairs = [
+        ([1, 2, 3], [1, 2, 1]),
+        ([2, 2, 7], [3, 5, 1]),
+        ([17, 23, 4], [17, 23, 4]),
+        ([1, 2, 3], [1, 2, 1]),
+    ]
+    .into_iter()
+    .map(|(x, y)| {
+        (
+            x.map(PrimeCharacteristicRing::from_u32),
+            y.map(PrimeCharacteristicRing::from_u32),
+        )
+    })
+    .collect();
+
+    let chip = IsEqArrayChip::new(pairs);
+    let air = chip.air;
+
+    let trace = chip.generate_trace();
+
+    let traces = [trace]
+        .into_iter()
+        .map(AirProvingContext::simple_no_pis)
+        .collect::<Vec<_>>();
+    test_engine_small()
+        .run_test(any_air_arc_vec![air], traces)
+        .expect("Verification failed");
+}
+
+#[test_case([1, 2, 3], [1, 2, 3]; "1, 2, 3 == 1, 2, 3")]
+#[test_case([1, 2, 3], [1, 2, 1]; "1, 2, 3 != 1, 2, 1")]
+#[test_case([2, 2, 7], [3, 5, 1]; "2, 2, 7 != 3, 5, 1")]
+#[test_case([17, 23, 4], [17, 23, 4]; "17, 23, 4 == 17, 23, 4")]
+#[test_case([92, 27, 32], [92, 27, 32]; "92, 27, 32 == 92, 27, 32")]
+#[test_case([1, 27, 4], [1, 2, 43]; "1, 27, 4 != 1, 2, 43")]
+fn test_is_eq_array_single_row_fail(x: [u32; 3], y: [u32; 3]) {
+    let x = x.map(PrimeCharacteristicRing::from_u32);
+    let y = y.map(PrimeCharacteristicRing::from_u32);
+
+    let chip = IsEqArrayChip::new(vec![(x, y)]);
+    let air = chip.air;
+    let mut trace = chip.generate_trace();
+
+    disable_debug_builder();
+    let row: &mut IsEqArrayCols<F, 3> = trace.values.as_mut_slice().borrow_mut();
+    row.out = F::ONE - row.out;
+    let traces = [trace]
+        .into_iter()
+        .map(AirProvingContext::simple_no_pis)
+        .collect::<Vec<_>>();
+    let result = test_engine_small().run_test(any_air_arc_vec![air], traces);
+    assert!(matches!(result, Err(StarkTestError::Verifier(_))));
+}
+
+#[test]
+fn test_is_eq_array_fail_rand() {
+    const N: usize = 4;
+    let height = 2;
+    let mut rng = create_seeded_rng();
+    let pairs: Vec<_> = (0..height)
+        .map(|_| {
+            let x = from_fn(|_| F::from_u32(rng.random::<u32>()));
+            (x, x)
+        })
+        .collect();
+    let chip = IsEqArrayChip::<_, N>::new(pairs);
+    let air = chip.air;
+    let mut trace = chip.generate_trace();
+
+    disable_debug_builder();
+    // Corrupt the first element to trigger a constraint failure
+    trace.row_mut(0)[0] += F::from_u32(rng.random::<u32>() + 1);
+    let traces = [trace]
+        .into_iter()
+        .map(AirProvingContext::simple_no_pis)
+        .collect::<Vec<_>>();
+    let result = test_engine_small().run_test(any_air_arc_vec![air], traces);
+    assert!(matches!(result, Err(StarkTestError::Verifier(_))));
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn test_cuda_simple_is_equal_array_tracegen() {
+    const ARRAY_LEN: usize = 4;
+    let device_ctx = crate::utils::test_device_ctx();
+    let n = 4;
+    let trace = DeviceMatrix::<F>::with_capacity_on(n, ARRAY_LEN + 1, &device_ctx);
+
+    let vec_x: Vec<F> = vec![1u32, 2, 3, 4, 5, 6, 7, 8, 9u32, 10, 11, 12, 13, 14, 15, 16]
+        .into_iter()
+        .map(F::from_u32)
+        .collect();
+
+    let vec_y: Vec<F> = vec![
+        1u32, 3, 3, 4, 5, 6, 10, 8, 9u32, 10, 11, 12, 13, 200, 15, 16,
+    ]
+    .into_iter()
+    .map(F::from_u32)
+    .collect();
+
+    let inputs_x = vec_x.as_slice().to_device_on(&device_ctx).unwrap();
+    let inputs_y = vec_y.as_slice().to_device_on(&device_ctx).unwrap();
+
+    unsafe {
+        is_equal::dummy_tracegen_array(
+            trace.buffer(),
+            &inputs_x,
+            &inputs_y,
+            ARRAY_LEN,
+            device_ctx.stream.as_raw(),
+        )
+        .unwrap()
+    };
+
+    let cpu_matrix = Arc::new(RowMajorMatrix::<F>::new(
+        (0..n)
+            .flat_map(|i| {
+                let cur_x: [F; ARRAY_LEN] = std::array::from_fn(|k| vec_x[i + k * n]);
+                let cur_y: [F; ARRAY_LEN] = std::array::from_fn(|k| vec_y[i + k * n]);
+
+                let mut cur_inv: [F; ARRAY_LEN] = [F::ONE; ARRAY_LEN];
+                let mut cur_out = F::ONE;
+                IsEqArraySubAir.generate_subrow((&cur_x, &cur_y), (&mut cur_inv, &mut cur_out));
+
+                cur_inv.into_iter().chain(std::iter::once(cur_out))
+            })
+            .collect::<Vec<_>>(),
+        ARRAY_LEN + 1,
+    ));
+
+    assert_eq_host_and_device_matrix(cpu_matrix, &trace, &device_ctx);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn test_cuda_random_is_equal_array_tracegen() {
+    let device_ctx = crate::utils::test_device_ctx();
+    let mut rng = create_seeded_rng();
+    const ARRAY_LEN: usize = 64;
+
+    for log_height in 1..=16 {
+        let n = 1 << log_height;
+
+        let vec_x: Vec<F> = (0..n * ARRAY_LEN)
+            .map(|_| F::from_u32(rng.random_range(0..F::ORDER_U32)))
+            .collect();
+
+        let vec_y: Vec<F> = (0..n * ARRAY_LEN)
+            .map(|_| F::from_u32(rng.random_range(0..F::ORDER_U32)))
+            .collect();
+
+        let inputs_x = vec_x.as_slice().to_device_on(&device_ctx).unwrap();
+        let inputs_y = vec_y.as_slice().to_device_on(&device_ctx).unwrap();
+
+        let gpu_matrix = DeviceMatrix::<F>::with_capacity_on(n, ARRAY_LEN + 1, &device_ctx);
+        unsafe {
+            is_equal::dummy_tracegen_array(
+                gpu_matrix.buffer(),
+                &inputs_x,
+                &inputs_y,
+                ARRAY_LEN,
+                device_ctx.stream.as_raw(),
+            )
+            .unwrap();
+        }
+
+        let cpu_matrix = Arc::new(RowMajorMatrix::<F>::new(
+            (0..n)
+                .flat_map(|i| {
+                    let cur_x: [F; ARRAY_LEN] = std::array::from_fn(|k| vec_x[i + k * n]);
+                    let cur_y: [F; ARRAY_LEN] = std::array::from_fn(|k| vec_y[i + k * n]);
+
+                    let mut cur_inv: [F; ARRAY_LEN] = [F::ONE; ARRAY_LEN];
+                    let mut cur_out = F::ONE;
+                    IsEqArraySubAir.generate_subrow((&cur_x, &cur_y), (&mut cur_inv, &mut cur_out));
+
+                    cur_inv.into_iter().chain(std::iter::once(cur_out))
+                })
+                .collect::<Vec<_>>(),
+            ARRAY_LEN + 1,
+        ));
+
+        assert_eq_host_and_device_matrix(cpu_matrix, &gpu_matrix, &device_ctx);
+    }
+}

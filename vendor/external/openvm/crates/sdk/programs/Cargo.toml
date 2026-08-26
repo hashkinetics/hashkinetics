@@ -1,0 +1,17 @@
+[workspace]
+[package]
+name = "openvm-sdk-test-programs"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+openvm = { path = "../../toolchain/openvm", default-features = false }
+openvm-deferral-guest = { path = "../../../extensions/deferral/guest", default-features = false }
+openvm-verify-stark-guest = { path = "../../../guest-libs/verify-stark/guest", default-features = false }
+
+[features]
+default = []
+
+[profile.release]
+panic = "abort"
+lto = "thin"

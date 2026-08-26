@@ -1,0 +1,20 @@
+[package]
+name = "openvm-bigint-guest"
+description = "OpenVM guest library for bigint"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+openvm-platform = { workspace = true }
+strum_macros = { workspace = true }
+
+[features]
+default = []
+export-intrinsics = [
+    "openvm-platform/rust-runtime",
+] # export extern no_mangle functions for external linkage

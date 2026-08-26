@@ -1,0 +1,138 @@
+# Circuit Architecture
+
+OpenVM's circuit architecture is designed around modularity and composability. For a detailed
+treatment, see the [whitepaper](https://openvm.dev/whitepaper.pdf).
+
+There is no monolithic CPU circuit; instead, functionality is distributed across independent
+_chips_ that communicate through shared _buses_. New instruction families can be added via
+[VM extensions](/book/advanced-usage/creating-a-new-extension) without modifying existing chips.
+
+A chip bundles an _AIR_ together with execution logic and trace generation logic used by the
+prover. An AIR defines polynomial constraints over a trace matrix and specifies
+_interactions_ with other AIRs over buses.
+
+## Overview
+
+An OpenVM circuit has two kinds of AIRs:
+
+- **System AIRs and chips**, which are shared across VM configurations. These include the program
+  AIR, the VM connector AIR, the memory boundary and memory Merkle AIRs, the Poseidon2 periphery AIR
+  (used for Merkle hashing), and shared lookup AIRs (e.g., range checking).
+- **Instruction executor AIRs and chips**, which constrain opcode families. For example, an RV32
+  arithmetic AIR may constrain operations such as `add` and `sub`, while precompile AIRs may
+  constrain instructions such as SHA256 or Keccak.
+
+In the verifying key of the app circuit, the program AIR, VM connector AIR, memory boundary AIR, and
+memory Merkle AIR are marked as required, so the verifier rejects proofs in which any of those
+traces has height zero. These AIRs fix the segment boundary conditions: the committed program, the
+initial and final execution states, and the initial and final memory commitments. Because bus
+interactions must balance, requiring these boundary AIRs also forces many other traces to be
+present in any valid proof.
+
+The important architectural point is that there is no CPU AIR that materializes the full execution
+transcript in one trace matrix. Instead, execution is distributed across instruction executor
+AIRs, and global coherence comes from the buses plus the local AIR constraints.
+
+## Execution flow
+
+An _execution state_ consists of `pc` and `timestamp`.
+
+Although we use sequential language below, a witness (a set of traces) is a static object. The AIR
+constraints and bus balancing conditions are designed so that from any valid witness one can extract
+a valid execution of the committed program whose boundary states match the public values. Under
+standard cryptographic assumptions, the proof system ensures the verifier only accepts proofs for
+which such a witness exists.
+
+The connector AIR exposes the initial and final execution states of the segment as public values. On
+the execution bus, the connector sends the initial execution state and receives the final execution
+state. If the segment terminates the whole program, the connector also constrains that `final_pc`
+points to a `TERMINATE` instruction with the declared exit code.
+
+For each instruction it handles, an instruction executor AIR receives an execution state from the
+bus and sends the next execution state back. It also looks up the instruction at that `pc` on the
+program bus, and the local AIR constraints check the semantics of the opcode family.
+
+Bus balancing forces these interactions to form a chain: the initial state sent by the connector
+is received by some instruction executor trace row, whose post-state is received by another
+instruction executor trace row, and so on, until the final state is received by the connector. The
+program bus pins each step to the instruction committed at that `pc`.
+
+The net effect is that a valid witness encodes a chain of instruction executions from `initial_pc`
+to `final_pc`. Large executions may be split into segments; continuations then relate the boundary
+states of adjacent segments. See
+[Continuations](/specs/architecture/continuations) for full details.
+
+## Memory flow
+
+The memory argument is parallel to the execution-flow argument.
+
+- The memory boundary AIR (`PersistentBoundaryAir`) closes the memory history at the segment
+  boundaries.
+- The memory Merkle AIR (`MemoryMerkleAir`) ties the initial and final boundary states to the
+  committed memory roots for the segment.
+- Instruction executor trace rows that access memory post interactions on the memory bus that connect
+  the previous value and timestamp to the new value and timestamp.
+- The local AIR constraints tie those memory accesses to the semantics of the opcode being
+  executed.
+
+So a valid witness encodes a consistent memory history compatible with the committed initial and
+final memory states. See [Memory](/specs/architecture/memory) for more details.
+
+## Instruction executors
+
+An _instruction executor_ is a chip that packages an instruction-handling AIR together with
+execution logic and trace generation.
+
+An instruction executor typically handles a family of related opcodes rather than a single opcode.
+For example, one executor may constrain several RV32 arithmetic operations, while others constrain
+precompile instructions such as SHA256 or Keccak.
+
+Most instruction executors are implemented in two parts:
+- **Adapter:** connects the opcode family to the program, execution, and memory buses.
+- **Core:** constrains the instruction-specific arithmetic.
+
+This split isolates the system interactions from the instruction-specific arithmetic. It is a
+common pattern, not a requirement.
+
+Instruction executors are responsible for updating the execution state, constraining the local
+instruction semantics, and preserving the shared system invariants.
+
+To prevent [timestamp overflow](/specs/architecture/memory#time-goes-forward), we require that each
+instruction executor chip satisfy the following condition:
+
+:::warning
+In the AIR, the amount that the timestamp is constrained to increase during execution of a single instruction is at most `num_interactions * num_rows_per_execution`.
+:::
+
+Here `num_interactions` is the number of interactions contributed by one trace row; it is a static
+property of the AIR, independent of trace height and runtime multiplicity. The trace for the
+execution of a single instruction can use multiple rows in the chip's trace matrix; this is
+represented by `num_rows_per_execution`.
+
+To ensure the timestamp cannot overflow, we bound the amount it can increase during any logical
+instruction execution. See
+[Memory](/specs/architecture/memory#timestamp-growth-bound-for-openvm-chips) for details.
+
+## Global meaning
+
+Local AIR constraints ensure that each individual step is correct (e.g., an arithmetic AIR
+constrains that a destination register receives the correct 32-bit result). The bus interactions
+stitch those local constraints into one execution flow and one memory history, anchored by the
+boundary AIRs and the committed program.
+
+Together, these guarantee that a valid witness encodes a valid execution of the committed program
+whose initial and final execution and memory states match the public values exposed by the connector
+and memory boundary AIRs.
+
+## Extending the VM
+
+New instruction executors are added through the VM extension framework. See
+[Creating a New Extension](/book/advanced-usage/creating-a-new-extension) for a practical guide.
+
+At the constraint level, a new instruction executor must:
+
+- [Ensure memory consistency](/specs/architecture/memory#what-to-take-into-account-when-adding-a-new-chip)
+- Constrain the semantics of every opcode family that your AIR handles.
+- Balance the relevant system buses for each logical instruction execution.
+- Update the execution state correctly, including the `pc` and `timestamp`.
+- Preserve the timestamp-growth bound above, even if one logical instruction execution spans multiple trace rows.

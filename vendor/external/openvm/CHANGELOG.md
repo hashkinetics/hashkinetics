@@ -1,0 +1,197 @@
+# Changelog
+
+All notable changes to OpenVM will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project follows a versioning principles documented in [VERSIONING.md](./VERSIONING.md).
+
+## Unreleased
+
+## v2.0.2 (2026-08-07)
+
+### Changed
+- Improved the Halo2 GPU prover to achieve sub-5-second SNARK proving.
+
+## v2.0.1 (2026-07-15)
+
+### Changed
+- Updated Cargo manifests and yanked dependencies.
+
+## v2.0.0 (2026-07-06)
+
+### Added
+- (Recursion) Add the recursive verifier circuit for the SWIRL proof system.
+- (Continuations/Deferrals) Add the continuation aggregation pipeline and deferral framework, including the `verify-stark` deferral path for guest programs.
+- (Guest Library/SHA-2) Add guest library support for SHA-256, SHA-384, and SHA-512 incremental hashers.
+- (Guest Library/Keccak) Add Keccak-256 guest library support with incremental hashing.
+
+### Changed
+- (Prover) Use the SWIRL proof system through STARK Backend v2.0.0.
+- (Circuits/Memory) Remove memory access adapters from the VM memory system.
+- (Circuits/SHA-2) Replace the SHA-256-specific AIR with SHA-2 family AIRs for SHA-256, SHA-384, and SHA-512.
+- (Circuits/Keccak) Redesign the Keccak-256 AIRs, splitting Keccak-f into operation and permutation AIRs.
+
+## v1.7.0
+
+### Changed
+- (Circuits/Memory) Fix a soundness issue in `MemoryMerkleAir` by rejecting Merkle expansion rows below the leaf layer, preventing malformed traces from changing the committed memory root without a corresponding memory operation.
+- (Verifier) Fix a selector-clash issue in the Solidity verifier wrapper to ensure proof verification runs through the generated Halo2 fallback.
+- (Verifier) Reject non-canonical BN254 scalar encodings for `appExeCommit` and `appVmCommit` in the Solidity verifier wrapper.
+
+## v1.6.0
+
+### Changed
+- (Transpiler) Reject non-contiguous executable segments in ELF decoder.
+- (Circuits/VM) Add boolean constraints to `PhantomAir` (`is_valid`) and `VmConnectorAir` (`is_terminate`) bus interaction multiplicities.
+- (Circuits/SHA-256) Enforce that the `Sha256Air` trace ends on a padding row.
+- (Circuits/SHA-256) Add range checks on byte limbs in `Sha256VmAir` message length comparison to prevent field-modulus wraparound.
+- (Circuits/SHA-256) Enforce `is_last_block` is constant across all rows within a block in `Sha256VmAir`.
+- (Circuits/SHA-256) Constrain padding block count after the terminal marker in `Sha256VmAir` to prevent extra padding blocks.
+- (Circuits/Keccak) Add terminal finalization constraint to `KeccakVmAir` to ensure partial tail rows (since 24 never divides a power of two) cannot contain enabled instructions.
+- (Circuits/Keccak) Add explicit boolean assertion on `is_enabled` in `KeccakVmAir`.
+- (Circuits/Memory) Anchor the root node's `as_label` and `address_label` to zero in `MemoryMerkleAir`.
+- (Recursion) Constrain `air_perm_by_height` in the recursive STARK verifier to be a valid permutation of AIR indices.
+- (Recursion) Add bounds checks for unchecked `builder.get` on dynamic arrays in the recursive STARK verifier and continuations verifier to prevent out-of-bounds reads from malicious proof data.
+- (Recursion) Zero-fill the `mask` array in `verify_raps` to prevent reads of uninitialized memory in the permutation check.
+- (Recursion) Validate that each AIR proof's `exposed_values_after_challenge` length matches verifier key advice, preventing injection of extra post-challenge exposed-value vectors.
+- (Recursion) Fix `add_felt_exti` ASM lowering to correctly compute `lhs + rhs[0]` for the base coefficient instead of silently dropping `rhs[0]`.
+- (Recursion) Constrain `VERIFY_BATCH` inside-row hashing to start at the correct `opened_values` index and prevent `opened_index` from advancing across row boundaries.
+- (Recursion) Update Plonky3 to v0.4.3. The static verifier challenger now mirrors `MultiField32Challenger` from that release: Each absorb packs the pending `F` scalars and tags the block with the number of `F` elements consumed, and each squeeze splits the `PF` rate cells into canonical base-`|F|` limbs. Also adds a DSL primitive (`CircuitVarToFieldOrderLimbsF`) that constrains the in-circuit base-`|F|` decomposition to be canonical.
+- (Guest Library/IO) Add checked arithmetic to hint stream read and deserialization buffer allocation to prevent integer overflow from untrusted hint lengths.
+- (Guest Library/Algebra) Ensure zero is always reported as a perfect square in modular arithmetic.
+- (Guest Library/Pairing) Add Fp6 subfield checks for the hinted scalar factor in `openvm-pairing` BN254/BLS12-381 pairing check optimization.
+- (Guest Library/ECC) Make all `from_xy_*` point constructors `unsafe` since they do not perform subgroup membership checks.
+- (Guest Library/ECC) Reject the identity point (point at infinity) as a valid public key in ECDSA verification.
+- (Guest Library/ruint) Restrict zkVM-accelerated bitwise intrinsics (`and`, `or`, `xor`) to 256-bit `Uint` types only. Fix `cmp` fallback to avoid infinite recursion on non-256-bit types.
+- (Guest Library/ruint) Fix OOB read in `ruint` shift intrinsics by passing correctly sized buffer.
+
+### Removed
+- (Recursion) Delete dead and buggy `ConstraintCompiler` code.
+
+## v1.5.0 (2026-02-05)
+
+### Added
+- Formal verification of the RV32IM VM extension in Lean.
+
+### Changed
+- Updated Plonky3 to crates.io `v0.4.1`.
+- Updated STARK protocol to 100 bits of provable security with FRI.
+- (Verifier/CLI) The `Halo2ProvingKey` and `Halo2Verifier.sol` verifier contract generated by the CLI now requires `wrapper_k = 24`.
+
+## v1.4.3 (2026-01-11)
+
+### Changed
+- (Prover) Fixes to metered execution. Execution now tracks memory accesses since last checkpoint.
+- (Prover) CUDA tracegen optimization for memory merkle tree.
+
+## v1.4.2 (2025-12-08)
+
+### Added
+- (Executor) Added ahead of time (AOT) compilation of OpenVM executables to host x86 binaries using x86 assembly and dynamic linking.
+
+### Changed
+- Workspace MSRV has been updated to Rust 1.90.0.
+- (Verifier) The formatting of the Solidity code generated for the EVM SNARK verifier has changed due to an update to `forge-fmt v1.5.0`. No other change to the smart contract besides formatting.
+- (Prover) Fix metered execution trace height estimations to account for uninitialized memory.
+- (Prover) More robust CUDA stream synchronization for memory merkle tree trace generation.
+- (Prover) Updated `cuda-backend` with fixes to virtual memory management for long running processes.
+- (Executor) Performance optimizations to elliptic curve host execution.
+
+## v1.4.1 (2025-10-26)
+
+### Added
+- (CLI) Add configurable segmentation arguments to `cargo openvm prove` commands.
+
+### Added
+- (CLI) Add configurable segmentation arguments to `cargo openvm prove` commands.
+
+### Changed
+- (Toolchain) Update `cargo openvm build` to use Rust nightly version `nightly-2025-08-02`.
+- (Primitives Library) Fix in `openvm-algebra-complex-macros` to ensure `const` byte arrays have proper memory alignment.
+- (Executor) Modified `VirtualMachine::build_metered_ctx` to take the program (`&VmExe<Val<E::SC>>`) as an argument.
+- (Prover/Executor) Changed default segmentation limits.
+
+## v1.4.0 (2025-09-01)
+
+### Added
+- (Verifier) An `AggVerifyingKey` struct is introduced so that verifying the final STARK proof does not require the proving key.
+- (Config) Added `addr_spaces` vector of `AddressSpaceHostConfig` to `MemoryConfig`.
+- (Prover) Nvidia GPU trace generation and STARK backend proving support.
+
+### Changed
+- (Verifier) The `MultiStarkVerifyingKey`s for all existing App and Agg configs remain unchanged. However the serialized binary for the `AppVerifyingKey` has changed due to the removal of `as_offset` from `MemoryDimensions` (see below).
+- (Verifier) A fix was made to apply a missing permutation to the trace height constraints in the root verifier circuit's vkey. This changes the pre-vkey hash of the root verifier vkey for initializing Fiat-Shamir. This fix does not impact the security of existing root verifier vkeys generated through the SDK because root verifier proofs have fixed trace heights and these trace heights have been checked to satisfy all trace height constraints statically.
+- (Verifier/CLI) The `Halo2ProvingKey` and `Halo2Verifier.sol` verifier contract generated by the CLI now use `verifier_k = 23` instead of `24` (previous) for a smaller circuit.
+- (Toolchain) Removed `step` from `Program` struct because `DEFAULT_PC_STEP = 4` is always used.
+- (Config) The `SystemConfig` default now has `continuation_enabled: true` instead of the previous default of `false`. This is a **breaking change**.
+- (Config) The `clk_max_bits` field in `MemoryConfig` has been renamed to `timestamp_max_bits`.
+- (Config) The `as_offset` field in `MemoryDimensions` has been removed and replaced by the constant `ADDR_SPACE_OFFSET = 1`.
+- (ISA) Field arithmetic instructions now restrict address spaces `e, f` to be either `0` or `4`, instead of allowing any address space.
+- (ISA) RV32IM load instructions are now restricted to address space `2` only, instead of allowing address spaces `0`, `1`, or `2`.
+- (ISA) The maximum valid pointer value in address space `1` (register address space) is now `127`, corresponding to 32 registers with 4 byte limbs each.
+- (ISA) Memory accesses now have configurable minimum block size requirements per address space. Address spaces `1`, `2`, and `3` require minimum block size of 4. Native address space (`4`) allows minimum block size of 1. Address spaces beyond `4` default to minimum block size of 1 but are configurable.
+- (Prover) Guest memory is stored on host with address space-specified memory layouts. In particular address space `1` through `3` are now represented in bytes instead of field elements.
+- (Prover) The internal format of `VmCommittedExe` has changed. Moreover the main proving flows have been updated so they rely primarily on `VmExe` and not `VmCommittedExe`.
+- (CLI) The `prove stark` output proof no longer contains the `app_commit`. The `verify stark` command now needs to specify the target name to read the `app_commit` stored from a previous call to the `commit` command.
+- (CLI) The `setup` command now stores an `agg.vk` verifying key and the `verify stark` command now reads `agg.vk` instead of `agg.pk`.
+- (SDK) The `Sdk` is now specific to a VM config, with default constructors `Sdk::standard()` and `Sdk::riscv32()`. The methods of the `Sdk` have been updated for a better developer experience.
+- (SDK) The `Halo2ProvingKey` struct now internally contains `Arc` so it can be cloned and shared.
+
+## v1.3.0 (2025-07-15)
+
+No circuit constraints or verifying keys were changed in this release.
+
+A substantial refactor has been done to the guest libraries to separate the low level Rust bindings for OpenVM intrinsic instructions from the higher level user interface. For each VM extension, the `openvm-$name-guest` crate is now a _primitives library_ containing only the Rust bindings for the intrinsic instructions and essential logic related to the extension (e.g., ECDSA signature verification). We introduce new _guest libraries_ as standalone Rust crates which provide the high-level interfaces guest programs should use to interact with the associated VM extensions.
+
+Users are advised to switch to using the new guest libraries.
+
+### Added
+- (ISA) Added OpenVM phantom sub-instructions `HintNonQr` and `HintSqrt` to the algebra (modular arithmetic) extension. Added corresponding RISC-V custom instructions `hint_non_qr` and `hint_sqrt`.
+- (Guest Libraries) We introduce the following new guest libraries:
+  - `openvm-keccak256`: guest library for the Keccak256 hash function.
+  - `openvm-sha2`: guest library providing access to a set of accelerated SHA-2 family hash functions. Currently, the SHA-256 hash function is supported.
+  - `openvm-pairing`: guest library for the elliptic curve pairing check operation.
+  - `ff_derive`: patch of [ff_derive](https://crates.io/crates/ff_derive) using the algebra extension.
+  - `k256`: patch of [k256](https://crates.io/crates/k256) using the algebra and ECC extensions.
+  - `p256`: patch of [p256](https://crates.io/crates/p256) using the algebra and ECC extensions.
+  - `ruint`: patch of [ruint](https://crates.io/crates/ruint) using the big integer extension.
+  - `openvm-verify-stark`: a new guest library providing a `define_verify_stark_proof!` macro which generates a user-named function `$verify_stark` that can be used to verify an OpenVM STARK proof from within a Rust program. The `$verify_stark` function is accelerated using the native field arithmetic extension.
+- (CLI) New `cargo openvm init` and `cargo openvm commit` commands.
+- (CLI) New `cargo openvm prove stark` and `cargo openvm verify stark` commands to generate a single final STARK proof without Halo2 SNARK wrapper.
+- (SDK) New functions `generate_e2e_stark_proof` and `verify_e2e_stark_proof`
+
+### Changed
+- (Toolchain) The `openvm` crate and `cargo openvm build` command have been updated to support both `getrandom` `v0.2` and `v0.3`.
+- (Primitives Libraries) In the algebra and elliptic curve primitive libraries, the `setup_*` functions have been removed from guest bindings and are now called on-demand within other relevant binding functions. Additionally, custom opcode initialization is now simplified through the inclusion of `openvm_init.rs` files and the `openvm::init!()` macro. Read the book for more details.
+- (CLI) The build command `cargo openvm build` now stores build artifacts in the `target/` to match cargo conventions.
+- (CLI) The `cargo openvm setup` command now supports skipping halo2 proving keys and outputs halo2 PK and STARK PK as separate files.
+- (CLI) The `cargo openvm commit` and `cargo openvm prove stark` commands now consistently output commit values in hexadecimal format.
+- (CLI) The `cargo openvm prove` command now outputs proofs to `${bin_name}.app.proof` instead of `app.proof`.
+
+### Removed
+- (ISA) Removed OpenVM phantom sub-instructions `HintDecompress` and `HintNonQr` from the elliptic curve extension. Removed corresponding RISC-V custom instructions `hint_decompress` and `hint_non_qr`.
+
+## v1.2.0 (2025-06-02)
+
+### Security Fixes
+This release makes fixes for security advisories:
+- Plonky3: https://github.com/Plonky3/Plonky3/security/advisories/GHSA-f69f-5fx9-w9r9
+- OpenVM: https://github.com/openvm-org/openvm/security/advisories/GHSA-4w7p-8f9q-f4g2 (recursion circuit fixes corresponding to Plonky3)
+
+## v1.1.2 (2025-05-08)
+
+- The solidity verifier contract no longer has any awareness of the OpenVM patch version. `{MAJOR_VERSION}.{MINOR_VERSION}` is the minimum information necessary to identify the verifier contract since any verifier contract changes will be accompanied by a minor version bump.
+
+## v1.1.1 (2025-05-03)
+
+- Adds `OpenVmHalo2Verifier` generation to the SDK which is a thin wrapper around the original `Halo2Verifier` contract exposing a more user-friendly interface.
+- Updates the CLI to generate the new `OpenVmHalo2Verifier` contract during `cargo openvm setup`.
+- Removes the ability to generate the old `Halo2Verifier` contract from the SDK and CLI.
+- Changes the `EvmProof` struct to align with the interface of the `OpenVmHalo2Verifier` contract.
+- Formats the verifier contract during generation for better readability on block explorers.
+- For verifier contract compilation, explicitly sets the `solc` config via standard-json input for metadata consistency.
+
+## v1.1.0 (2025-05-02)
+
+### Security Fixes
+- Fixes security vulnerability [OpenVM allows the byte decomposition of pc in AUIPC chip to overflow](https://github.com/advisories/GHSA-jf2r-x3j4-23m7)

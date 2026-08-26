@@ -1,0 +1,19 @@
+[package]
+name = "hk-wallet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hk-primitives = { path = "../hk-primitives" }
+hk-crypto = { path = "../hk-crypto", features = ["mlkem"] }
+# Shared statement crate — the same bytes the guests prove and the chain's pool hashes.
+hk-spend-circuit = { path = "../../../zkvm-bakeoff/circuit" }
+# For `pool::full_tree_path` (wallet-side path rebuild) — logic only, no node machinery.
+hk-state = { path = "../hk-state" }
+# Disclosure packages are serialized (JSON files handed to auditors) — P2.2.
+serde = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

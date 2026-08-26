@@ -1,0 +1,105 @@
+[package]
+name = "frodo-kem"
+version = "0.2.0"
+description = "Pure Rust implementation of FrodoKEM and eFrodoKEM"
+authors = ["The RustCrypto Team"]
+documentation = "https://docs.rs/frodo-kem"
+homepage = "https://github.com/RustCrypto/KEMs/tree/master/frodo-kem"
+repository = "https://github.com/RustCrypto/KEMs"
+categories = ["cryptography"]
+keywords = ["quantum", "post", "zero", "knowledge", "encryption"]
+exclude = ["tests/**", "bench/**", "examples/**", ".github/**"]
+license = "Apache-2.0 OR MIT"
+readme = "README.md"
+edition = "2024"
+rust-version = "1.85"
+
+[features]
+default = [
+    "frodo",
+    "efrodo",
+    "serde",
+    "std"
+]
+hazmat = []
+efrodo = [
+    "efrodo640aes",
+    "efrodo640shake",
+    "efrodo976aes",
+    "efrodo976shake",
+    "efrodo1344aes",
+    "efrodo1344shake",
+]
+frodo = [
+    "frodo640aes",
+    "frodo640shake",
+    "frodo976aes",
+    "frodo976shake",
+    "frodo1344aes",
+    "frodo1344shake",
+]
+efrodo640aes = ["dep:aes"]
+frodo640aes = ["dep:aes"]
+efrodo640shake = []
+frodo640shake = []
+efrodo976aes = ["dep:aes"]
+frodo976aes = ["dep:aes"]
+efrodo976shake = []
+frodo976shake = []
+efrodo1344aes = ["dep:aes"]
+frodo1344aes = ["dep:aes"]
+efrodo1344shake = []
+frodo1344shake = []
+openssl = ["openssl-aes", "openssl-shake"]
+openssl-aes = ["dep:openssl-sys"]
+openssl-shake = ["dep:openssl-sys"]
+serde = ["std", "dep:hex", "dep:serde"]
+std = []
+
+[dependencies]
+aes = { version = "0.9", optional = true }
+ctutils = "0.4"
+hex = { version = "0.4", optional = true }
+hybrid-array = { version = "0.4.13", features = ["extra-sizes"] }
+kem = "0.3"
+openssl-sys = { version = "0.9.104", optional = true }
+rand_core = { version = "0.10", features = [] }
+serde = { version = "1.0", features = ["derive"], optional = true }
+serdect = "0.4"
+sha3 = "0.12"
+shake = "0.1"
+thiserror = "2.0"
+zeroize = "1"
+
+[dev-dependencies]
+aes = "0.9"
+criterion = "0.7"
+getrandom = { version = "0.4", features = ["sys_rng"] }
+hex = "0.4"
+hybrid-array = "0.4"
+chacha20 = { version = "0.10", features = ["rng"] }
+rstest = "0.26"
+postcard = { version = "1.0", features = ["use-std"] }
+serde_bare = "0.5"
+serde_cbor = "0.11"
+serde_json = "1.0"
+serde_yaml = "0.9"
+toml = "1"
+
+[package.metadata.docs.rs]
+features = [
+    "frodo",
+    "efrodo",
+    "openssl",
+    "serde",
+]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "frodo"
+harness = false
+path = "benches/frodo.rs"
+required-features = ["frodo"]

@@ -1,0 +1,29 @@
+#!/bin/bash
+
+# Download ~/.openvm setup artifacts
+HALO2_DIR="halo2/src/v2.0-base"
+mkdir -p ~/.openvm
+mkdir -p ~/.openvm/$HALO2_DIR
+mkdir -p ~/.openvm/$HALO2_DIR/interfaces
+mkdir -p ~/.openvm/params
+
+BASE_URL="https://openvm-public-artifacts-us-east-1.s3.us-east-1.amazonaws.com/v2.0.2"
+
+for file in "internal_recursive.pk" "internal_recursive.vk" "root.pk" "halo2.pk"; do
+    URL="$BASE_URL/$file"
+    LOCAL=~/.openvm/$file
+    wget "$URL" -O "$LOCAL" || curl -L "$URL" -o "$LOCAL"
+done
+
+for file in "Halo2Verifier.sol" "interfaces/IOpenVmHalo2Verifier.sol" "OpenVmHalo2Verifier.sol" "verifier.bytecode.json"; do
+    URL="$BASE_URL/$HALO2_DIR/$file"
+    LOCAL=~/.openvm/$HALO2_DIR/$file
+    wget "$URL" -O "$LOCAL" || curl -L "$URL" -o "$LOCAL"
+done
+
+for k in {10..24}; do
+    file="kzg_bn254_${k}.srs"
+    URL="$BASE_URL/params/$file"
+    LOCAL=~/.openvm/params/$file
+    wget "$URL" -O "$LOCAL" || curl -L "$URL" -o "$LOCAL"
+done

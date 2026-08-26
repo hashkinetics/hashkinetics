@@ -1,0 +1,260 @@
+use std::{array::from_fn, fmt};
+
+use num_bigint::BigUint;
+use openvm_stark_backend::codec::{Decode, Encode};
+use openvm_stark_sdk::config::baby_bear_poseidon2::{DIGEST_SIZE, F};
+use openvm_verify_stark_host::pvs::VkCommit;
+use p3_field::{PrimeCharacteristicRing, PrimeField32};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+pub const COMMIT_NUM_BYTES: usize = 32;
+
+/// Wrapper for the canonical big-endian byte representation of a BabyBear digest interpreted as
+/// an unsigned integer in base `F::MODULUS`. Each commit can be converted to a Bn254 using the
+/// trivial identification as natural numbers or into a `u32` digest by decomposing the big integer
+/// base-`F::MODULUS`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Encode)]
+pub struct CommitBytes([u8; COMMIT_NUM_BYTES]);
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CommitBytesError {
+    #[error("non-canonical CommitBytes for BabyBear digest")]
+    NonCanonical,
+}
+
+impl CommitBytes {
+    /// Use this rather than [`CommitBytes::new`] for bytes from an untrusted source.
+    pub fn try_new(bytes: [u8; COMMIT_NUM_BYTES]) -> Result<Self, CommitBytesError> {
+        if u32_digest_to_bytes(&bytes_to_u32_digest(&bytes)) == bytes {
+            Ok(Self(bytes))
+        } else {
+            Err(CommitBytesError::NonCanonical)
+        }
+    }
+
+    /// Panics if `bytes` is non-canonical.
+    pub fn new(bytes: [u8; COMMIT_NUM_BYTES]) -> Self {
+        Self::try_new(bytes).expect("non-canonical CommitBytes for BabyBear digest")
+    }
+
+    pub fn as_slice(&self) -> &[u8; COMMIT_NUM_BYTES] {
+        &self.0
+    }
+
+    pub fn to_field_le_bytes(self) -> [u8; COMMIT_NUM_BYTES] {
+        let digest: [F; DIGEST_SIZE] = self.into();
+        let mut bytes = [0u8; COMMIT_NUM_BYTES];
+        for (i, limb) in digest.into_iter().enumerate() {
+            bytes[4 * i..4 * (i + 1)].copy_from_slice(&limb.to_unique_u32().to_le_bytes());
+        }
+        bytes
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct VkCommitBytes {
+    pub cached_commit: CommitBytes,
+    pub vk_pre_hash: CommitBytes,
+}
+
+impl<F: PrimeCharacteristicRing> From<VkCommitBytes> for VkCommit<F> {
+    fn from(value: VkCommitBytes) -> Self {
+        VkCommit {
+            cached_commit: value.cached_commit.into(),
+            vk_pre_hash: value.vk_pre_hash.into(),
+        }
+    }
+}
+
+impl From<[F; DIGEST_SIZE]> for CommitBytes {
+    fn from(value: [F; DIGEST_SIZE]) -> Self {
+        Self::from(value.map(|x| x.as_canonical_u32()))
+    }
+}
+
+impl From<[u32; DIGEST_SIZE]> for CommitBytes {
+    fn from(value: [u32; DIGEST_SIZE]) -> Self {
+        assert!(
+            value.iter().all(|&digit| digit < F::ORDER_U32),
+            "non-canonical BabyBear digest limb"
+        );
+        Self(u32_digest_to_bytes(&value))
+    }
+}
+
+impl<F: PrimeCharacteristicRing> From<CommitBytes> for [F; DIGEST_SIZE] {
+    fn from(value: CommitBytes) -> Self {
+        assert!(
+            u32_digest_to_bytes(&bytes_to_u32_digest(&value.0)) == value.0,
+            "non-canonical CommitBytes for BabyBear digest"
+        );
+        bytes_to_u32_digest(&value.0).map(F::from_u32)
+    }
+}
+
+fn bytes_to_biguint(bytes: &[u8; COMMIT_NUM_BYTES]) -> BigUint {
+    let mut bigint = BigUint::ZERO;
+    for byte in bytes.iter() {
+        bigint <<= 8;
+        bigint += BigUint::from(*byte);
+    }
+    bigint
+}
+
+fn biguint_to_u32_digest(mut bigint: BigUint) -> [u32; DIGEST_SIZE] {
+    let order = F::ORDER_U32;
+    from_fn(|_| {
+        let bigint_digit = bigint.clone() % order;
+        let digit = if bigint_digit == BigUint::ZERO {
+            0u32
+        } else {
+            bigint_digit.to_u32_digits()[0]
+        };
+        bigint /= order;
+        digit
+    })
+}
+
+fn u32_digest_to_biguint(digest: &[u32; DIGEST_SIZE]) -> BigUint {
+    let mut bigint = BigUint::ZERO;
+    let mut base = BigUint::from(1u32);
+    let order = BigUint::from(F::ORDER_U32);
+    for digit in digest {
+        bigint += &base * BigUint::from(*digit);
+        base *= &order;
+    }
+    bigint
+}
+
+fn bytes_to_u32_digest(bytes: &[u8; COMMIT_NUM_BYTES]) -> [u32; DIGEST_SIZE] {
+    biguint_to_u32_digest(bytes_to_biguint(bytes))
+}
+
+fn u32_digest_to_bytes(digest: &[u32; DIGEST_SIZE]) -> [u8; COMMIT_NUM_BYTES] {
+    let mut ret = [0u8; COMMIT_NUM_BYTES];
+    let bytes = u32_digest_to_biguint(digest).to_bytes_be();
+    let start = COMMIT_NUM_BYTES - bytes.len();
+    ret[start..].copy_from_slice(&bytes);
+    ret
+}
+
+impl fmt::Display for CommitBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "0x{}", hex::encode(self.as_slice()))
+    }
+}
+
+impl Serialize for CommitBytes {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.to_string().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CommitBytes {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let hex_str = String::deserialize(deserializer)?;
+        let hex_str = hex_str.strip_prefix("0x").unwrap_or(&hex_str);
+        let bytes: [u8; COMMIT_NUM_BYTES] = hex::decode(hex_str)
+            .map_err(serde::de::Error::custom)?
+            .try_into()
+            .map_err(|_| serde::de::Error::custom("expected 32 bytes"))?;
+        CommitBytes::try_new(bytes).map_err(serde::de::Error::custom)
+    }
+}
+
+// Hand-written so that decoding goes through `try_new` instead of bypassing the canonicity check.
+impl Decode for CommitBytes {
+    fn decode<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let bytes = <[u8; COMMIT_NUM_BYTES]>::decode(reader)?;
+        CommitBytes::try_new(bytes).map_err(std::io::Error::other)
+    }
+}
+
+#[cfg(feature = "root-prover")]
+mod bn254 {
+    use p3_bn254::Bn254;
+    use p3_field::PrimeField;
+
+    use super::*;
+
+    impl From<Bn254> for CommitBytes {
+        fn from(value: Bn254) -> Self {
+            Self::new(bn254_to_bytes(value))
+        }
+    }
+
+    impl From<[Bn254; 1]> for CommitBytes {
+        fn from(value: [Bn254; 1]) -> Self {
+            CommitBytes::from(value[0])
+        }
+    }
+
+    impl From<CommitBytes> for Bn254 {
+        fn from(value: CommitBytes) -> Self {
+            bytes_to_bn254(&value.0)
+        }
+    }
+
+    fn bytes_to_bn254(bytes: &[u8; COMMIT_NUM_BYTES]) -> Bn254 {
+        let order = Bn254::from_u32(1 << 8);
+        let mut ret = Bn254::ZERO;
+        let mut base = Bn254::ONE;
+        for byte in bytes.iter().rev() {
+            ret += base * Bn254::from_u8(*byte);
+            base *= order;
+        }
+        ret
+    }
+
+    fn bn254_to_bytes(bn254: Bn254) -> [u8; COMMIT_NUM_BYTES] {
+        let mut ret = [0u8; COMMIT_NUM_BYTES];
+        let bytes = bn254.as_canonical_biguint().to_bytes_be();
+        let start = COMMIT_NUM_BYTES - bytes.len();
+        ret[start..].copy_from_slice(&bytes);
+        ret
+    }
+}
+
+/// Untrusted input paths must reject non-canonical bytes as errors rather than panicking.
+#[cfg(test)]
+mod tests {
+    use serde::de::IntoDeserializer;
+
+    use super::*;
+
+    /// Largest canonical digest, i.e. `F::MODULUS^8 - 1`.
+    fn max_canonical() -> [u8; COMMIT_NUM_BYTES] {
+        u32_digest_to_bytes(&[F::ORDER_U32 - 1; DIGEST_SIZE])
+    }
+
+    #[test]
+    fn try_new_canonicity() {
+        assert!(CommitBytes::try_new([0u8; COMMIT_NUM_BYTES]).is_ok());
+        assert!(CommitBytes::try_new(max_canonical()).is_ok());
+        assert_eq!(
+            CommitBytes::try_new([0xff; COMMIT_NUM_BYTES]),
+            Err(CommitBytesError::NonCanonical)
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_non_canonical() {
+        let hex = format!("0x{}", hex::encode([0xffu8; COMMIT_NUM_BYTES]));
+        let de: serde::de::value::StrDeserializer<serde::de::value::Error> =
+            hex.as_str().into_deserializer();
+        assert!(CommitBytes::deserialize(de).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_non_canonical() {
+        let encoded = [0xffu8; COMMIT_NUM_BYTES];
+        assert!(CommitBytes::decode(&mut encoded.as_slice()).is_err());
+    }
+
+    #[test]
+    fn encode_decode_roundtrip() {
+        let commit = CommitBytes::try_new(max_canonical()).unwrap();
+        let bytes = commit.encode_to_vec().unwrap();
+        assert_eq!(CommitBytes::decode_from_bytes(&bytes).unwrap(), commit);
+    }
+}

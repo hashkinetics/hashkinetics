@@ -1,0 +1,188 @@
+% HashKinetics Yellowpaper v1.0 — formal protocol specification (LaTeX source)
+% Build: pdflatex (x2). TeX Live 2022-compatible; standard packages only.
+\documentclass[10pt]{article}
+
+\usepackage[a4paper,margin=2.3cm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage[hidelinks]{hyperref}
+\usepackage{titlesec}
+
+\definecolor{hkink}{RGB}{20,25,45}
+\titleformat{\section}{\large\bfseries\color{hkink}}{\thesection}{0.7em}{}
+\titleformat{\subsection}{\normalsize\bfseries\color{hkink}}{\thesubsection}{0.7em}{}
+
+\lstdefinestyle{spec}{basicstyle=\ttfamily\footnotesize,backgroundcolor=\color{gray!7},frame=single,framerule=0.3pt,rulecolor=\color{gray!35},breaklines=true,columns=fullflexible,keepspaces=true,xleftmargin=5pt,xrightmargin=5pt,aboveskip=6pt,belowskip=6pt}
+\lstset{style=spec}
+
+\newtheorem{inv}{Invariant}
+\newcommand{\ct}[1]{\texttt{#1}}
+\newcommand{\Hs}{\mathsf{H32}}
+\newcommand{\Hc}{\mathsf{Hc}}
+\newcommand{\cat}{\,\Vert\,}
+\newcommand{\stx}{\ensuremath{\Sigma}}
+
+\title{\vspace{-1.0cm}\textbf{HashKinetics Yellowpaper}\\[0.25em]\large Formal Protocol Specification, v1.0}
+\author{HashKinetics \textperiodcentered\ \normalsize companion to the whitepaper; where prose and specification disagree, this document governs}
+\date{2026-08-18}
+
+\begin{document}
+\maketitle
+\vspace{-0.9cm}
+
+\begin{abstract}
+\noindent This document formally specifies the HashKinetics ledger: world state and its commitment; transaction syntax, authentication, and the state transition function $\Upsilon$; MandateTree accounting; PayWord channels; the shielded pool including the mint and spend proof relations; recursive aggregation and per-block coverage; block structure, consensus signing layouts, and processing order; wire and digest encodings; the confidentiality layer and the offline disclosure verification algorithm; verifying-key pinning; and the consensus-critical invariants. Normative keywords follow RFC~2119. The reference implementation is the Rust workspace \ct{chain/} together with the circuit crate \ct{zkvm-bakeoff/circuit} --- the \emph{single hashing truth}, compiled into prover guests and linked by the state machine alike.
+\end{abstract}
+
+\section{Notation}
+$\mathbb{B}$: byte strings; $a \cat b$: concatenation. $\Hs(\mathit{tag}, m_1,\ldots,m_k)$: SHAKE-256, 32-byte output, over $\mathit{tag}\cat m_1\cat\cdots\cat m_k$ with $\mathit{tag}$ an ASCII string from the registry (\S\ref{sec:registry}); all chain-side hashing. $\Hc(d, m_1,\ldots,m_k)$: SHA-256 over $d\cat m_1\cat\cdots$ with $d$ a single domain byte; all in-circuit hashing (pool v1, rotatable per \S\ref{sec:pins}). $\mathsf{u64^{LE}}, \mathsf{i64^{LE}}$: 8-byte little-endian; $\mathsf{u32^{BE}}, \mathsf{u64^{BE}}$: big-endian where stated. \ct{H256}: 32 bytes; identifiers (accounts, mandates, channels, assets) are \ct{H256}; \ct{Amount} $= \mathsf{u128}$ micro-units ($10^6$ per token); \ct{Timestamp} $= \mathsf{u64}$ seconds. $\mathsf{JSONc}(x)$: canonical JSON of a fixed-field structure (declaration order, no maps, byte fields as lowercase hex) --- used \emph{only} for signing digests and transaction identifiers, never on the wire. $\Upsilon(\stx, T) \rightarrow (\stx', r)$ produces a post-state and a typed receipt $r \in \{\mathsf{ok}(\mathit{events}), \mathsf{rejected}(\mathit{reason})\}$; a rejected transaction MUST leave \stx{} unmodified.
+
+\section{Cryptographic primitives}
+\textbf{SHAKE-256} (FIPS 202) instantiates $\Hs$; distinct tags yield independent oracles; untagged hashing is forbidden. \textbf{SLH-DSA-SHAKE-192s} (FIPS 205): stateless root signatures (pk 48\,B, sig 16{,}224\,B; deterministic keygen from a 32-byte seed; non-hedged); roots sign only certificates. \textbf{LMS/HSS} (RFC 8554, SHAKE-256 sets): stateful consensus signatures, profile $[H10,H5]$ ($2^{15}$ signatures); state advancement is durable before release (\S\ref{sec:consint}). \textbf{WOTS} ($w{=}16$): a 32-byte digest parses to 64 base-16 digits $m_i$ plus checksum $C=\sum_i(15-m_i)$ (3 digits; 67 chains). Signing reveals $\sigma_j = \mathrm{chain}_j(\mathit{sk}_j, m_j)$; verification \emph{recovers} the key: $\sigma'_j = \mathrm{chain}_j(\sigma_j, 15-m_j)$, $\mathit{pk} = \Hc(3, \sigma'_1\cat\cdots\cat\sigma'_{67})$; the checksum blocks digit inflation; no public key is transmitted. \textbf{PayWord}: $w_0 = \Hs(\ct{payword-seed}, s)$, $w_i = \Hs(\ct{payword-link}, w_{i-1})$, tip $w_n$; revealing $w_{n-k}$ proves $k$ payments. \textbf{Lamport ratchet} (account tier v0): \ct{auth\_commit} $= \Hs(\ct{lamport-pk-commit}, \mathit{pk})$ at index $=$ nonce; a transaction reveals $\mathit{pk}$, signs the digest of \S\ref{sec:tx}, installs \ct{next\_auth} --- leaf index $=$ nonce as a ledger rule. \textbf{ML-KEM-768} (FIPS 203): $\mathit{ek}$ 1184\,B, ct 1088\,B; epoch keygen $(\mathit{ek}_e,\mathit{dk}_e) = \mathrm{KeyGen}(\Hs(\ct{mlkem-note-seed}, \mathit{master}\cat \mathsf{u32^{BE}}(e)))$; deterministic encapsulation; implicit-rejection decapsulation. \textbf{SHAKE-AEAD}: keystream $\Hs(\ct{note-enc}, k\cat\nu\cat \mathit{ctr})$, tag $\tau = \Hs(\ct{note-mac}, k\cat\nu\cat c)$ (32\,B), nonce $\nu$ = the note commitment; keys one-time, $k = \Hs(\ct{note-key}, \mathit{ss}\cat \mathit{ctx})$. \textbf{STARKs}: SP1 proofs over the circuit crate; modes core ($\approx$2.7\,MB) and compressed ($\approx$1.24\,MB). \emph{F1 (normative): pairing-based wraps MUST NOT be emitted, transmitted, or accepted.} Interface: $\mathrm{Verify}(\mathit{vk}, \pi, P) \in \{0,1\}$ with $P$ the byte-exact committed public string.
+
+\section{Protocol constants}
+\begin{center}\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Constant & Value & Meaning \\
+\midrule
+$M$ & $10^6$ & micro-units per token \\
+\ct{POOL\_DEPTH} & 32 & commitment tree depth (capacity $2^{32}{-}1$) \\
+\ct{ANCHOR\_WINDOW} & 128 & blocks of valid anchors \\
+\ct{SPEND\_TREE\_DEPTH} & 10 & statement-side spend tree ($2^h \le 2^{10}$ wallet capacity) \\
+\ct{EPOCH\_BLOCKS} & 1{,}000 & KEM-key epoch length \\
+\ct{MAX\_TXS\_PER\_BLOCK} & 256 & batch capacity (configuration tier) \\
+\ct{EK\_LEN}/\ct{CT\_LEN}/\ct{TAG\_LEN} & 1184/1088/32 & ML-KEM sizes; AEAD tag \\
+WOTS & $w{=}16$, 67 chains & \S2 \\
+HSS profile & $[H10,H5]$ & $\approx$32.7k signatures per operational key \\
+SLH-DSA-192s & pk 48\,B, sig 16{,}224\,B & root tier \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{World state}
+$\stx = (\mathrm{Acc}, \mathrm{Man}, \mathrm{Chan}, \mathrm{Pool}, \mathrm{Val})$ with
+\begin{itemize}[leftmargin=1.3em,itemsep=1pt]
+\item $\mathrm{Acc}: \mathbb{A} \to (\mathit{bal}: \mathit{Asset}\to\mathit{Amount},\ \mathit{nonce},\ \mathit{auth\_commit})$;
+\item $\mathrm{Man}: \mathbb{A} \to (\mathit{parent?}, \mathit{holder}, \mathit{asset}, \mathit{rate\_per\_sec}, \mathit{buffer}, \mathit{buffer\_max}, \mathit{per\_tx\_max}, \mathit{last\_accrual}, \mathit{expiry}, \mathit{revoked}, \mathit{tier})$; roots bind a funding account;
+\item $\mathrm{Chan}: \mathbb{A} \to (\mathit{payer}, \mathit{payee}, \mathit{asset}, \mathit{mandate}, \mathit{tip}, \mathit{unit\_price}, \mathit{max\_steps}, \mathit{highest\_step\_settled}, \mathit{escrow\_remaining}, \mathit{expiry})$;
+\item $\mathrm{Pool} = (F: \mathrm{Frontier}_{32},\ A: \text{ring of} \le 128 \text{ anchors},\ N \subseteq \ct{H256},\ \mathit{total\_shielded},\ \mathit{asset?},\ \mathit{version})$;
+\item $\mathrm{Val}$: per validator, stable address, SLH-DSA \ct{root\_pk}, operational \ct{op\_pk}, epoch, power.
+\end{itemize}
+\emph{Transient, excluded from commitment:} \ct{agg\_cover} (\S\ref{sec:agg}). \textbf{State commitment} $C(\stx) = \Hs(\ct{state-commit}, \mathrm{enc}(\stx))$ over a canonical encoding of the non-transient components (v1 whole-state; merkleization is a scheduled same-interface replacement).
+
+\section{Transactions}\label{sec:tx}
+\textbf{Envelope.} $\ct{SignedTx} = \{\mathit{sender}, \mathit{nonce}, \mathit{payload}, \mathit{next\_auth}, \mathit{lamport\_pk}, \mathit{sig}\}$. Signing digest $d(T) = \Hs(\ct{hk/v1/tx}, \mathsf{JSONc}(T \setminus \mathit{sig}))$; $\mathrm{txid}(T) = \Hs(\ct{hk/v1/txid}, \mathsf{JSONc}(T))$ --- both wire-codec-independent (Invariant~\ref{inv:codec}).
+
+\textbf{Syntax.}
+\begin{lstlisting}
+Tx ::= Transfer      { to, asset, amount }
+     | MandateCreate { id, parent?, holder, asset, rate_per_sec, buffer_max,
+                       per_tx_max, initial_buffer, expiry, tier }
+     | MandateSpend  { leaf, to, amount }
+     | MandateRevoke { target }
+     | ChannelOpen   { id, mandate, payee, asset, tip, unit_price, max_steps, expiry }
+     | ChannelSettle { id, word, step }
+     | ChannelRefund { id }
+     | MintToPool    { asset, value, commitment, proof, stealth_ct }
+     | ShieldedSpend { anchor, nullifier, out_commitment, out2_commitment,
+                       fee, credit?, mandate?, proof, stealth_ct, stealth_ct2 }
+\end{lstlisting}
+\ct{stealth\_ct*} are \emph{advisory}: stored and gossiped, never interpreted by consensus (Invariant~\ref{inv:blob}).
+
+\textbf{Envelope validity} (all payloads): (E1) $\mathrm{Acc}[\mathit{sender}]$ exists; (E2) $\mathit{nonce} = \mathrm{Acc}[\mathit{sender}].\mathit{nonce}$; (E3) $\Hs(\ct{lamport-pk-commit}, \mathit{lamport\_pk}) = \mathit{auth\_commit}$; (E4) $\mathit{sig}$ verifies over $d(T)$. Success advances the ratchet: $\mathit{nonce}{+}{=}1$, $\mathit{auth\_commit} \leftarrow \mathit{next\_auth}$.
+
+\section{Mandate semantics}
+\textbf{Accrual (drip-not-reset).}
+\[ \mathrm{avail}(n, t) \;=\; \min\big(\mathit{buffer\_max},\ \mathit{buffer} + \mathit{rate\_per\_sec}\cdot(t - \mathit{last\_accrual})\big). \]
+\textbf{Authorization walk.} For leaf $\ell$, amount $a$, time $t$, with $\mathrm{chain}(\ell) = [\ell, \mathrm{parent}(\ell), \ldots, \mathrm{root}]$, $\mathrm{check}(\ell,a,t)$ fails with the \emph{first} violation at its depth $k$ (0 = leaf): $\mathsf{Revoked}(k)$; $\mathsf{Expired}(k)$ if $t \ge \mathit{expiry}$; $\mathsf{PerTxCap}(k)$ if $a > \mathit{per\_tx\_max}$; $\mathsf{Buffer}(k)$ if $a > \mathrm{avail}(n_k, t)$ --- rendered \ct{insufficient buffer at depth k from leaf (have ..., need ...)}.
+
+\textbf{Rules.} \emph{Create}: root $\Rightarrow$ sender becomes holder and funding account; child $\Rightarrow$ sender MUST hold the parent and $\mathit{per\_tx\_max}(\mathrm{child}) \le \mathit{per\_tx\_max}(\mathrm{parent})$ (attenuation at creation); sibling oversubscription of buffers is legal by design. \emph{Spend}: sender MUST hold the leaf; $\mathrm{check}$ first; funds move from the \emph{root's} funding account; every node on the chain draws down; two-phase --- no partial effects. \emph{Revoke}: sender MUST hold the target's parent (root: itself); cascade is implicit.
+
+\section{Channels}
+\emph{Open}: sender $=$ leaf holder; $\mathit{escrow} = \mathit{unit\_price}\times\mathit{max\_steps}$ drawn through the walk once, at open; \ct{id} MUST equal the derived channel id; \ct{tip} anchors the chain. \emph{Settle} (proof-carrying, any sender): for $s > \mathit{highest}$, verify $s - \mathit{highest}$ PayWord links from \ct{word} to the last settled word (or tip); pay $(s-\mathit{highest})\cdot\mathit{unit\_price}$ from escrow. \emph{Refund}: after expiry, payer reclaims the remainder. Reference measurement: 1{,}000 steps settled by one 32-byte word in one transaction.
+
+\section{The shielded pool}\label{sec:pool}
+\textbf{Note and commitment.} $\mathit{note} = (v: \mathsf{u64}, \mathit{tag}, \rho, \mathit{rcm})$; $\mathit{cm} = \Hc(1, \mathsf{u64^{LE}}(v)\cat \mathit{tag}\cat\rho\cat \mathit{rcm})$.
+
+\textbf{Frontier insertion.} With empty ladder $E_0 \ldots E_{32}$ ($E_{l+1} = \Hc(2, E_l \cat E_l)$), inserting at $\mathit{next\_index}$ updates one frontier node per level and recomputes the root in $\le 32$ steps of $\Hc(2, L\cat R)$. Every block end (and genesis) seals the root into $A$ (dedup; evict beyond 128).
+
+\textbf{Nullifiers.} $\mathit{nf} = \Hc(4, \mathit{nk}\cat\rho)$ with $\mathit{nk}$ secret to the owner (public fingerprint $\Hc(10, \mathit{nk})$). $N$ is append-only forever.
+
+\textbf{Address tag and spend tree.} $\mathit{tag} = \Hc(9, \mathit{spend\_root}\cat \Hc(10, \mathit{nk}))$; the spend tree is depth-10 over WOTS pk digests ($\Hc(8,\cdot\cat\cdot)$ inner nodes), wallet capacity $2^h$ with empty-ladder padding.
+
+\textbf{The spend relation.} Public $P = (\mathit{anchor}, \mathit{nf}, \mathit{cm}_1, \mathit{cm}_2, \mathit{fee}, b)$; the witness $w$ comprises the input note and its Merkle path, the WOTS signature with spend-tree path and leaf index, the nullifier key $\mathit{nk}$, the two output notes, and the credit account. $R_{\mathrm{spend}}(P, w) = 1$ iff
+\begin{align}
+\mathit{cm}_{\mathrm{in}} &= \Hc(1, \mathit{note}_{\mathrm{in}}), & \mathrm{Fold}_{32}(\mathit{cm}_{\mathrm{in}}, \mathit{path}) &= \mathit{anchor};\\
+\mathit{pk} &= \mathrm{Recover}(\sigma, d_P), & \mathrm{Fold}_{10}(\Hc(3,\mathit{pk}), \mathit{ots\_path}) &= \mathit{spend\_root};\\
+\mathit{note}_{\mathrm{in}}.\mathit{tag} &= \Hc(9, \mathit{spend\_root}\cat\Hc(10,\mathit{nk})), & \mathit{nf} &= \Hc(4, \mathit{nk}\cat\mathit{note}_{\mathrm{in}}.\rho);\\
+\mathit{cm}_1 &= \Hc(1, \mathit{out}_1),\quad \mathit{cm}_2 = \Hc(1, \mathit{out}_2), & \mathit{note}_{\mathrm{in}}.v &= \mathit{out}_1.v + \mathit{out}_2.v + \mathit{fee};\\
+b &= \Hc(7, \mathit{credit}\cat \mathit{fee}). &&
+\end{align}
+\textbf{The mint relation.} $R_{\mathrm{mint}}((\mathit{cm}, v), (\mathit{tag},\rho,\mathit{rcm})) = 1$ iff $\mathit{cm} = \Hc(1, \mathsf{u64^{LE}}(v)\cat\mathit{tag}\cat\rho\cat\mathit{rcm})$ --- the inflation guard.
+
+\textbf{Expected publics (chain-derived).} $\hat P(\ct{MintToPool}) = (\mathit{commitment}, \mathit{value})$; $\hat P(\ct{ShieldedSpend}) = (\mathit{anchor}, \mathit{nullifier}, \mathit{cm}_1, \mathit{cm}_2, \mathit{fee}, \Hc(7, \mathit{credit}\cat\mathit{fee}))$. Verification compares the proof's committed bytes to $\mathrm{bincode}(\hat P)$ \emph{byte-exactly}, then checks the STARK (Invariant~\ref{inv:derived}).
+
+\textbf{Transition rules.} \emph{MintToPool}: (M1) capacity; (M2) asset matches (first mint pins); (M3) balance $\ge$ value; (M4) proof valid for $\hat P$ \textbf{or} coverage (\S\ref{sec:agg}). Effects: debit; insert; $\mathit{total\_shielded}{+}{=}\mathit{value}$. \emph{ShieldedSpend}: (S1) $\mathit{anchor} \in A$; (S2) $\mathit{nf} \notin N$; (S3) $\mathit{fee}>0 \Rightarrow \mathit{credit}$ present; (S4) if \ct{mandate}: envelope sender $=$ leaf holder and $\mathrm{check}(\mathit{leaf}, \mathit{fee}, t)$ (public-skeleton mode); (S5) proof valid for $\hat P$ or coverage. Effects, in order: mandate draw-down $\to$ $N \cup\!= \{\mathit{nf}\}$ $\to$ insert $\mathit{cm}_1, \mathit{cm}_2$ $\to$ if $\mathit{fee}>0$: credit transparently, $\mathit{total\_shielded}{-}{=}\mathit{fee}$.
+
+\section{Aggregation and coverage}\label{sec:agg}
+With kinds $\ct{KIND\_SPEND}=1$, $\ct{KIND\_MINT}=2$ and $\mathrm{vkbytes}(\mathit{vk})$ the verifying key's 8 hash words big-endian:
+\[ \mathit{leaf}_i = \Hc\big(\mathit{kind}_i \cat \mathrm{vkbytes}(\mathit{vk}_i) \cat \mathsf{u32^{BE}}(|P_i|) \cat P_i\big), \qquad \mathit{digest} = \Hc\big(\mathsf{u32^{BE}}(n) \cat \mathit{leaf}_1 \cat \cdots \cat \mathit{leaf}_n\big), \]
+binding kind, key, content, order, and count. The \textbf{aggregator statement} verifies, in-zkVM, $\mathrm{verify}(\mathit{vk}_i, \mathrm{SHA256}(P_i))$ for each of $n$ compressed proofs and commits $\mathit{digest}$; the emitted aggregate is itself a compressed raw STARK (F1 applies). \textbf{Block rule}: at commit, a present \ct{agg\_proof} is verified once against the digest recomputed from the block's proof-less pool transactions in order, with each $P_i = \hat P(\mathit{tx}_i)$; success installs $\ct{agg\_cover} = \{\Hs(\ct{agg-cover}, \mathit{kind}\cat\mathrm{bincode}(\hat P))\}$. A proof-less pool transaction is valid iff its key $\in$ \ct{agg\_cover}; the set clears at block end (Invariant~\ref{inv:cover}); the per-proof path stays legal.
+
+\section{Blocks and consensus interface}\label{sec:consint}
+\textbf{Batch.} $\{\mathit{parent\_app\_hash}, \mathit{txs}, \mathit{rotations}, \mathit{agg\_proof}\}$, bincode-encoded; the consensus value id is $\Hs(\ct{block-value}, \mathit{batchbytes})$ --- \emph{a vote for a block is a vote for its parent state} (Invariant~\ref{inv:parent}).
+
+\textbf{Processing order (normative).} (1) $\mathit{parent\_app\_hash} = C(\stx)$ or consensus-fatal; (2) verify \ct{agg\_proof}, install coverage; (3) apply \ct{txs} in order; (4) apply rotations; (5) seal the anchor; (6) clear coverage; (7) publish $C(\stx')$.
+
+\textbf{Sign-bytes.} Votes (\ct{DOM\_SIGN\_VOTE}):
+\begin{lstlisting}
+tag || 0x00 || type(1B: 0=prevote,1=precommit) || u64LE(height) || i64LE(round)
+    || (0x00 | 0x01 || value_id) || validator_address
+\end{lstlisting}
+Proposals (\ct{DOM\_SIGN\_PROPOSAL}): \ct{tag||0x00||u64LE(height)||i64LE(round)||i64LE(pol\_round)||value\_id}. Parts (\ct{DOM\_SIGN\_PART}): \ct{tag||0x00||} part tag 0 (Init: height, round, pol\_round, proposer) / 1 (TxBatch chunk: u64LE length || bytes) / 2 (Fin: value\_id). The Fin carries only the value id: proposal authenticity is the engine's signed proposal --- \emph{one key, one signer} (Invariant~\ref{inv:single}).
+
+\textbf{Rotation.} $\ct{RotationCert} = \{\mathit{root\_pk}, \mathit{new\_op\_pk}, \mathit{epoch}, \mathit{valid\_from}, \sigma_{\mathrm{root}}\}$: valid iff the root is the validator's registered root, the epoch strictly increases, and the SLH-DSA signature verifies; on commit all nodes swap \ct{op\_pk} and the owner swaps its live signer in the same commit.
+
+\textbf{Reserve-then-sign (normative).} A signer MUST durably persist $\mathit{used}\cat\mathit{state}$ (write, fsync, atomic rename) before releasing any signature, and MUST resume from it on restart. Observed one-time-leaf reuse is equivocation evidence.
+
+\section{Wire and digest encodings}
+Consensus wire and WAL: bincode over fixed-field structures (deterministic, no maps). Byte fields are \emph{format-aware}: raw in binary formats; lowercase hex in human-readable surfaces (RPC, receipts, genesis). $d(T)$, txid, and all sign-bytes are codec-independent (Invariant~\ref{inv:codec}); a codec change alters wire/WAL compatibility only.
+
+\section{Confidentiality layer}
+\textbf{Seal} (sender), for output $o$ to $(\mathit{tag}, \mathit{ek}_e)$: $(\mathit{ss}, \mathit{ct}_{\mathrm{kem}}) = \mathrm{Encaps}(\mathit{ek}_e)$; $k = \Hs(\ct{note-key}, \mathit{ss}\cat\mathit{ctx})$; $c\cat\tau = \mathrm{Seal}(k, \nu{=}\mathit{cm}(o), o\cat\mathit{memo})$; publish $\mathit{ct}_{\mathrm{kem}} \cat c \cat \tau$. \textbf{Scan} (recipient), per entry $(i, \mathit{cm}, \mathit{blob})$: split at \ct{CT\_LEN}; decapsulate (implicit rejection); derive $k'$; if $\mathrm{Open}$ succeeds, parse the note and \emph{require} $\Hc(1, \mathit{note}) = \mathit{cm}$ --- the lying-ciphertext rule. \textbf{IVK}$_e$ $= \mathit{dk}_e$ ($+$ context): one epoch's discovery$+$decryption; no spend authority, no $\mathit{nk}$. \textbf{Disclosure package} $D = \{\mathit{chain\_id}, k, \mathit{payload}, \mathit{cm}, \mathit{index}, \mathit{path}, \mathit{anchor}\}$; $\mathrm{Verify}(D)$, offline and pure: (1) $\mathrm{Open}(k, \mathit{cm}, \mathit{payload})$; (2) $\Hc(1, \mathit{note}) = \mathit{cm}$; (3) $\mathrm{Fold}_{32}((\mathit{cm}, \mathit{index}), \mathit{path}) = \mathit{anchor}$. One key opens exactly one payment.
+
+\section{Verifying-key pinning and version pools}\label{sec:pins}
+Genesis MAY (mainnet: MUST) carry $\ct{vk\_pins} = \{\mathrm{spend}, \mathrm{mint}, \mathrm{agg}\}$, each $= \mathrm{hex}(\Hs(\ct{vk-pin}, \mathrm{vkbytes}))$; a verifying node MUST refuse to run on mismatch. Statement changes ship as new pool versions with fresh pins; old-version notes migrate by spending into the new pool.
+
+\section{Consensus-critical invariants}
+\begin{inv}[Determinism] $\Upsilon$ and block processing are pure in $(\stx, \mathit{block})$; honest replicas replay to identical $C(\stx)$. \end{inv}
+\begin{inv}[Parent binding]\label{inv:parent} The value id commits to $\mathit{parent\_app\_hash}$; divergence cannot gather votes. \end{inv}
+\begin{inv}[Single signer]\label{inv:single} One consensus signer per node; one-time-leaf reuse is equivocation. \end{inv}
+\begin{inv}[Chain-derived statements]\label{inv:derived} Proofs verify only against $\hat P$ computed from transaction fields. \end{inv}
+\begin{inv}[Conservation] Transparent supply $+$ \ct{total\_shielded} is preserved by every rule. \end{inv}
+\begin{inv}[Coverage locality]\label{inv:cover} \ct{agg\_cover} never survives its block nor enters $C(\stx)$. \end{inv}
+\begin{inv}[Nullifier permanence] $N$ is append-only; anchor eviction never touches it. \end{inv}
+\begin{inv}[Advisory blobs]\label{inv:blob} No consensus rule depends on stealth-ciphertext contents. \end{inv}
+\begin{inv}[Codec independence]\label{inv:codec} Signatures and identifiers are invariant under wire-codec change. \end{inv}
+\begin{inv}[Atomic refusal] A rejected payload mutates nothing; nullifiers burn only on success. \end{inv}
+
+\section{Receipts (normative strings, excerpt)}
+\ct{ok: <n> event(s)} \textperiodcentered\ \ct{rejected: mandate: insufficient buffer at depth <k> from leaf (have <a>, need <b>)} \textperiodcentered\ \ct{rejected: mandate: per-tx cap at depth <k>} \textperiodcentered\ \ct{rejected: mandate: revoked at depth <k>} \textperiodcentered\ \ct{rejected: nullifier already spent (double spend)} \textperiodcentered\ \ct{rejected: unknown anchor} \textperiodcentered\ \ct{rejected: pool proof rejected (invalid, or no verifier wired)} \textperiodcentered\ \ct{rejected: fee requires a credit account} \textperiodcentered\ channel and envelope analogues per the reference implementation's typed error set.
+
+\section{Domain registries}\label{sec:registry}
+\textbf{Chain-side string tags (SHAKE-256; normative list in \ct{hk-crypto::hash}):} \ct{hk/v1/tx}, \ct{hk/v1/txid}, \ct{hk/v1/state-commit}, \ct{hk/v1/account-id}, \ct{hk/v1/mandate-id}, \ct{hk/v1/channel-id}, \ct{hk/v1/delegation-cert}, \ct{hk/v1/payword-seed}, \ct{hk/v1/payword-link}, \ct{hk/v1/lamport-\{sk,leaf,pk-commit\}}, \ct{hk/v1/mlkem-note-seed}, \ct{hk/v1/note-\{key,enc,mac\}}, \ct{hk/v1/agg-cover}, \ct{hk/v1/vk-pin}, plus block-value and consensus signing tags.
+
+\textbf{In-circuit byte domains (SHA-256):} 1 note commitment \textperiodcentered\ 2 commitment-tree node \textperiodcentered\ 3 WOTS pk digest/owner \textperiodcentered\ 4 nullifier \textperiodcentered\ 5 WOTS chain step \textperiodcentered\ 6 WOTS sk derivation (host) \textperiodcentered\ 7 tx binding \textperiodcentered\ 8 spend-tree node \textperiodcentered\ 9 address tag \textperiodcentered\ 10 nk commitment \textperiodcentered\ 11 nk seed (host) \textperiodcentered\ 12 per-leaf WOTS seed (host).
+
+\vspace{0.6em}
+\noindent\small\emph{HashKinetics yellowpaper v1.0 (2026-08-18). Normative companions: the reference implementation and its test suite; \ct{docs/SHIELDED-POOL-SPEC.md} (narrative protocol detail); the whitepaper (motivation, economics, history).}
+
+\end{document}

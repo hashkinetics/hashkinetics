@@ -1,0 +1,132 @@
+use std::borrow::{Borrow, BorrowMut};
+
+use openvm_cpu_backend::CpuBackend;
+use openvm_stark_backend::{proof::Proof, prover::AirProvingContext};
+use openvm_stark_sdk::config::baby_bear_poseidon2::{
+    poseidon2_compress_with_capacity, BabyBearPoseidon2Config, DIGEST_SIZE, F,
+};
+use openvm_verify_stark_host::pvs::{DeferralPvs, VerifierBasePvs};
+use p3_field::{Field, PrimeCharacteristicRing, PrimeField32};
+use p3_matrix::dense::RowMajorMatrix;
+
+use crate::{
+    circuit::{
+        deferral::{
+            hook::verifier::air::DeferralHookPvsCols, DeferralAggregationPvs, DEF_AGG_PVS_AIR_ID,
+            DEF_AGG_VERIFIER_AIR_ID,
+        },
+        root::NUM_DIGESTS_IN_VM_COMMIT,
+        subair::hash_slice_trace,
+        SingleAirTraceData,
+    },
+    utils::{digests_to_poseidon2_input, pad_slice_to_poseidon2_input, zero_hash},
+    SC,
+};
+
+pub struct DeferralHookVerifierTraceCtx {
+    pub trace_data: SingleAirTraceData<CpuBackend<BabyBearPoseidon2Config>>,
+    pub def_circuit_commit: [F; DIGEST_SIZE],
+}
+
+pub fn def_circuit_commit_from_verifier_pvs(verifier_pvs: &VerifierBasePvs<F>) -> [F; DIGEST_SIZE] {
+    let hash_elements = [
+        verifier_pvs.app_vk_commit.cached_commit,
+        verifier_pvs.app_vk_commit.vk_pre_hash,
+        verifier_pvs.leaf_vk_commit.cached_commit,
+        verifier_pvs.leaf_vk_commit.vk_pre_hash,
+        verifier_pvs.internal_for_leaf_vk_commit.cached_commit,
+        verifier_pvs.internal_for_leaf_vk_commit.vk_pre_hash,
+    ];
+    hash_slice_trace(&hash_elements, None, None).1
+}
+
+pub fn generate_proving_ctx(
+    proof: &Proof<SC>,
+    input_onion: [F; DIGEST_SIZE],
+    output_onion: [F; DIGEST_SIZE],
+) -> DeferralHookVerifierTraceCtx {
+    let verifier_pvs: &VerifierBasePvs<F> = proof.public_values[DEF_AGG_VERIFIER_AIR_ID]
+        .as_slice()
+        .borrow();
+    let def_pvs: &DeferralAggregationPvs<F> =
+        proof.public_values[DEF_AGG_PVS_AIR_ID].as_slice().borrow();
+
+    let hash_elements = [
+        verifier_pvs.app_vk_commit.cached_commit,
+        verifier_pvs.app_vk_commit.vk_pre_hash,
+        verifier_pvs.leaf_vk_commit.cached_commit,
+        verifier_pvs.leaf_vk_commit.vk_pre_hash,
+        verifier_pvs.internal_for_leaf_vk_commit.cached_commit,
+        verifier_pvs.internal_for_leaf_vk_commit.vk_pre_hash,
+    ];
+
+    let width = DeferralHookPvsCols::<u8>::width();
+    let mut trace = vec![F::ZERO; width];
+    let cols: &mut DeferralHookPvsCols<F> = trace.as_mut_slice().borrow_mut();
+    cols.verifier_pvs = *verifier_pvs;
+    cols.def_pvs = *def_pvs;
+    let depth_minus_one = verifier_pvs.recursion_depth - F::ONE;
+    cols.recursion_depth_minus_one_inv = if depth_minus_one == F::ZERO {
+        F::ZERO
+    } else {
+        depth_minus_one.inverse()
+    };
+    let range_check_inputs = vec![depth_minus_one.as_canonical_u32() as usize];
+    cols.num_merkle_leaves =
+        F::from_usize(1usize << def_pvs.merkle_depth.as_canonical_u32() as usize);
+    cols.input_onion = input_onion;
+    cols.output_onion = output_onion;
+
+    let mut poseidon2_compress_inputs = Vec::with_capacity(6);
+    let mut poseidon2_permute_inputs = Vec::with_capacity(NUM_DIGESTS_IN_VM_COMMIT - 1);
+    let (intermediate_vk_states, def_circuit_commit) = hash_slice_trace(
+        &hash_elements,
+        Some(&mut poseidon2_permute_inputs),
+        Some(&mut poseidon2_compress_inputs),
+    );
+    cols.intermediate_vk_states = intermediate_vk_states.try_into().unwrap();
+    cols.def_circuit_commit = def_circuit_commit;
+
+    const ZERO_DIGEST: [F; DIGEST_SIZE] = [F::ZERO; DIGEST_SIZE];
+    let def_circuit_commit_padded =
+        poseidon2_compress_with_capacity(def_circuit_commit, ZERO_DIGEST).0;
+    let input_onion_padded = poseidon2_compress_with_capacity(input_onion, ZERO_DIGEST).0;
+    let output_onion_padded = poseidon2_compress_with_capacity(output_onion, ZERO_DIGEST).0;
+    cols.def_circuit_commit_padded = def_circuit_commit_padded;
+    cols.input_onion_padded = input_onion_padded;
+    cols.output_onion_padded = output_onion_padded;
+
+    let zero_hash = zero_hash(1);
+    let initial_acc_hash = poseidon2_compress_with_capacity(def_circuit_commit_padded, zero_hash).0;
+    let final_acc_hash =
+        poseidon2_compress_with_capacity(input_onion_padded, output_onion_padded).0;
+
+    let mut public_values = vec![F::ZERO; DeferralPvs::<u8>::width()];
+    let root_pvs: &mut DeferralPvs<F> = public_values.as_mut_slice().borrow_mut();
+    root_pvs.initial_acc_hash = initial_acc_hash;
+    root_pvs.final_acc_hash = final_acc_hash;
+    root_pvs.depth = F::ONE;
+    root_pvs.node_idx = def_pvs.def_idx;
+
+    poseidon2_compress_inputs.extend_from_slice(&[
+        pad_slice_to_poseidon2_input(&def_circuit_commit, F::ZERO),
+        pad_slice_to_poseidon2_input(&input_onion, F::ZERO),
+        pad_slice_to_poseidon2_input(&output_onion, F::ZERO),
+        digests_to_poseidon2_input(def_circuit_commit_padded, zero_hash),
+        digests_to_poseidon2_input(input_onion_padded, output_onion_padded),
+    ]);
+
+    DeferralHookVerifierTraceCtx {
+        trace_data: SingleAirTraceData {
+            air_proving_ctx: AirProvingContext {
+                cached_mains: vec![],
+                common_main: RowMajorMatrix::new(trace, width),
+                public_values,
+            },
+            poseidon2_compress_inputs,
+            poseidon2_permute_inputs,
+            range_check_inputs,
+        },
+        def_circuit_commit,
+    }
+}

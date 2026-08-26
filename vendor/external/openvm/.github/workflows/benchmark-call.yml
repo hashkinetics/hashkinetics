@@ -1,0 +1,259 @@
+name: Run Individual Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      benchmark_name:
+        type: string
+        required: true
+        description: The name of the benchmark to run
+      instance_type:
+        type: string
+        required: false
+        description: The AWS instance type or family (e.g., m8g.16xlarge)
+        default: g7.4xlarge
+      memory_allocator:
+        type: string
+        required: false
+        description: Memory allocator to use (mimalloc or jemalloc)
+        default: jemalloc
+      e2e_bench:
+        type: boolean
+        required: false
+        description: Whether to run full e2e benchmark (aggregation + halo2)
+        default: false
+      kzg_params_dir:
+        type: string
+        required: false
+        description: Directory containing KZG trusted setup files
+      features:
+        type: string
+        required: false
+        description: Host features, comma separated (aggregation,perf-metrics)
+  workflow_call:
+    inputs:
+      benchmark_name:
+        type: string
+        required: true
+        description: The name of the benchmark to run
+      benchmark_id:
+        type: string
+        required: true
+        description: The id of the benchmark to run, must be unique within matrix
+      instance_type:
+        type: string
+        required: false
+        description: The AWS instance type or family (e.g., m8g.16xlarge)
+        default: g7.4xlarge
+      memory_allocator:
+        type: string
+        required: false
+        description: Memory allocator to use (mimalloc or jemalloc)
+        default: jemalloc
+      e2e_bench:
+        type: boolean
+        required: false
+        description: Whether to run full e2e benchmark (aggregation + halo2)
+        default: false
+      kzg_params_dir:
+        type: string
+        required: false
+        description: Directory containing KZG trusted setup files
+      features:
+        type: string
+        required: false
+        description: Host features, comma separated (aggregation,perf-metrics)
+      job_index:
+        type: string
+        required: false
+        description: Job index from strategy matrix
+        default: "0"
+      is_merge_queue:
+        type: boolean
+        required: false
+        description: Whether this is being called from merge queue
+        default: false
+
+env:
+  S3_METRICS_PATH: s3://${{ vars.OPENVM_S3_DATA_BUCKET }}/benchmark/github/metrics
+  S3_PUBLIC_PATH_BASE: s3://${{ vars.OPENVM_S3_DATA_BUCKET }}/benchmark/github
+  FEATURE_FLAGS: "metrics,parallel,tco"
+  INPUT_ARGS: ""
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+permissions:
+  contents: write
+
+jobs:
+  bench-new:
+    name: Run benchmark
+    runs-on:
+      - runs-on=${{ github.run_id }}-benchcall-${{ github.run_attempt }}-${{ inputs.job_index || inputs.benchmark_id || inputs.benchmark_name || github.event.inputs.benchmark_name }}/family=${{ inputs.instance_type || github.event.inputs.instance_type }}/image=${{ startsWith(inputs.instance_type || github.event.inputs.instance_type, 'g') && 'ubuntu24-gpu-x64' || contains(inputs.instance_type || github.event.inputs.instance_type, 'g.') && 'ubuntu24-full-arm64' || 'ubuntu24-full-x64' }}/volume=80gb/spot=capacity-optimized/extras=s3-cache
+    steps:
+      - uses: runs-on/action@v2
+        with:
+          sccache: s3
+      ##########################################################################
+      # Environment setup                                                      #
+      ##########################################################################
+      - name: Load SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: |
+            ${{ secrets.GH_ACTIONS_DEPLOY_PRIVATE_KEY }}
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+      - run: | # avoid cross-device link error
+          rustup component remove clippy || true
+          rm -rf ~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu || true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/sccache
+
+      # TODO: remove once https://github.com/runs-on/runner-images-for-aws/issues/55 is fixed
+      - name: Setup GPU driver
+        if: ${{ startsWith(inputs.instance_type || github.event.inputs.instance_type, 'g') }}
+        run: bash ./scripts/gpu_driver_setup.sh
+
+      - uses: ./.github/actions/rust-cache-cuda
+        with:
+          cache-on-failure: true
+
+      - name: Install architecture specific tools
+        run: |
+          source ci/scripts/utils.sh
+          install_s5cmd
+
+      - name: Display workflow inputs
+        run: echo "${{ toJSON(inputs) }}"
+      - name: "Feature flags: memory allocator + e2e"
+        run: |
+          ALLOCATOR=${{ inputs.memory_allocator || github.event.inputs.memory_allocator }}
+          if [[ ! "${{ inputs.instance_type || github.event.inputs.instance_type }}" =~ ^g ]]; then
+            FEATURE_FLAGS=${FEATURE_FLAGS}
+          else
+            FEATURE_FLAGS=${FEATURE_FLAGS},cuda
+          fi
+          echo "FEATURE_FLAGS=$ALLOCATOR,${FEATURE_FLAGS}" >> $GITHUB_ENV
+      - name: "Feature flags: workflow"
+        if: inputs.features || github.event.inputs.features
+        run: |
+          EXTRA_FEATURES=${{ inputs.features || github.event.inputs.features }}
+          echo "FEATURE_FLAGS=${FEATURE_FLAGS},$EXTRA_FEATURES" >> $GITHUB_ENV
+
+      - name: Setup e2e (halo2 and arguments)
+        run: |
+          E2E_BENCH=${{ inputs.e2e_bench }}
+          echo "E2E_BENCH=${E2E_BENCH}" >> $GITHUB_ENV
+
+          if [[ "${E2E_BENCH}" == "true" ]]; then
+            FEATURE_FLAGS=${FEATURE_FLAGS},evm
+            # On GPU instances, prove the halo2/EVM layer on GPU too (halo2-gpu implies cuda + evm).
+            if [[ "${{ inputs.instance_type || github.event.inputs.instance_type }}" =~ ^g ]]; then
+              FEATURE_FLAGS=${FEATURE_FLAGS},halo2-gpu
+            fi
+            echo "FEATURE_FLAGS=${FEATURE_FLAGS}" >> $GITHUB_ENV
+            bash ./scripts/trusted_setup_s3.sh
+            PARAMS_DIR=${{ inputs.kzg_params_dir || github.event.inputs.kzg_params_dir || '$HOME/.openvm/params' }}
+            INPUT_ARGS="${INPUT_ARGS} --evm --kzg-params-dir $PARAMS_DIR"
+            echo "INPUT_ARGS=${INPUT_ARGS}" >> $GITHUB_ENV
+          fi
+
+      - name: Install solc
+        if: env.E2E_BENCH == 'true'
+        run: (hash svm 2>/dev/null || cargo install --locked --version 0.2.23 svm-rs) && svm install 0.8.19 && solc --version
+
+      - name: Set BIN_NAME
+        run: |
+          echo "BIN_NAME=${{ inputs.benchmark_name }}" >> $GITHUB_ENV
+
+      - name: Set working directory
+        id: set-working-dir
+        run: |
+          WORKING_DIR=$(jq -r --arg id "${{ inputs.benchmark_id }}" '
+            .benchmarks[] |
+            select(.id == $id) |
+            .working_directory
+          ' ./ci/benchmark-config.json)
+          RELATIVE_PATH=$(python3 -c "import os.path; print(os.path.relpath('.', '$WORKING_DIR'))")
+          echo "working_dir=$WORKING_DIR" >> $GITHUB_OUTPUT
+          echo "relative_path=$RELATIVE_PATH" >> $GITHUB_OUTPUT
+
+      # Metric name is unique within a run (matrix)
+      # When uploading to S3, use ${METRIC_NAME}-${current_sha}.[md/json]
+      - name: Set metric name
+        run: |
+          METRIC_NAME=${{ inputs.benchmark_id || inputs.benchmark_name }}
+          echo "METRIC_NAME=${METRIC_NAME}" >> $GITHUB_ENV
+          METRIC_PATH=".bench_metrics/${METRIC_NAME}.json"
+          echo "METRIC_PATH=${METRIC_PATH}" >> $GITHUB_ENV
+
+      - name: Set input args
+        run: |
+          FEATURES="--features $FEATURE_FLAGS"
+          OUTPUT_PATH="--output_path $(pwd)/$METRIC_PATH"
+          echo "INPUT_ARGS=${FEATURES} ${OUTPUT_PATH} ${INPUT_ARGS}" >> $GITHUB_ENV
+          echo "VPMM_PAGES=2048" >> $GITHUB_ENV # 4GB
+
+      ##########################################################################
+      # Find working directory based on benchmark_name and run the benchmark   #
+      ##########################################################################
+      - name: Run benchmark
+        working-directory: ${{ steps.set-working-dir.outputs.working_dir }}
+        run: |
+          export JEMALLOC_SYS_WITH_MALLOC_CONF="retain:true,background_thread:true,metadata_thp:always,thp:always,dirty_decay_ms:-1,muzzy_decay_ms:-1,abort_conf:true"
+          export RUST_BACKTRACE=1
+          python3 ${{ steps.set-working-dir.outputs.relative_path }}/ci/scripts/bench.py $BIN_NAME $INPUT_ARGS
+
+      ##########################################################################
+      # Store metric json file to S3                                           #
+      ##########################################################################
+      - name: Upload metric json and compute diff with previous to generate markdown
+        run: |
+          current_sha=$(git rev-parse HEAD)
+          echo "Current SHA: $current_sha"
+          echo "current_sha=${current_sha}" >> $GITHUB_ENV
+
+          s5cmd cp $METRIC_PATH ${{ env.S3_METRICS_PATH }}/${METRIC_NAME}-${current_sha}.json
+
+      - name: Install inferno-flamegraph
+        if: ${{ contains(env.FEATURE_FLAGS, 'perf-metrics') }}
+        run: cargo install inferno
+
+      - name: Generate flamegraphs
+        if: ${{ contains(env.FEATURE_FLAGS, 'perf-metrics') }}
+        run: |
+          if [[ -f $METRIC_PATH ]]; then
+            GUEST_SYMBOLS_PATH="${METRIC_PATH%.json}.syms"
+            if [[ -f $GUEST_SYMBOLS_PATH ]]; then
+              echo "Generating flamegraphs with guest symbols"
+              python3 ci/scripts/metric_unify/flamegraph.py $METRIC_PATH --guest-symbols $GUEST_SYMBOLS_PATH
+            else
+              echo "No guest symbols found, generating flamegraphs without symbols"
+              python3 ci/scripts/metric_unify/flamegraph.py $METRIC_PATH
+            fi
+            s5cmd cp '.bench_metrics/flamegraphs/*.svg' "${{ env.S3_PUBLIC_PATH_BASE }}/flamegraphs/${current_sha}/"
+            echo "UPLOAD_FLAMEGRAPHS=1" >> $GITHUB_ENV
+          fi
+
+      ##########################################################################
+      # Update s3 for latest branch metrics upon a push event                  #
+      ##########################################################################
+      - name: Update latest branch result in s3
+        if: github.event_name == 'push' || inputs.is_merge_queue == true
+        run: |
+          # Treat merge_queue events as main branch for ref-hash purposes
+          if [[ "${{ inputs.is_merge_queue }}" == "true" ]]; then
+            REF_HASH="main"
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            # for backwards compatibility
+            REF_HASH="main"
+          else
+            REF_HASH=$(echo "${{ github.ref }}" | sha256sum | cut -d' ' -f1)
+          fi
+          s5cmd cp $METRIC_PATH "${{ env.S3_METRICS_PATH }}/${REF_HASH}-${METRIC_NAME}.json"
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true

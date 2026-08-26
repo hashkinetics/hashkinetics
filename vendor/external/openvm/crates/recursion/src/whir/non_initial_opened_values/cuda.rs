@@ -1,0 +1,97 @@
+use openvm_cuda_backend::{base::DeviceMatrix, prelude::F, GpuBackend};
+use openvm_cuda_common::{memory_manager::MemTracker, stream::GpuDeviceCtx};
+use openvm_stark_backend::{prover::AirProvingContext, SystemParams};
+use p3_field::TwoAdicField;
+
+use crate::{
+    cuda::to_device_or_nullptr_on,
+    tracegen::ModuleChip,
+    whir::{
+        cuda_abi::non_initial_opened_values_tracegen, cuda_tracegen::WhirBlobGpu,
+        non_initial_opened_values::NonInitialOpenedValuesCols, num_queries_per_round,
+        WhirQueryLayout,
+    },
+};
+
+pub(in crate::whir) struct NonInitialOpenedValuesGpuCtx<'a> {
+    pub blob: &'a WhirBlobGpu,
+    pub params: &'a SystemParams,
+    pub device_ctx: &'a GpuDeviceCtx,
+}
+
+pub(in crate::whir) struct NonInitialOpenedValuesGpuTraceGenerator;
+
+impl ModuleChip<GpuBackend> for NonInitialOpenedValuesGpuTraceGenerator {
+    type Ctx<'a> = NonInitialOpenedValuesGpuCtx<'a>;
+
+    #[tracing::instrument(level = "trace", skip_all)]
+    fn generate_proving_ctx(
+        &self,
+        ctx: &Self::Ctx<'_>,
+        required_height: Option<usize>,
+    ) -> Option<AirProvingContext<GpuBackend>> {
+        let blob = ctx.blob;
+        let params = ctx.params;
+        let device_ctx = ctx.device_ctx;
+
+        let mem = MemTracker::start("tracegen.whir_non_initial_opened_values");
+        let num_valid_rows = blob.codeword_opened_values.len();
+        let height = if let Some(h) = required_height {
+            if h < num_valid_rows {
+                return None;
+            }
+            h
+        } else {
+            num_valid_rows.next_power_of_two()
+        };
+        let width = NonInitialOpenedValuesCols::<F>::width();
+        let trace_d = DeviceMatrix::with_capacity_on(height, width, device_ctx);
+
+        let num_rounds = params.num_whir_rounds();
+        let num_queries_per_round = num_queries_per_round(params);
+        let query_layout = WhirQueryLayout::new(1, &num_queries_per_round);
+        let total_queries = query_layout.queries_per_proof();
+        let k_whir = params.k_whir();
+        let rows_per_query = 1 << k_whir;
+
+        // Compute round_row_offsets for rounds 1..num_rounds (non-initial rounds)
+        let mut round_row_offsets = Vec::with_capacity(num_rounds);
+        round_row_offsets.push(0usize);
+        for whir_round in 1..num_rounds {
+            let rows_this_round = query_layout.round_num_queries(whir_round) * rows_per_query;
+            round_row_offsets.push(round_row_offsets.last().unwrap() + rows_this_round);
+        }
+        let rows_per_proof = *round_row_offsets.last().unwrap();
+
+        let round_row_offsets_d = to_device_or_nullptr_on(&round_row_offsets, device_ctx).unwrap();
+        let round_query_offsets_d =
+            to_device_or_nullptr_on(query_layout.query_offsets(), device_ctx).unwrap();
+
+        let omega_k = F::two_adic_generator(k_whir);
+        unsafe {
+            non_initial_opened_values_tracegen(
+                trace_d.buffer(),
+                num_valid_rows,
+                height,
+                &blob.codeword_opened_values,
+                &blob.codeword_states,
+                num_rounds,
+                k_whir,
+                omega_k,
+                &blob.zis,
+                &blob.zi_roots,
+                &blob.yis,
+                &blob.raw_queries,
+                &round_row_offsets_d,
+                rows_per_proof,
+                &round_query_offsets_d,
+                total_queries,
+                device_ctx.stream.as_raw(),
+            )
+            .unwrap();
+        }
+
+        mem.emit_metrics();
+        Some(AirProvingContext::simple_no_pis(trace_d))
+    }
+}

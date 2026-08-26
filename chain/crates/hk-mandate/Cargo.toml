@@ -1,0 +1,10 @@
+[package]
+name = "hk-mandate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hk-primitives = { path = "../hk-primitives" }
+thiserror = { workspace = true }
+serde = { workspace = true }

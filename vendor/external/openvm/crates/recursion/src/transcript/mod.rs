@@ -1,0 +1,669 @@
+use core::borrow::BorrowMut;
+use std::sync::Arc;
+
+use itertools::Itertools;
+use openvm_cpu_backend::CpuBackend;
+use openvm_poseidon2_air::{Poseidon2Config, Poseidon2SubChip, POSEIDON2_WIDTH};
+use openvm_stark_backend::{
+    keygen::types::MultiStarkVerifyingKey, p3_maybe_rayon::prelude::*, proof::Proof,
+    prover::AirProvingContext, AirRef, StarkProtocolConfig, SystemParams,
+};
+use openvm_stark_sdk::config::baby_bear_poseidon2::{poseidon2_perm, BabyBearPoseidon2Config, F};
+use p3_air::BaseAir;
+use p3_baby_bear::Poseidon2BabyBear;
+use p3_field::{PrimeCharacteristicRing, PrimeField32};
+use p3_matrix::dense::RowMajorMatrix;
+use p3_symmetric::Permutation;
+use tracing::trace_span;
+
+use crate::{
+    system::{AirModule, BusInventory, GlobalCtxCpu, Preflight, TraceGenModule},
+    transcript::{
+        merkle_verify::{MerkleVerifyAir, MerkleVerifyCols},
+        poseidon2::{Poseidon2Air, Poseidon2Cols, CHUNK},
+        transcript::{TranscriptAir, TranscriptCols},
+    },
+};
+
+#[cfg(feature = "cuda")]
+mod cuda_abi;
+pub mod merkle_verify;
+pub mod poseidon2;
+#[allow(clippy::module_inception)]
+pub mod transcript;
+
+// Should be 1 when 3 <= max_constraint_degree < 7
+const SBOX_REGISTERS: usize = 1;
+
+pub struct TranscriptModule {
+    pub bus_inventory: BusInventory,
+    params: SystemParams,
+    final_state_bus_enabled: bool,
+
+    sub_chip: Poseidon2SubChip<F, SBOX_REGISTERS>,
+    perm: Poseidon2BabyBear<POSEIDON2_WIDTH>,
+}
+
+impl TranscriptModule {
+    pub fn new(
+        bus_inventory: BusInventory,
+        params: SystemParams,
+        final_state_bus_enabled: bool,
+    ) -> Self {
+        let sub_chip = Poseidon2SubChip::<F, 1>::new(Poseidon2Config::default().constants);
+        Self {
+            bus_inventory,
+            params,
+            final_state_bus_enabled,
+            sub_chip,
+            perm: poseidon2_perm().clone(),
+        }
+    }
+
+    // Builds trace for transcript and merkle verify AIRs (and records poseidon2 permutations).
+    // Also combines in the poseidon2 permutations from preflight (from WHIR).
+    #[tracing::instrument(name = "generate_trace", level = "trace", skip_all)]
+    fn build_trace_artifacts(
+        &self,
+        preflights: &[Preflight],
+        mut poseidon2_perm_inputs: Vec<[F; POSEIDON2_WIDTH]>,
+        mut poseidon2_compress_inputs: Vec<[F; POSEIDON2_WIDTH]>,
+        required_height: Option<usize>,
+    ) -> Option<TranscriptTraceArtifacts> {
+        let transcript_width = TranscriptCols::<F>::width();
+        let mut valid_rows = Vec::with_capacity(preflights.len());
+
+        let mut transcript_valid_rows = 0;
+        // First pass, calculate number of rows for transcript
+        for preflight in preflights.iter() {
+            poseidon2_perm_inputs.extend_from_slice(&preflight.poseidon2_perm_inputs);
+            poseidon2_compress_inputs.extend_from_slice(&preflight.poseidon2_compress_inputs);
+            let mut cur_is_sample = false; // should always start with observe?
+            let mut count = 0;
+            let mut num_valid_rows: usize = 0;
+            for op_is_sample in preflight.transcript.samples() {
+                if *op_is_sample {
+                    // sample
+                    if !cur_is_sample {
+                        // observe -> sample, need a new row and permute
+                        num_valid_rows += 1;
+                        cur_is_sample = true;
+                        count = 1;
+                    } else {
+                        if count == CHUNK {
+                            num_valid_rows += 1;
+                            count = 0;
+                        }
+                        count += 1;
+                    }
+                } else {
+                    // observe
+                    if cur_is_sample {
+                        // sample -> observe, no need to permute, but still need a new row
+                        num_valid_rows += 1;
+                        cur_is_sample = false;
+                        count = 1;
+                    } else {
+                        if count == CHUNK {
+                            num_valid_rows += 1;
+                            count = 0;
+                        }
+                        count += 1;
+                    }
+                }
+            }
+            if count > 0 {
+                num_valid_rows += 1;
+            }
+            valid_rows.push(num_valid_rows);
+            transcript_valid_rows += num_valid_rows;
+        }
+        let transcript_num_rows = if let Some(height) = required_height {
+            if height < transcript_valid_rows {
+                return None;
+            }
+            height
+        } else {
+            transcript_valid_rows.next_power_of_two()
+        };
+        let mut transcript_trace = vec![F::ZERO; transcript_num_rows * transcript_width];
+
+        let mut skip = 0;
+        // Second pass, fill in the transcript trace.
+        for (pidx, preflight) in preflights.iter().enumerate() {
+            let mut tidx = 0;
+            let mut prev_poseidon_state = [F::ZERO; POSEIDON2_WIDTH];
+            let off = skip * transcript_width;
+            let end = off + valid_rows[pidx] * transcript_width;
+            for (i, row) in transcript_trace[off..end]
+                .chunks_exact_mut(transcript_width)
+                .enumerate()
+            {
+                let cols: &mut TranscriptCols<F> = row.borrow_mut();
+                cols.proof_idx = F::from_usize(pidx);
+                if i == 0 {
+                    cols.is_proof_start = F::ONE;
+                }
+                let is_sample = preflight.transcript.samples()[tidx];
+
+                cols.is_sample = F::from_bool(is_sample);
+                cols.tidx = F::from_usize(tidx);
+                cols.mask[0] = F::from_bool(true);
+
+                cols.prev_state = prev_poseidon_state;
+
+                if is_sample {
+                    debug_assert_eq!(
+                        cols.prev_state[CHUNK - 1],
+                        preflight.transcript.values()[tidx],
+                        "sample value mismatch",
+                    );
+                } else {
+                    cols.prev_state[0] = preflight.transcript.values()[tidx];
+                }
+
+                tidx += 1;
+                let mut idx: usize = 1;
+
+                let mut permuted = false;
+                loop {
+                    if tidx >= preflight.transcript.len() {
+                        // at the end, no permutation needed
+                        break;
+                    }
+
+                    if preflight.transcript.samples()[tidx] != is_sample {
+                        // encounter a different type of operation. Permute if it's going to sample
+                        permuted = preflight.transcript.samples()[tidx];
+                        break;
+                    }
+
+                    cols.mask[idx] = F::from_bool(true);
+                    if is_sample {
+                        debug_assert_eq!(
+                            cols.prev_state[CHUNK - 1 - idx],
+                            preflight.transcript.values()[tidx],
+                            "sample value mismatch",
+                        );
+                    } else {
+                        cols.prev_state[idx] = preflight.transcript.values()[tidx];
+                    }
+
+                    tidx += 1;
+                    idx += 1;
+                    if idx == CHUNK {
+                        // If it's sample -> observe, we don't need to permute. otherwise permute
+                        permuted = tidx < preflight.transcript.len()
+                            && (!is_sample || preflight.transcript.samples()[tidx]);
+                        break;
+                    }
+                }
+
+                prev_poseidon_state = cols.prev_state;
+                if permuted {
+                    self.perm.permute_mut(&mut prev_poseidon_state);
+                    poseidon2_perm_inputs.push(cols.prev_state);
+                }
+                cols.post_state = prev_poseidon_state;
+            }
+            skip += valid_rows[pidx];
+            assert_eq!(tidx, preflight.transcript.len());
+        }
+
+        Some(TranscriptTraceArtifacts {
+            transcript_trace: RowMajorMatrix::new(transcript_trace, transcript_width),
+            poseidon2_perm_inputs,
+            poseidon2_compress_inputs,
+        })
+    }
+
+    fn dedup_poseidon_inputs(
+        poseidon2_perm_inputs: Vec<[F; POSEIDON2_WIDTH]>,
+        poseidon2_compress_inputs: Vec<[F; POSEIDON2_WIDTH]>,
+    ) -> (Vec<[F; POSEIDON2_WIDTH]>, Vec<Poseidon2Count>) {
+        let keyed_perm_states = poseidon2_perm_inputs
+            .into_iter()
+            .map(|state| (state.map(|x| x.as_canonical_u32()), state, true));
+        let keyed_compress_states = poseidon2_compress_inputs
+            .into_iter()
+            .map(|state| (state.map(|x| x.as_canonical_u32()), state, false));
+        let mut keyed_states = keyed_perm_states
+            .into_iter()
+            .chain(keyed_compress_states)
+            .collect_vec();
+        keyed_states.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        let mut deduped = Vec::new();
+        let mut counts: Vec<Poseidon2Count> = Vec::new();
+        let mut last_key: Option<[u32; POSEIDON2_WIDTH]> = None;
+
+        for (key, state, is_perm) in keyed_states {
+            if last_key == Some(key) {
+                if is_perm {
+                    counts.last_mut().unwrap().perm += 1;
+                } else {
+                    counts.last_mut().unwrap().compress += 1;
+                }
+            } else {
+                deduped.push(state);
+                counts.push(if is_perm {
+                    Poseidon2Count {
+                        perm: 1,
+                        compress: 0,
+                    }
+                } else {
+                    Poseidon2Count {
+                        perm: 0,
+                        compress: 1,
+                    }
+                });
+                last_key = Some(key);
+            }
+        }
+        (deduped, counts)
+    }
+}
+
+impl AirModule for TranscriptModule {
+    fn num_airs(&self) -> usize {
+        3
+    }
+
+    fn airs<SC: StarkProtocolConfig<F = F>>(&self) -> Vec<AirRef<SC>> {
+        let transcript_air = TranscriptAir {
+            transcript_bus: self.bus_inventory.transcript_bus,
+            poseidon2_permute_bus: self.bus_inventory.poseidon2_permute_bus,
+            final_state_bus: self
+                .final_state_bus_enabled
+                .then_some(self.bus_inventory.final_state_bus),
+        };
+        let poseidon2_air = Poseidon2Air::<F, SBOX_REGISTERS> {
+            subair: self.sub_chip.air.clone(),
+            poseidon2_permute_bus: self.bus_inventory.poseidon2_permute_bus,
+            poseidon2_compress_bus: self.bus_inventory.poseidon2_compress_bus,
+        };
+        let merkle_verify_air = MerkleVerifyAir {
+            poseidon2_compress_bus: self.bus_inventory.poseidon2_compress_bus,
+            merkle_verify_bus: self.bus_inventory.merkle_verify_bus,
+            commitments_bus: self.bus_inventory.commitments_bus,
+            right_shift_bus: self.bus_inventory.right_shift_bus,
+            k: self.params.k_whir(),
+        };
+        vec![
+            Arc::new(transcript_air),
+            Arc::new(poseidon2_air),
+            Arc::new(merkle_verify_air),
+        ]
+    }
+}
+
+pub(super) struct TranscriptTraceArtifacts {
+    transcript_trace: RowMajorMatrix<F>,
+    poseidon2_perm_inputs: Vec<[F; POSEIDON2_WIDTH]>,
+    poseidon2_compress_inputs: Vec<[F; POSEIDON2_WIDTH]>,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub(super) struct Poseidon2Count {
+    pub perm: u32,
+    pub compress: u32,
+}
+
+impl<SC: StarkProtocolConfig<F = F>> TraceGenModule<GlobalCtxCpu, CpuBackend<SC>>
+    for TranscriptModule
+{
+    // External Poseidon2 compress inputs
+    type ModuleSpecificCtx<'a> = (&'a Vec<[F; POSEIDON2_WIDTH]>, &'a Vec<[F; POSEIDON2_WIDTH]>);
+
+    #[tracing::instrument(skip_all)]
+    fn generate_proving_ctxs(
+        &self,
+        child_vk: &MultiStarkVerifyingKey<BabyBearPoseidon2Config>,
+        proofs: &[Proof<BabyBearPoseidon2Config>],
+        preflights: &[Preflight],
+        ctx: &Self::ModuleSpecificCtx<'_>,
+        required_heights: Option<&[usize]>,
+    ) -> Option<Vec<AirProvingContext<CpuBackend<SC>>>> {
+        let external_poseidon2_permute_inputs = ctx.0;
+        let external_poseidon2_compress_inputs = ctx.1;
+        let (required_transcript, required_poseidon2, required_merkle_verify) =
+            if let Some(heights) = required_heights {
+                if heights.len() != 3 {
+                    return None;
+                }
+                (Some(heights[0]), Some(heights[1]), Some(heights[2]))
+            } else {
+                (None, None, None)
+            };
+
+        let (merkle_verify_trace_vec, poseidon2_compress_inputs) =
+            tracing::info_span!("wrapper.generate_trace", air = "MerkleVerify").in_scope(|| {
+                merkle_verify::generate_trace(
+                    child_vk,
+                    proofs,
+                    preflights,
+                    &self.params,
+                    required_merkle_verify,
+                )
+            })?;
+        let merkle_verify_trace =
+            RowMajorMatrix::new(merkle_verify_trace_vec, MerkleVerifyCols::<F>::width());
+        let TranscriptTraceArtifacts {
+            transcript_trace,
+            mut poseidon2_perm_inputs,
+            mut poseidon2_compress_inputs,
+        } = tracing::trace_span!("wrapper.generate_trace", air = "Transcript").in_scope(|| {
+            self.build_trace_artifacts(
+                preflights,
+                vec![],
+                poseidon2_compress_inputs,
+                required_transcript,
+            )
+        })?;
+        poseidon2_perm_inputs.extend_from_slice(external_poseidon2_permute_inputs);
+        poseidon2_compress_inputs.extend_from_slice(external_poseidon2_compress_inputs);
+
+        let poseidon2_trace =
+            trace_span!("wrapper.generate_trace", air = "Poseidon2").in_scope(|| {
+                trace_span!("generate_trace").in_scope(|| {
+                    let (mut poseidon_states, poseidon_counts) = Self::dedup_poseidon_inputs(
+                        poseidon2_perm_inputs,
+                        poseidon2_compress_inputs,
+                    );
+                    let poseidon2_valid_rows = poseidon_states.len();
+                    let poseidon2_num_rows = if let Some(height) = required_poseidon2 {
+                        if height == 0 || poseidon2_valid_rows > height {
+                            return None;
+                        }
+                        height
+                    } else if poseidon2_valid_rows == 0 {
+                        1
+                    } else {
+                        poseidon2_valid_rows.next_power_of_two()
+                    };
+                    poseidon_states.resize(poseidon2_num_rows, [F::ZERO; POSEIDON2_WIDTH]);
+
+                    let inner_width = self.sub_chip.air.width();
+                    let poseidon2_width = Poseidon2Cols::<F, SBOX_REGISTERS>::width();
+                    let inner_trace = self.sub_chip.generate_trace(poseidon_states);
+                    let mut poseidon_trace = F::zero_vec(poseidon2_num_rows * poseidon2_width);
+
+                    poseidon_trace
+                        .par_chunks_mut(poseidon2_width)
+                        .zip(inner_trace.values.par_chunks(inner_width))
+                        .enumerate()
+                        .for_each(|(i, (row, inner_row))| {
+                            row[..inner_width].copy_from_slice(inner_row);
+                            let cols: &mut Poseidon2Cols<F, SBOX_REGISTERS> = row.borrow_mut();
+                            let count = poseidon_counts.get(i).copied().unwrap_or_default();
+                            cols.permute_mult = F::from_u32(count.perm);
+                            cols.compress_mult = F::from_u32(count.compress);
+                        });
+                    Some(RowMajorMatrix::new(poseidon_trace, poseidon2_width))
+                })
+            })?;
+
+        // Finally, make the RawInput structs
+        Some(
+            [transcript_trace, poseidon2_trace, merkle_verify_trace]
+                .map(AirProvingContext::simple_no_pis)
+                .into_iter()
+                .collect(),
+        )
+    }
+}
+
+#[cfg(feature = "cuda")]
+mod cuda_tracegen {
+    use itertools::Itertools;
+    use openvm_cuda_backend::{base::DeviceMatrix, prelude::F, GpuBackend};
+    use openvm_cuda_common::{
+        copy::{MemCopyD2H, MemCopyH2D},
+        d_buffer::DeviceBuffer,
+        stream::GpuDeviceCtx,
+    };
+    use openvm_stark_backend::prover::MatrixDimensions;
+
+    use super::*;
+    use crate::{
+        cuda::{preflight::PreflightGpu, proof::ProofGpu, vk::VerifyingKeyGpu, GlobalCtxGpu},
+        transcript::{
+            cuda_abi,
+            merkle_verify::{self, cuda::MerkleVerifyBlob},
+            transcript::cuda::TranscriptAirBlob,
+        },
+    };
+
+    pub(crate) struct TranscriptBlob {
+        pub merkle_verify_blob: MerkleVerifyBlob,
+        pub transcript_air_blob: TranscriptAirBlob,
+
+        // Because we currently can only copy to the beginning of a DeviceBuffer, the layout is
+        // expected to be in this order:
+        // - Preflight permutations
+        // - Preflight compressions
+        // - Merkle verify compressions
+        // - Transcript permutations
+        pub poseidon2_buffer: DeviceBuffer<F>,
+        pub num_prefix_perms: usize,
+        pub num_suffix_perms: usize,
+        pub num_compress_inputs: usize,
+    }
+
+    impl TranscriptBlob {
+        #[tracing::instrument(name = "generate_blob", skip_all)]
+        pub fn new(
+            child_vk: &VerifyingKeyGpu,
+            proofs: &[ProofGpu],
+            preflights: &[PreflightGpu],
+            external_poseidon2_inputs: &(
+                &Vec<[F; POSEIDON2_WIDTH]>,
+                &Vec<[F; POSEIDON2_WIDTH]>,
+                &GpuDeviceCtx,
+            ),
+        ) -> Self {
+            let external_poseidon2_permute_inputs = external_poseidon2_inputs.0;
+            let external_poseidon2_compress_inputs = external_poseidon2_inputs.1;
+            let device_ctx = external_poseidon2_inputs.2;
+            let poseidon2_perm_inputs = preflights
+                .iter()
+                .flat_map(|preflight| preflight.cpu.poseidon2_perm_inputs.clone())
+                .chain(external_poseidon2_permute_inputs.iter().copied())
+                .collect_vec();
+            let poseidon2_compress_inputs = preflights
+                .iter()
+                .flat_map(|preflight| preflight.cpu.poseidon2_compress_inputs.clone())
+                .chain(external_poseidon2_compress_inputs.iter().copied())
+                .collect_vec();
+            let num_prefix_perms = poseidon2_perm_inputs.len();
+            let mut num_compress_inputs = poseidon2_compress_inputs.len();
+
+            let merkle_verify_blob = MerkleVerifyBlob::new(
+                child_vk,
+                proofs,
+                preflights,
+                num_prefix_perms + num_compress_inputs,
+            );
+            num_compress_inputs += merkle_verify_blob.total_rows;
+
+            let transcript_air_blob =
+                TranscriptAirBlob::new(preflights, (num_prefix_perms + num_compress_inputs) as u32);
+            let num_suffix_perms = transcript_air_blob.num_poseidon2_perms;
+
+            let mut poseidon2_buffer = DeviceBuffer::with_capacity_on(
+                (num_prefix_perms + num_compress_inputs + num_suffix_perms) * POSEIDON2_WIDTH,
+                device_ctx,
+            );
+            poseidon2_perm_inputs
+                .into_iter()
+                .flatten()
+                .chain(poseidon2_compress_inputs.into_iter().flatten())
+                .collect_vec()
+                .copy_to_on(&mut poseidon2_buffer, device_ctx)
+                .unwrap();
+
+            Self {
+                merkle_verify_blob,
+                transcript_air_blob,
+                poseidon2_buffer,
+                num_prefix_perms,
+                num_suffix_perms,
+                num_compress_inputs,
+            }
+        }
+    }
+
+    impl TraceGenModule<GlobalCtxGpu, GpuBackend> for TranscriptModule {
+        type ModuleSpecificCtx<'a> = (
+            &'a Vec<[F; POSEIDON2_WIDTH]>,
+            &'a Vec<[F; POSEIDON2_WIDTH]>,
+            &'a openvm_cuda_common::stream::GpuDeviceCtx,
+        );
+
+        #[tracing::instrument(skip_all)]
+        fn generate_proving_ctxs(
+            &self,
+            child_vk: &VerifyingKeyGpu,
+            proofs: &[ProofGpu],
+            preflights: &[PreflightGpu],
+            ctx: &Self::ModuleSpecificCtx<'_>,
+            required_heights: Option<&[usize]>,
+        ) -> Option<Vec<AirProvingContext<GpuBackend>>> {
+            let device_ctx = ctx.2;
+            let (required_transcript, required_poseidon2, required_merkle_verify) =
+                if let Some(heights) = required_heights {
+                    if heights.len() != 3 {
+                        return None;
+                    }
+                    (Some(heights[0]), Some(heights[1]), Some(heights[2]))
+                } else {
+                    (None, None, None)
+                };
+            let blob = TranscriptBlob::new(child_vk, proofs, preflights, ctx);
+
+            let merkle_trace = tracing::trace_span!("wrapper.generate_trace", air = "MerkleVerify")
+                .in_scope(|| {
+                    merkle_verify::cuda::generate_trace(&blob, device_ctx, required_merkle_verify)
+                })?;
+            let transcript_trace = tracing::trace_span!(
+                "wrapper.generate_trace",
+                air = "Transcript"
+            )
+            .in_scope(|| {
+                transcript::cuda::generate_trace(preflights, &blob, device_ctx, required_transcript)
+            })?;
+            let poseidon_trace = trace_span!("wrapper.generate_trace", air = "Poseidon2")
+                .in_scope(|| {
+                    trace_span!("generate_trace").in_scope(|| {
+                        let poseidon2_width = Poseidon2Cols::<F, SBOX_REGISTERS>::width();
+                        let total_poseidon2_inputs = blob.num_prefix_perms
+                            + blob.num_compress_inputs
+                            + blob.num_suffix_perms;
+
+                        let d_counts = if total_poseidon2_inputs == 0 {
+                            DeviceBuffer::<Poseidon2Count>::new()
+                        } else {
+                            DeviceBuffer::<Poseidon2Count>::with_capacity_on(
+                                total_poseidon2_inputs,
+                                device_ctx,
+                            )
+                        };
+                        let d_records_dedup = if total_poseidon2_inputs == 0 {
+                            DeviceBuffer::<F>::new()
+                        } else {
+                            DeviceBuffer::<F>::with_capacity_on(
+                                total_poseidon2_inputs * POSEIDON2_WIDTH,
+                                device_ctx,
+                            )
+                        };
+                        let d_counts_dedup = if total_poseidon2_inputs == 0 {
+                            DeviceBuffer::<Poseidon2Count>::new()
+                        } else {
+                            DeviceBuffer::<Poseidon2Count>::with_capacity_on(
+                                total_poseidon2_inputs,
+                                device_ctx,
+                            )
+                        };
+
+                        let mut num_records = total_poseidon2_inputs;
+                        if num_records > 0 {
+                            unsafe {
+                                let d_num_records = [num_records].to_device_on(device_ctx).unwrap();
+                                let mut temp_bytes = 0;
+                                cuda_abi::poseidon2_deduplicate_records_get_temp_bytes(
+                                    &blob.poseidon2_buffer,
+                                    &d_counts,
+                                    num_records,
+                                    &d_num_records,
+                                    &mut temp_bytes,
+                                    device_ctx.stream.as_raw(),
+                                )
+                                .unwrap();
+                                let d_temp_storage = if temp_bytes == 0 {
+                                    DeviceBuffer::<u8>::new()
+                                } else {
+                                    DeviceBuffer::<u8>::with_capacity_on(temp_bytes, device_ctx)
+                                };
+                                cuda_abi::poseidon2_deduplicate_records(
+                                    &blob.poseidon2_buffer,
+                                    &d_counts,
+                                    &d_records_dedup,
+                                    &d_counts_dedup,
+                                    num_records,
+                                    &d_num_records,
+                                    blob.num_prefix_perms,
+                                    blob.num_compress_inputs,
+                                    blob.num_suffix_perms,
+                                    &d_temp_storage,
+                                    temp_bytes,
+                                    device_ctx.stream.as_raw(),
+                                )
+                                .unwrap();
+                                num_records = *d_num_records
+                                    .to_host_on(device_ctx)
+                                    .unwrap()
+                                    .first()
+                                    .unwrap();
+                            }
+                        }
+                        let poseidon2_num_rows = if let Some(height) = required_poseidon2 {
+                            if height < num_records {
+                                return None;
+                            }
+                            height
+                        } else if num_records == 0 {
+                            1
+                        } else {
+                            num_records.next_power_of_two()
+                        };
+                        let poseidon_trace_gpu = DeviceMatrix::<F>::with_capacity_on(
+                            poseidon2_num_rows,
+                            poseidon2_width,
+                            device_ctx,
+                        );
+                        unsafe {
+                            cuda_abi::poseidon2_tracegen(
+                                poseidon_trace_gpu.buffer(),
+                                poseidon_trace_gpu.height(),
+                                poseidon_trace_gpu.width(),
+                                &d_records_dedup,
+                                &d_counts_dedup,
+                                num_records,
+                                SBOX_REGISTERS,
+                                device_ctx.stream.as_raw(),
+                            )
+                            .unwrap();
+                        }
+                        Some(poseidon_trace_gpu)
+                    })
+                })?;
+
+            Some(vec![
+                AirProvingContext::simple_no_pis(transcript_trace),
+                AirProvingContext::simple_no_pis(poseidon_trace),
+                AirProvingContext::simple_no_pis(merkle_trace),
+            ])
+        }
+    }
+}

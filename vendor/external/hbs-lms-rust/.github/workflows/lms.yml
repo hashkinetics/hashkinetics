@@ -1,0 +1,146 @@
+name: lms
+
+on:
+  pull_request:
+    branches: [ master ]
+  push:
+    branches: [ master ]
+
+env:
+  MSRV: 1.63.0
+  RUSTFLAGS: "-Dwarnings"
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  rustfmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: RustCrypto/actions/cargo-cache@master
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt
+      - run: |
+          cargo fmt --version
+          cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: RustCrypto/actions/cargo-cache@master
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: clippy
+      - run: |
+          cargo clippy --version
+          cargo clippy --lib --bins --tests --examples --all-features -- -D warnings
+
+  check-for-todos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make check-for-todos
+        continue-on-error: true
+
+  msrv:
+    runs-on: ubuntu-latest
+    outputs:
+      msrv: ${{ steps.msrv.outputs.msrv }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: RustCrypto/actions/cargo-cache@master
+      - name: Install msrv
+        run: cargo install cargo-msrv
+      - name: Run msrv
+        run: |
+            make check-msrv
+            cargo msrv verify
+
+  set-msrv:
+    runs-on: ubuntu-latest
+    outputs:
+      msrv: ${{ steps.msrv.outputs.msrv }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: msrv
+        run: echo "msrv=$(grep rust-version Cargo.toml | cut -d'"' -f2-2)" >> $GITHUB_OUTPUT
+
+  build:
+    needs: set-msrv
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rust:
+          - ${{needs.set-msrv.outputs.msrv}}
+          - stable
+        target:
+          - thumbv7em-none-eabi
+          - wasm32-unknown-unknown
+    steps:
+      - uses: actions/checkout@v4
+      - uses: RustCrypto/actions/cargo-cache@master
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ matrix.rust }}
+          targets: ${{ matrix.target }}
+      - run: cargo build --no-default-features --target ${{ matrix.target }}
+
+  test:
+    needs: set-msrv
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rust:
+          - ${{needs.set-msrv.outputs.msrv}}
+          - stable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: RustCrypto/actions/cargo-cache@master
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ matrix.rust }}
+      - run: cargo test
+      - run: cargo test -- --include-ignored
+      - run: cargo test --features fast_verify
+      - run: cargo test --features fast_verify -- --include-ignored
+
+  bench:
+    needs: set-msrv
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: RustCrypto/actions/cargo-cache@master
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2025-10-11
+      - run: rustup run nightly-2025-10-11 cargo bench
+
+  # Cross-compiled tests
+  cross:
+    needs: set-msrv
+    strategy:
+      matrix:
+        rust:
+          - ${{needs.set-msrv.outputs.msrv}}
+          - stable
+        target:
+          - aarch64-unknown-linux-gnu
+        features:
+          - default
+
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+      # Cross mounts only current package, i.e. by default it ignores workspace's Cargo.toml
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/cross-tests
+        with:
+          rust: ${{ matrix.rust }}
+          package: ${{ github.workflow }}
+          target: ${{ matrix.target }}
+          features: ${{ matrix.features }}

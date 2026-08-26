@@ -1,0 +1,218 @@
+name: CLI Tests (CUDA)
+
+# Mirrors cli.yml but builds and runs `cargo-openvm` with the CUDA backend
+# (--features cuda) on a GPU runner. Exercises:
+#   * App and STARK proving tests in crates/cli/tests/integration.rs.
+#   * Optionally the #[ignore]'d EVM end-to-end test.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_evm_e2e:
+        description: "Also run the ignored EVM end-to-end test (expensive)"
+        type: boolean
+        default: true
+      run_verify_stark_stress:
+        description: "Also run expensive verify-stark multi-circuit/proof cases"
+        type: boolean
+        default: false
+      instance_family:
+        type: string
+        required: false
+        description: Runner instance family, or multiple families joined with "+" (e.g. g7.4xlarge+g6e.2xlarge)
+        default: g7.4xlarge+g6e.2xlarge
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["**"]
+    paths:
+      - "crates/toolchain/build/**"
+      - "crates/cli/**"
+      - "examples/verify-stark/**"
+      - ".github/workflows/cli.cuda.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cli-cuda-tests:
+    name: Proving tests
+    runs-on:
+      - runs-on=${{ github.run_id }}/image=ubuntu24-gpu-x64/family=${{ inputs.instance_family || github.event.inputs.instance_family || 'g7.4xlarge+g6e.2xlarge' }}/volume=80gb/tag=cli-cuda-${{ github.run_id }}-${{ github.run_number }}-${{ github.run_attempt }}/extras=s3-cache/spot=false
+
+    steps:
+      - uses: runs-on/action@v2
+        with:
+          sccache: s3
+      - name: Load SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: |
+            ${{ secrets.GH_ACTIONS_DEPLOY_PRIVATE_KEY }}
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        env:
+          RUSTUP_PERMIT_COPY_RENAME: "1"
+      - uses: ./.github/actions/sccache
+
+      # TODO: remove once https://github.com/runs-on/runner-images-for-aws/issues/55 is fixed
+      - name: Setup GPU driver
+        run: bash ./scripts/gpu_driver_setup.sh
+
+      - uses: ./.github/actions/rust-cache-cuda
+      - uses: taiki-e/install-action@nextest
+
+      - name: Install solc
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_evm_e2e }}
+        run: |
+          (hash svm 2>/dev/null || cargo install --locked --version 0.2.23 svm-rs) && svm install 0.8.19 && solc --version
+
+      - name: Verify GPU setup
+        run: |
+          nvidia-smi
+          nvidia-smi -L
+          nvcc --version
+          echo "CUDA_ARCH=86,89,120" >> $GITHUB_ENV
+
+      - name: Setup CUDA environment
+        run: |
+          CUDART_PATH=$(find /usr/local -name "libcudart.so" | head -1)
+          if [ -n "$CUDART_PATH" ]; then
+            CUDA_LIB_DIR=$(dirname "$CUDART_PATH")
+            echo "CUDA libraries found at: $CUDA_LIB_DIR"
+            echo "CUDA_LIB_DIR=$CUDA_LIB_DIR" >> $GITHUB_ENV
+          else
+            echo "CUDA libraries not found!"
+            exit 1
+          fi
+
+      - name: Build cargo-openvm (CUDA)
+        # Build once with --features cuda,halo2-gpu, then put it on PATH so
+        # subsequent steps and the integration tests (which set SKIP_INSTALL=1)
+        # all use the same GPU-enabled binary.
+        run: |
+          cargo build --locked --profile fast -p cargo-openvm --features cuda,halo2-gpu
+          echo "${{ github.workspace }}/target/fast" >> $GITHUB_PATH
+
+      - name: Install guest rust-src
+        run: rustup component add rust-src --toolchain nightly-2026-01-18
+
+      - name: Run CLI proving tests (CUDA)
+        # SKIP_INSTALL=1 so the tests reuse the CUDA-built cargo-openvm on PATH
+        # rather than `cargo install`'ing a non-CUDA copy.
+        working-directory: crates/cli
+        env:
+          SKIP_INSTALL: "1"
+        run: |
+          cargo nextest run --cargo-profile=fast --test-threads=1 --features cuda,halo2-gpu \
+            -E 'test(test_cli_app_e2e) | test(test_cli_app_e2e_simplified) | test(test_cli_stark_e2e_simplified) | test(test_cli_stark_e2e_no_commit)'
+
+      - name: Run ignored EVM end-to-end test (CUDA)
+        # `test_cli_evm_e2e_simplified` is #[ignore]d because EVM proof generation
+        # is expensive; opt in via the workflow_dispatch checkbox.
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_evm_e2e }}
+        working-directory: crates/cli
+        env:
+          SKIP_INSTALL: "1"
+        run: cargo nextest run --cargo-profile=fast --test-threads=1 --features cuda,halo2-gpu --run-ignored=only -- test_cli_evm_e2e_simplified
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
+  verify-stark-examples:
+    name: verify-stark examples
+    runs-on:
+      - runs-on=${{ github.run_id }}-verify-stark-examples/image=ubuntu24-gpu-x64/family=g7.4xlarge+g6.4xlarge+g5.4xlarge/volume=80gb/spot=price-capacity-optimized/extras=s3-cache
+
+    steps:
+      - uses: runs-on/action@v2
+        with:
+          sccache: s3
+      - name: Load SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: |
+            ${{ secrets.GH_ACTIONS_DEPLOY_PRIVATE_KEY }}
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        env:
+          RUSTUP_PERMIT_COPY_RENAME: "1"
+      - uses: ./.github/actions/sccache
+
+      # TODO: remove once https://github.com/runs-on/runner-images-for-aws/issues/55 is fixed
+      - name: Setup GPU driver
+        run: bash ./scripts/gpu_driver_setup.sh
+
+      - uses: ./.github/actions/rust-cache-cuda
+        with:
+          cache-on-failure: true
+
+      - name: Verify GPU setup
+        run: |
+          nvidia-smi
+          nvidia-smi -L
+          nvcc --version
+          echo "CUDA_ARCH=86,89,120" >> $GITHUB_ENV
+
+      - name: Setup CUDA environment
+        run: |
+          CUDART_PATH=$(find /usr/local -name "libcudart.so" | head -1)
+          if [ -n "$CUDART_PATH" ]; then
+            CUDA_LIB_DIR=$(dirname "$CUDART_PATH")
+            echo "CUDA libraries found at: $CUDA_LIB_DIR"
+            echo "CUDA_LIB_DIR=$CUDA_LIB_DIR" >> $GITHUB_ENV
+          else
+            echo "CUDA libraries not found!"
+            exit 1
+          fi
+
+      - name: Build cargo-openvm
+        run: |
+          cargo build --locked --profile fast -p cargo-openvm --features cuda,halo2-gpu
+          echo "${{ github.workspace }}/target/fast" >> $GITHUB_PATH
+
+      - name: Install guest rust-src
+        run: rustup component add rust-src --toolchain nightly-2026-01-18
+
+      - name: Verify book examples with verify-stark
+        run: |
+          ./examples/verify-stark/verify-book-examples.sh
+
+      - name: Verify multi-circuit/proof cases with verify-stark
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_verify_stark_stress }}
+        run: |
+          set -euo pipefail
+
+          example=sha2
+          cases=(
+            "1|1"
+            "1|2"
+            "1|3"
+            "1|5"
+            "1|6"
+            "1|8"
+            "1|1000"
+            "2|0,0"
+            "2|0,1"
+            "3|0,1,0"
+            "3|2,1,0"
+            "3|3,0,1"
+            "3|1,1000,0"
+            "8|3,0,0,0,0,0,0,0"
+            "8|0,1,0,2,2,0,0,0"
+          )
+
+          for case in "${cases[@]}"; do
+            IFS='|' read -r num_def_circuits num_proves_per_circuit <<< "$case"
+            echo "Verifying $example with $num_def_circuits deferral circuit(s) and proof distribution $num_proves_per_circuit"
+            ./examples/verify-stark/verify-book-examples.sh "$num_def_circuits" "$num_proves_per_circuit" "$example"
+          done
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true

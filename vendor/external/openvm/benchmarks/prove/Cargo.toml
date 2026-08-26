@@ -1,0 +1,103 @@
+[package]
+name = "openvm-benchmarks-prove"
+publish = false
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+openvm-circuit.workspace = true
+openvm-sdk.workspace = true
+openvm-sdk-config.workspace = true
+openvm-stark-backend.workspace = true
+openvm-stark-sdk.workspace = true
+openvm-transpiler.workspace = true
+openvm-verify-stark-host.workspace = true
+
+clap = { workspace = true, features = ["derive", "env"] }
+eyre.workspace = true
+tracing.workspace = true
+metrics.workspace = true
+zstd.workspace = true
+p3-field = { workspace = true }
+
+# for ecrecover benchmark
+rand_chacha = { version = "0.3", default-features = false }
+k256 = { workspace = true, features = ["ecdsa"] }
+tiny-keccak.workspace = true
+
+[dev-dependencies]
+
+[features]
+default = ["parallel", "jemalloc", "metrics"]
+metrics = ["openvm-sdk/metrics", "openvm-stark-sdk/metrics"]
+tco = ["openvm-sdk/tco"]
+aot = ["openvm-sdk/aot"]
+perf-metrics = ["openvm-sdk/perf-metrics", "metrics"]
+stark-debug = ["openvm-sdk/stark-debug"]
+evm = ["openvm-sdk/evm-verify"]
+parallel = ["openvm-sdk/parallel"]
+mimalloc = ["openvm-sdk/mimalloc"]
+jemalloc = ["openvm-sdk/jemalloc"]
+jemalloc-prof = ["openvm-sdk/jemalloc-prof"]
+
+cuda = [
+    "openvm-circuit/cuda",
+    "openvm-sdk/cuda",
+]
+halo2-gpu = [
+    "evm",
+    "cuda",
+    "openvm-sdk/halo2-gpu",
+]
+
+[[bin]]
+name = "fibonacci"
+path = "src/bin/fibonacci.rs"
+
+[[bin]]
+name = "keccak"
+path = "src/bin/keccak.rs"
+
+[[bin]]
+name = "keccak_par"
+path = "src/bin/keccak_par.rs"
+
+[[bin]]
+name = "kitchen_sink"
+path = "src/bin/kitchen_sink.rs"
+
+[[bin]]
+name = "regex"
+path = "src/bin/regex.rs"
+
+[[bin]]
+name = "ecrecover"
+path = "src/bin/ecrecover.rs"
+
+[[bin]]
+name = "pairing"
+path = "src/bin/pairing.rs"
+
+[[bin]]
+name = "base64_json"
+path = "src/bin/base64_json.rs"
+
+[[bin]]
+name = "bincode"
+path = "src/bin/bincode.rs"
+
+[[bin]]
+name = "rkyv"
+path = "src/bin/rkyv.rs"
+
+[[bin]]
+name = "revm_transfer"
+path = "src/bin/revm_transfer.rs"
+
+[[bin]]
+name = "sha2_bench"
+path = "src/bin/sha2_bench.rs"

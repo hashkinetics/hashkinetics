@@ -1,0 +1,133 @@
+name: RISC-V Test Vectors
+
+on:
+  workflow_call:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["**"]
+    paths:
+      - "crates/circuits/primitives/**"
+      - "crates/vm/**"
+      - "crates/toolchain/build/**"
+      - "crates/toolchain/custom_insn/**"
+      - "crates/toolchain/decoder/**"
+      - "crates/toolchain/instructions/**"
+      - "crates/toolchain/platform/**"
+      - "crates/toolchain/tests/**"
+      - "crates/toolchain/transpiler/**"
+      - "extensions/rv32im/circuit/**"
+      - "extensions/rv32im/transpiler/**"
+      - "extensions/rv32im/guest/**"
+      - "extensions/rv32-adapters/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".cargo/config.toml"
+      - ".github/actions/sccache/**"
+      - ".github/workflows/riscv.yml"
+      - "scripts/gpu_driver_setup.sh"
+
+concurrency:
+  group: ${{ github.workflow_ref }}-riscv-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  OPENVM_SKIP_DEBUG: "1"
+
+jobs:
+  riscv-test-vector:
+    strategy:
+      matrix:
+        platform:
+          - {
+              name: "runtime (AOT)",
+              labels: "family=c8i-flex.8xlarge+c8i.8xlarge+c8a.8xlarge+m8i-flex.8xlarge+m8i.8xlarge+m8a.8xlarge+c7i.8xlarge+c7a.8xlarge+m7i.8xlarge+m7a.8xlarge/image=ubuntu24-full-x64/volume=80gb",
+              image: "ubuntu24-full-x64",
+              features: "aot",
+            }
+          - {
+              name: "prover (CUDA)",
+              labels: "image=ubuntu24-gpu-x64/family=g7.2xlarge+g6.2xlarge+g5.2xlarge/volume=40gb/spot=price-capacity-optimized",
+              image: "ubuntu24-gpu-x64",
+              features: "cuda,touchemall",
+            }
+
+    name: ${{ matrix.platform.name }}
+    runs-on:
+      - runs-on=${{ github.run_id }}-riscv-${{ github.run_attempt }}-${{ strategy.job-index }}/${{ matrix.platform.labels }}/extras=s3-cache
+
+    steps:
+      - uses: runs-on/action@v2
+        with:
+          sccache: s3
+      - run: | # avoid cross-device link error
+          rustup component remove clippy || true
+          rm -rf ~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu || true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: taiki-e/install-action@nextest
+      - name: Load SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: |
+            ${{ secrets.GH_ACTIONS_DEPLOY_PRIVATE_KEY }}
+      - uses: actions/checkout@v5
+      - name: Init RISC-V test-vector submodule
+        run: git submodule update --init --depth 1 crates/toolchain/tests/rv32im-test-vectors/riscv-tests
+      - uses: ./.github/actions/sccache
+
+      - name: Setup GPU driver
+        if: contains(matrix.platform.features, 'cuda')
+        run: bash ./scripts/gpu_driver_setup.sh
+
+      - name: Set feature flags
+        run: |
+          if [ -n "${{ matrix.platform.features }}" ]; then
+            echo "FEATURE_ARGS=--features=${{ matrix.platform.features }}" >> $GITHUB_ENV
+          else
+            echo "FEATURE_ARGS=" >> $GITHUB_ENV
+          fi
+
+      - name: Set VPMM_PAGES for GPU
+        if: contains(matrix.platform.features, 'cuda')
+        run: |
+          nvidia-smi
+          nvidia-smi -L
+          nvcc --version
+          echo "CUDA_ARCH=86,89,120" >> $GITHUB_ENV
+          echo "VPMM_PAGES=1" >> $GITHUB_ENV
+
+      - name: Download and install risc64-elf-gcc
+        if: contains(matrix.platform.image, 'x64')
+        working-directory: ${{ github.workspace }}
+        run: |
+          # Download pre-built binary for x86
+          wget -O gcc.tar.xz "https://github.com/riscv-collab/riscv-gnu-toolchain/releases/download/2025.07.16/riscv64-elf-ubuntu-24.04-gcc-nightly-2025.07.16-nightly.tar.xz"
+          tar -xJf gcc.tar.xz
+          echo "$GITHUB_WORKSPACE/riscv/bin" >> $GITHUB_PATH
+          rm gcc.tar.xz
+
+      - name: Run Makefile
+        working-directory: crates/toolchain/tests/rv32im-test-vectors
+        run: |
+          make
+
+        # Run execution tests on CPU, full prover tests on GPU
+      - name: Run RISC-V test vector tests
+        working-directory: crates/toolchain/tests
+        run: |
+          rustup component add rust-src --toolchain nightly-2026-01-18
+          if [[ "${{ matrix.platform.features }}" == *"cuda"* ]]; then
+            TEST_NAME=test_rv32im_riscv_vector_prove
+          else
+            TEST_NAME=test_rv32im_riscv_vector_runtime
+          fi
+          cargo nextest run ${{ env.FEATURE_ARGS }} --cargo-profile=fast --run-ignored only --no-capture -- $TEST_NAME
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true

@@ -1,0 +1,65 @@
+# Big Integers
+
+The OpenVM BigInt extension (aka `Int256`) provides 256-bit integer instructions for both unsigned and signed arithmetic. The low-level guest-side interface is provided by the `openvm-bigint-guest` crate, which can be used in any OpenVM program.
+
+## `U256`
+
+For a Rust `U256` type, use the [Ruint guest library](/book/guest-libraries/ruint). See the full example [here](https://github.com/openvm-org/openvm/blob/main/examples/u256/src/main.rs).
+
+## `I256`
+
+The extension also supports signed 256-bit arithmetic. The checked-in signed example uses `alloy_primitives::I256`, with `ruint` patched to the [OpenVM fork](https://github.com/openvm-org/uint) underneath. See the full example [here](https://github.com/openvm-org/openvm/blob/main/examples/i256/src/main.rs).
+
+
+
+## External Linking
+
+The BigInt guest extension provides another way to use the native implementation. It exposes external functions that are meant to be linked from other libraries as hooks for the 256-bit integer intrinsics. This is enabled only when `target_os = "zkvm"`. All of the functions are defined as `unsafe extern "C" fn`. Also note that you must enable the `export-intrinsics` feature to make them globally linkable. The exported hooks are the `zkvm_u256_*` symbols listed below.
+
+- `zkvm_u256_wrapping_add_impl(result: *mut u8, a: *const u8, b: *const u8)`: takes in a pointer to the result, and two pointers to the inputs. `result = a + b`.
+- `zkvm_u256_wrapping_sub_impl(result: *mut u8, a: *const u8, b: *const u8)`: takes in a pointer to the result, and two pointers to the inputs. `result = a - b`.
+- `zkvm_u256_wrapping_mul_impl(result: *mut u8, a: *const u8, b: *const u8)`: takes in a pointer to the result, and two pointers to the inputs. `result = a * b`.
+- `zkvm_u256_bitxor_impl(result: *mut u8, a: *const u8, b: *const u8)`: takes in a pointer to the result, and two pointers to the inputs. `result = a ^ b`.
+- `zkvm_u256_bitand_impl(result: *mut u8, a: *const u8, b: *const u8)`: takes in a pointer to the result, and two pointers to the inputs. `result = a & b`.
+- `zkvm_u256_bitor_impl(result: *mut u8, a: *const u8, b: *const u8)`: takes in a pointer to the result, and two pointers to the inputs. `result = a | b`.
+- `zkvm_u256_wrapping_shl_impl(result: *mut u8, a: *const u8, b: *const u8)`: takes in a pointer to the result, and two pointers to the inputs. `result = a << b`.
+- `zkvm_u256_wrapping_shr_impl(result: *mut u8, a: *const u8, b: *const u8)`: takes in a pointer to the result, and two pointers to the inputs. `result = a >> b`.
+- `zkvm_u256_arithmetic_shr_impl(result: *mut u8, a: *const u8, b: *const u8)`: takes in a pointer to the result, and two pointers to the inputs. `result = a.arithmetic_shr(b)`.
+- `zkvm_u256_eq_impl(a: *const u8, b: *const u8) -> bool`: takes in two pointers to the inputs. Returns `true` if `a == b`, otherwise `false`.
+- `zkvm_u256_cmp_impl(a: *const u8, b: *const u8) -> Ordering`: takes in two pointers to the inputs. Returns the ordering of `a` and `b`.
+- `zkvm_u256_clone_impl(result: *mut u8, a: *const u8)`: takes in a pointer to the result buffer, and a pointer to the input. `result = a`.
+
+And in the external library, you can do the following:
+
+```rust
+use core::mem::MaybeUninit;
+
+extern "C" {
+    fn zkvm_u256_wrapping_add_impl(result: *mut u8, a: *const u8, b: *const u8);
+}
+
+fn wrapping_add(a: &CustomU256, b: &CustomU256) -> CustomU256 {
+    #[cfg(target_os = "zkvm")] {
+        let mut result = MaybeUninit::<CustomU256>::uninit();
+        unsafe {
+            zkvm_u256_wrapping_add_impl(
+                result.as_mut_ptr() as *mut u8,
+                a as *const CustomU256 as *const u8,
+                b as *const CustomU256 as *const u8,
+            );
+        }
+        unsafe { result.assume_init() }
+    }
+    #[cfg(not(target_os = "zkvm"))] {
+        unimplemented!("native bigint ops are only available on zkvm target")
+    }
+}
+```
+
+### Config parameters
+
+For the guest program to build successfully add the following to your `.toml` file:
+
+```toml
+[app_vm_config.bigint]
+```

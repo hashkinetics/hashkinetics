@@ -1,0 +1,114 @@
+use itertools::Itertools;
+use openvm_circuit::system::memory::merkle::public_values::UserPublicValuesProof;
+use openvm_recursion_circuit::system::{
+    AggregationSubCircuit, CachedTraceCtx, VerifierExternalData, VerifierTraceGen,
+};
+use openvm_stark_backend::{
+    proof::Proof,
+    prover::{ProverBackend, ProvingContext},
+};
+use openvm_stark_sdk::config::baby_bear_poseidon2::{
+    default_duplex_sponge_recorder, DIGEST_SIZE, EF, F,
+};
+use tracing::instrument;
+
+use super::RootProver;
+use crate::{
+    circuit::{deferral::DeferralMerkleProofs, root::RootTraceGen},
+    RootSC, SC,
+};
+
+impl<S: AggregationSubCircuit, T> RootProver<S, T> {
+    pub fn generate_proving_ctx<PB, DC: Clone + Send + Sync>(
+        &self,
+        proof: Proof<SC>,
+        user_pvs_proof: &UserPublicValuesProof<DIGEST_SIZE, PB::Val>,
+        deferral_merkle_proofs: Option<&DeferralMerkleProofs<PB::Val>>,
+        device_ctx: &DC,
+    ) -> Option<ProvingContext<PB>>
+    where
+        PB: ProverBackend<Val = F, Challenge = EF>,
+        PB::Matrix: Clone,
+        S: VerifierTraceGen<PB, RootSC, DC>,
+        T: RootTraceGen<PB, DC>,
+    {
+        assert_eq!(
+            user_pvs_proof.public_values.len(),
+            self.circuit.num_user_pvs
+        );
+
+        // These AIRs should have the same height regardless of proof or user_pvs_proof.
+        let mut pre_data = self.agg_node_tracegen.generate_pre_verifier_subcircuit_ctx(
+            &proof,
+            user_pvs_proof,
+            self.circuit.memory_dimensions,
+            device_ctx,
+        );
+        let (post_verifier_subcircuit_ctxs, other_compress_inputs) =
+            self.agg_node_tracegen.generate_other_proving_ctxs(
+                &proof,
+                self.circuit.memory_dimensions,
+                deferral_merkle_proofs,
+                device_ctx,
+            );
+        pre_data
+            .poseidon2_compress_inputs
+            .extend(other_compress_inputs);
+
+        // Get the verifier sub-circuit trace heights. If deferrals are enabled, there is
+        // an additional AIR at the end.
+        let verifier_trace_heights = self.trace_heights.as_ref().map(|v| {
+            let num_airs = v.len() - deferral_merkle_proofs.is_some() as usize;
+            &v[3..num_airs]
+        });
+
+        let power_check_inputs = vec![];
+        let mut external_data = VerifierExternalData {
+            poseidon2_compress_inputs: &pre_data.poseidon2_compress_inputs,
+            poseidon2_permute_inputs: &pre_data.poseidon2_permute_inputs,
+            range_check_inputs: &pre_data.range_check_inputs,
+            power_check_inputs: &power_check_inputs,
+            required_heights: verifier_trace_heights,
+            final_transcript_state: None,
+        };
+
+        let subcircuit_ctxs = self.circuit.verifier_circuit.generate_proving_ctxs(
+            &self.child_vk,
+            CachedTraceCtx::Records(self.cached_trace_record.clone()),
+            &[proof],
+            &mut external_data,
+            device_ctx,
+            default_duplex_sponge_recorder(),
+        );
+
+        subcircuit_ctxs.map(|subcircuit_ctxs| ProvingContext {
+            per_trace: pre_data
+                .air_proving_ctxs
+                .into_iter()
+                .chain(subcircuit_ctxs)
+                .chain(post_verifier_subcircuit_ctxs)
+                .enumerate()
+                .collect_vec(),
+        })
+    }
+
+    #[instrument(name = "trace_gen", skip_all)]
+    pub fn generate_proving_ctx_no_def<PB, DC: Clone + Send + Sync>(
+        &self,
+        proof: Proof<SC>,
+        user_pvs_proof: &UserPublicValuesProof<DIGEST_SIZE, PB::Val>,
+        device_ctx: &DC,
+    ) -> Option<ProvingContext<PB>>
+    where
+        PB: ProverBackend<Val = F, Challenge = EF>,
+        PB::Matrix: Clone,
+        S: VerifierTraceGen<PB, RootSC, DC>,
+        T: RootTraceGen<PB, DC>,
+    {
+        assert!(
+            self.circuit.def_hook_commit.is_none(),
+            "deferral-enabled root prover requires generate_proving_ctx_with_deferrals"
+        );
+        self.generate_proving_ctx(proof, user_pvs_proof, None, device_ctx)
+    }
+}

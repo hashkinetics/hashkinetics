@@ -1,0 +1,51 @@
+name: Continuations Tests
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["**"]
+    paths:
+      - "crates/continuations/**"
+      - "crates/recursion/**"
+      - ".github/workflows/continuations.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  tests:
+    name: CPU suite
+    runs-on:
+      - runs-on=${{ github.run_id }}/family=c9g.4xlarge+c8g.4xlarge/image=ubuntu24-full-arm64/volume=40gb/extras=s3-cache
+
+    steps:
+      - uses: runs-on/action@v2
+        with:
+          sccache: s3
+      - name: Load SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: |
+            ${{ secrets.GH_ACTIONS_DEPLOY_PRIVATE_KEY }}
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        env:
+          RUSTUP_PERMIT_COPY_RENAME: "1"
+      - uses: ./.github/actions/sccache
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+
+      - name: Run tests
+        working-directory: crates/continuations
+        run: |
+          rustup component add rust-src --toolchain nightly-2026-01-18
+          cargo nextest run
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true

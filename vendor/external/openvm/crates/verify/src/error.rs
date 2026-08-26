@@ -1,0 +1,84 @@
+use openvm_circuit::system::memory::merkle::public_values::UserPublicValuesProofError;
+use openvm_stark_backend::verifier::VerifierError;
+use openvm_stark_sdk::config::baby_bear_poseidon2::{Digest, EF, F};
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum VerifyStarkError {
+    #[error("Stark verifier failed with error: {0}")]
+    StarkVerificationFailure(#[from] VerifierError<EF>),
+    #[error("User public value proof verification failed with error: {0}")]
+    UserPvsVerificationFailure(#[from] UserPublicValuesProofError),
+    #[error("Invalid user public values length: expected {expected}, actual {actual}")]
+    UserPvsLengthMismatch { expected: usize, actual: usize },
+    #[error("Invalid app exe commit: expected {expected:?}, actual {actual:?}")]
+    AppExeCommitMismatch { expected: Digest, actual: Digest },
+    #[error("Invalid app cached commit: expected {expected:?}, actual {actual:?}")]
+    AppVkCachedCommitMismatch { expected: Digest, actual: Digest },
+    #[error("Invalid app vk pre-hash: expected {expected:?}, actual {actual:?}")]
+    AppVkPreHashMismatch { expected: Digest, actual: Digest },
+    #[error("Invalid leaf cached commit: expected {expected:?}, actual {actual:?}")]
+    LeafVkCachedCommitMismatch { expected: Digest, actual: Digest },
+    #[error("Invalid leaf vk pre-hash: expected {expected:?}, actual {actual:?}")]
+    LeafVkPreHashMismatch { expected: Digest, actual: Digest },
+    #[error("Invalid internal for leaf cached commit: expected {expected:?}, actual {actual:?}")]
+    InternalForLeafVkCachedCommitMismatch { expected: Digest, actual: Digest },
+    #[error("Invalid internal for leaf vk pre-hash: expected {expected:?}, actual {actual:?}")]
+    InternalForLeafVkPreHashMismatch { expected: Digest, actual: Digest },
+    #[error("Invalid internal recursive cached commit: expected {expected:?}, actual {actual:?}")]
+    InternalRecursiveVkCachedCommitMismatch { expected: Digest, actual: Digest },
+    #[error("Invalid internal recursive vk pre-hash: expected {expected:?}, actual {actual:?}")]
+    InternalRecursiveVkPreHashMismatch { expected: Digest, actual: Digest },
+    #[error("Internal recursive cached commit should be unset, actual {actual:?}")]
+    InternalRecursiveVkCachedCommitSet { actual: Digest },
+    #[error("Internal recursive vk pre-hash should be unset, actual {actual:?}")]
+    InternalRecursiveVkPreHashSet { actual: Digest },
+    #[error("Invalid proof cached commit: expected {expected:?}, actual {actual:?}")]
+    ProofCachedCommitMismatch { expected: Digest, actual: Digest },
+    #[error("Missing constraint-eval trace vdata, expected at AIR idx {air_idx}")]
+    MissingConstraintEvalTraceVdata { air_idx: usize },
+    #[error("Missing constraint-eval cached trace at AIR idx {air_idx} cached idx {cached_idx}")]
+    MissingConstraintEvalCachedTrace { air_idx: usize, cached_idx: usize },
+    #[error("Program execution did not terminate successfully, exit_code: {0}")]
+    ExecutionUnsuccessful(F),
+    #[error("Invalid internal flag {0}, should be 2")]
+    InvalidInternalFlag(F),
+    #[error("Invalid recursion depth {actual}, should be in [1, {max}]")]
+    InvalidRecursionDepth { actual: F, max: u32 },
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Other error: {0}")]
+    Other(#[from] eyre::Error),
+    #[error("Deferral Merkle proof length mismatch: expected {expected}, actual {actual}")]
+    DeferralMerkleProofLengthMismatch { expected: usize, actual: usize },
+    #[error("Deferral depth exceeds address space height: depth {depth}, address_height {address_height}")]
+    DeferralDepthTooLarge { depth: usize, address_height: usize },
+    #[error("Deferral Merkle proofs differ inside DEFERRAL_AS at depth {depth}: initial {initial:?}, final {final_:?}")]
+    DeferralMerkleProofSiblingMismatch {
+        depth: usize,
+        initial: Digest,
+        final_: Digest,
+    },
+    #[error("Deferral initial root mismatch: expected {expected:?}, actual {actual:?}")]
+    DeferralInitialRootMismatch { expected: Digest, actual: Digest },
+    #[error("Deferral final root mismatch: expected {expected:?}, actual {actual:?}")]
+    DeferralFinalRootMismatch { expected: Digest, actual: Digest },
+    #[error("Invalid deferral flag {0}, should be 0 or 2")]
+    InvalidDeferralFlag(F),
+    #[error("Deferral hook VK commit mismatch: expected {expected:?}, actual {actual:?}")]
+    DefHookCommitMismatch { expected: Digest, actual: Digest },
+    #[error("Proof has deferrals but baseline has no expected_def_hook_commit")]
+    UnexpectedDeferralDisabled,
+    #[error("Baseline expects deferrals but proof has no deferral Merkle proofs")]
+    MissingDeferralMerkleProofs,
+    #[error("Proof has deferral_flag=0 but def_hook_commit is set, actual {actual:?}")]
+    DefHookCommitSet { actual: Digest },
+    #[error("Proof has deferral_flag=0 but initial_acc_hash is set, actual {actual:?}")]
+    DefInitialAccHashCommitSet { actual: Digest },
+    #[error("Proof has deferral_flag=0 but final_acc_hash is set, actual {actual:?}")]
+    DefFinalAccHashCommitSet { actual: Digest },
+    #[error("Proof has deferral_flag=0 but depth is set, actual {actual:?}")]
+    DefDepthSet { actual: F },
+    #[error("Proof has unsupported deferral node_idx {actual:?}, should be 0")]
+    DefNodeIdxNonZero { actual: F },
+}

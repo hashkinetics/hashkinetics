@@ -1,0 +1,222 @@
+# Memory overview
+
+- [Basic performed interactions](#basic-performed-interactions)
+- [Memory boundary chip](#memory-boundary-chip)
+- [Invariants](#invariants)
+- [Soundness proof](#soundness-proof)
+  - [Time goes forward](#time-goes-forward)
+  - [Timestamp-growth bound for OpenVM chips](#timestamp-growth-bound-for-openvm-chips)
+  - [Memory consistency](#memory-consistency)
+- [The `PersistentBoundaryChip`](#the-persistentboundarychip)
+- [Implementation details](#implementation-details)
+- [What to take into account when adding a new chip](#what-to-take-into-account-when-adding-a-new-chip)
+
+---
+
+Chips in the VM need to perform memory read and write operations. The goal of memory checking is to ensure memory consistency across all chips. Every memory operation consists of an operation type (Read or Write), address (`address_space` and `pointer`), data, and timestamp. All memory operations across all chips should happen at distinct timestamps between $1$ and $2^{\text{timestamp\_max\_bits}}$ (in the current implementation, `timestamp_max_bits <= 29`). The memory boundary chip represents the initial memory state on the memory bus at timestamp $0$.
+
+There is no single global memory trace. Instead, chips that access memory post interactions on the
+memory bus, and the boundary chips account for the initial and final memory states. The soundness
+argument shows that from any valid set of traces, one can extract a consistent sequence of logical
+memory reads and writes. Below we describe this memory-checking argument. First, we look at the
+interactions on the memory bus and why they are sound in our setting. Next, we discuss how the
+boundary chip commits to both the initial and final memory state.
+
+This follows the offline memory-checking argument of
+[BEGKN92](https://www.cs.ubc.ca/~will/papers/memcheck.pdf).
+
+## Basic performed interactions
+
+We say an address is _accessed_ when it's initialized, finalized, read from, or written to. An address is initialized by the memory boundary chip at timestamp $0$ and is finalized at the same timestamp it was last read from or written to (or $0$ if there were no operations involving it).
+
+To verify memory consistency, we use MEMORY_BUS to post information about all memory accesses through interactions. More specifically, we use a **memory bridge** that **both** checks the timestamp inequality and performs the necessary interactions:
+
+- To verify Read (`address`, `data`, `new_timestamp`) operations, we need to know `prev_timestamp`, the previous timestamp when the address was accessed. We enforce that `prev_timestamp < new_timestamp`, and perform the following interactions on MEMORY_BUS:
+  - Receive (`address`, `data`, `prev_timestamp`),
+  - Send (`address`, `data`, `new_timestamp`).
+- To verify Write (`address`, `new_data`, `new_timestamp`) operations, we need to know `prev_timestamp` and `prev_data`, the previous timestamp when the address was accessed and the data stored at the address at that time. We enforce that `prev_timestamp < new_timestamp`, and perform the following interactions on MEMORY_BUS:
+  - Receive (`address`, `prev_data`, `prev_timestamp`),
+  - Send (`address`, `new_data`, `new_timestamp`).
+
+Here is how it's done, for example, for the write operations:
+
+```rust
+/// The max degree of constraints is:
+/// eval_timestamps: deg(enabled) + max(1, deg(self.timestamp))
+/// eval_bulk_access: refer to private function MemoryOfflineChecker::eval_bulk_access
+impl<T: PrimeCharacteristicRing, V: Copy + Into<T>, const N: usize> MemoryWriteOperation<'_, T, V, N> {
+    /// Evaluate constraints and send/receive interactions. `enabled` must be boolean.
+    pub fn eval<AB>(self, builder: &mut AB, enabled: impl Into<AB::Expr>)
+    where
+        AB: InteractionBuilder<Var = V, Expr = T>,
+    {
+        let enabled = enabled.into();
+        self.offline_checker.eval_timestamps(
+            builder,
+            self.timestamp.clone(),
+            &self.aux.base,
+            enabled.clone(),
+        );
+
+        self.offline_checker.eval_bulk_access(
+            builder,
+            self.address,
+            &self.data,
+            &self.aux.prev_data.map(Into::into),
+            self.timestamp,
+            self.aux.base.prev_timestamp,
+            enabled,
+        );
+    }
+}
+```
+
+Every instruction executor does this via the **memory controller** API.
+
+## Memory boundary chip
+
+The only unaccounted for interactions are the initial birth of a segment and the final memory state. We use the **memory boundary chip** (`PersistentBoundaryChip`) to handle them.
+
+The `PersistentBoundaryChip` commits to both the initial and final memory state. The initial memory is provided as part of the program, and the chip produces commitments (Merkle roots) for both the initial and final states. These commitments become part of the public values used later in proof aggregation (see [Continuations](/specs/architecture/continuations)).
+
+The memory boundary chip performs, for every touched memory chunk, a send interaction on birth and a receive interaction on death.
+
+## Invariants
+
+The following invariants **must** be maintained by the memory architecture:
+1. In the MEMORY_BUS, the `timestamp` is always in range `[0, 2^timestamp_max_bits)` where `timestamp_max_bits <= F::bits() - 2` is a configuration constant.
+2. In the MEMORY_BUS, the `address_space` is always in range `[1, 1 + 2^addr_space_height)` where `addr_space_height` is a configuration constant satisfying `addr_space_height < F::bits() - 2`. (Our current implementation only supports `addr_space_height` less than the max bits supported by the VariableRangeCheckerBus).
+3. In the MEMORY_BUS, the `pointer` is always in range `[0, 2^pointer_max_bits)` where `pointer_max_bits <= F::bits() - 2` is a configuration constant.
+
+Invariant 1 is guaranteed by [time goes forward](#time-goes-forward) under the [assumption](/specs/architecture/circuit-architecture#instruction-executors) that the timestamp increase during a single logical instruction execution is bounded by `num_interactions * num_rows_per_execution`, where `num_interactions` is the number of interactions contributed by one trace row.
+
+Invariants 2 and 3 are guaranteed at timestamp `0` in the MEMORY_BUS by the memory boundary chip: `PersistentBoundaryChip` populates the MEMORY_BUS at timestamp `0` from the initial memory state, which is committed to in the public value `initial_root`. The chip upholds Invariants 2 and 3 **assuming** that the initial memory state only contains addresses in the required range. This assumption needs to be checked outside the scope of the circuit.
+
+:::warning
+At all later timestamps, it is the responsibility of each chip to ensure their memory accesses maintain Invariants 2 and 3.
+:::
+
+We note an observation that may be useful in soundness analysis of instruction executor chips: if the `MemoryBridge` is used to add the interactions necessary for a write operation, then under the assumptions that time goes forward and that all memory accesses at previous timestamps are in valid range, any attempt to write to an address out of range will lead to an unbalanced MEMORY_BUS because it will require a send at an earlier timestamp that was also out of bounds.
+
+## Soundness proof
+
+Assume that the MEMORY_BUS interactions and the constraints mentioned above are satisfied.
+
+### Time goes forward
+
+In the connector chip, we constrain that the final timestamp is less than $2^{\text{timestamp\_max\_bits}}$ and that the start timestamp is equal to `1`. It is [guaranteed](https://github.com/openvm-org/stark-backend/blob/main/docs/interactions.md) that the total number of interaction messages is less than $p$. For the OpenVM chips discussed here, the timestamp-growth bound justified in [Timestamp-growth bound for OpenVM chips](#timestamp-growth-bound-for-openvm-chips) guarantees that the final timestamp cannot overflow: its actual (not mod $p$) value is less than $2^{\text{timestamp\_max\_bits}}$. Given that, our check that `timestamp - prev_timestamp - 1 < 2^timestamp_max_bits` guarantees that `prev_timestamp < timestamp` everywhere we check it.
+
+### Timestamp-growth bound for OpenVM chips
+
+This subsection justifies the timestamp-growth assumption from
+[Circuit Architecture](/specs/architecture/circuit-architecture#instruction-executors) for the
+OpenVM chips discussed in this spec. Custom downstream extensions must establish the same bound
+separately.
+
+Most instruction executors satisfy a stronger property: they increase the timestamp by `1` per
+memory access, and each memory access contributes `4` interactions in the AIR: `2` on the memory
+bus and `2` range-check interactions. For one-row instruction executors, this implies
+`timestamp_delta <= num_interactions / 4`.
+
+It therefore remains to examine:
+
+1. Chips that increase timestamp by `1` per memory access, but where a single logical instruction
+   execution may use multiple trace rows.
+2. Chips that set the timestamp delta in a custom way.
+
+The chips that fall into these categories are:
+
+| Name                  | timestamp_delta | # of interactions | Comment                                                    |
+| --------------------- | --------------- | ----------------- | ---------------------------------------------------------- |
+| PhantomChip           | 1               | 3                 | Case 2. No memory accesses; only program and execution interactions. |
+| XorinVmChip           | -               | -                 | Case 2. Special timestamp jump.                            |
+| KeccakfOpChip         | 51              | -                 | Case 2. 1 register read + 50 word writes.                  |
+| Rv32HintStoreChip     | –               | –                 | Case 1.                                                    |
+| Sha2MainChip          | –               | –                 | Case 1.                                                    |
+| DeferralOutputChip    | –               | –                 | Case 1.                                                    |
+
+For `PhantomChip`, `timestamp_delta = 1`, `num_interactions = 3`, and
+`num_rows_per_execution = 1`, so `timestamp_delta < num_interactions * num_rows_per_execution`.
+
+All the chips in Case 1 can use a variable number of trace rows to execute a single instruction,
+but their AIR constraints maintain that the timestamp increments by `1` per memory access and that
+these memory accesses account for all timestamp increments. Therefore
+`timestamp_delta <= num_interactions * num_rows_per_execution / 4` in these cases.
+
+#### XorinVmChip
+
+The `XorinVmAir` timestamp change is `3 + 3 * num_words` where `num_words = len / 4` is the number
+of non-padding 4-byte chunks (at most `34`, since `len` is at most `136`). The maximum timestamp
+change is therefore `3 + 3 * 34 = 105`. Each XORIN instruction uses `1` trace row.
+
+In the AIR constraints:
+
+- `eval_instruction` does an `execute_and_increment_pc` (`3`), `3` register reads (`12`), and `2`
+  range checks (`2`), giving `17` interactions.
+- `constrain_input_read` does up to `34` input reads (`136`) and `34` buffer reads (`136`).
+- `constrain_xor` does up to `136` XOR lookups on the bitwise lookup bus.
+- `constrain_output_write` does up to `34` buffer writes (`136`).
+
+In total, there are at least `17 + 136 + 136 + 136 + 136 = 561` interactions per row when
+`num_words = 34`. Since `timestamp_delta = 105 < 561 = num_interactions`, the condition is
+satisfied.
+
+#### KeccakfOpChip
+
+The `KeccakfOpAir` timestamp delta is `51` (`1` register read + `50` word writes). Each KECCAKF
+instruction uses `1` trace row in the `KeccakfOpAir` and `24` rows in the separate
+`KeccakfPermAir`.
+
+In the AIR constraints:
+
+- `1` `execute_and_increment_pc` (`3`), `1` register read (`4`), `1` pointer range check (`1`),
+  `50` word writes (`200`), `100` paired byte range checks (`100`), and `2` keccakf state bus sends (`2`).
+
+In total, there are at least `310` interactions per row. Since `timestamp_delta = 51 < 310`, the
+condition is satisfied.
+
+### Memory consistency
+
+To show that memory is consistent, consider any interactions with segments containing some `address`. They can be done by:
+
+- Memory boundary chip: one send with the initial timestamp and some value at this address, one receive with the final timestamp and some value at this address. The fact that there is only one send/receive is guaranteed by the fact that we ensure in the memory boundary chip that all the addresses are distinct.
+- Instruction executors via memory bridge: one receive with the previous timestamp and some value at this address, one send with the new timestamp and some value at this address. We also have `prev_timestamp < timestamp`.
+
+To prove memory consistency, we need to show that accessing an address always gives us the last value observed at that address. In other words, for every receive interaction with timestamp $t$ and value $v$ corresponding to this address, the value $v$ is the value from the send interaction with the greatest timestamp $t'$ less than $t$.
+
+For every row that gets handled by a memory bridge, draw a directed edge from the previous timestamp to the new timestamp with capacity $1$. We know that in the obtained network, where the source and the sink are defined by the boundary interactions, all edges go left to right, and the maximal flow is $1$ (because there is only one edge from the source, therefore the minimal cut is $1$). Since all edges go left to right, there is no circulation in this network. Hence, all edges represent exactly one path from the source to the sink. Therefore, for every vertex (which is a timestamp), the value for the edge going to this vertex (the last receive interaction) equals the value for the edge going from this vertex (the considered send instruction).
+
+## The `PersistentBoundaryChip`
+
+The `PersistentBoundaryChip` commits to both the initial and final memory state, making these commitments available as public values for proof aggregation.
+
+- **Commitments:**
+  The chip takes the initial memory (provided as part of the program) and computes a commitment over it by incorporating it into a Merkle tree. When the segment finishes, the chip produces a final commitment (Merkle root) that reflects every change made during execution.
+- **Field: Expand Direction:**
+  Each memory chunk is tagged with an `expand_direction` field:
+  - `expand_direction = 1` indicates a boundary row representing the initial memory state.
+  - `expand_direction = -1` indicates a boundary row representing the final memory state.
+  - `expand_direction = 0` marks rows that are not relevant (padding rows where all interaction multiplicities are zero).
+- **Multiple Buses:**
+  To enforce these commitments, the `PersistentBoundaryChip` interacts with three buses:
+  - **Merkle Bus:**
+    For initial memory rows, it sends a record with `expand_direction = 1`, and for final memory rows, it receives a record with `expand_direction = -1`. This allows the Merkle chip to build and later verify a full commitment over the memory.
+  - **Compression Bus:**
+    It sends the values and hash arrays for each chunk. The multiplicity of these interactions is determined by the square of the `expand_direction` (so that both initial and final rows are treated uniformly in the compression process).
+  - **Memory Bus:**
+    It performs the basic send/receive interactions that balance out each memory operation, similar to the ones described in the "Basic performed interactions" section.
+
+The uniqueness of the addresses is achieved by the interactions on the merkle bus. The other chip that does interactions there is the **merkle chip**, which builds the merkle tree, and to balance everything out, the memory boundary chip's interactions must correspond to the leaves of the merkle tree, thus, all distinct.
+
+## Implementation details
+
+In this model, there is no central memory/offline checker AIR. Every chip is responsible for doing the necessary interactions discussed above for its memory operations. For this, every chip's AIR must have some auxiliary columns for every memory operation. The auxiliary columns include `prev_timestamp` and, for Write operations, `prev_data`.
+
+The initial memory state is constrained at the AIR level by the `PersistentBoundaryChip`, which commits to it via the `initial_root` Merkle root (a public value) and sends initial values on the memory bus at timestamp $0$.
+
+## What to take into account when adding a new chip
+
+Key points:
+- For all memory accesses, use memory bridge. It will ensure that all memory interactions are of a certain kind, which we already established soundness for.
+- Do not increase the timestamp more than necessary -- otherwise the timestamp may overflow. Ideally, the timestamp should be increased by 1 for every memory access and never otherwise.
+- In general, do not communicate with system buses directly.

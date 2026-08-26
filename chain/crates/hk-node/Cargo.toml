@@ -1,0 +1,50 @@
+[package]
+name = "hk-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hk-node"
+path = "src/main.rs"
+
+[dependencies]
+hk-primitives = { path = "../hk-primitives" }
+hk-crypto = { path = "../hk-crypto" }
+hk-mandate = { path = "../hk-mandate" }
+hk-state = { path = "../hk-state" }
+hk-consensus = { path = "../hk-consensus" }
+hk-wallet = { path = "../hk-wallet" }
+hk-spend-circuit = { path = "../../../zkvm-bakeoff/circuit" }
+bincode = "1"
+# In-node STARK verification (P2.0/WS2). default = [] on the sdk keeps this lean —
+# verifier components only, no network/gnark/cuda. Feature-gated so `--no-default-features`
+# still builds the transparent-only node if the sdk ever fights the host toolchain.
+sp1-sdk = { version = "6.4.0", default-features = false, optional = true }
+
+async-trait = { workspace = true }
+bytes = { workspace = true, features = ["serde"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+
+tokio = { version = "1", features = ["full"] }
+eyre = "0.6"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+rand = "0.8"
+ed25519-consensus = { version = "2.1", features = ["serde"] }
+
+# Vendored Malachite (pins in vendor/external/PINS.md); renamed to the engine's import convention.
+malachitebft-app-channel = { package = "informalsystems-malachitebft-app-channel", path = "../../../vendor/external/malachite/code/crates/app-channel" }
+malachitebft-codec = { package = "informalsystems-malachitebft-codec", path = "../../../vendor/external/malachite/code/crates/codec" }
+malachitebft-peer = { package = "informalsystems-malachitebft-peer", path = "../../../vendor/external/malachite/code/crates/peer", features = ["serde"] }
+malachitebft-core-types = { package = "informalsystems-malachitebft-core-types", path = "../../../vendor/external/malachite/code/crates/core-types", features = ["serde"] }
+malachitebft-core-consensus = { package = "informalsystems-malachitebft-core-consensus", path = "../../../vendor/external/malachite/code/crates/core-consensus" }
+malachitebft-sync = { package = "informalsystems-malachitebft-sync", path = "../../../vendor/external/malachite/code/crates/sync" }
+malachitebft-signing-ed25519 = { package = "informalsystems-malachitebft-signing-ed25519", path = "../../../vendor/external/malachite/code/crates/signing-ed25519", features = ["serde"] }
+
+[features]
+default = ["sp1-verify"]
+sp1-verify = ["dep:sp1-sdk"]

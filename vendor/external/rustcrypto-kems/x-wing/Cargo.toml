@@ -1,0 +1,42 @@
+[package]
+name = "x-wing"
+description = "Pure Rust implementation of the X-Wing Key Encapsulation Mechanism (draft 06)"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0 OR MIT"
+readme = "README.md"
+homepage = "https://github.com/RustCrypto/KEMs/tree/master/x-wing"
+repository = "https://github.com/RustCrypto/KEMs/tree/master/x-wing"
+categories = ["cryptography", "no-std"]
+keywords = ["crypto", "x-wing", "xwing", "kem", "post-quantum"]
+exclude = ["src/test-vectors.json"]
+
+[features]
+default = []
+getrandom = ["kem/getrandom"]
+zeroize = ["dep:zeroize", "ml-kem/zeroize", "x25519-dalek/zeroize"]
+hazmat = []
+
+[dependencies]
+kem = "0.3"
+ml-kem = { version = "0.3", default-features = false, features = ["hazmat"] }
+sha3 = { version = "0.12", default-features = false }
+shake = { version = "0.1", default-features = false }
+x25519-dalek = { version = "3", default-features = false, features = ["static_secrets"] }
+
+# optional dependencies
+zeroize = { version = "1.8.1", optional = true, default-features = true }
+
+[dev-dependencies]
+getrandom = { version = "0.4", features = ["sys_rng"] }
+hex = { version = "0.4", features = ["serde"] }
+rand_core = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true

@@ -1,0 +1,118 @@
+use openvm_circuit_primitives::{StructReflection, StructReflectionHelper};
+use openvm_recursion_circuit_derive::AlignedBorrow;
+use openvm_stark_sdk::config::baby_bear_poseidon2::DIGEST_SIZE;
+use serde::{Deserialize, Serialize};
+
+pub const VERIFIER_PVS_AIR_ID: usize = 0;
+pub const VM_PVS_AIR_ID: usize = 1;
+pub const DEF_PVS_AIR_ID: usize = 2;
+pub const CONSTRAINT_EVAL_AIR_ID: usize = 3;
+
+pub const CONSTRAINT_EVAL_CACHED_INDEX: usize = 0;
+
+pub const LOG_MAX_RECURSION_DEPTH: u8 = 8;
+pub const MAX_RECURSION_DEPTH: u32 = 1 << LOG_MAX_RECURSION_DEPTH;
+
+#[repr(C)]
+#[derive(
+    AlignedBorrow, StructReflection, Clone, Copy, Debug, Serialize, Deserialize, PartialEq,
+)]
+pub struct VkCommit<F> {
+    /// Cached trace commit of this verifier circuit's SymbolicExpressionAir, which is derived
+    /// from its child_vk.
+    pub cached_commit: [F; DIGEST_SIZE],
+    /// Field pre_hash of the child MultiStarkVerifyingKey.
+    pub vk_pre_hash: [F; DIGEST_SIZE],
+}
+
+#[repr(C)]
+#[derive(AlignedBorrow, StructReflection, Clone, Copy)]
+pub struct VerifierBasePvs<F> {
+    //////////////////////////////////////////////////////////////////////
+    /// VERIFIER-SPECIFIC PVS
+    //////////////////////////////////////////////////////////////////////
+    /// Ternary flag to indicate which continuations layer this Proof is for. Should be 0 for
+    /// the leaf verifier, 1 for the internal-for-leaf verifier, and 2 for the internal-
+    /// recursive verifier.
+    pub internal_flag: F,
+    /// Commit to the app_vk's DAG and its pre-hash, first exposed by the leaf verifier.
+    pub app_vk_commit: VkCommit<F>,
+    /// Commit to the leaf_vk's DAG and its pre-hash, first exposed by the internal-for-leaf
+    /// verifier.
+    pub leaf_vk_commit: VkCommit<F>,
+    /// Commit to the internal_for_leaf_vk's DAG and its pre-hash, first exposed by the first
+    /// (i.e. index 0) internal-recursive layer verifier.
+    pub internal_for_leaf_vk_commit: VkCommit<F>,
+
+    //////////////////////////////////////////////////////////////////////
+    /// VERIFIER-SPECIFIC RECURSION PVS
+    //////////////////////////////////////////////////////////////////////
+    /// Depth of the internal-recursive layer this Proof is for: 0 for non-internal-recursive
+    /// layers, 1 for the first (i.e. index 0) internal-recursive layer, 2 for the second (i.e.
+    /// index 1) internal-recursive layer, and so on.
+    pub recursion_depth: F,
+    /// Commit to the internal_recursive_vk's DAG and its pre-hash, exposed by subsequent (i.e.
+    /// index > 0) internal-recursive layer verifiers.
+    pub internal_recursive_vk_commit: VkCommit<F>,
+}
+
+#[repr(C)]
+#[derive(AlignedBorrow, StructReflection, Clone, Copy)]
+pub struct VerifierDefPvs<F> {
+    //////////////////////////////////////////////////////////////////////
+    /// DEFERRAL-SPECIFIC PVS
+    //////////////////////////////////////////////////////////////////////
+    /// Ternary flag to indicate which public values this Proof contains. Should be 0 if it
+    /// has only VM public values defined, 1 if only deferral public values, and 2 if both.
+    pub deferral_flag: F,
+    /// Commit to the deferral hook verifying key, computed by hashing the cached_commit and
+    /// vk_pre_hash components of the app-or-deferral, leaf, and internal-for-leaf vk commits
+    /// when deferral_flag == 1. It is propagated unchanged once set.
+    pub def_hook_commit: [F; DIGEST_SIZE],
+}
+
+#[repr(C)]
+#[derive(AlignedBorrow, StructReflection, Clone, Copy)]
+pub struct VmPvs<F> {
+    //////////////////////////////////////////////////////////////////////
+    /// PROGRAM COMMIT PVS
+    //////////////////////////////////////////////////////////////////////
+    /// Cached trace commit of the app verifier circuit's ProgramAir.
+    pub program_commit: [F; DIGEST_SIZE],
+
+    //////////////////////////////////////////////////////////////////////
+    /// CONNECTOR PVS
+    //////////////////////////////////////////////////////////////////////
+    /// Starting PC value of the program (or segment) run.
+    pub initial_pc: F,
+    /// Final PC value of the program (or segment) run.
+    pub final_pc: F,
+    /// Exit code of the program run.
+    pub exit_code: F,
+    /// Boolean flag to determine whether or not this segment terminated the program.
+    pub is_terminate: F,
+
+    //////////////////////////////////////////////////////////////////////
+    /// MEMORY MERKLE PVS
+    //////////////////////////////////////////////////////////////////////
+    /// Merkle root commit of the starting memory state for this program (or segment).
+    pub initial_root: [F; DIGEST_SIZE],
+    /// Merkle root commit of the final memory state for this program (or segment).
+    pub final_root: [F; DIGEST_SIZE],
+}
+
+#[repr(C)]
+#[derive(AlignedBorrow, StructReflection, Clone, Copy)]
+pub struct DeferralPvs<F> {
+    /// Merkle root of all the initial hash accumulators for deferral circuit proofs that
+    /// have been aggregated up to this point.
+    pub initial_acc_hash: [F; DIGEST_SIZE],
+    /// Merkle root of all the final hash accumulators for deferral circuit proofs that
+    /// have been aggregated up to this point.
+    pub final_acc_hash: [F; DIGEST_SIZE],
+    /// Depth of the Merkle subtrees above.
+    pub depth: F,
+    /// Node index at the current depth of the deferral accumulator Merkle tree. Hook
+    /// proofs start at their def_idx; combined proofs end at node_idx 0.
+    pub node_idx: F,
+}

@@ -1,0 +1,398 @@
+use std::{array::from_fn, borrow::Borrow};
+
+use openvm_circuit::arch::POSEIDON2_WIDTH;
+use openvm_circuit_primitives::{ColumnsAir, StructReflection, StructReflectionHelper, SubAir};
+use openvm_recursion_circuit::{
+    bus::{
+        CachedCommitBus, CachedCommitBusMessage, Poseidon2CompressBus, Poseidon2CompressMessage,
+        PreHashBus, PreHashMessage, PublicValuesBus, PublicValuesBusMessage,
+    },
+    primitives::bus::{
+        PowerCheckerBus, PowerCheckerBusMessage, RangeCheckerBus, RangeCheckerBusMessage,
+    },
+};
+use openvm_recursion_circuit_derive::AlignedBorrow;
+use openvm_stark_backend::{
+    interaction::InteractionBuilder, BaseAirWithPublicValues, PartitionedBaseAir,
+};
+use openvm_stark_sdk::config::baby_bear_poseidon2::DIGEST_SIZE;
+use openvm_verify_stark_host::pvs::{
+    DeferralPvs, VerifierBasePvs, VkCommit, CONSTRAINT_EVAL_AIR_ID, CONSTRAINT_EVAL_CACHED_INDEX,
+    LOG_MAX_RECURSION_DEPTH, VERIFIER_PVS_AIR_ID,
+};
+use p3_air::{Air, AirBuilder, AirBuilderWithPublicValues, BaseAir};
+use p3_field::{Field, PrimeCharacteristicRing};
+use p3_matrix::Matrix;
+
+use crate::{
+    circuit::{
+        deferral::{
+            hook::bus::{
+                DefCircuitCommitBus, DefCircuitCommitMessage, OnionResultBus, OnionResultMessage,
+            },
+            DeferralAggregationPvs, DEF_AGG_PVS_AIR_ID, MAX_DEF_AGG_MERKLE_DEPTH,
+        },
+        root::NUM_DIGESTS_IN_VM_COMMIT,
+        subair::{HashSliceCtx, HashSliceSubAir, MerkleRootBus, MerkleRootMessage},
+        utils::{assert_vk_commit_eq, assert_vk_commit_unset, vk_commit_components},
+    },
+    utils::{digests_to_poseidon2_input, pad_slice_to_poseidon2_input, zero_hash},
+    CommitBytes, VkCommitBytes,
+};
+
+#[repr(C)]
+#[derive(AlignedBorrow, StructReflection)]
+pub struct DeferralHookPvsCols<F> {
+    pub verifier_pvs: VerifierBasePvs<F>,
+    pub def_pvs: DeferralAggregationPvs<F>,
+
+    pub num_merkle_leaves: F,
+    pub recursion_depth_minus_one_inv: F,
+
+    pub intermediate_vk_states: [[F; POSEIDON2_WIDTH]; NUM_DIGESTS_IN_VM_COMMIT - 1],
+    pub def_circuit_commit: [F; DIGEST_SIZE],
+
+    pub input_onion: [F; DIGEST_SIZE],
+    pub output_onion: [F; DIGEST_SIZE],
+
+    pub def_circuit_commit_padded: [F; DIGEST_SIZE],
+    pub input_onion_padded: [F; DIGEST_SIZE],
+    pub output_onion_padded: [F; DIGEST_SIZE],
+}
+
+#[derive(ColumnsAir)]
+#[columns_via(DeferralHookPvsCols<u8>)]
+pub struct DeferralHookPvsAir {
+    pub public_values_bus: PublicValuesBus,
+    pub cached_commit_bus: CachedCommitBus,
+    pub pre_hash_bus: PreHashBus,
+    pub poseidon2_compress_bus: Poseidon2CompressBus,
+    pub hash_slice_subair: HashSliceSubAir,
+    pub pow_checker_bus: PowerCheckerBus,
+    pub range_checker_bus: RangeCheckerBus,
+
+    pub def_circuit_commit_bus: DefCircuitCommitBus,
+    pub merkle_root_bus: MerkleRootBus,
+    pub onion_res_bus: OnionResultBus,
+
+    pub expected_internal_recursive_vk_commit: VkCommitBytes,
+    pub zero_hash: CommitBytes,
+}
+
+impl DeferralHookPvsAir {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        public_values_bus: PublicValuesBus,
+        cached_commit_bus: CachedCommitBus,
+        pre_hash_bus: PreHashBus,
+        poseidon2_compress_bus: Poseidon2CompressBus,
+        hash_slice_subair: HashSliceSubAir,
+        pow_checker_bus: PowerCheckerBus,
+        range_checker_bus: RangeCheckerBus,
+        def_circuit_commit_bus: DefCircuitCommitBus,
+        merkle_root_bus: MerkleRootBus,
+        onion_res_bus: OnionResultBus,
+        expected_internal_recursive_vk_commit: VkCommitBytes,
+    ) -> Self {
+        let zero_hash = zero_hash(1).into();
+        Self {
+            public_values_bus,
+            cached_commit_bus,
+            pre_hash_bus,
+            poseidon2_compress_bus,
+            hash_slice_subair,
+            pow_checker_bus,
+            range_checker_bus,
+            def_circuit_commit_bus,
+            merkle_root_bus,
+            onion_res_bus,
+            expected_internal_recursive_vk_commit,
+            zero_hash,
+        }
+    }
+}
+
+impl<F: Field> BaseAir<F> for DeferralHookPvsAir {
+    fn width(&self) -> usize {
+        DeferralHookPvsCols::<u8>::width()
+    }
+}
+impl<F: Field> BaseAirWithPublicValues<F> for DeferralHookPvsAir {
+    fn num_public_values(&self) -> usize {
+        DeferralPvs::<u8>::width()
+    }
+}
+impl<F: Field> PartitionedBaseAir<F> for DeferralHookPvsAir {}
+
+impl<AB: AirBuilder + InteractionBuilder + AirBuilderWithPublicValues> Air<AB>
+    for DeferralHookPvsAir
+{
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let local = main.row_slice(0).expect("window should have one element");
+        let local: &DeferralHookPvsCols<AB::Var> = (*local).borrow();
+
+        /*
+         * Check that the final proof is computed by the internal recursive prover, i.e.
+         * that internal_flag is 2 and that recursion_depth is in [1, MAX_RECURSION_DEPTH].
+         */
+        builder.assert_eq(local.verifier_pvs.internal_flag, AB::F::TWO);
+
+        let depth_minus_one = local.verifier_pvs.recursion_depth - AB::F::ONE;
+        let is_depth_not_one = depth_minus_one.clone() * local.recursion_depth_minus_one_inv;
+        let is_depth_one = AB::Expr::ONE - is_depth_not_one.clone();
+
+        builder.assert_bool(is_depth_one.clone());
+        builder
+            .when(is_depth_one.clone())
+            .assert_one(local.verifier_pvs.recursion_depth);
+
+        self.range_checker_bus.lookup_key(
+            builder,
+            RangeCheckerBusMessage {
+                value: depth_minus_one,
+                max_bits: AB::Expr::from_u8(LOG_MAX_RECURSION_DEPTH),
+            },
+            AB::F::ONE,
+        );
+
+        /*
+         * We need to receive public values from ProofShapeModule to ensure the values read
+         * here are correct. All verifier public values will be at VERIFIER_PVS_AIR_ID,
+         * while the deferral public values will be at DEF_AGG_PVS_AIR_ID.
+         */
+        let verifier_pvs_id = AB::Expr::from_usize(VERIFIER_PVS_AIR_ID);
+        let def_pvs_id = AB::Expr::from_usize(DEF_AGG_PVS_AIR_ID);
+
+        for (pv_idx, value) in local.verifier_pvs.as_slice().iter().enumerate() {
+            self.public_values_bus.receive(
+                builder,
+                AB::F::ZERO,
+                PublicValuesBusMessage {
+                    air_idx: verifier_pvs_id.clone(),
+                    pv_idx: AB::Expr::from_usize(pv_idx),
+                    value: (*value).into(),
+                },
+                AB::F::ONE,
+            );
+        }
+
+        for (pv_idx, value) in local.def_pvs.as_slice().iter().enumerate() {
+            self.public_values_bus.receive(
+                builder,
+                AB::F::ZERO,
+                PublicValuesBusMessage {
+                    air_idx: def_pvs_id.clone(),
+                    pv_idx: AB::Expr::from_usize(pv_idx),
+                    value: (*value).into(),
+                },
+                AB::F::ONE,
+            );
+        }
+
+        /*
+         * We also need to receive the cached commit from ProofShapeModule, which is either for
+         * the internal-for-leaf (i.e. if recursion_depth == 1) or internal-recursive layer. In
+         * the former case we constrain verifier_pvs.internal_recursive_vk_commit to be unset
+         * (i.e. all 0), and in the latter we constrain it to be equal to a pre-generated
+         * constant as it should be the same regardless of def_vk (provided internal system
+         * params are the same).
+         */
+        let cached_commit = from_fn(|i| {
+            local.verifier_pvs.internal_for_leaf_vk_commit.cached_commit[i] * is_depth_one.clone()
+                + local
+                    .verifier_pvs
+                    .internal_recursive_vk_commit
+                    .cached_commit[i]
+                    * is_depth_not_one.clone()
+        });
+        self.cached_commit_bus.receive(
+            builder,
+            AB::F::ZERO,
+            CachedCommitBusMessage {
+                air_idx: AB::Expr::from_usize(CONSTRAINT_EVAL_AIR_ID),
+                cached_idx: AB::Expr::from_usize(CONSTRAINT_EVAL_CACHED_INDEX),
+                global_cached_idx: AB::Expr::ZERO,
+                cached_commit,
+            },
+            AB::F::ONE,
+        );
+
+        self.pre_hash_bus.receive(
+            builder,
+            AB::F::ZERO,
+            PreHashMessage::<AB::F> {
+                vk_pre_hash: self
+                    .expected_internal_recursive_vk_commit
+                    .vk_pre_hash
+                    .into(),
+            },
+            AB::F::ONE,
+        );
+
+        assert_vk_commit_unset(
+            &mut builder.when(is_depth_one),
+            local.verifier_pvs.internal_recursive_vk_commit,
+        );
+
+        assert_vk_commit_eq(
+            &mut builder.when(is_depth_not_one),
+            local.verifier_pvs.internal_recursive_vk_commit,
+            VkCommit::<AB::Expr>::from(self.expected_internal_recursive_vk_commit),
+        );
+
+        /*
+         * Commit def_circuit_commit is hash_slice of the 6 vk_commit_components (cached_commit
+         * and vk_pre_hash for each of def_vk_commit (called app_vk_commit in the
+         * struct), leaf_vk_commit, and internal_for_leaf_vk_commit). We constrain this
+         * here and send def_circuit_commit to its bus.
+         */
+        let vk_commit_components: Vec<_> = vk_commit_components(&local.verifier_pvs)
+            .into_iter()
+            .map(|c| c.map(Into::into))
+            .collect();
+        self.hash_slice_subair.eval(
+            builder,
+            HashSliceCtx {
+                elements: vk_commit_components.as_slice(),
+                intermediate: local
+                    .intermediate_vk_states
+                    .map(|v| v.map(Into::into))
+                    .as_slice(),
+                result: &local.def_circuit_commit.map(Into::into),
+                enabled: &AB::Expr::ONE,
+            },
+        );
+
+        self.def_circuit_commit_bus.send(
+            builder,
+            DefCircuitCommitMessage {
+                def_circuit_commit: local.def_circuit_commit,
+            },
+            AB::F::ONE,
+        );
+
+        /*
+         * The input_onion and output_onion are computed by decommitting def_pvs.merkle_commit
+         * and performing two onion hashes. Both steps are done in different AIRs, but we must
+         * receive these commits to constrain consistency. Note that merkle_depth is constrained
+         * to be in [0, MAX_DEF_AGG_MERKLE_DEPTH] - the power check forces merkle_depth to be in
+         * [0, 31], and the range check forces merkle_depth <= MAX_DEF_AGG_MERKLE_DEPTH.
+         */
+        self.pow_checker_bus.lookup_key(
+            builder,
+            PowerCheckerBusMessage {
+                log: local.def_pvs.merkle_depth,
+                exp: local.num_merkle_leaves,
+            },
+            AB::F::ONE,
+        );
+
+        self.range_checker_bus.lookup_key(
+            builder,
+            RangeCheckerBusMessage {
+                value: AB::Expr::from_usize(MAX_DEF_AGG_MERKLE_DEPTH) - local.def_pvs.merkle_depth,
+                max_bits: AB::Expr::from_usize(8),
+            },
+            AB::F::ONE,
+        );
+
+        self.merkle_root_bus.receive(
+            builder,
+            MerkleRootMessage {
+                merkle_root: local.def_pvs.merkle_commit.map(Into::into),
+                idx: AB::Expr::ZERO,
+                num_rows_or_zero: local.num_merkle_leaves * AB::Expr::TWO,
+            },
+            AB::F::ONE,
+        );
+
+        self.onion_res_bus.receive(
+            builder,
+            OnionResultMessage {
+                input_onion: local.input_onion,
+                output_onion: local.output_onion,
+                num_elements: local.def_pvs.num_def_circuit_proofs,
+            },
+            AB::F::ONE,
+        );
+
+        /*
+         * Finally, we need to constrain that the public values this AIR produces are consistent
+         * with the child's. initial_acc_hash should be the compression of a padded
+         * def_circuit_commit, and final_acc_hash should be the compression of the input and
+         * output onions. node_idx should be equal to the def_idx of the deferral circuit this
+         * hook proof is for. Note that the Merkle root computation hashes each leaf with the
+         * zero digest prior.
+         */
+        let &DeferralPvs::<_> {
+            initial_acc_hash,
+            final_acc_hash,
+            depth,
+            node_idx,
+        } = builder.public_values().borrow();
+
+        builder.assert_one(depth);
+        builder.assert_eq(node_idx, local.def_pvs.def_idx);
+
+        self.poseidon2_compress_bus.lookup_key(
+            builder,
+            Poseidon2CompressMessage {
+                input: pad_slice_to_poseidon2_input(
+                    &local.def_circuit_commit.map(Into::into),
+                    AB::Expr::ZERO,
+                ),
+                output: local.def_circuit_commit_padded.map(Into::into),
+            },
+            AB::F::ONE,
+        );
+
+        self.poseidon2_compress_bus.lookup_key(
+            builder,
+            Poseidon2CompressMessage {
+                input: pad_slice_to_poseidon2_input(
+                    &local.input_onion.map(Into::into),
+                    AB::Expr::ZERO,
+                ),
+                output: local.input_onion_padded.map(Into::into),
+            },
+            AB::F::ONE,
+        );
+
+        self.poseidon2_compress_bus.lookup_key(
+            builder,
+            Poseidon2CompressMessage {
+                input: pad_slice_to_poseidon2_input(
+                    &local.output_onion.map(Into::into),
+                    AB::Expr::ZERO,
+                ),
+                output: local.output_onion_padded.map(Into::into),
+            },
+            AB::F::ONE,
+        );
+
+        self.poseidon2_compress_bus.lookup_key(
+            builder,
+            Poseidon2CompressMessage {
+                input: digests_to_poseidon2_input(
+                    local.def_circuit_commit_padded.map(Into::into),
+                    self.zero_hash.into(),
+                ),
+                output: initial_acc_hash.map(Into::into),
+            },
+            AB::F::ONE,
+        );
+
+        self.poseidon2_compress_bus.lookup_key(
+            builder,
+            Poseidon2CompressMessage {
+                input: digests_to_poseidon2_input(
+                    local.input_onion_padded.map(Into::into),
+                    local.output_onion_padded.map(Into::into),
+                ),
+                output: final_acc_hash.map(Into::into),
+            },
+            AB::F::ONE,
+        );
+    }
+}
