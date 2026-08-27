@@ -22,6 +22,8 @@ mod demo_economy;
 mod demo_mandates;
 mod demo_shielded;
 mod genesis;
+mod gossip;
+mod mempool;
 mod node;
 mod rpc;
 mod state;
@@ -249,6 +251,12 @@ fn cmd_testnet(n: usize, home: &PathBuf) -> eyre::Result<()> {
             .map(|j| format!("\"/ip4/127.0.0.1/tcp/{}\"", CONSENSUS_BASE_PORT + j))
             .collect();
 
+        // C2.3: every other node's RPC — a tx submitted to ANY devnet node reaches
+        // every proposer's mempool one hop later.
+        let gossip_peers: Vec<String> = (0..n)
+            .filter(|j| *j != i)
+            .map(|j| format!("\"http://127.0.0.1:{}\"", RPC_BASE_PORT + j))
+            .collect();
         let config = config_template(
             &format!("hk-{i}"),
             &format!("/ip4/127.0.0.1/tcp/{}", CONSENSUS_BASE_PORT + i),
@@ -256,6 +264,7 @@ fn cmd_testnet(n: usize, home: &PathBuf) -> eyre::Result<()> {
             false,
             &format!("127.0.0.1:{}", METRICS_BASE_PORT + i),
             &format!("127.0.0.1:{}", RPC_BASE_PORT + i),
+            &gossip_peers.join(", "),
         );
         std::fs::write(dir.join("config.toml"), config)?;
         println!("wrote {}  (rpc :{}) ", dir.display(), RPC_BASE_PORT + i);
@@ -274,6 +283,7 @@ fn config_template(
     metrics_enabled: bool,
     metrics_addr: &str,
     rpc_addr: &str,
+    gossip_peers: &str,
 ) -> String {
     format!(
         r#"moniker = "{moniker}"
@@ -342,6 +352,9 @@ flavor = "single_threaded"
 [hk_rpc]
 enabled = true
 listen_addr = "{rpc_addr}"
+# C2.3: peer RPC endpoints to push admitted txs to (single-hop tx gossip).
+# Empty = v0 behavior (submit to your home node; only it can propose your tx).
+gossip_peers = [{gossip_peers}]
 "#
     )
 }
@@ -417,11 +430,12 @@ fn cmd_genesis_build(validators_path: &str, out_path: &str) -> eyre::Result<()> 
 
 /// Operator-side: write a WAN-ready config.toml into HOME.
 fn cmd_config_gen(rest: &[String]) -> eyre::Result<()> {
-    let usage = "usage: hk-node config-gen <HOME> --listen /ip4/0.0.0.0/tcp/27000 --peers /ip4/A.B.C.D/tcp/27000,/ip4/… [--moniker NAME] [--rpc 127.0.0.1:26000] [--metrics 127.0.0.1:29000]";
+    let usage = "usage: hk-node config-gen <HOME> --listen /ip4/0.0.0.0/tcp/27000 --peers /ip4/A.B.C.D/tcp/27000,/ip4/… [--moniker NAME] [--rpc 127.0.0.1:26000] [--metrics 127.0.0.1:29000] [--gossip-peers http://A.B.C.D:26000,…]";
     let home = PathBuf::from(rest.first().ok_or_else(|| eyre::eyre!("{usage}"))?);
     let (mut listen, mut peers, mut metrics) = (None::<String>, None::<String>, None::<String>);
     let mut moniker = "hk-validator".to_string();
     let mut rpc_addr = "127.0.0.1:26000".to_string();
+    let mut gossip = String::new();
     let mut i = 1;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -430,12 +444,18 @@ fn cmd_config_gen(rest: &[String]) -> eyre::Result<()> {
             "--moniker" => { moniker = rest.get(i + 1).cloned().ok_or_else(|| eyre::eyre!("{usage}"))?; i += 2 }
             "--rpc" => { rpc_addr = rest.get(i + 1).cloned().ok_or_else(|| eyre::eyre!("{usage}"))?; i += 2 }
             "--metrics" => { metrics = rest.get(i + 1).cloned(); i += 2 }
+            "--gossip-peers" => { gossip = rest.get(i + 1).cloned().unwrap_or_default(); i += 2 }
             other => eyre::bail!("unknown flag {other}\n{usage}"),
         }
     }
     let listen = listen.ok_or_else(|| eyre::eyre!("--listen is required\n{usage}"))?;
     let quoted: Vec<String> = peers
         .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| format!("\"{}\"", s.trim()))
+        .collect();
+    let gossip_quoted: Vec<String> = gossip
         .split(',')
         .filter(|s| !s.trim().is_empty())
         .map(|s| format!("\"{}\"", s.trim()))
@@ -448,6 +468,7 @@ fn cmd_config_gen(rest: &[String]) -> eyre::Result<()> {
         metrics.is_some(),
         metrics.as_deref().unwrap_or("127.0.0.1:29000"),
         &rpc_addr,
+        &gossip_quoted.join(", "),
     );
     std::fs::write(home.join("config.toml"), cfg)?;
     println!(

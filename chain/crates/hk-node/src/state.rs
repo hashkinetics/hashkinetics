@@ -47,7 +47,7 @@ use hk_consensus::HkValidator;
 #[derive(Clone)]
 pub struct SharedHandles {
     pub chain: Arc<Mutex<hk_state::State>>,
-    pub mempool: Arc<Mutex<VecDeque<SignedTx>>>,
+    pub mempool: Arc<Mutex<crate::mempool::Mempool>>,
     pub receipts: Arc<Mutex<ReceiptLog>>,
     /// Every pool commitment in insertion order, WITH its stealth payload — a node-level
     /// INDEX (derivable by anyone replaying the chain; consensus keeps only the frontier).
@@ -64,6 +64,9 @@ pub struct SharedHandles {
     pub validators: Arc<Mutex<HkValidatorSet>>,
     /// Deterministic chain clock epoch (block time = chain_start_time + height).
     pub chain_start_time: u64,
+    /// C2.3: tx-gossip enqueue handle (`None` = gossip off; node.rs wires it when
+    /// `hk_rpc.gossip_peers` is non-empty).
+    pub gossip: Option<crate::gossip::GossipHandle>,
 }
 
 /// Bounded map of txid -> human receipt string ("ok: ..." / "rejected: ...").
@@ -118,7 +121,7 @@ pub struct HkApp {
 
     /// THE chain — the verified deterministic state machine, shared with RPC.
     pub chain: Arc<Mutex<hk_state::State>>,
-    pub mempool: Arc<Mutex<VecDeque<SignedTx>>>,
+    pub mempool: Arc<Mutex<crate::mempool::Mempool>>,
     pub receipts: Arc<Mutex<ReceiptLog>>,
     /// Pool-note index for wallet path rebuilds + scanning (see SharedHandles docs).
     pub pool_notes: Arc<Mutex<Vec<(hk_primitives::H256, Vec<u8>)>>>,
@@ -190,7 +193,7 @@ impl HkApp {
             address,
             validators: Arc::new(Mutex::new(validators)),
             chain: Arc::new(Mutex::new(chain)),
-            mempool: Arc::new(Mutex::new(VecDeque::new())),
+            mempool: Arc::new(Mutex::new(crate::mempool::Mempool::default())),
             receipts: Arc::new(Mutex::new(ReceiptLog::new(4096))),
             pool_notes: Arc::new(Mutex::new(Vec::new())),
             bundles: Arc::new(Mutex::new(Vec::new())),
@@ -233,6 +236,7 @@ impl HkApp {
             store: self.store.clone(),
             validators: self.validators.clone(),
             chain_start_time: self.chain_start_time,
+            gossip: None,
         }
     }
 
@@ -537,14 +541,14 @@ impl HkApp {
             }
             drop(rlog);
             if !included.is_empty() {
-                let mut mp = self.mempool.lock().unwrap();
-                mp.retain(|t| !included.iter().any(|(s, n)| *s == t.sender && *n == t.nonce));
+                // C2.2: indexed prune — one O(mempool) pass, O(1) membership tests.
+                self.mempool.lock().unwrap().remove_included(&included);
                 // P2.3: a bundle is spent once any of its txs committed.
+                let gone: std::collections::HashSet<(hk_primitives::AccountId, u64)> =
+                    included.iter().copied().collect();
                 let mut bundles = self.bundles.lock().unwrap();
                 bundles.retain(|(btxs, _)| {
-                    !btxs
-                        .iter()
-                        .any(|t| included.iter().any(|(s, n)| *s == t.sender && *n == t.nonce))
+                    !btxs.iter().any(|t| gone.contains(&(t.sender, t.nonce)))
                 });
             }
 
@@ -696,7 +700,7 @@ impl HkApp {
                 match store.save_snapshot(&snap) {
                     Ok(()) => {
                         let mp = self.mempool.lock().unwrap();
-                        if let Err(e) = store.wal_reset(&mp) {
+                        if let Err(e) = store.wal_reset(mp.iter()) {
                             error!(%e, "failed to reset mempool WAL");
                         }
                         info!(height, "Node snapshot persisted (restart resumes here)");
@@ -765,7 +769,13 @@ impl HkApp {
             *self.chain.lock().unwrap() = st;
             *self.pool_notes.lock().unwrap() = snap.pool_notes;
             self.receipts.lock().unwrap().restore(snap.receipts);
-            *self.mempool.lock().unwrap() = snap.mempool.into_iter().collect();
+            {
+                // Rebuild WITH indexes (C2); duplicate frames in an old image are suppressed.
+                let mut mp = self.mempool.lock().unwrap();
+                for tx in snap.mempool {
+                    mp.insert_unchecked(tx);
+                }
+            }
             if !snap.validators.is_empty() {
                 *self.validators.lock().unwrap() =
                     HkValidatorSet::new(snap.validators.into_iter().map(|v| HkValidator {
@@ -818,17 +828,15 @@ impl HkApp {
             self.current_height = HkHeight::new(h + 1);
         }
 
-        // Mempool WAL: admissions since the last snapshot. Stale nonces are dropped
-        // (the state machine would reject them anyway); duplicates skipped.
+        // Mempool WAL: admissions since the last snapshot, re-run through the SAME
+        // admission gate as live traffic (C2.1) — stale nonces, spent nullifiers and
+        // duplicates all drop here for the same reasons they would at the door.
         let mut wal_restored = 0usize;
         {
             let chain = self.chain.lock().unwrap();
             let mut mp = self.mempool.lock().unwrap();
             for tx in store.wal_load() {
-                let cur = chain.accounts.get(&tx.sender).map(|a| a.nonce).unwrap_or(0);
-                let dup = mp.iter().any(|t| t.sender == tx.sender && t.nonce == tx.nonce);
-                if tx.nonce >= cur && !dup {
-                    mp.push_back(tx);
+                if mp.try_admit(tx, &chain).is_ok() {
                     wal_restored += 1;
                 }
             }

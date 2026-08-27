@@ -31,11 +31,20 @@ pub struct Config {
 pub struct HkRpcConfig {
     pub enabled: bool,
     pub listen_addr: String,
+    /// C2.3: peer RPC base addresses ("http://host:port") to push admitted txs to —
+    /// single-hop tx gossip. `#[serde(default)]` keeps pre-C2 configs loading
+    /// (empty = v0 submit-to-your-home-node behavior).
+    #[serde(default)]
+    pub gossip_peers: Vec<String>,
 }
 
 impl Default for HkRpcConfig {
     fn default() -> Self {
-        Self { enabled: false, listen_addr: "127.0.0.1:26000".to_string() }
+        Self {
+            enabled: false,
+            listen_addr: "127.0.0.1:26000".to_string(),
+            gossip_peers: Vec::new(),
+        }
     }
 }
 

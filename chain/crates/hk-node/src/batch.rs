@@ -12,7 +12,12 @@ use hk_crypto::hash::shake256_32;
 use serde::{Deserialize, Serialize};
 
 pub const DOM_TXID: &str = "hk/v1/txid";
-pub const MAX_TXS_PER_BLOCK: usize = 256;
+/// C2.4: 256 → 1024. Proposer-side cap (consensus never rejects a fuller block —
+/// wire limits do). Budget at 1024 transparent txs: ~24.5 KB each on the bincode
+/// wire ≈ 25 MB/block, inside the 32 MiB pubsub cap with headroom; shielded blocks
+/// ride ONE 1.24 MB aggregate + ~2.7 KB/tx, far smaller. Devnet-measured before
+/// any public-testnet bump: see docs/CAPACITY-SHEET.md.
+pub const MAX_TXS_PER_BLOCK: usize = 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Batch {

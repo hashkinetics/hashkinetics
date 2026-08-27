@@ -60,6 +60,29 @@ pub async fn serve(addr: SocketAddr, h: SharedHandles) -> eyre::Result<()> {
     }
 }
 
+/// C2.1: the shared admission gate for `hk_submitTx` AND `hk_gossipTxs`.
+/// Lock order: chain BEFORE mempool (the commit path's order — no deadlocks).
+/// WAL on success only: the WAL replays through this same gate at restart, so
+/// what was never admissible is never persisted.
+fn admit_one(h: &SharedHandles, tx: &SignedTx) -> Result<[u8; 32], String> {
+    let admitted = {
+        let chain = h.chain.lock().unwrap();
+        let mut mp = h.mempool.lock().unwrap();
+        mp.try_admit(tx.clone(), &chain)
+    };
+    match admitted {
+        Ok(id) => {
+            if let Some(store) = &h.store {
+                if let Err(e) = store.wal_append(tx) {
+                    warn!(%e, "mempool WAL append failed");
+                }
+            }
+            Ok(id)
+        }
+        Err(e) => Err(e.as_str()),
+    }
+}
+
 async fn handle_conn(sock: &mut tokio::net::TcpStream, h: &SharedHandles) -> eyre::Result<()> {
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 4096];
@@ -157,21 +180,39 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
         "hk_submitTx" => {
             let tx_val = params.get("tx").cloned().unwrap_or(Value::Null);
             match serde_json::from_value::<SignedTx>(tx_val) {
-                Ok(tx) => {
-                    let id = txid(&tx);
-                    // P3.0/WS-B: WAL the admission first (crash between append and
-                    // push loses nothing; crash between push and append loses one
-                    // un-included tx — clients re-submit).
-                    if let Some(store) = &h.store {
-                        if let Err(e) = store.wal_append(&tx) {
-                            warn!(%e, "mempool WAL append failed");
+                Ok(tx) => match admit_one(h, &tx) {
+                    Ok(id) => {
+                        // C2.3: single-hop push to peers (local admissions only —
+                        // gossip-received txs never re-forward, so no loops).
+                        if let Some(g) = &h.gossip {
+                            g.enqueue(tx);
                         }
+                        json!({"result": {"accepted": true, "txid": hex::encode(id)}})
                     }
-                    h.mempool.lock().unwrap().push_back(tx);
-                    json!({"result": {"accepted": true, "txid": hex::encode(id)}})
-                }
+                    Err(reason) => {
+                        json!({"result": {"accepted": false, "reason": reason}})
+                    }
+                },
                 Err(e) => json!({"error": format!("bad tx: {e}")}),
             }
+        }
+        // C2.3: peer ingress. Same admission gate as hk_submitTx, but NEVER
+        // re-forwarded (single-hop by construction). Duplicate/stale refusals here
+        // are business as usual — most gossiped txs race their own origin copies.
+        "hk_gossipTxs" => {
+            let txs: Vec<SignedTx> = params
+                .get("txs")
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default();
+            let (mut admitted, mut dropped) = (0usize, 0usize);
+            for tx in txs {
+                match admit_one(h, &tx) {
+                    Ok(_) => admitted += 1,
+                    Err(_) => dropped += 1,
+                }
+            }
+            json!({"result": {"admitted": admitted, "dropped": dropped}})
         }
         "hk_getChannel" => match param_h256(params, "id") {
             Some(id) => {

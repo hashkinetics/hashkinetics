@@ -212,7 +212,12 @@ impl Node for App {
 
         // 0.7: spawn the RPC server sharing the chain/mempool/receipts handles.
         if config.hk_rpc.enabled {
-            let handles = state.handles();
+            let mut handles = state.handles();
+            // C2.3: single-hop tx gossip — locally admitted txs push to peer RPCs.
+            if !config.hk_rpc.gossip_peers.is_empty() {
+                handles.gossip =
+                    Some(crate::gossip::spawn(config.hk_rpc.gossip_peers.clone()));
+            }
             match config.hk_rpc.listen_addr.parse() {
                 Ok(addr) => {
                     tokio::spawn(async move {

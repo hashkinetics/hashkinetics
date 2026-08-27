@@ -36,8 +36,13 @@ demo re-runs on one command.
 - **Surfaces**: a zero-build block explorer (`explorer/index.html` — no amounts, no
   parties, by construction), a full user wallet (`hk-node wallet` — shield → stealth-pay
   → unshield → disclose), a genesis-ceremony join flow for external validators, and a
-  load harness (`hk-node storm` — measured devnet baseline: 123 tx/s at the 256-tx cap;
-  the capacity ledger is `docs/CAPACITY-SHEET.md`).
+  load harness (`hk-node storm` — measured devnet baseline: **274 tx/s sustained at the
+  1,024-tx cap**; the capacity ledger is `docs/CAPACITY-SHEET.md`).
+- **The C2 mempool (2026-08-27)**: admission pre-checks at the door (duplicates, stale
+  nonces, spent/pending nullifiers, expired anchors — refused with a reason, never a
+  wasted block slot), indexed O(1)-membership prune, and **single-hop tx gossip**: a tx
+  submitted to any node reaches every proposer's mempool (`hk_rpc.gossip_peers`). The run
+  that measured 27 tx/s pre-gossip now does 99.9 from a single RPC.
 
 ## What is NOT yet real (the honesty ledger — read this first)
 
@@ -45,9 +50,11 @@ demo re-runs on one command.
 value-bearing mainnet, and mainnet launches **guarded** (value caps lifted as findings
 close). The public-testnet 30-day soak is in progress, not done. Numbers are single-machine
 measurements unless the capacity sheet says otherwise. Known open items: rotation-restart
-signer resume, mempool sync between nodes (submit to your home node meanwhile), block-log
-segmentation, in-circuit WOTS KAT campaign, account-creation tx (accounts are genesis-only
-— hence no faucet yet). We keep this list current because it is the moat.
+signer resume, block-log segmentation, in-circuit WOTS KAT campaign, account-creation tx
+(accounts are genesis-only — hence no faucet yet), and the next throughput wall: block
+BYTES (25 MB Lamport-tx blocks stretch intervals; shielded txs are ~20× smaller). Closed
+since the release: ~~mempool sync between nodes~~ (C2 tx gossip, 2026-08-27). We keep
+this list current because it is the moat.
 
 ## Quickstart
 

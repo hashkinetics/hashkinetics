@@ -87,9 +87,14 @@ pub fn run(base: &str, rate: u64, duration_s: u64, nodes: u64) -> eyre::Result<(
     println!("    target: {base} (+{} sibling RPCs) · rate: {} · duration: {duration_s}s",
         nodes.saturating_sub(1),
         if rate == 0 { "MAX".into() } else { format!("{rate} tx/s") });
-    println!("    C1 FINDING #1 baked in: v0 has NO tx gossip between mempools — a proposer");
-    println!("    only includes txs submitted to ITS OWN RPC. Each sender gets a home node so");
-    println!("    every proposer has work (client-side guidance until C2 revisits mempool sync).\n");
+    if nodes <= 1 {
+        println!("    SINGLE-NODE MODE — every sender submits to {base} only. Pre-C2.3 this");
+        println!("    measured 27 tx/s (C1 finding #1: no tx gossip; only node0's proposals had");
+        println!("    work). With gossip live, this run should match the home-node baseline.\n");
+    } else {
+        println!("    Home-node-per-sender across {nodes} RPCs; C2.3 gossip additionally pushes");
+        println!("    every admission to all peers, so every proposer sees every tx.\n");
+    }
 
     if !wait("node RPC reachable", || chain_height(base) >= 1) {
         eyre::bail!("node not reachable at {base}");

@@ -25,7 +25,6 @@
 //! a machine crash may lose mempool admissions since the last snapshot (clients
 //! re-submit; consensus-critical data never lives only in the WAL).
 
-use std::collections::VecDeque;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -198,7 +197,7 @@ impl NodeStore {
 
     /// Rewrite the WAL to exactly the given txs (called at snapshot time, after
     /// included txs were pruned — the snapshot carries them; the WAL restarts).
-    pub fn wal_reset(&self, txs: &VecDeque<SignedTx>) -> Result<()> {
+    pub fn wal_reset<'a>(&self, txs: impl IntoIterator<Item = &'a SignedTx>) -> Result<()> {
         let mut buf = Vec::new();
         for tx in txs {
             let frame = bincode::serialize(tx)?;

@@ -11,7 +11,7 @@ operating post-quantum BFT.
   block log + snapshots — plan for growth).
 - **No GPU.** Validators VERIFY STARKs in-node on CPU; GPUs are for people *making*
   payments, not validating them.
-- Rust (stable) + access to the `hashkinetics/chain` repo (the coordinator grants it).
+- Rust (stable) + the public repo: `git clone https://github.com/hashkinetics/hashkinetics`.
 - One open inbound TCP port for consensus (default **27000**). Do NOT expose the node RPC
   (26000) publicly — it has no auth; keep it loopback or behind your own proxy.
 
@@ -53,10 +53,18 @@ trustless.
 hk-node config-gen ~/hk-validator \
   --listen /ip4/0.0.0.0/tcp/27000 \
   --peers /ip4/COORD.IP/tcp/27000,/ip4/PEER2.IP/tcp/27000 \
-  --moniker my-moniker
+  --moniker my-moniker \
+  --gossip-peers http://PEER1.IP:26000,http://PEER2.IP:26000   # optional, see below
 ```
 Peers = the multiaddrs the coordinator circulates (include at least the seed node; more is
 better). Firewall: allow inbound 27000/tcp.
+
+**Tx gossip (C2, optional but recommended):** `--gossip-peers` takes the RPC endpoints the
+coordinator circulates; your node then pushes every admitted tx to them (single hop), so a
+tx submitted anywhere reaches every proposer. To RECEIVE gossip, your own RPC must be
+reachable by the other validators — bind it to a peer-facing interface and **firewall it to
+the validator IPs only** (the RPC has no auth; the "never expose publicly" rule stands).
+Skipping gossip is safe: your node still validates everything; only tx relay is affected.
 
 ## 5 · Start (and keep started)
 
