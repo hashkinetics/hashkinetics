@@ -30,8 +30,12 @@ your consensus key and your permanent SLH-DSA root identity — and `validator.j
 
 ## 2 · Send the coordinator two things
 
+Mail **validators@hashkinetics.org** with:
+
 1. The contents of `~/hk-validator/validator.json`.
 2. Your public consensus multiaddr: `/ip4/<YOUR-PUBLIC-IP>/tcp/27000`.
+
+That address is also the operator channel for incidents once you're running.
 
 ## 3 · Receive and VERIFY genesis
 
