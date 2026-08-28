@@ -209,6 +209,10 @@ impl Node for App {
         } else {
             info!("HK_NO_PERSIST set — running in-memory (no block log, no snapshots)");
         }
+        // R2/WS-F: if the restored chain says our validator entry rotated to epoch E,
+        // swap the live signer to that epoch's tree BEFORE consensus starts (the engine
+        // holds a clone of the same handle; per-epoch state files resume their counters).
+        state.adopt_epoch_signer();
 
         // 0.7: spawn the RPC server sharing the chain/mempool/receipts handles.
         if config.hk_rpc.enabled {

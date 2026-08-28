@@ -70,6 +70,11 @@ async fn main() {
         );
     }
 
+    // C1p2.a/C3: proofs this server generates are kept here so `aggregate` can
+    // reference them by id ({"ids":[...]}) instead of re-uploading megabytes of
+    // hex — the inline-items path stays for compatibility. `store_clear` resets.
+    let mut proof_store: Vec<(u8, Vec<u8>)> = Vec::new();
+
     let listener = TcpListener::bind(&addr).await.expect("bind failed");
     println!("hk-prove: listening on {addr}  mode={mode}");
     println!(
@@ -142,10 +147,19 @@ async fn main() {
                                                     "proved SPEND in {prove_ms} ms  ({} KB)",
                                                     bytes.len() / 1024
                                                 );
+                                                // Compressed proofs are aggregatable — store
+                                                // for by-id aggregation.
+                                                let id: i64 = if !req_core {
+                                                    proof_store.push((KIND_SPEND, bytes.clone()));
+                                                    (proof_store.len() - 1) as i64
+                                                } else {
+                                                    -1
+                                                };
                                                 json!({"result": {
                                                     "proof": hex::encode(bytes),
                                                     "public": serde_json::to_value(&public).unwrap(),
                                                     "prove_ms": prove_ms,
+                                                    "id": id,
                                                 }})
                                             }
                                         }
@@ -191,10 +205,17 @@ async fn main() {
                                                 "proved MINT in {prove_ms} ms  ({} KB)",
                                                 bytes.len() / 1024
                                             );
+                                            let id: i64 = if !req_core {
+                                                proof_store.push((KIND_MINT, bytes.clone()));
+                                                (proof_store.len() - 1) as i64
+                                            } else {
+                                                -1
+                                            };
                                             json!({"result": {
                                                 "proof": hex::encode(bytes),
                                                 "public": serde_json::to_value(&public).unwrap(),
                                                 "prove_ms": prove_ms,
+                                                "id": id,
                                             }})
                                         }
                                     }
@@ -204,11 +225,33 @@ async fn main() {
                     }
                 }
             }
+            "store_clear" => {
+                let n = proof_store.len();
+                proof_store.clear();
+                json!({"result": {"cleared": n}})
+            }
             "aggregate" => {
-                // items: [{kind: "spend"|"mint", proof: <hex bincode SP1ProofWithPublicValues,
-                // COMPRESSED mode>}] — order is preserved into the digest.
+                // Two input forms, order preserved into the digest either way:
+                //   {"ids": [0,1,2]}   — reference proofs THIS server generated (no re-upload)
+                //   {"items": [{kind, proof(hex)}]} — inline (compat; large bodies)
                 let items = params.get("items").and_then(|i| i.as_array()).cloned().unwrap_or_default();
-                match parse_agg_items(&items) {
+                let parsed_input: Result<Vec<(u8, SP1ProofWithPublicValues)>, String> =
+                    if let Some(ids) = params.get("ids").and_then(|i| i.as_array()) {
+                        ids.iter()
+                            .map(|v| {
+                                let i = v.as_u64().ok_or_else(|| "bad id".to_string())? as usize;
+                                let (k, b) = proof_store
+                                    .get(i)
+                                    .ok_or_else(|| format!("unknown proof id {i}"))?;
+                                let p = bincode::deserialize::<SP1ProofWithPublicValues>(b)
+                                    .map_err(|e| format!("stored proof {i} decode: {e}"))?;
+                                Ok((*k, p))
+                            })
+                            .collect()
+                    } else {
+                        parse_agg_items(&items)
+                    };
+                match parsed_input {
                     Err(e) => json!({"error": e}),
                     Ok(parsed) if parsed.is_empty() => json!({"error": "no items"}),
                     Ok(parsed) => {

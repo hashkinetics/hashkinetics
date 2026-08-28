@@ -4,6 +4,8 @@
 //! quantum-secure, not stock Ed25519. Network/transport identity stays Ed25519 in
 //! libp2p (derived from the same seed) — that is peer auth, not ledger security.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use async_trait::async_trait;
 use bytes::Bytes;
 
@@ -14,6 +16,10 @@ use malachitebft_signing::{Error, SigningProvider, VerificationResult};
 
 use crate::context::{HkContext, HkProposal, HkProposalPart, HkVote};
 use crate::hashsig_scheme::{self, HkPriv, HkPub, HkSig};
+
+/// Rate limiter for the exhaustion error log (a stuck round retries signing forever;
+/// one screaming line per attempt would drown the journal).
+static EXHAUSTED_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 pub struct HkSigningProvider {
@@ -30,20 +36,38 @@ impl HkSigningProvider {
     }
 
     /// Sign, advancing the stateful key. State is persisted before release
-    /// (reserve-then-sign) when this provider was built via `get_signing_provider`. A
-    /// validator that exhausts its ~32K-signature (2^15) tree rotates to a fresh tree
-    /// certified by its stateless SLH-DSA root — see docs/MAINNET-KEY-MANAGEMENT.md.
-    pub fn sign(&self, data: &[u8]) -> HkSig {
-        self.private_key
-            .sign(data)
-            .expect("consensus signing key exhausted — rotate the tree via the SLH-DSA root")
+    /// (reserve-then-sign) when this provider was built via `get_signing_provider`.
+    ///
+    /// R2 (staging incident #1): exhaustion is NOT fatal. A validator that spends its
+    /// full tree (CONSENSUS_CAPACITY one-time leaves) returns `Err` here; the engine
+    /// logs and drops that one signature, and the node stays ALIVE — RPC serving,
+    /// value-sync running — as a mute observer. Recovery is a root-signed RotationCert
+    /// (issued offline via `hk-node issue-rotation`, carried by any peer via
+    /// `hk_submitRotation`); when it commits, `rotate_to` swaps this shared handle to
+    /// the fresh tree and signing resumes in place. See docs/MAINNET-KEY-MANAGEMENT.md.
+    pub fn sign(&self, data: &[u8]) -> Result<HkSig, Error> {
+        match self.private_key.sign(data) {
+            Some(sig) => Ok(sig),
+            None => {
+                let n = EXHAUSTED_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+                if n == 0 || n % 100 == 0 {
+                    tracing::error!(
+                        attempts = n + 1,
+                        "consensus signing key EXHAUSTED — node stays alive as observer; \
+                         revive: `hk-node issue-rotation <HOME>` offline, submit the cert \
+                         to any peer via hk_submitRotation, then this node rotates live"
+                    );
+                }
+                Err(Error::new())
+            }
+        }
     }
 }
 
 #[async_trait]
 impl SigningProvider<HkContext> for HkSigningProvider {
     async fn sign_vote(&self, vote: HkVote) -> Result<SignedVote<HkContext>, Error> {
-        let signature = self.sign(&vote.to_sign_bytes());
+        let signature = self.sign(&vote.to_sign_bytes())?;
         Ok(SignedVote::new(vote, signature))
     }
 
@@ -61,7 +85,7 @@ impl SigningProvider<HkContext> for HkSigningProvider {
     }
 
     async fn sign_proposal(&self, proposal: HkProposal) -> Result<SignedProposal<HkContext>, Error> {
-        let signature = self.sign(&proposal.to_sign_bytes());
+        let signature = self.sign(&proposal.to_sign_bytes())?;
         Ok(SignedProposal::new(proposal, signature))
     }
 
@@ -82,7 +106,7 @@ impl SigningProvider<HkContext> for HkSigningProvider {
         &self,
         proposal_part: HkProposalPart,
     ) -> Result<SignedProposalPart<HkContext>, Error> {
-        let signature = self.sign(&proposal_part.to_sign_bytes());
+        let signature = self.sign(&proposal_part.to_sign_bytes())?;
         Ok(SignedProposalPart::new(proposal_part, signature))
     }
 
@@ -100,7 +124,7 @@ impl SigningProvider<HkContext> for HkSigningProvider {
     }
 
     async fn sign_vote_extension(&self, extension: Bytes) -> Result<SignedExtension<HkContext>, Error> {
-        let signature = self.sign(extension.as_ref());
+        let signature = self.sign(extension.as_ref())?;
         Ok(SignedMessage::new(extension, signature))
     }
 

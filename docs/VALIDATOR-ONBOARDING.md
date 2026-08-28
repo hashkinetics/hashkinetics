@@ -109,8 +109,18 @@ publishes the URL) should list your address under Validators.
 
 - **Never** run two nodes from the same key material (equivocation; slashable at mainnet).
 - **Never** delete `consensus_state*.bin` while keeping the key (one-time-leaf safety).
+- **Never** copy `consensus_state*.bin` between machines — it is your signer's
+  spent-leaf counter, not chain data. Restoring a node from another node's backup?
+  Take `blocks/` + `snapshot.bin` ONLY; your own signer files stay yours.
+- **Know your leaf budget.** Your operational tree holds ~32.7K one-time signatures
+  ≈ ~10.9K heights at ~3 sigs/height (~6 h at 2 s blocks). Staging incident #1
+  (2026-08-28) ran a tree to exactly zero: the chain HALTED rather than reuse a
+  leaf — correct behavior, avoidable outage. Until automatic threshold rotation
+  ships (R1, next release), set `HK_ROTATE_EVERY=500` in your service environment
+  so your tree rotates under your root well before exhaustion.
 - Your key exhausting or your node dying is a **liveness** fault only — the chain continues;
-  key rotation under your SLH-DSA root brings you back (SCMS; cert flow is live).
+  key rotation under your SLH-DSA root brings you back (SCMS; cert flow is live —
+  a rotated validator shows its new epoch badge on the explorer).
 - Incidents: RUNBOOK-DEVNET.md §4/§7 troubleshooting tables, then the operator channel.
 
 ## Appendix — coordinator's ceremony (reference)

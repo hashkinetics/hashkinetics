@@ -50,7 +50,9 @@ pub struct HkPriv {
 }
 
 impl HkPriv {
-    /// Build a consensus key from a 32-byte seed (HSS 2×H10 ≈ 1M signatures).
+    /// Build a consensus key from a 32-byte seed (HSS tree of
+    /// `hk_crypto::hashsig::CONSENSUS_CAPACITY` = 2^15 = 32,768 one-time signatures —
+    /// ~10.9K heights at ~3 sigs/height; staging incident #1 burned one to exactly zero).
     /// One keygen; the public key is cached (all later `public()` calls are free).
     pub fn from_seed(seed: [u8; 32]) -> Self {
         let (signer, pk) = hashsig::generate_consensus(&seed);

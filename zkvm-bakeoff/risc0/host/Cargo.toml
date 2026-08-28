@@ -1,0 +1,16 @@
+[package]
+name = "hk-spend-risc0-host"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+# GPU proving on the RTX 5090: `cargo run --release --features cuda`
+# (requires the CUDA toolkit visible in WSL for the build).
+cuda = ["risc0-zkvm/cuda"]
+
+[dependencies]
+risc0-zkvm = "5.0.0-rc.1"
+hk-spend-risc0-methods = { path = "../methods" }
+hk-spend-circuit = { path = "../../circuit" }
+bincode = "1"

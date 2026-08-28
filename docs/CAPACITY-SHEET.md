@@ -23,17 +23,24 @@ Measured implicitly when storm runs concurrently with shielded demo traffic (pro
 
 Landed by the soak itself: real interval distribution from the public testnet explorer data. | Date ⬜ | p50 ⬜ | p95 ⬜ |
 
-## d · Aggregation scaling curve (THE unknown: T_agg(N) = a + b·N)
+## d · Aggregation scaling curve — ✅ MEASURED 2026-08-28 (agg-bench, 6 points, one GPU)
 
-Known point: N=3 → 2,902 ms (RTX 5090, 0.9.9). Needed: N = 10 / 50 / 100 / 256 on one GPU. Harness = phase 2 (drives prove_spend(compressed)×N → `/aggregate`, GPU-hours; runs during the soak).
+**T_agg(N) ≈ 2.66 s + 0.2882 s·N** (least-squares over 6 points; residuals ≤ 2.24 s from N=4 to N=256 — linear, no wall). Aggregate size **constant 1,242 KB at every N**: 256 compressed spends (~318 MB of individual proofs) fold to ONE 1.24 MB STARK — 256× wire compression, ONE verify per block. Harness: `hk-node agg-bench` (local pool, no devnet; proofs by store-id — serve holds them, requests stay bytes-sized).
 
 | N | T_agg (ms) | Aggregate size | Date/GPU |
 |---|---|---|---|
 | 3 | 2,902 (measured 0.9.9) | 1,242 KB | 2026-08-17 · RTX 5090 |
-| 10 | ⬜ | ⬜ | |
-| 50 | ⬜ | ⬜ | |
-| 100 | ⬜ | ⬜ | |
-| 256 | ⬜ | ⬜ | |
+| 4 | 2,922 | 1,242 KB | 2026-08-28 · RTX 5090 |
+| 10 | 4,596 | 1,242 KB | 2026-08-28 · RTX 5090 |
+| 25 | 8,834 | 1,242 KB | 2026-08-28 · RTX 5090 |
+| 50 | 18,762 | 1,242 KB | 2026-08-28 · RTX 5090 |
+| 100 | 33,721 | 1,242 KB | 2026-08-28 · RTX 5090 |
+| 256 | **75,389** | 1,242 KB | 2026-08-28 · RTX 5090 |
+| fit | T_agg(N) ≈ 2.66 s + 0.2882 s·N | — | least-squares over 6 points |
+
+**Farm sizing (GPUs ≈ b × R, this GPU class, SEQUENTIAL single-stream measurement — conservative; concurrency only improves it):** R=64/s → ~19 GPUs · R=256/s → ~74 GPUs · R=1024/s → ~296 GPUs. Per-GPU fold throughput 1/b ≈ 3.5 proofs/s; the 2.66 s fixed overhead amortizes away at scale. Same session: 256 compressed spend proofs generated at 2.3 s avg each (9.9 min total, one GPU — wallet-side proving cost).
+
+**Quote lines this row unlocks (label "RTX 5090, measured"):** "256 shielded spends → one 1.24 MB proof in 75 s on a single gaming GPU" · "aggregate size is constant — 4 or 256 txs, same 1.24 MB." C3.A projection from b (tree-of-aggregates, 1024-tx block: 16 parallel sub-folds ≈ 21 s + root fold ≈ 7 s ≈ ~28 s wall) stays GOLD until demoed.
 
 ## e · Mempool admission under storm
 

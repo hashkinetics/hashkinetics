@@ -9,9 +9,8 @@
 //! against vendor/external/xmss-reference-c KATs — no mature Rust crate (research 03); LMS
 //! covers agent keys until then.
 //!
-//! ⚠ Honesty guard: nothing in this crate is audited. KAT cross-checks against the
-//! FIPS 205 reference implementation and the C references are REQUIRED before any key
-//! holds value.
+//! ⚠ Honesty guard: nothing in this crate is audited. KAT cross-checks against
+//! the vendored SLH-DSA C references are REQUIRED before any key holds value.
 
 pub mod hash;
 pub mod lamport;

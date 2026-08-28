@@ -222,6 +222,8 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use super::*;
     use hk_state::tx::Tx;
 

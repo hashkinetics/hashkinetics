@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use eyre::{eyre, Result};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use malachitebft_app_channel::app::streaming::{StreamContent, StreamId, StreamMessage};
 use malachitebft_app_channel::app::types::core::{CommitCertificate, Round, Validity, VoteExtensions};
@@ -67,6 +67,11 @@ pub struct SharedHandles {
     /// C2.3: tx-gossip enqueue handle (`None` = gossip off; node.rs wires it when
     /// `hk_rpc.gossip_peers` is non-empty).
     pub gossip: Option<crate::gossip::GossipHandle>,
+    /// R2: foreign rotation certs queued by `hk_submitRotation` — an exhausted validator
+    /// can't propose its own revival cert, so any peer accepts + carries it.
+    pub foreign_rotations: Arc<Mutex<Vec<RotationCert>>>,
+    /// R4: (epoch, remaining-leaves) of this node's live consensus signer.
+    pub signer_gauge: Arc<Mutex<(u64, u64)>>,
 }
 
 /// Bounded map of txid -> human receipt string ("ok: ..." / "rejected: ...").
@@ -156,10 +161,18 @@ pub struct HkApp {
     op_handle: HkPriv,
     /// Node home dir, for per-epoch persisted signer state files.
     home_dir: PathBuf,
-    /// Demo trigger: if set, rotate our key every N committed heights (`HK_ROTATE_EVERY`).
+    /// Demo/ops override: if set, ALSO rotate every N committed heights (`HK_ROTATE_EVERY`).
+    /// The production trigger is the R1 leaf-budget threshold — always on, no env needed.
     rotate_every: Option<u64>,
     /// Certs we've issued but not yet seen committed (included when we next propose).
     pending_rotations: Vec<RotationCert>,
+    /// R2: root-signed certs submitted by OTHER validators via `hk_submitRotation` —
+    /// an exhausted validator can't propose its own revival, so peers carry it.
+    /// Shared with the RPC server; drained (validated) into every batch we build.
+    foreign_rotations: Arc<Mutex<Vec<RotationCert>>>,
+    /// R4: (epoch, remaining-leaves) of OUR live signer, refreshed every commit — the RPC
+    /// serves it so operators watch the fuse instead of discovering it at zero.
+    signer_gauge: Arc<Mutex<(u64, u64)>>,
     /// P3.0/WS-B: durable store (block log + snapshots + mempool WAL). `None` = the
     /// old in-memory devnet behavior (`HK_NO_PERSIST=1`, and unit tests).
     store: Option<Arc<NodeStore>>,
@@ -189,6 +202,7 @@ impl HkApp {
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .filter(|n| *n > 0);
+        let signer_gauge = Arc::new(Mutex::new((0u64, op_handle.remaining())));
         Ok(Self {
             address,
             validators: Arc::new(Mutex::new(validators)),
@@ -215,6 +229,8 @@ impl HkApp {
             home_dir,
             rotate_every,
             pending_rotations: Vec::new(),
+            foreign_rotations: Arc::new(Mutex::new(Vec::new())),
+            signer_gauge,
             store: None,
         })
     }
@@ -237,6 +253,8 @@ impl HkApp {
             validators: self.validators.clone(),
             chain_start_time: self.chain_start_time,
             gossip: None,
+            foreign_rotations: self.foreign_rotations.clone(),
+            signer_gauge: self.signer_gauge.clone(),
         }
     }
 
@@ -283,8 +301,25 @@ impl HkApp {
             let mp = self.mempool.lock().unwrap();
             txs.extend(mp.iter().take(room).cloned());
         }
-        // Include any rotation certs we've issued but not yet seen committed.
-        let rotations = self.pending_rotations.clone();
+        // Include any rotation certs we've issued but not yet seen committed — PLUS
+        // foreign certs peers submitted via `hk_submitRotation` (R2: an exhausted
+        // validator can't propose its own revival; we carry it). Foreign certs are
+        // re-validated against the CURRENT set here (they were checked at submit time,
+        // but the set may have advanced); stale ones are dropped in place.
+        let mut rotations = self.pending_rotations.clone();
+        {
+            let validators = self.validators.lock().unwrap().clone();
+            let mut foreign = self.foreign_rotations.lock().unwrap();
+            foreign.retain(|c| validators.apply_rotation(c).is_ok());
+            for cert in foreign.iter() {
+                if !rotations
+                    .iter()
+                    .any(|r| r.root_pk == cert.root_pk && r.epoch >= cert.epoch)
+                {
+                    rotations.push(cert.clone());
+                }
+            }
+        }
         Bytes::from(Batch { parent_app_hash, txs, rotations, agg_proof }.encode())
     }
 
@@ -597,9 +632,10 @@ impl HkApp {
     /// SCMS: apply operational-key rotations committed in a block. Every node updates
     /// the validator set (so it verifies the rotated validator's future votes against
     /// the new key). The validator that OWNS the rotated root also swaps its own live
-    /// signer to the new tree, in lockstep — EXCEPT on replay: resuming a rotated
-    /// signer's used-leaf counter is the WS-F hardening item, so replay updates the
-    /// set (vote VERIFICATION stays correct) and refuses to guess about our own tree.
+    /// signer to the new tree, in lockstep. On REPLAY (restore-from-store) we only track
+    /// the epoch: `adopt_epoch_signer` runs once after restore and builds the signer at
+    /// the FINAL epoch directly — the per-epoch state file carries its own used-leaf
+    /// counter, so resume never reuses a leaf (this closed the WS-F ledger item).
     fn apply_rotations(&mut self, batch: &Option<Batch>, replay: bool) {
         if let Some(b) = &batch {
             for cert in &b.rotations {
@@ -611,12 +647,8 @@ impl HkApp {
                         info!(epoch = cert.epoch, mine = mine, replay, "Applied validator key rotation");
                         if mine && cert.epoch > self.current_epoch {
                             if replay {
-                                error!(
-                                    epoch = cert.epoch,
-                                    "restart-after-rotation: own-signer resume is WS-F (P3 plan) — \
-                                     this node's votes may mismatch until it lands; if consensus \
-                                     stalls, restart this validator --fresh and let value-sync catch it up"
-                                );
+                                // Signer adoption happens post-restore (adopt_epoch_signer);
+                                // here we only track how far our epoch advanced on-chain.
                                 self.current_epoch = cert.epoch;
                             } else {
                                 let seed = op_seed(&self.master_seed, cert.epoch);
@@ -628,16 +660,71 @@ impl HkApp {
                                     error!("rotation key mismatch: regenerated tree != cert pubkey");
                                 }
                                 self.current_epoch = cert.epoch;
-                                info!(epoch = cert.epoch, "Rotated OUR operational signing key (live)");
+                                info!(
+                                    epoch = cert.epoch,
+                                    remaining = self.op_handle.remaining(),
+                                    "Rotated OUR operational signing key (live) — fresh tree"
+                                );
                             }
                         }
                         self.pending_rotations
+                            .retain(|c| !(c.root_pk == cert.root_pk && c.epoch <= cert.epoch));
+                        // R2: a committed cert also retires any queued foreign copy.
+                        self.foreign_rotations
+                            .lock()
+                            .unwrap()
                             .retain(|c| !(c.root_pk == cert.root_pk && c.epoch <= cert.epoch));
                     }
                     Err(e) => error!(%e, "Rejected rotation cert"),
                 }
             }
         }
+    }
+
+    /// R2/WS-F: after restore, make the LIVE signer match the epoch the chain says we're
+    /// on. Restore rebuilds the validator set (snapshot + replayed certs) but the signer
+    /// was constructed at startup from the genesis-era file; if our on-chain entry moved
+    /// to epoch E > current signer epoch, rebuild the tree from `op_seed(master, E)` and
+    /// attach `consensus_state_e{E}.bin` — an existing file resumes its own used-leaf
+    /// counter (reserve-then-sign wrote it before any signature left the box); a missing
+    /// file means the tree never signed, so leaf 0 is correct (the revival case).
+    pub fn adopt_epoch_signer(&mut self) {
+        let (chain_epoch, expected_pk) = {
+            let vals = self.validators.lock().unwrap();
+            match vals.iter().find(|v| v.root_pk == self.my_root_pk) {
+                Some(v) => (v.epoch, v.public_key.clone()),
+                None => return, // not a validator on this chain (RPC-only node)
+            }
+        };
+        if self.op_handle.public() == expected_pk {
+            self.current_epoch = chain_epoch;
+            self.highest_issued_epoch = self.highest_issued_epoch.max(chain_epoch);
+            return; // signer already matches the registered key (epoch 0, or pre-adopted)
+        }
+        let seed = op_seed(&self.master_seed, chain_epoch);
+        let path = if chain_epoch == 0 {
+            self.home_dir.join("consensus_state.bin")
+        } else {
+            self.home_dir.join(format!("consensus_state_e{chain_epoch}.bin"))
+        };
+        let resumed = path.exists();
+        let new_pk = self.op_handle.rotate_to(seed, path);
+        if new_pk != expected_pk {
+            error!(
+                epoch = chain_epoch,
+                "adopt_epoch_signer: rebuilt tree != registered key — wrong master seed?"
+            );
+            return;
+        }
+        self.current_epoch = chain_epoch;
+        self.highest_issued_epoch = self.highest_issued_epoch.max(chain_epoch);
+        *self.signer_gauge.lock().unwrap() = (chain_epoch, self.op_handle.remaining());
+        info!(
+            epoch = chain_epoch,
+            resumed,
+            remaining = self.op_handle.remaining(),
+            "Adopted rotated signer for our on-chain epoch (restart-after-rotation resume)"
+        );
     }
 
     pub fn commit(
@@ -668,20 +755,49 @@ impl HkApp {
         self.undecided.retain(|(h, _), _| *h > height);
         self.current_height = HkHeight::new(height + 1);
 
-        // ---- SCMS demo trigger: periodically rotate our own key (HK_ROTATE_EVERY=N) ----
-        if let Some(n) = self.rotate_every {
+        // ---- SCMS rotation triggers (R1) + leaf-budget gauge (R4) ----------------------
+        // The PRODUCTION trigger is the leaf budget itself: rotate when < 20% of the
+        // tree remains (staging incident #1: a tree ran to exactly zero and halted the
+        // chain — 32,768 leaves ÷ ~3 sigs/height burned in ~6 h of 2 s blocks). The
+        // HK_ROTATE_EVERY interval survives as a demo/ops override, not a requirement.
+        {
+            let remaining = self.op_handle.remaining();
+            *self.signer_gauge.lock().unwrap() = (self.current_epoch, remaining);
+            let capacity = hk_crypto::hashsig::CONSENSUS_CAPACITY;
+            if height % 100 == 0 {
+                let pct = remaining * 100 / capacity;
+                if pct < 5 {
+                    error!(remaining, pct, epoch = self.current_epoch, "signer leaf budget CRITICAL");
+                } else if pct < 20 {
+                    warn!(remaining, pct, epoch = self.current_epoch, "signer leaf budget low — rotation should be in flight");
+                } else {
+                    info!(remaining, pct, epoch = self.current_epoch, "signer leaf budget");
+                }
+            }
+            let mine_pending =
+                self.pending_rotations.iter().any(|c| c.root_pk == self.my_root_pk);
             let next_epoch = self.current_epoch + 1;
-            if height > 0
-                && height % n == 0
-                && self.pending_rotations.is_empty()
-                && next_epoch > self.highest_issued_epoch
-            {
+            let (due, threshold_hit) = rotation_due(
+                remaining,
+                capacity,
+                height,
+                self.rotate_every,
+                mine_pending,
+                next_epoch,
+                self.highest_issued_epoch,
+            );
+            if due {
                 let seed = op_seed(&self.master_seed, next_epoch);
                 let new_op_pk = HkPriv::from_seed(seed).public();
                 let cert = RotationCert::issue(&self.root, new_op_pk, next_epoch, height + 1);
                 self.highest_issued_epoch = next_epoch;
                 self.pending_rotations.push(cert);
-                info!(epoch = next_epoch, "Issued rotation cert (applies once committed)");
+                info!(
+                    epoch = next_epoch,
+                    remaining,
+                    trigger = if threshold_hit { "leaf-threshold" } else { "interval" },
+                    "Issued rotation cert (applies once committed)"
+                );
             }
         }
 
@@ -864,4 +980,64 @@ impl HkApp {
 /// content hash, so this pins the block file to what consensus signed).
 fn certificate_value_mismatch(cert: &crate::codec::RawCommitCertificate, value: &HkValue) -> bool {
     cert.value_id != value.id()
+}
+
+/// R1: should this validator issue a rotation cert at this commit?
+/// Returns (due, threshold_hit). The PRODUCTION trigger is the leaf budget
+/// (< 20% remaining); the interval is a demo/ops override. Guards: never while our
+/// own cert is pending, never re-issuing an epoch at-or-below the highest issued.
+fn rotation_due(
+    remaining: u64,
+    capacity: u64,
+    height: u64,
+    rotate_every: Option<u64>,
+    mine_pending: bool,
+    next_epoch: u64,
+    highest_issued: u64,
+) -> (bool, bool) {
+    let threshold_hit = remaining < capacity / 5;
+    let interval_hit = rotate_every.is_some_and(|n| height > 0 && height % n == 0);
+    let due = (threshold_hit || interval_hit) && !mine_pending && next_epoch > highest_issued;
+    (due, threshold_hit)
+}
+
+#[cfg(test)]
+mod rotation_trigger_tests {
+    use super::rotation_due;
+    const CAP: u64 = 32_768; // hk_crypto::hashsig::CONSENSUS_CAPACITY
+
+    #[test]
+    fn fresh_tree_never_rotates_without_interval() {
+        // The staging fleet's pre-incident config (no env) must now be SAFE by default:
+        for h in [1u64, 500, 10_848] {
+            assert_eq!(rotation_due(CAP, CAP, h, None, false, 1, 0), (false, false));
+        }
+    }
+
+    #[test]
+    fn threshold_fires_below_twenty_percent_regardless_of_height() {
+        // 20% of 32,768 = 6,553; the incident's tree would have triggered ~2.2K
+        // heights (>1 hour) before the halt instead of dying at leaf zero.
+        assert_eq!(rotation_due(6_552, CAP, 10_777, None, false, 1, 0), (true, true));
+        assert_eq!(rotation_due(6_553, CAP, 10_777, None, false, 1, 0), (false, false));
+        assert_eq!(rotation_due(0, CAP, 3, None, false, 1, 0), (true, true));
+    }
+
+    #[test]
+    fn interval_override_still_works() {
+        assert_eq!(rotation_due(CAP, CAP, 500, Some(500), false, 1, 0), (true, false));
+        assert_eq!(rotation_due(CAP, CAP, 501, Some(500), false, 1, 0), (false, false));
+        assert_eq!(rotation_due(CAP, CAP, 0, Some(500), false, 1, 0), (false, false));
+    }
+
+    #[test]
+    fn guards_suppress_double_issue() {
+        // Our cert already pending → never re-issue, however low the budget runs.
+        assert_eq!(rotation_due(10, CAP, 100, None, true, 1, 0), (false, true));
+        // Epoch already issued (e.g. included but we replayed past the bookkeeping).
+        assert_eq!(rotation_due(10, CAP, 100, None, false, 1, 1), (false, true));
+        // After the rotation applies (fresh tree, epoch advanced), the cycle re-arms.
+        assert_eq!(rotation_due(CAP, CAP, 101, None, false, 2, 1), (false, false));
+        assert_eq!(rotation_due(6_000, CAP, 200, None, false, 2, 1), (true, true));
+    }
 }

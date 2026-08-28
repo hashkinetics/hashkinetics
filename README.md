@@ -1,107 +1,128 @@
-# HashKinetics
+# HashKinetics ($HKN)
 
-**The quantum-proof private settlement rail for the AI-agent economy.**
+**A post-quantum L1 that enforces AI-agent spending limits it cannot see.**
 
-Agents get *allowances, not keys to the vault*: spending budgets enforced by consensus
-itself, confidential balances with lawful one-time disclosure, and micropayments at
-machine speed — standing on hash functions alone, the one cryptographic assumption a
-quantum computer doesn't touch. This repository is the whole chain: node, state machine,
-circuits, prover service, wallet, explorer, and the operational docs to run all of it.
+[**hashkinetics.org**](https://www.hashkinetics.org) · [**Live explorer**](https://www.hashkinetics.org/explorer) · [**Public RPC**](https://rpc.hashkinetics.org) · [**X @hashkinetics**](https://x.com/hashkinetics) · validators@hashkinetics.org
 
-**Site + papers:** [hashkinetics.org](https://hashkinetics.org) · whitepaper & yellowpaper
-(md masters at repo root, PDFs in `papers/`, also on ResearchGate).
+`staging testnet: LIVE` · `spend proof: 1.24 s (GPU)` · `274 tx/s storm-measured` · `256 proofs → ONE 1.24 MB STARK: measured` · `nothing is for sale`
 
-## What is real (v0.10.3 · testnet era)
+---
 
-Every claim below is **demo-gated**: it logged as done only after running live, and every
-demo re-runs on one command.
+## The idea in 90 seconds
 
-- **Hash-based BFT, live**: a 4-validator network where every vote and proposal is signed
-  with LMS/HSS over SHAKE-256 under stateless SLH-DSA-192s roots, ~1.4–2 s blocks, live
-  operational-key rotation (SCMS), reserve-then-sign signer persistence (a crash can never
-  reuse a one-time leaf).
-- **The shielded pool, live**: hash-committed notes, real SP1 STARK spend/mint proofs
-  **verified in-node**, ML-KEM-768 stealth addresses with trial-decapsulation discovery,
-  fee-0 zero-trace payments, and an aggregation tier — **one 1.24 MB constant-size proof
-  per block covers every shielded tx** (client proof: 1.24 s on consumer GPU).
-- **Consensus-enforced budgets over hidden balances** — the thesis demo: an org's
-  hierarchical mandate tree refuses a rogue agent's overspend *over balances the chain
-  cannot see*, with a receipt: `insufficient buffer at depth 1 from leaf`.
-- **CVA disclosure**: one-time disclosure packages verified **offline** (the key opens
-  exactly one payment — measured: 0 of 21 others), epoch-scoped viewing keys.
-  **No master key exists, structurally** — see `docs/LAWFUL-ACCESS.md`.
-- **The durable node**: per-height block log + commitment-verified snapshots.
-  `kill -9` every validator mid-flight and the network resumes to a **byte-identical
-  state commitment** — restart is resume, never resync.
-- **Surfaces**: a zero-build block explorer (`explorer/index.html` — no amounts, no
-  parties, by construction), a full user wallet (`hk-node wallet` — shield → stealth-pay
-  → unshield → disclose), a genesis-ceremony join flow for external validators, and a
-  load harness (`hk-node storm` — measured devnet baseline: **274 tx/s sustained at the
-  1,024-tx cap**; the capacity ledger is `docs/CAPACITY-SHEET.md`).
-- **The C2 mempool (2026-08-27)**: admission pre-checks at the door (duplicates, stale
-  nonces, spent/pending nullifiers, expired anchors — refused with a reason, never a
-  wasted block slot), indexed O(1)-membership prune, and **single-hop tx gossip**: a tx
-  submitted to any node reaches every proposer's mempool (`hk_rpc.gossip_peers`). The run
-  that measured 27 tx/s pre-gossip now does 99.9 from a single RPC.
+AI agents already pay for things (x402 crossed hundreds of millions of transactions in year one) and already lose money (a third of enterprises running agents report direct financial losses). Every vendor's answer is a spending cap **in an app layer** — a promise, revocable by whoever holds the API.
 
-## What is NOT yet real (the honesty ledger — read this first)
+HashKinetics moves the cap into consensus:
 
-**Nothing is audited.** External audits + a public audit competition precede any
-value-bearing mainnet, and mainnet launches **guarded** (value caps lifted as findings
-close). The public-testnet 30-day soak is in progress, not done. Numbers are single-machine
-measurements unless the capacity sheet says otherwise. Known open items: rotation-restart
-signer resume, block-log segmentation, in-circuit WOTS KAT campaign, account-creation tx
-(accounts are genesis-only — hence no faucet yet), and the next throughput wall: block
-BYTES (25 MB Lamport-tx blocks stretch intervals; shielded txs are ~20× smaller). Closed
-since the release: ~~mempool sync between nodes~~ (C2 tx gossip, 2026-08-27). We keep
-this list current because it is the moat.
+- **Allowances, not keys to the vault.** An organization funds a hierarchical **MandateTree**; agents get drip-fed, capped budget envelopes. An overspend isn't declined by a server — it's **refused by the chain**, with a signed receipt (`insufficient buffer at depth 1`). Revocation cascades through the subtree in one transaction.
+- **Shielded by default.** Balances, amounts, and counterparties live in a commitment pool (STARK spend proofs verified in-consensus, ML-KEM-768 stealth addresses). The chain enforces budgets **over balances it cannot read**. There is **no master view key — structurally, not by policy**.
+- **Lawful disclosure without surveillance.** One-time, offline-verifiable disclosure packages and epoch-scoped viewing keys: a court can compel exactly one payment or one epoch — measured: one key opened its payment and **0 of the other 21**.
+- **Hash functions only.** Every signature that moves money or votes in consensus is hash-based (SLH-DSA roots, LMS/HSS operational trees, WOTS, PayWord). STARK proofs — no pairings, no lattice signatures in the money path. The one assumption a quantum computer doesn't touch.
+- **Machine-speed micropayments.** PayWord channels: 1,000 metered API calls settle as ONE on-chain transaction; each payment costs the payer a 32-byte preimage and the verifier one hash.
 
-## Quickstart
+## Live right now
+
+A 4-validator **staging testnet** runs in public — real hash-signed BFT, pinned genesis, shielded pool active:
+
+- **Explorer:** [hashkinetics.org/explorer](https://www.hashkinetics.org/explorer) — "the scanner that can't dox you": commitments, nullifiers, one running total. No amounts, no parties, by construction.
+- **RPC:** `https://rpc.hashkinetics.org` (JSON-RPC over POST; try `{"method":"hk_chainInfo","params":{}}`).
+- The pool shows a **$8 shielded economy** placed by the public demo suite: mandate-fed purchases, stealth bonuses wallets discovered by scanning, a rogue agent refused on-chain, and a disclosure package verified offline.
+- Validator epochs are public: when a validator rotates its consensus tree under its SLH-DSA root, the explorer shows the new epoch badge.
+
+## Field report: the chain that refused to reuse a leaf
+
+On 2026-08-28 the staging chain **halted itself at height 10,848**. A validator's LMS/HSS operational tree holds ~32,768 one-time signatures; at ~3 consensus signatures per height, that's ~10.9K blocks — and the fuse burned on schedule. Faced with signing leaf 32,769, the node **panicked rather than reuse a one-time key**. That is the designed behavior: reserve-then-sign, persisted before release, no reuse under any failure.
+
+Recovery was the designed path too: rotation certificates signed by the stateless SLH-DSA root (which never exhausts), quorum re-formed, the rotated epoch visible on the public explorer. The outage was an ops gap, not a crypto gap — the trigger for automatic rotation wasn't armed. The fixes ship as the next release (threshold rotation, exhausted-validator revival via peer-carried certs, leaf-budget gauges — the R-series). Operator guidance: `docs/VALIDATOR-ONBOARDING.md` §7.
+
+We publish incidents like this because a settlement rail's credibility is its failure behavior. **The chain chose halt over key reuse. That's the product working.**
+
+## Measured numbers (receipts, not projections)
+
+Everything below was measured on real hardware and is reproducible from this repo. Full provenance: `docs/CAPACITY-SHEET.md`.
+
+| What | Number | Where |
+|---|---|---|
+| Shielded spend proof (full statement: commitment, 32-level Merkle, in-circuit WOTS auth) | **1.24 s** | SP1-CUDA, RTX 5090 |
+| Chain throughput, storm-measured end-to-end (submit→commit, 4 validators) | **274 tx/s sustained** (1,024-cap config) · 123 tx/s (256-cap) | `hk-node storm` |
+| Aggregation curve, N=4→256 (6 points, linear, no wall) | **T_agg(N) ≈ 2.66 s + 0.2882 s·N** | `hk-node agg-bench` |
+| 256 shielded spends folded to ONE proof | **75.4 s, one GPU** | same run |
+| Aggregate proof size at ANY N | **1,242 KB, constant** | 4 txs or 256 — same bytes |
+| Validator cost per block of shielded txs | **ONE STARK verify (~100 ms), constant in N** | in-consensus |
+| Crash recovery | `kill -9` all four validators → **byte-identical state commitment**, resume not resync | durable store |
+| Micropayments | 1,000 metered calls settled by **one 32-byte word** | PayWord channels |
+| Disclosure scope | one key opened its payment, **0 of 21 others** | CVA packages |
+
+Numbers we do **not** claim: anything WAN-paced (the soak measures it), anything audited (nothing is audited yet), any TPS beyond the measured configs. The aggregation farm table extrapolates the measured curve and says so: ~296 GPUs of this class saturate 1,024 shielded proofs/s, measured sequentially — concurrency only improves it.
+
+## Try it (10 minutes, one machine)
+
+Runs in WSL2/Linux (the SP1 verifier is POSIX-only). Rust stable required; GPU only needed for *proving* (verification is CPU-cheap; a devnet without shielded proving needs no GPU).
 
 ```bash
-# Build (Linux/WSL2; the prover needs POSIX + a CUDA GPU, validating does not)
-cd chain && cargo build --release -p hk-node && cargo test
+git clone https://github.com/hashkinetics/hashkinetics
+cd hashkinetics/chain && cargo build --release
 
-# Prover (terminal A — GPU):   cd zkvm-bakeoff/sp1/script && cargo run --release --bin serve
-# Devnet (terminal B):         ./devnet.sh --fresh -n 4 --prover-url http://127.0.0.1:9911
-# The whole machine economy:   hk-node demo-economy http://127.0.0.1:26000 http://127.0.0.1:9911
-# Explorer: open explorer/index.html in a browser (green dot = connected)
-# Wallet:   hk-node wallet init ~/w org && hk-node wallet shield ~/w 3 && hk-node wallet scan ~/w
+# 4-validator devnet (add --prover-url http://127.0.0.1:9911 if the GPU prover is up):
+./devnet.sh --fresh -n 4
+
+# the six-act machine economy (budgets, stealth pay, a refused rogue, offline disclosure):
+./target/release/hk-node demo-economy http://127.0.0.1:26000
+
+# load harness — reproduce the 274 tx/s row yourself:
+./target/release/hk-node storm http://127.0.0.1:26000
+
+# the aggregation curve (needs the GPU prover, zkvm-bakeoff/sp1):
+./target/release/hk-node agg-bench http://127.0.0.1:9911 --n 4,10,25
 ```
 
-Full run sequences, demo suite, troubleshooting, crash-kill procedure: `docs/RUNBOOK-DEVNET.md`.
-**Join the testnet as a validator** (no GPU, no stake, one Linux box): `docs/VALIDATOR-ONBOARDING.md`.
+Every claim in the table above has a command that reproduces it.
 
-## Cryptographic stance
+## Run a full node on the staging network (now, no permission needed)
 
-| Layer | Primitive | Assumption |
-|---|---|---|
-| Everything that moves money | SLH-DSA / LMS-HSS / Lamport / WOTS / PayWord — hash-based only | SHAKE-256 second-preimage resistance |
-| ZK proofs | Raw STARKs (SP1), **no pairing wraps, ever** (doctrine F1) | Same hash family |
-| Note confidentiality only | ML-KEM-768 + SHAKE-AEAD | A lattice break reads old metadata; it can never forge a signature or move funds |
+`networks/staging-1/` holds the pinned genesis and bootstrap peers — clone, build, point your node at them, and you're syncing and independently verifying the live chain, serving your own RPC and explorer. One screen of commands, no GPU, no stake: `networks/staging-1/README.md`. The genesis digest is the network's fingerprint; your node's `app_hash` at any height must equal what `rpc.hashkinetics.org` reports — same input, same hash, no trust required.
 
-## Repository layout
+## Run a validator
 
-`chain/` — the Rust workspace (9 crates: primitives, crypto, mandate engine, state machine,
-wallet lib, consensus context, node + RPC + durable store + demos + wallet CLI + storm) ·
-`zkvm-bakeoff/circuit/` — the spend/mint circuit + aggregation digests (single source of
-hashing truth, shared by chain and guests) · `zkvm-bakeoff/sp1/` — guest programs + the
-GPU prover service (`serve`) · `explorer/` — the single-file block explorer ·
-`vendor/external/` — pinned vendored dependencies (see `vendor/README.md`; pins in
-`external/PINS.md`) · `docs/` — specs, runbook, audit scope, capacity sheet, validator
-onboarding, lawful-access model · `WHITEPAPER.md` / `YELLOWPAPER.md` + `papers/`.
+The staging network recruits external validators now — one Linux box, **no GPU, no stake, no cost**. Your keys are generated on your machine and never leave it; your permanent identity is a stateless SLH-DSA root; exhaustion and downtime are liveness faults only, never fund-loss — proven the hard way: this network's val-0 ran its tree to zero, was revived by a root-signed cert carried through a peer (`issue-rotation` → `hk_submitRotation`), and rejoined with a fresh tree. The whole flow is in this repo.
+
+Read `docs/VALIDATOR-ONBOARDING.md`, then mail **validators@hashkinetics.org** with your `validator.json`. The next genesis ceremony forms testnet-1 with external operators from day one.
+
+## What this repo is
+
+| Path | What |
+|---|---|
+| `chain/` | The Rust workspace — state machine, mandates, shielded pool, channels, consensus adapter (Malachite BFT), node, wallet, RPC |
+| `chain/crates/hk-crypto` | Hash-based signatures: LMS/HSS (RFC 8554) with reserve-then-sign persistence, SLH-DSA-SHAKE-192s roots (FIPS 205), PayWord, KAT-verified |
+| `zkvm-bakeoff/` | The shared spend circuit (`no_std`) + SP1/RISC0/OpenVM harnesses, the GPU prover service, and the aggregation guest |
+| `docs/CAPACITY-SHEET.md` | Every measured number with date, hardware, and the command that produced it |
+| `docs/VALIDATOR-ONBOARDING.md` | Join the network: keygen → ceremony → run → operating rules |
+| `docs/AUDIT-SCOPE.md` | Trust boundaries, crypto inventory, consensus invariants — the audit work-packages, prepared before the auditors |
+
+Protocol papers (whitepaper + formal yellowpaper with the state transition, proof relations, and invariants I1–I10): [hashkinetics.org](https://www.hashkinetics.org) → Papers.
+
+## The honesty ledger (what is NOT real yet)
+
+This section is load-bearing. If it ever disappears, assume the worst.
+
+- **Nothing is audited.** Scope is prepared (`docs/AUDIT-SCOPE.md`); the audit campaign is a gate before any mainnet.
+- **No 30-day public soak yet** — the staging net is young; the soak clock starts with external validators aboard.
+- **Rotation hardening (R-series):** the core landed the same day the incident demanded it — automatic threshold rotation (<20% budget), survivable exhaustion (mute observer, not a dead actor), peer-carried revival certs (`issue-rotation` + `hk_submitRotation`), restart-after-rotation resume, and a leaf-budget gauge in `hk_chainInfo` — devnet-gated end-to-end (a live validator was rotated by a cert carried through a *different* node, then restarted and resumed its exact leaf counter). Still open: engine resume at store tip, faster value-sync for deep backlogs.
+- All throughput numbers are **single-machine or single-datacenter**; WAN pacing is unmeasured until the soak.
+- Transparent (Lamport-signed) transactions are wire-heavy at scale — block-log segmentation and the WOTS account scheme are queued; the shielded path (2.7 KB/tx + one aggregate) is the product path.
+- A faucet waits on the account-creation transaction (accounts are genesis-only today).
+- Explorer and wallet are devnet-grade surfaces; in-circuit WOTS awaits its KAT campaign; agent-side proving assumes GPU-class hardware.
+
+What "LIVE" means above: demonstrated on a running chain with a receipt you can reproduce from this repo. Nothing here is a projection wearing a demo's clothes.
 
 ## Security
 
-See `SECURITY.md` — coordinated disclosure, 90 days, security@hashkinetics.org. The
-attack map an auditor should start from is `docs/AUDIT-SCOPE.md` and the yellowpaper's
-ten invariants.
+Found something? **security@hashkinetics.org.** No bug bounty is funded yet (pre-audit stage); reports are credited, taken seriously, and answered by a human who reads code.
 
-## Contributing & license
+## License
 
-`CONTRIBUTING.md` for the how; the short version: small PRs, tests required, every
-consensus-visible change needs a demo or a test that would have caught its absence.
-Licensed under **MIT OR Apache-2.0** at your option (`LICENSE-MIT`, `LICENSE-APACHE`).
-Vendored trees keep their own licenses (`vendor/README.md`).
+MIT OR Apache-2.0, at your option. Vendored third-party trees keep their own licenses.
 
-*HashKinetics — kinetic money on hash-based trust.*
+---
+
+*HashKinetics — kinetic money on hash-based trust. Nothing is for sale; the chain is the pitch.*

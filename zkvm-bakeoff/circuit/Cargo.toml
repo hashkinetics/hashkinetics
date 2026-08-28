@@ -2,7 +2,7 @@
 name = "hk-spend-circuit"
 version = "0.1.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "UNLICENSED"
 description = "HashKinetics shielded-spend statement — the shared circuit benchmarked across SP1/RISC0/OpenVM (gate G2)."
 
 # no_std so the exact same crate compiles inside every zkVM guest; std only during tests.

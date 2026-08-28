@@ -2163,6 +2163,7 @@ dependencies = [
  "informalsystems-malachitebft-signing",
  "informalsystems-malachitebft-signing-ed25519",
  "serde",
+ "tracing",
 ]
 
 [[package]]

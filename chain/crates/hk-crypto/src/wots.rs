@@ -1,8 +1,8 @@
 //! WOTS+ — B-channel balance signing (plan §6). SPEC NOTES ONLY — deliberately not
 //! implemented yet: WOTS+ has subtle checksum/ADRS details and we will NOT ship
 //! hand-rolled signature code without KATs. Implementation path:
-//!   1. Port from the XMSS reference implementation (wots.c) with its test vectors.
-//!   2. Cross-check against a FIPS 205 reference (SLH-DSA's internal WOTS+ differs
+//!   1. Port from vendor/external/xmss-reference-c (wots.c) with its test vectors.
+//!   2. Cross-check against the vendored SLH-DSA C reference (its internal WOTS+ differs
 //!      in ADRS layout — do NOT mix; ours follows RFC 8391 §3 for standalone use).
 //!
 //! Parameters (target): n=24 or 32, w=16 → len = len_1 + len_2 chains.

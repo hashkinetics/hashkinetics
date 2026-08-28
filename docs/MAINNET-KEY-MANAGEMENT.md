@@ -233,11 +233,22 @@ block). That is the property to preserve.
 - Per-epoch operational seeds via `op_seed(master, epoch)` (epoch 0 = genesis key).
 - Demo trigger `HK_ROTATE_EVERY=N` issues a self-rotation every N heights.
 
-**Remaining hardening (not blocking the demo):**
+**Remaining hardening — URGENCY FIELD-PROVEN (staging incident #1, 2026-08-28):**
+The staging testnet ran with no rotation trigger set; val-0's tree exhausted at height
+10,848 (~32.7K sigs ÷ ~3/height — leaf arithmetic, on schedule) and the chain halted
+6 h rather than reuse a leaf. The design held; the ops gap is exactly this list, now
+sequenced as the R-series (C-PROGRAM-PLAN.md §R; R1+R2+R4 = next binary rev):
+- **R1** — rotation on the real `remaining()` threshold (~20 % left), not the demo interval.
+- **R2** — exhausted-validator revival: the incident exposed the chicken-and-egg
+  (a dead-key validator can't propose its own cert; today a node includes only its own
+  pending certs). Fix: `issue-rotation` CLI (root signs offline) + `hk_submitRotation`
+  RPC so ANY peer carries the root-signed cert into a proposal — minimal cert gossip.
+- **R4** — leaf-budget gauge: `remaining()` in logs/RPC/explorer so operators see the fuse.
 - Restart-after-rotation: persist `current_epoch` so a restarted node reloads the right tree
   (today it reloads epoch 0). Keygen off the hot path (pre-generate) to remove the brief
-  rotation stall. Gossip certs through the mempool (today a node includes only its own when
-  it proposes). Rotation on the real `remaining()` threshold, not just the demo interval.
+  rotation stall.
+- Operator hygiene learned in recovery: `consensus_state.bin` is the signer's spent-leaf
+  state — never copy it between nodes; chain-data restores take `blocks/` + `snapshot.bin` only.
 
 **Mainnet crypto (P2/P3):**
 - STARK-aggregated commit certificates (proof of consensus).

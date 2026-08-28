@@ -1,0 +1,20 @@
+[package]
+name = "hk-spend"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone workspace root — required so risc0-build compiles the guest in isolation,
+# and so the [patch] below is at a workspace root (the only place patches apply).
+[workspace]
+
+[dependencies]
+risc0-zkvm = { version = "5.0.0-rc.1", default-features = false, features = ["std"] }
+hk-spend-circuit = { path = "../../../circuit" }
+# RISC0's accelerator patch provides sha2 0.10.9 — the resolver's natural pick for the
+# circuit's "0.10" req, so no pin needed here (unlike SP1, whose patch is 0.10.8).
+sha2 = "0.10.9"
+
+[patch.crates-io]
+# RISC Zero SHA-256 accelerator for all downstream `sha2` usage in this guest
+# (tag taken from vendor/external-full/risc0/examples/sha — the current v5-era tag).
+sha2 = { git = "https://github.com/risc0/RustCrypto-hashes", tag = "sha2-v0.10.9-risczero.0" }

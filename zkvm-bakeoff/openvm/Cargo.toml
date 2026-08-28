@@ -1,0 +1,18 @@
+[package]
+name = "hk-spend-openvm"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone workspace root (cargo-openvm builds this crate directly).
+[workspace]
+
+[dependencies]
+# Path deps into the vendored OpenVM tree (pinned 2026-08 snapshot) so the guest API
+# matches exactly what we read there. Swap to git deps if you prefer:
+#   openvm = { git = "https://github.com/openvm-org/openvm.git" }
+openvm = { path = "../../vendor/external/openvm/crates/toolchain/openvm" }
+hk-spend-circuit = { path = "../circuit", features = ["openvm-accel"] }
+
+[features]
+default = []
+std = ["openvm/std"]

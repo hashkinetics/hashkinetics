@@ -4,7 +4,10 @@
 //! or `{"error":"..."}`. Agent-first surface; nothing EVM-shaped.
 //!
 //! Methods:
-//!   hk_chainInfo                              -> {chain_id, height, app_hash}
+//!   hk_chainInfo                              -> {chain_id, height, app_hash,
+//!                                                 signer: {epoch, remaining, capacity}}  (R4)
+//!   hk_submitRotation {cert}                   -> {accepted, epoch, queued}  (R2: peer-carried
+//!                                                 revival — cert from `hk-node issue-rotation`)
 //!   hk_getAccount   {id}                      -> {found, nonce, auth_commit}
 //!   hk_balance      {id, asset}               -> {amount}            (u128 as string)
 //!   hk_mandateAvailable {leaf, at?}           -> {available}         (string | null)
@@ -137,13 +140,51 @@ async fn handle_conn(sock: &mut tokio::net::TcpStream, h: &SharedHandles) -> eyr
 fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
     match method {
         "hk_chainInfo" => {
+            let (epoch, remaining) = *h.signer_gauge.lock().unwrap();
             let chain = h.chain.lock().unwrap();
             json!({"result": {
                 "chain_id": h.chain_id,
                 "height": chain.height,
                 "app_hash": hex::encode(chain.state_commitment().0),
+                // R4: THIS node's consensus-signer leaf budget (the fuse, visible).
+                "signer": {
+                    "epoch": epoch,
+                    "remaining": remaining,
+                    "capacity": hk_crypto::hashsig::CONSENSUS_CAPACITY,
+                },
             }})
         }
+        // R2: accept a root-signed RotationCert on behalf of ANOTHER validator (an
+        // exhausted signer can't propose its own revival — peers carry it). Validated
+        // against the live set here AND re-validated at propose + commit; the root
+        // signature makes this trustless (nothing to spoof, replay is epoch-monotone).
+        "hk_submitRotation" => match params.get("cert") {
+            Some(c) => match serde_json::from_value::<hk_consensus::RotationCert>(c.clone()) {
+                Ok(cert) => {
+                    let check = { h.validators.lock().unwrap().apply_rotation(&cert) };
+                    match check {
+                        Ok(_) => {
+                            let mut q = h.foreign_rotations.lock().unwrap();
+                            let dup = q
+                                .iter()
+                                .any(|x| x.root_pk == cert.root_pk && x.epoch >= cert.epoch);
+                            if !dup {
+                                q.retain(|x| {
+                                    !(x.root_pk == cert.root_pk && x.epoch < cert.epoch)
+                                });
+                                q.push(cert.clone());
+                            }
+                            json!({"result": {"accepted": true, "epoch": cert.epoch,
+                                "queued": !dup,
+                                "note": "cert rides this node's next proposal"}})
+                        }
+                        Err(e) => json!({"result": {"accepted": false, "reason": e}}),
+                    }
+                }
+                Err(e) => json!({"error": format!("bad cert: {e}")}),
+            },
+            None => json!({"error": "params.cert required (output of `hk-node issue-rotation`)"}),
+        },
         "hk_getAccount" => match param_h256(params, "id") {
             Some(id) => {
                 let chain = h.chain.lock().unwrap();

@@ -1,0 +1,6 @@
+# OpenVM app VM config for the spend circuit: base RISC-V + IO + the SHA-256 extension
+# (the accelerator the circuit's `openvm-accel` feature targets).
+[app_vm_config.rv32i]
+[app_vm_config.rv32m]
+[app_vm_config.io]
+[app_vm_config.sha2]

@@ -1,6 +1,6 @@
 //! Domain-separated SHAKE-256 (plan §3.1: SHAKE outside circuits, Poseidon2/RPO inside).
 //! Every hash in the protocol carries an explicit domain tag — frozen strings below.
-//! Convention: "hk/v1/..." domain tags — rename-proof, versioned.
+//! Convention: versioned, rename-proof domain tags ("hk/v1/...").
 
 use sha3::digest::{ExtendableOutput, Update, XofReader};
 use sha3::Shake256;

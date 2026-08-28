@@ -9,7 +9,7 @@
 //!   - on success the account ratchets: auth_commit ← next_auth, nonce += 1.
 //! Each key signs exactly once (nonce = chain position = the leaf-index=nonce rule of
 //! plan §3.3 in miniature). Security = second-preimage resistance of SHAKE-256 only.
-//! Cost: pk 16 KiB + sig 8 KiB per tx — fine for devnet; production accounts use LMS/HSS.
+//! Cost: pk 16 KiB + sig 8 KiB per tx — fine for devnet (hash-based mainnets live at ~50 KB).
 //! Production path: same ratchet discipline, XMSS/LMS keys (constant-size, multi-use).
 //!
 //! Bit convention: message bit i (0-based) = bit (7 - i%8) of msg32[i/8] — big-endian

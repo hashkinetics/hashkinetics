@@ -13,6 +13,7 @@
 
 mod app;
 mod batch;
+mod bench_agg;
 mod codec;
 mod config;
 mod demo;
@@ -36,7 +37,7 @@ mod verifier;
 
 use std::path::PathBuf;
 
-use hk_consensus::{HkPriv, RootSecret};
+use hk_consensus::{op_seed, HkPriv, RootSecret, RotationCert};
 
 use crate::genesis::{GenesisValidator, HkGenesis};
 use crate::node::App;
@@ -138,6 +139,28 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
             // P3.0c operator-side: WAN-ready config.toml.
             cmd_config_gen(&args[2..])
         }
+        Some("issue-rotation") => {
+            // R2: mint a root-signed RotationCert OFFLINE (the stateless SLH-DSA root
+            // never exhausts — this works even when the operational tree is at zero).
+            // Submit the output to ANY live peer: it rides that peer's next proposal.
+            let home = PathBuf::from(args.get(2).cloned().ok_or_else(|| {
+                eyre::eyre!("usage: hk-node issue-rotation <HOME> [EPOCH] [VALID_FROM_HEIGHT]")
+            })?);
+            let epoch = args.get(3).and_then(|s| s.parse().ok());
+            let valid_from = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
+            cmd_issue_rotation(&home, epoch, valid_from)
+        }
+        Some("agg-bench") => {
+            // C1p2.a: the aggregation scaling curve — T_agg(N) = a + b·N (prover only).
+            let url = args.get(2).cloned().unwrap_or_else(|| "http://127.0.0.1:9911".into());
+            let mut ns = vec![4usize, 10, 50, 100, 256];
+            if let Some(p) = args.iter().position(|a| a == "--n") {
+                if let Some(csv) = args.get(p + 1) {
+                    ns = csv.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+                }
+            }
+            bench_agg::run(&url, ns)
+        }
         Some("storm") => {
             // P3.1/C1: transparent load harness → the capacity sheet.
             let url = args.get(2).cloned().unwrap_or_else(|| "http://127.0.0.1:26000".into());
@@ -172,7 +195,7 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
         }
         _ => {
             eprintln!("HashKinetics node v0.10 (hash-based consensus + shielded pool + disclosure + durable store)");
-            eprintln!("usage: hk-node testnet <N> <HOME> | start <NODE_HOME> | wallet <CMD …> | keygen <HOME> [MONIKER] | genesis-build <VALIDATORS.json> <OUT.json> | config-gen <HOME> --listen … --peers … | storm <RPC> [RATE] [DURATION_S] | demo <RPC> | demo-economy <RPC> <PROVER> | demo-shielded <RPC> <PROVER> | demo-disclose <RPC> <PROVER> | demo-agg <RPC> <PROVER> | demo-mandates <RPC> <PROVER> | verify-disclosure <package.json>");
+            eprintln!("usage: hk-node testnet <N> <HOME> | start <NODE_HOME> | wallet <CMD …> | keygen <HOME> [MONIKER] | issue-rotation <HOME> [EPOCH] [VALID_FROM] | genesis-build <VALIDATORS.json> <OUT.json> | config-gen <HOME> --listen … --peers … | storm <RPC> [RATE] [DURATION_S] | demo <RPC> | demo-economy <RPC> <PROVER> | demo-shielded <RPC> <PROVER> | demo-disclose <RPC> <PROVER> | demo-agg <RPC> <PROVER> | demo-mandates <RPC> <PROVER> | verify-disclosure <package.json>");
             eprintln!("join a testnet: docs/VALIDATOR-ONBOARDING.md (keygen → send validator.json → receive genesis → config-gen → start)");
             eprintln!("wallet: init DIR ACCOUNT [RPC] · status DIR [RPC] · address DIR [RPC] · scan DIR [RPC] · transfer DIR TO USD [RPC] · shield DIR USD [RPC] [PROVER] · unshield DIR USD [RPC] [PROVER] · pay DIR HKADDR USD [MEMO] [RPC] [PROVER] · disclose DIR COMMITMENT OUT.json [RPC]");
             Ok(())
@@ -392,6 +415,45 @@ fn cmd_keygen(home: &PathBuf, moniker: &str) -> eyre::Result<()> {
     println!("  consensus address : {}", hk_consensus::HkAddress::from_public_key(&gv.public_key));
     println!("\nAlso send the coordinator your PUBLIC consensus multiaddr, e.g.:");
     println!("    /ip4/<YOUR-PUBLIC-IP>/tcp/27000");
+    Ok(())
+}
+
+/// R2 (staging incident #1): mint a root-signed RotationCert OFFLINE. The stateless
+/// SLH-DSA root signs regardless of the operational tree's leaf budget — this is the
+/// revival path for a validator whose HSS tree exhausted (it can no longer sign votes,
+/// so it can never PROPOSE its own cert; any live peer carries it instead).
+///
+/// Flow: run this on the validator's machine (needs priv_validator_key.json) →
+/// submit the printed JSON to any peer's RPC (`hk_submitRotation`) → the cert rides
+/// that peer's next proposal → on commit every node swaps this validator's key in the
+/// set → restart the exhausted node: `adopt_epoch_signer` builds the fresh epoch tree
+/// (never-signed ⇒ starts at leaf 0) and it rejoins consensus.
+fn cmd_issue_rotation(home: &PathBuf, epoch: Option<u64>, valid_from: u64) -> eyre::Result<()> {
+    let key_path = home.join("priv_validator_key.json");
+    let raw = std::fs::read_to_string(&key_path)
+        .map_err(|e| eyre::eyre!("{}: {e} (run on the VALIDATOR's machine)", key_path.display()))?;
+    let seed: [u8; 32] = serde_json::from_str(&raw)?;
+    let root = RootSecret::from_seed(&seed);
+    let epoch = epoch.unwrap_or(1);
+    if epoch == 0 {
+        eyre::bail!("epoch must be ≥ 1 (0 is the genesis key; certs are strictly monotone)");
+    }
+    println!("deriving epoch-{epoch} operational tree (LMS/HSS keygen — a moment)...");
+    let new_op_pk = HkPriv::from_seed(op_seed(&seed, epoch)).public();
+    println!("signing the rotation cert with the SLH-DSA root (stateless — never exhausts)...");
+    let cert = RotationCert::issue(&root, new_op_pk, epoch, valid_from);
+    let out = home.join(format!("rotation_e{epoch}.json"));
+    std::fs::write(&out, serde_json::to_string(&serde_json::json!({ "cert": cert }))?)?;
+    println!("✓ rotation cert written: {}", out.display());
+    println!("  root identity : SLH-DSA-192s {}…", hex::encode(&cert.root_pk[..8]));
+    println!("  new epoch     : {epoch}   (must be strictly greater than the on-chain epoch)");
+    println!("\nsubmit it through ANY live peer (the cert rides that peer's next proposal):");
+    println!(
+        "  printf '{{\"method\":\"hk_submitRotation\",\"params\":%s}}' \"$(cat {})\" | \\",
+        out.display()
+    );
+    println!("    curl -s -X POST <PEER_RPC> -d @-");
+    println!("\nthen restart THIS validator's node — it adopts the fresh epoch-{epoch} tree on boot.");
     Ok(())
 }
 
