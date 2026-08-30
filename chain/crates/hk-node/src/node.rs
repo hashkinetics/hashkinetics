@@ -143,6 +143,25 @@ impl Node for App {
         let ctx = HkContext::new();
 
         let genesis = self.load_genesis()?;
+
+        // Genesis-gate: our genesis digest IS our network identity. Hash the EXACT
+        // genesis bytes (SHA-256 == the published `sha256sum genesis.json` fingerprint)
+        // and hand it to the network layer BEFORE the engine spawns, so identify
+        // advertises it and any peer on a different genesis (an "island" chain) is
+        // refused at connect time. Also bound into chain_id + surfaced by hk_chainInfo.
+        let genesis_digest: [u8; 32] = {
+            use sha2::{Digest, Sha256};
+            let bytes = std::fs::read(self.genesis_path())?;
+            let mut d = [0u8; 32];
+            d.copy_from_slice(Sha256::digest(&bytes).as_slice());
+            d
+        };
+        malachitebft_network::hk_set_genesis_digest(genesis_digest);
+        info!(
+            genesis_digest = %hex::encode(genesis_digest),
+            "genesis fingerprint pinned — network identity (island peers refused)"
+        );
+
         let initial_validator_set = genesis.validator_set()?;
 
         info!(%address, validators = initial_validator_set.len(), "Starting HashKinetics node");
@@ -196,6 +215,9 @@ impl Node for App {
             self.home_dir.clone(),
             pool_verifier,
         )?;
+        // Genesis-gate: bind identity to genesis — sets the digest + derives chain_id
+        // from it, so hk_chainInfo distinguishes the canonical chain from any island.
+        state.set_genesis_digest(genesis_digest);
 
         // P3.0/WS-B: durable node. Restore Σ + history + mempool from the home dir,
         // then attach the store so every commit persists. The engine's start height

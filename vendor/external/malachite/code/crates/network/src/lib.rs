@@ -36,6 +36,68 @@ use handle::Handle;
 const METRICS_PREFIX: &str = "malachitebft_network";
 const DISCOVERY_METRICS_PREFIX: &str = "malachitebft_discovery";
 
+// ---------------------------------------------------------------------------
+// HK genesis-gate (HashKinetics fork)
+//
+// A node's genesis digest IS its network identity: two nodes on different
+// genesis files are DIFFERENT chains and must never peer. This stops an
+// "independent island" (someone running `--fresh` with their own genesis) from
+// attaching to the canonical network, and it forces a real joiner to sync OUR
+// genesis from block 1. hk-node sets `HK_GENESIS_DIGEST` once at startup from
+// SHA-256(genesis.json) (== the published fingerprint) BEFORE the engine spawns;
+// we advertise it in identify's `agent_version`, and the identify handler
+// disconnects any consensus-protocol peer that advertises a MISMATCHED digest.
+//
+// Migration safety: a peer that advertises NO HK genesis tag (a pre-gate build,
+// or a foreign libp2p node) is GRACED — never disconnected — so a one-at-a-time
+// rolling upgrade of the live validator set can't partition it. `protocol_version`
+// is deliberately left unchanged for the same reason.
+// ---------------------------------------------------------------------------
+
+/// Our genesis digest, set once by hk-node before `spawn`. `None` until set
+/// (gate inert — fail open, never disconnect).
+pub static HK_GENESIS_DIGEST: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+
+/// hk-node calls this once at boot with SHA-256(genesis.json).
+pub fn hk_set_genesis_digest(digest: [u8; 32]) {
+    let _ = HK_GENESIS_DIGEST.set(digest);
+}
+
+pub(crate) fn hk_our_genesis_digest() -> Option<[u8; 32]> {
+    HK_GENESIS_DIGEST.get().copied()
+}
+
+fn hk_hex32(bytes: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}
+
+/// The libp2p identify `agent_version` we advertise — carries our genesis digest
+/// so peers can gate us. Untagged (`"hashkinetics/1"`) until the digest is set.
+pub(crate) fn hk_agent_version() -> String {
+    match hk_our_genesis_digest() {
+        Some(d) => format!("hashkinetics/1/genesis/{}", hk_hex32(&d)),
+        None => "hashkinetics/1".to_string(),
+    }
+}
+
+/// Extract a peer's advertised genesis digest from its identify `agent_version`.
+/// `None` = the peer advertised no HK genesis tag (legacy/foreign) → do NOT gate.
+pub(crate) fn hk_peer_genesis_digest(agent_version: &str) -> Option<[u8; 32]> {
+    let hexpart = agent_version.strip_prefix("hashkinetics/1/genesis/")?;
+    if hexpart.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(hexpart.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProtocolNames {
     pub consensus: String,
@@ -527,6 +589,25 @@ async fn handle_swarm_event(
                         "Peer {peer_id} is using compatible protocol version: {:?}",
                         info.protocol_version
                     );
+
+                    // HK genesis-gate: a consensus-protocol peer must be on OUR genesis.
+                    // If it advertises a DIFFERENT genesis digest it is an independent
+                    // chain — drop the connection instead of admitting it. Peers with no
+                    // HK genesis tag (pre-gate builds / discovery) are graced (fail open).
+                    if let (Some(ours), Some(theirs)) = (
+                        hk_our_genesis_digest(),
+                        hk_peer_genesis_digest(&info.agent_version),
+                    ) {
+                        if ours != theirs {
+                            warn!(
+                                "HK genesis-gate: peer {peer_id} is on a DIFFERENT genesis \
+                                 (agent={}) — refusing island chain, disconnecting",
+                                info.agent_version
+                            );
+                            let _ = swarm.disconnect_peer_id(peer_id);
+                            return ControlFlow::Continue(());
+                        }
+                    }
 
                     let is_already_connected = state.discovery.handle_new_peer(
                         swarm,

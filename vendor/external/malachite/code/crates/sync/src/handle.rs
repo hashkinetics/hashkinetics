@@ -83,7 +83,8 @@ where
                     // hence we update the score of the peer accordingly.
                     state.peer_scorer.update_score(peer_id, SyncResult::Failure);
 
-                    return Ok(());
+                    // HK-R5: keep the pipeline moving regardless.
+                    return refill_pipeline(co, state, metrics).await;
                 }
             };
 
@@ -93,7 +94,8 @@ where
                 // Received an invalid value from this peer and hence update the peer's score accordingly.
                 state.peer_scorer.update_score(peer_id, SyncResult::Failure);
 
-                return Ok(());
+                // HK-R5: the freed inflight slot must be re-used immediately.
+                return refill_pipeline(co, state, metrics).await;
             };
 
             let start = response.start_height;
@@ -110,7 +112,8 @@ where
                     // Received a value with invalid range of heights from this peer and hence update the peer's score accordingly.
                     state.peer_scorer.update_score(peer_id, SyncResult::Failure);
 
-                    return Ok(());
+                    // HK-R5: the freed inflight slot must be re-used immediately.
+                    return refill_pipeline(co, state, metrics).await;
                 }
                 current_height = current_height.increment();
             }
@@ -130,7 +133,8 @@ where
                 // Received a value with invalid range of heights from this peer and hence update the peer's score accordingly.
                 state.peer_scorer.update_score(peer_id, SyncResult::Failure);
 
-                return Ok(());
+                // HK-R5: the freed inflight slot must be re-used immediately.
+                return refill_pipeline(co, state, metrics).await;
             }
 
             // Only notify consensus to start processing the response after we've performed sanity checks on the response.
@@ -155,6 +159,10 @@ where
                 request_id.clone(),
                 (vec![RangeInclusive::new(start, actual_end)], peer_id),
             );
+            // HK-R5: timestamp the hand-off so ghost entries can expire (see on_tick).
+            state
+                .pending_since
+                .insert(request_id.clone(), std::time::Instant::now());
 
             // Update peer's response time.
             debug!(start = %start, num_values = %response.values.len(), %peer_id, "Received response from peer");
@@ -166,7 +174,9 @@ where
                 );
             }
 
-            Ok(())
+            // HK-R5: the response freed an inflight slot — request the next batch NOW
+            // instead of idling until the next peer status (≤10 s away).
+            refill_pipeline(co, state, metrics).await
         }
 
         Input::GotDecidedValues(request_id, range, values) => {
@@ -194,7 +204,9 @@ where
                 }
             };
 
-            Ok(())
+            // HK-R5: the timed-out slot is free — retry from another peer immediately
+            // (the scorer already de-prioritized the one that timed out).
+            refill_pipeline(co, state, metrics).await
         }
 
         Input::InvalidValue(peer_id, height) => {
@@ -202,7 +214,10 @@ where
 
             state.peer_scorer.update_score(peer_id, SyncResult::Failure);
 
-            on_invalid_value(state, height, peer_id)
+            on_invalid_value(state, height, peer_id)?;
+
+            // HK-R5: the excised height freed window capacity — re-request it now.
+            refill_pipeline(co, state, metrics).await
         }
 
         Input::ValueProcessingError(peer_id, height) => {
@@ -211,7 +226,10 @@ where
             // NOTE: In contrast to `Input::InvalidValue` we do not update the peer score here, as
             // this is an internal error and not a failure from the peer's side.
 
-            on_invalid_value(state, height, peer_id)
+            on_invalid_value(state, height, peer_id)?;
+
+            // HK-R5: the excised height freed window capacity — re-request it now.
+            refill_pipeline(co, state, metrics).await
         }
     }
 }
@@ -239,6 +257,14 @@ where
     }
 
     debug!("Peer scores: {:#?}", state.peer_scorer.get_scores());
+
+    // HK-R5: free ghost ranges (responses whose consensus-side processing died) so
+    // the request window can refill — a fully leaked window wedges sync forever.
+    let stale_ttl = state.config.request_timeout.saturating_mul(4);
+    let expired = state.expire_stale_pending(stale_ttl);
+    if expired > 0 {
+        warn!(%expired, "Expired stale pending-consensus sync requests (freeing the request window)");
+    }
 
     // In the exceptional case where we stop getting `Status` updates from other peers, we initiate
     // the request of values from here up to the maximum `tip_height` we have seen so far.
@@ -644,6 +670,41 @@ where
         .collect();
 
     compute_free_window(tip, up_to_height, batch_size, ranges)
+}
+
+/// HK-R5: refill the request pipeline the moment capacity frees up (a response,
+/// a failure, or a timeout) instead of waiting for the next Status/Tick.
+///
+/// Upstream only calls `request_values` from `on_tick` and `on_status`, which caps
+/// sync throughput at ~(parallel_requests × batch_size) heights per status interval
+/// (a burst-then-idle pipeline: ~25 heights per 10 s with defaults) and leaves freed
+/// slots idle until the next status arrives. With this continuation the window stays
+/// full and throughput is bounded by peer RTT + apply speed instead of the status
+/// clock. See R5 in HashKinetics docs/C-PROGRAM-PLAN.md.
+async fn refill_pipeline<Ctx>(
+    co: Co<Ctx>,
+    state: &mut State<Ctx>,
+    metrics: &Metrics,
+) -> Result<(), Error<Ctx>>
+where
+    Ctx: Context,
+{
+    if !state.started {
+        return Ok(());
+    }
+
+    let max_tip_height = state
+        .peers
+        .values()
+        .map(|s| s.tip_height)
+        .max()
+        .unwrap_or(state.tip_height);
+
+    if state.tip_height < max_tip_height {
+        request_values(co, state, max_tip_height, metrics).await?;
+    }
+
+    Ok(())
 }
 
 /// Request multiple batches of values in parallel that are of height less than `up_to_height`.

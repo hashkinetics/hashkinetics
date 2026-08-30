@@ -57,6 +57,9 @@ pub struct SharedHandles {
     /// P2.3: aggregation bundles submitted via `hk_submitBundle`.
     pub bundles: Arc<Mutex<Vec<(Vec<SignedTx>, Vec<u8>)>>>,
     pub chain_id: String,
+    /// Genesis-gate: SHA-256(genesis.json) — the network's identity fingerprint,
+    /// surfaced by `hk_chainInfo` so anyone can confirm they're on the real chain.
+    pub genesis_digest: [u8; 32],
     /// P3.0/WS-B: the persistence store — RPC admission appends to the mempool WAL;
     /// the explorer endpoints read the block log from it.
     pub store: Option<Arc<NodeStore>>,
@@ -136,6 +139,8 @@ pub struct HkApp {
     /// P2.3: aggregate verifier + (spend, mint) vk hashes.
     agg: Option<(AggVerifyFn, [u32; 8], [u32; 8])>,
     chain_id: String,
+    /// Genesis-gate: SHA-256(genesis.json). `set_genesis_digest` binds chain_id to it.
+    genesis_digest: [u8; 32],
     chain_start_time: u64,
 
     pub current_height: HkHeight,
@@ -213,6 +218,7 @@ impl HkApp {
             bundles: Arc::new(Mutex::new(Vec::new())),
             agg,
             chain_id: "hashkinetics-devnet-1".to_string(),
+            genesis_digest: [0u8; 32],
             chain_start_time: genesis.chain_start_time,
             current_height: HkHeight::INITIAL,
             current_round: Round::Nil,
@@ -240,6 +246,16 @@ impl HkApp {
         self.store = Some(store);
     }
 
+    /// Genesis-gate: bind this node's identity to its genesis. Stores the digest
+    /// (SHA-256 of genesis.json) and derives the human `chain_id` from its first 4
+    /// bytes, so a node on a DIFFERENT genesis reports a different chain_id and is
+    /// visibly not the canonical chain. Call once at boot (node.rs), before RPC
+    /// handles are cloned. The digest also drives the libp2p peer gate.
+    pub fn set_genesis_digest(&mut self, digest: [u8; 32]) {
+        self.genesis_digest = digest;
+        self.chain_id = format!("hashkinetics-1-{}", hex::encode(&digest[..4]));
+    }
+
     /// Clonable handles for the RPC server (call before moving self into the loop).
     pub fn handles(&self) -> SharedHandles {
         SharedHandles {
@@ -249,6 +265,7 @@ impl HkApp {
             pool_notes: self.pool_notes.clone(),
             bundles: self.bundles.clone(),
             chain_id: self.chain_id.clone(),
+            genesis_digest: self.genesis_digest,
             store: self.store.clone(),
             validators: self.validators.clone(),
             chain_start_time: self.chain_start_time,

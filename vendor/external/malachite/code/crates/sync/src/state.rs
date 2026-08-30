@@ -37,6 +37,13 @@ where
     pub pending_consensus_requests:
         BTreeMap<OutboundRequestId, (Vec<RangeInclusive<Ctx::Height>>, PeerId)>,
 
+    /// HK-R5: when each pending-consensus entry was handed to consensus. Entries that
+    /// outlive the TTL in [`Self::expire_stale_pending`] are dropped so their heights
+    /// free the request window again — otherwise a response whose consensus-side
+    /// processing dies leaves ghost ranges that block
+    /// `find_range_of_heights_to_request` forever (observed as a fully wedged sync).
+    pub pending_since: BTreeMap<OutboundRequestId, std::time::Instant>,
+
     /// The set of peers we are connected to in order to get values, certificates and votes.
     pub peers: BTreeMap<PeerId, Status<Ctx>>,
 
@@ -65,9 +72,34 @@ where
             tip_height: Ctx::Height::ZERO,
             inflight_requests: BTreeMap::new(),
             pending_consensus_requests: BTreeMap::new(),
+            pending_since: BTreeMap::new(),
             peers: BTreeMap::new(),
             peer_scorer,
         }
+    }
+
+    /// HK-R5: drop pending-consensus entries older than `ttl` (ghost ranges from
+    /// responses whose processing never completed), freeing the sync window.
+    /// Returns how many requests were expired. Timestamps whose request is already
+    /// gone (pruned/removed elsewhere) are discarded lazily here.
+    pub fn expire_stale_pending(&mut self, ttl: std::time::Duration) -> usize {
+        let now = std::time::Instant::now();
+        let stale: Vec<OutboundRequestId> = self
+            .pending_since
+            .iter()
+            .filter(|(_, t)| now.duration_since(**t) > ttl)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut expired = 0;
+        for id in &stale {
+            self.pending_since.remove(id);
+            if self.pending_consensus_requests.remove(id).is_some() {
+                expired += 1;
+            }
+        }
+        let live = &self.pending_consensus_requests;
+        self.pending_since.retain(|id, _| live.contains_key(id));
+        expired
     }
 
     /// The maximum number of parallel requests that can be made to peers.

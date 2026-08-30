@@ -17,6 +17,9 @@ hk-consensus = { path = "../hk-consensus" }
 hk-wallet = { path = "../hk-wallet" }
 hk-spend-circuit = { path = "../../../zkvm-bakeoff/circuit" }
 bincode = "1"
+# Genesis-gate: SHA-256 of genesis.json = the network's identity fingerprint
+# (matches the published `sha256sum genesis.json`), bound into chain_id + the peer gate.
+sha2 = "0.10"
 # In-node STARK verification (P2.0/WS2). default = [] on the sdk keeps this lean —
 # verifier components only, no network/gnark/cuda. Feature-gated so `--no-default-features`
 # still builds the transparent-only node if the sdk ever fights the host toolchain.
@@ -43,6 +46,9 @@ malachitebft-peer = { package = "informalsystems-malachitebft-peer", path = "../
 malachitebft-core-types = { package = "informalsystems-malachitebft-core-types", path = "../../../vendor/external/malachite/code/crates/core-types", features = ["serde"] }
 malachitebft-core-consensus = { package = "informalsystems-malachitebft-core-consensus", path = "../../../vendor/external/malachite/code/crates/core-consensus" }
 malachitebft-sync = { package = "informalsystems-malachitebft-sync", path = "../../../vendor/external/malachite/code/crates/sync" }
+# Genesis-gate: hk-node hands the network layer our genesis digest before the engine
+# starts, so identify advertises it and island (wrong-genesis) peers are refused.
+malachitebft-network = { package = "informalsystems-malachitebft-network", path = "../../../vendor/external/malachite/code/crates/network" }
 malachitebft-signing-ed25519 = { package = "informalsystems-malachitebft-signing-ed25519", path = "../../../vendor/external/malachite/code/crates/signing-ed25519", features = ["serde"] }
 
 [features]

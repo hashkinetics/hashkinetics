@@ -363,7 +363,10 @@ max_response_size = "64 MiB"
 parallel_requests = 5
 scoring_strategy = "ema"
 inactive_threshold = "60s"
-batch_size = 5
+# R5: 5×20 = 100 heights in flight (queue capacity derives from this product).
+# The patched sync engine refills the window on every response, so throughput is
+# RTT/apply-bound, not status-tick-bound (was ~46 blk/min, burst-then-idle).
+batch_size = 20
 
 [metrics]
 enabled = {metrics_enabled}

@@ -144,6 +144,9 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
             let chain = h.chain.lock().unwrap();
             json!({"result": {
                 "chain_id": h.chain_id,
+                // Genesis-gate: the network's identity fingerprint (== `sha256sum
+                // genesis.json`). A joiner confirms this matches before trusting a node.
+                "genesis_digest": hex::encode(h.genesis_digest),
                 "height": chain.height,
                 "app_hash": hex::encode(chain.state_commitment().0),
                 // R4: THIS node's consensus-signer leaf budget (the fuse, visible).

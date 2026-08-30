@@ -42,7 +42,7 @@ window into the chain, served from your own verification.
 The genesis fingerprint (SHA-256 of `genesis.json` in this directory):
 
 ```
-557f2ea6e55713ae1a820043baf3900707101a6fceaccc34b05a44f1a5f62a22
+557f2ea6c55713ae1a820043baf3900707101e6fceaccc34b05e44f1a5f62a22
 ```
 
 Check it (`sha256sum genesis.json`) before starting your node. Then, running:
@@ -59,8 +59,12 @@ The `chain_id` and `app_hash` at any height must match what
 - Observers hold a validator keypair (from `keygen`) but are not in the validator
   set: you sync and verify, you don't vote. No stake, no cost, no GPU.
 - Bootstrap peers are DNS-based (`PEERS.txt`) — IPs may change; the names won't.
-- The staging chain id currently reads `hashkinetics-devnet-1` (a ceremony-era
-  label); testnet-1's re-genesis sets the proper id. The genesis digest below is
-  what actually pins the network.
+- The chain id is bound to genesis: a node reports `hashkinetics-1-<first 8 hex of
+  the genesis digest>` — for this network, `hashkinetics-1-557f2ea6`. A node on a
+  different genesis reports a different id and is visibly not this chain. `hk_chainInfo`
+  also returns the full `genesis_digest` (the fingerprint above).
+- Identity, not topology: nodes **refuse to peer across genesis**. A node whose genesis
+  digest differs from ours is dropped at connect time, so an "island" chain cannot attach
+  to the network — you are either syncing OUR genesis from block 1 or on your own chain.
 - Sync throughput is a known work item (R5): expect ~45 blocks/min today on deep
   backlogs.

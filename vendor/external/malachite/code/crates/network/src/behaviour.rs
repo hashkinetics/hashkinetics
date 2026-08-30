@@ -153,10 +153,18 @@ impl Behaviour {
         keypair: &Keypair,
         registry: &mut Registry,
     ) -> Result<Self> {
-        let identify = identify::Behaviour::new(identify::Config::new(
-            config.protocol_names.consensus.clone(),
-            keypair.public(),
-        ));
+        // HK genesis-gate: advertise our genesis digest in identify's `agent_version`.
+        // `protocol_version` is left untouched (compatibility key is unchanged, so a
+        // rolling upgrade never partitions the running network); peers read the tag and
+        // refuse us if they are on a different genesis, and we refuse them (see the
+        // identify handler in lib.rs).
+        let identify = identify::Behaviour::new(
+            identify::Config::new(
+                config.protocol_names.consensus.clone(),
+                keypair.public(),
+            )
+            .with_agent_version(crate::hk_agent_version()),
+        );
 
         let ping = ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(5)));
 
