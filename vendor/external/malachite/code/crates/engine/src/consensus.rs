@@ -1040,6 +1040,18 @@ where
             }
 
             Effect::VerifyCommitCertificate(certificate, validator_set, thresholds, r) => {
+                // HK-R6: verify against the validator set AS OF the certificate's
+                // height when the context tracks set history. Consensus hands us its
+                // CURRENT set, but a certificate arriving via sync/replay may predate
+                // one or more validator-key rotations — checking it against the
+                // rotated set yields UnknownValidator/InvalidSignature for perfectly
+                // valid history (and used to park syncing nodes at rotation
+                // boundaries). Falls back to the caller's set when no history exists.
+                let validator_set = self
+                    .ctx
+                    .validator_set_at(certificate.height)
+                    .unwrap_or(validator_set);
+
                 let result = self
                     .signing_provider
                     .verify_commit_certificate(&self.ctx, &certificate, &validator_set, thresholds)

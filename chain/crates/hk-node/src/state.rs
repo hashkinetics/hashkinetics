@@ -40,6 +40,35 @@ pub struct PoolVerifiers {
 use crate::batch::{txid, Batch, MAX_TXS_PER_BLOCK};
 use crate::genesis::HkGenesis;
 use crate::store::{NodeSnapshot, NodeStore, StoredBlock, ValidatorDto, SNAPSHOT_EVERY};
+
+/// HK-R5.2: rolling apply-cost accumulators (ms), logged and reset every 100 blocks —
+/// the catch-up bottleneck is MEASURED on every node, not inferred (C-plan §R5.2).
+#[derive(Default)]
+struct ApplyTimers {
+    n: u64,
+    pre_ms: u64,   // parallel envelope pre-verification (outside the state lock)
+    agg_ms: u64,   // aggregate STARK verify
+    apply_ms: u64, // ordered state apply
+    hash_ms: u64,  // post-apply state commitment (1× per block since R5.2)
+    save_ms: u64,  // block-log persist + fsync
+    snap_ms: u64,  // full snapshot + fsync (every snapshot_every() blocks)
+}
+
+/// HK-R5.2: snapshot cadence, env-tunable (`HK_SNAPSHOT_EVERY`, default
+/// [`SNAPSHOT_EVERY`] = 16). The full-image snapshot + fsync is a growing tax as
+/// state grows; a node grinding through catch-up can widen the cadence (the only
+/// cost is replaying a few more blocks after a crash). Read once — changing it
+/// requires a restart, which is exactly when you'd set it.
+fn snapshot_every() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("HK_SNAPSHOT_EVERY")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(SNAPSHOT_EVERY)
+    })
+}
 use crate::streaming::PartStreamsMap;
 use hk_consensus::HkValidator;
 
@@ -181,6 +210,16 @@ pub struct HkApp {
     /// P3.0/WS-B: durable store (block log + snapshots + mempool WAL). `None` = the
     /// old in-memory devnet behavior (`HK_NO_PERSIST=1`, and unit tests).
     store: Option<Arc<NodeStore>>,
+    /// HK-R6: shared (with HkContext) history of `(effective_from_height, set)` —
+    /// the engine verifies commit certificates against the set as of their height.
+    set_history: hk_consensus::SetHistory,
+    /// HK-R5.2: cached post-apply state commitment. The next block's parent-hash
+    /// check reads this instead of re-walking the ENTIRE state (every account,
+    /// every nullifier ever) a second time. Taken (not copied) per block: any
+    /// error path leaves `None` and the next check recomputes honestly.
+    last_app_hash: Option<[u8; 32]>,
+    /// HK-R5.2: apply-cost window (see [`ApplyTimers`]).
+    timers: ApplyTimers,
 }
 
 impl HkApp {
@@ -190,9 +229,17 @@ impl HkApp {
         master_seed: [u8; 32],
         op_handle: HkPriv,
         home_dir: PathBuf,
+        set_history: hk_consensus::SetHistory,
         verifiers: Option<PoolVerifiers>,
     ) -> Result<Self> {
         let validators = genesis.validator_set()?;
+        // HK-R6: seed the shared set history — the genesis set verifies from height 1.
+        // (restore_from_store reseeds at the snapshot; rotations append as they commit.)
+        {
+            let mut hist = set_history.lock().unwrap_or_else(|e| e.into_inner());
+            hist.clear();
+            hist.push((1, validators.clone()));
+        }
         let mut chain = hk_state::State::from_genesis(&genesis.chain_genesis())
             .map_err(|e| eyre!("chain genesis: {e}"))?;
         // WS2: inject the real STARK verifier. None ⇒ hk-state's RejectAll default stays —
@@ -238,6 +285,9 @@ impl HkApp {
             foreign_rotations: Arc::new(Mutex::new(Vec::new())),
             signer_gauge,
             store: None,
+            set_history,
+            last_app_hash: None,
+            timers: ApplyTimers::default(),
         })
     }
 
@@ -277,7 +327,7 @@ impl HkApp {
 
     /// Owned snapshot of the current validator set (engine replies + RPC share it).
     pub fn validator_set(&self) -> HkValidatorSet {
-        self.validators.lock().unwrap().clone()
+        self.validators.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     pub fn start_height(&self) -> HkHeight {
@@ -325,7 +375,7 @@ impl HkApp {
         // but the set may have advanced); stale ones are dropped in place.
         let mut rotations = self.pending_rotations.clone();
         {
-            let validators = self.validators.lock().unwrap().clone();
+            let validators = self.validators.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let mut foreign = self.foreign_rotations.lock().unwrap();
             foreign.retain(|c| validators.apply_rotation(c).is_ok());
             for cert in foreign.iter() {
@@ -480,6 +530,26 @@ impl HkApp {
     ) -> Result<bool> {
         let time = self.chain_start_time + height;
         let mut agg_valid = false;
+
+        // HK-R5.2: the pure part of envelope verification (signing digest + Lamport)
+        // runs in PARALLEL on the verification pool, OUTSIDE the state lock, before
+        // ordered apply. For the load-test-era fat blocks this is the bulk of the
+        // per-block CPU; the state-dependent checks stay ordered inside apply.
+        let txs: Vec<SignedTx> = batch.as_ref().map(|b| b.txs.clone()).unwrap_or_default();
+        let t_pre = std::time::Instant::now();
+        let sig_verdicts: Vec<bool> =
+            hk_consensus::par::par_bools(&txs, hk_state::State::verify_envelope);
+        let pre_ms = t_pre.elapsed().as_millis() as u64;
+
+        // HK-R5.2: cached post-apply commitment of the PREVIOUS block == our current
+        // commitment (nothing else mutates the chain between commits). Taken, not
+        // copied: every error path below leaves it `None` → honest recompute next time.
+        let cached_hash = self.last_app_hash.take();
+
+        let mut agg_ms = 0u64;
+        let mut apply_ms = 0u64;
+        let mut hash_ms = 0u64;
+        let post_hash;
         {
             let mut chain = self.chain.lock().unwrap();
 
@@ -487,7 +557,10 @@ impl HkApp {
             // equal our own current state commitment, or our state has diverged.
             // On replay this is the integrity chain: snapshot → each block → tip.
             if let Some(b) = &batch {
-                let ours = chain.state_commitment().0;
+                let ours = match cached_hash {
+                    Some(h) => h,
+                    None => chain.state_commitment().0,
+                };
                 if b.parent_app_hash != ours {
                     return Err(eyre!(
                         "app_hash divergence at height {height}: block parent {} != ours {}",
@@ -502,6 +575,7 @@ impl HkApp {
             // and install coverage; replay: install the recorded verdict's coverage.
             // Invalid/absent aggregate ⇒ empty coverage ⇒ those txs are rejected by the
             // state machine (deterministic on every validator).
+            let t_agg = std::time::Instant::now();
             if let Some(b) = &batch {
                 if !b.agg_proof.is_empty() {
                     let mut pubs: Vec<(u8, Vec<u8>)> = Vec::new();
@@ -575,10 +649,13 @@ impl HkApp {
                 }
             }
 
-            let txs: Vec<SignedTx> = batch.as_ref().map(|b| b.txs.clone()).unwrap_or_default();
+            agg_ms = t_agg.elapsed().as_millis() as u64;
+
+            let t_apply = std::time::Instant::now();
             let receipts = chain
-                .apply_block(height, time, &txs)
+                .apply_block_verified(height, time, &txs, Some(&sig_verdicts))
                 .map_err(|e| eyre!("apply_block failed: {e}"))?;
+            apply_ms = t_apply.elapsed().as_millis() as u64;
 
             // Record receipts + drop included txs from the mempool.
             let mut rlog = self.receipts.lock().unwrap();
@@ -632,7 +709,13 @@ impl HkApp {
                 }
             }
 
+            // HK-R5.2: ONE post-apply commitment per block — it feeds the log line
+            // AND becomes the cached parent-check value for the next block (this
+            // used to be two full-state walks per block).
+            let t_hash = std::time::Instant::now();
             let app_hash = chain.state_commitment();
+            hash_ms = t_hash.elapsed().as_millis() as u64;
+            post_hash = app_hash.0;
             let ok = receipts.iter().filter(|r| r.result.is_ok()).count();
             info!(
                 height,
@@ -642,6 +725,28 @@ impl HkApp {
                 app_hash = %hex::encode(&app_hash.0[..8]),
                 "Committed block"
             );
+        }
+        self.last_app_hash = Some(post_hash);
+
+        // HK-R5.2: accumulate the window; one summary line per 100 blocks.
+        let tm = &mut self.timers;
+        tm.n += 1;
+        tm.pre_ms += pre_ms;
+        tm.agg_ms += agg_ms;
+        tm.apply_ms += apply_ms;
+        tm.hash_ms += hash_ms;
+        if tm.n >= 100 {
+            info!(
+                blocks = tm.n,
+                pre_ms = tm.pre_ms,
+                agg_ms = tm.agg_ms,
+                apply_ms = tm.apply_ms,
+                hash_ms = tm.hash_ms,
+                save_ms = tm.save_ms,
+                snap_ms = tm.snap_ms,
+                "R5.2 apply-cost window"
+            );
+            *tm = ApplyTimers::default();
         }
         Ok(agg_valid)
     }
@@ -653,13 +758,15 @@ impl HkApp {
     /// the epoch: `adopt_epoch_signer` runs once after restore and builds the signer at
     /// the FINAL epoch directly — the per-epoch state file carries its own used-leaf
     /// counter, so resume never reuses a leaf (this closed the WS-F ledger item).
-    fn apply_rotations(&mut self, batch: &Option<Batch>, replay: bool) {
+    fn apply_rotations(&mut self, height: u64, batch: &Option<Batch>, replay: bool) {
+        let mut any_applied = false;
         if let Some(b) = &batch {
             for cert in &b.rotations {
-                let applied = { self.validators.lock().unwrap().apply_rotation(cert) };
+                let applied = { self.validators.lock().unwrap_or_else(|e| e.into_inner()).apply_rotation(cert) };
                 match applied {
                     Ok(new_set) => {
-                        *self.validators.lock().unwrap() = new_set;
+                        *self.validators.lock().unwrap_or_else(|e| e.into_inner()) = new_set;
+                        any_applied = true;
                         let mine = cert.root_pk == self.my_root_pk;
                         info!(epoch = cert.epoch, mine = mine, replay, "Applied validator key rotation");
                         if mine && cert.epoch > self.current_epoch {
@@ -696,6 +803,14 @@ impl HkApp {
                 }
             }
         }
+        // HK-R6: a rotation committed in block `height` changes the set that signs
+        // height+1 onward — record it so certificate verification for any later
+        // height uses the right keys (live commits AND replay both pass through here).
+        if any_applied {
+            let set = self.validators.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let mut hist = self.set_history.lock().unwrap_or_else(|e| e.into_inner());
+            hist.push((height + 1, set));
+        }
     }
 
     /// R2/WS-F: after restore, make the LIVE signer match the epoch the chain says we're
@@ -707,7 +822,7 @@ impl HkApp {
     /// file means the tree never signed, so leaf 0 is correct (the revival case).
     pub fn adopt_epoch_signer(&mut self) {
         let (chain_epoch, expected_pk) = {
-            let vals = self.validators.lock().unwrap();
+            let vals = self.validators.lock().unwrap_or_else(|e| e.into_inner());
             match vals.iter().find(|v| v.root_pk == self.my_root_pk) {
                 Some(v) => (v.epoch, v.public_key.clone()),
                 None => return, // not a validator on this chain (RPC-only node)
@@ -762,7 +877,7 @@ impl HkApp {
         let batch = Batch::decode(&value.txs);
 
         let agg_valid = self.apply_batch_to_chain(height, &batch, true, false)?;
-        self.apply_rotations(&batch, false);
+        self.apply_rotations(height, &batch, false);
 
         // P3.0/WS-B: capture the persistent facts BEFORE the value moves into `decided`.
         let cert_dto = crate::codec::RawCommitCertificate::from(&certificate);
@@ -823,12 +938,17 @@ impl HkApp {
         // live path: consensus safety never depends on this node's disk (a restart
         // simply replays less / value-syncs the gap).
         if let Some(store) = self.store.clone() {
+            let t_save = std::time::Instant::now();
             if let Err(e) =
                 store.save_block(&StoredBlock { height, value_bytes, certificate: cert_dto, agg_valid })
             {
                 error!(%e, height, "failed to persist block — restart will value-sync this height");
             }
-            if height % SNAPSHOT_EVERY == 0 {
+            self.timers.save_ms += t_save.elapsed().as_millis() as u64;
+            // HK-R5.2: cadence is env-tunable (`HK_SNAPSHOT_EVERY`) — the full-image
+            // snapshot + fsync grows with state and taxes catch-up at the default 16.
+            if height % snapshot_every() == 0 {
+                let t_snap = std::time::Instant::now();
                 let snap = self.make_snapshot();
                 match store.save_snapshot(&snap) {
                     Ok(()) => {
@@ -840,6 +960,7 @@ impl HkApp {
                     }
                     Err(e) => error!(%e, height, "failed to persist snapshot"),
                 }
+                self.timers.snap_ms += t_snap.elapsed().as_millis() as u64;
             }
         }
 
@@ -910,7 +1031,7 @@ impl HkApp {
                 }
             }
             if !snap.validators.is_empty() {
-                *self.validators.lock().unwrap() =
+                *self.validators.lock().unwrap_or_else(|e| e.into_inner()) =
                     HkValidatorSet::new(snap.validators.into_iter().map(|v| HkValidator {
                         address: v.address,
                         root_pk: v.root_pk,
@@ -921,6 +1042,16 @@ impl HkApp {
             }
             self.current_epoch = snap.current_epoch;
             self.highest_issued_epoch = snap.highest_issued_epoch;
+            // HK-R6: history restarts at the snapshot — its set (which already folds
+            // in every pre-snapshot rotation) is effective from the next height;
+            // rotations replayed below append their own entries. Heights before the
+            // snapshot are never verified by this node, so no older sets are needed.
+            {
+                let set = self.validators.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let mut hist = self.set_history.lock().unwrap_or_else(|e| e.into_inner());
+                hist.clear();
+                hist.push((snap.height + 1, set));
+            }
             info!(
                 height = snap.height,
                 app_hash = %hex::encode(&snap.app_hash[..8]),
@@ -952,7 +1083,7 @@ impl HkApp {
                 }
                 let batch = Batch::decode(&value.txs);
                 self.apply_batch_to_chain(h, &batch, false, sb.agg_valid)?;
-                self.apply_rotations(&batch, true);
+                self.apply_rotations(h, &batch, true);
                 replayed += 1;
             } else {
                 rehydrated += 1;

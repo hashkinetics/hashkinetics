@@ -38,6 +38,14 @@ where
 
     /// Last precommit broadcasted by this node
     pub last_signed_precommit: Option<SignedVote<Ctx>>,
+
+    /// HK-R5.2: identity of the last commit certificate that PASSED full signature
+    /// verification. During catch-up the sync path verifies a certificate and the
+    /// decide path then re-verified the SAME certificate — double hash-based
+    /// signature work on every synced block. `decide` skips re-verification when
+    /// the identity matches; live decides (no sync verify ran) miss and verify
+    /// exactly as before.
+    pub last_verified_certificate: Option<(Ctx::Height, Round, ValueId<Ctx>)>,
 }
 
 impl<Ctx> State<Ctx>
@@ -62,6 +70,7 @@ where
             full_proposal_keeper: Default::default(),
             last_signed_prevote: None,
             last_signed_precommit: None,
+            last_verified_certificate: None,
         }
     }
 

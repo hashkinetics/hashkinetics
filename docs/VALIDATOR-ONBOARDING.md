@@ -115,9 +115,21 @@ publishes the URL) should list your address under Validators.
 - **Know your leaf budget.** Your operational tree holds ~32.7K one-time signatures
   ≈ ~10.9K heights at ~3 sigs/height (~6 h at 2 s blocks). Staging incident #1
   (2026-08-28) ran a tree to exactly zero: the chain HALTED rather than reuse a
-  leaf — correct behavior, avoidable outage. Until automatic threshold rotation
-  ships (R1, next release), set `HK_ROTATE_EVERY=500` in your service environment
-  so your tree rotates under your root well before exhaustion.
+  leaf — correct behavior, avoidable outage. **Since v0.10.5 rotation is automatic:**
+  when your remaining budget crosses <20% (6,553 leaves), your node issues a
+  root-signed rotation cert by itself and it rides your next proposal — no env
+  vars, no operator action (the fleet has rotated through dozens of epochs
+  unattended). Watch it live: `hk_chainInfo.signer {epoch, remaining, capacity}`.
+  If you DO exhaust while parked/offline, any peer can carry your revival:
+  `hk-node issue-rotation <HOME> <EPOCH>` + `hk_submitRotation` on a live node
+  (three production revivals to date).
+- **Syncing across rotation history works (v0.10.7):** commit certificates are
+  verified against the validator set as of their height, so a new or restarted
+  node syncs from genesis (or any snapshot) across every epoch boundary. Deep
+  restarts on small instances rehydrate slowly and may trail the live chain for
+  a while (engine resume-at-tip is a ledgered work item); the interim cure for a
+  validator in a hurry is restoring from a snapshot near tip (`blocks/` +
+  `snapshot.bin` from a peer — snapshot.bin FIRST in the tar).
 - Your key exhausting or your node dying is a **liveness** fault only — the chain continues;
   key rotation under your SLH-DSA root brings you back (SCMS; cert flow is live —
   a rotated validator shows its new epoch badge on the explorer).

@@ -121,6 +121,7 @@
     <div class="stat"><div class="k">Nullifiers</div><div class="v" id="s-nulls">—</div><div class="sub">spends nobody can trace</div></div>
     <div class="stat"><div class="k">Validators</div><div class="v" id="s-vals">—</div><div class="sub" id="s-power"></div></div>
     <div class="stat"><div class="k">Mempool</div><div class="v" id="s-mempool">—</div><div class="sub">pending admissions</div></div>
+    <div class="stat"><div class="k">Genesis fingerprint</div><div class="v mono" id="s-genesis" title="Full SHA-256 of genesis.json — verify with: sha256sum genesis.json">—</div><div class="sub">identity, not topology — nodes refuse to peer across genesis</div></div>
   </div>
 
   <div class="cols">
@@ -146,7 +147,8 @@
       <div class="card">
         <h2><span class="spark">⬢</span> Validators</h2>
         <table id="vals"><thead><tr><th>Address</th><th class="right">Power</th><th class="right">Epoch</th></tr></thead><tbody></tbody></table>
-        <div class="privnote" style="border-color:var(--cyan)"><b style="color:var(--cyan)">Every vote is hash-based</b> (LMS/HSS over SHAKE-256) under an SLH-DSA root — the consensus itself is post-quantum, not just the wallets.</div>
+        <div class="kv" style="margin-top:8px"><div><span class="muted">External nodes (join kit)</span></div><div class="right"><span class="badge b-rot">1 observer — syncing from genesis</span></div></div>
+        <div class="privnote" style="border-color:var(--cyan)"><b style="color:var(--cyan)">Every vote is hash-based</b> (LMS/HSS over SHAKE-256) under an SLH-DSA root — the consensus itself is post-quantum, not just the wallets. Epoch badges climb when a validator rotates its signing tree — automatic since v0.10.5. External row: nodes that joined via <span class="mono">networks/staging-1</span> and independently verify the chain from block 1.</div>
       </div>
     </div>
   </div>
@@ -189,6 +191,7 @@ async function pollInfo(){
     $('s-height').textContent=info.height.toLocaleString();
     $('s-apphash').textContent=short(info.app_hash,18);
     $('s-time').textContent=info.chain_id;
+    if(info.genesis_digest){ const g=$('s-genesis'); g.textContent=short(info.genesis_digest,18); g.title='SHA-256 of genesis.json (verify: sha256sum genesis.json):\n'+info.genesis_digest; }
     if(pageBefore===null) loadBlocks();
   }catch(e){ $('conndot').classList.remove('on'); }
 }

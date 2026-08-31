@@ -631,12 +631,28 @@ impl malachitebft_core_types::ValidatorSet<HkContext> for HkValidatorSet {
 // The Context
 // ---------------------------------------------------------------------------
 
+/// HK-R6: shared validator-set history — entries of `(effective_from_height, set)`,
+/// ascending. The set that verifies a commit certificate for height `h` is the last
+/// entry with `effective_from <= h`. Rotations are rare (a handful per epoch-cycle),
+/// so this stays tiny; the node seeds it at genesis/restore and appends on every
+/// committed rotation (live AND replay).
+pub type SetHistory = std::sync::Arc<std::sync::Mutex<Vec<(u64, HkValidatorSet)>>>;
+
 #[derive(Clone, Debug, Default)]
-pub struct HkContext;
+pub struct HkContext {
+    /// `None` (e.g. plain `HkContext::new()` in tests) disables per-height lookup —
+    /// the engine then falls back to the current set, the pre-R6 behavior.
+    set_history: Option<SetHistory>,
+}
 
 impl HkContext {
+    /// HK-R6: a context that answers `validator_set_at` from the shared history.
+    pub fn with_history(history: SetHistory) -> Self {
+        Self { set_history: Some(history) }
+    }
+
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
@@ -651,6 +667,20 @@ impl Context for HkContext {
     type Vote = HkVote;
     type Extension = Bytes;
     type SigningScheme = HkHashScheme;
+
+    /// HK-R6: answer per-height validator-set lookups from the shared history so
+    /// the engine verifies commit certificates against the set that SIGNED them.
+    /// `None` when no history is attached or the height predates the first entry
+    /// (a node never needs sets older than its own restore point).
+    fn validator_set_at(&self, height: HkHeight) -> Option<HkValidatorSet> {
+        let hist = self.set_history.as_ref()?;
+        let hist = hist.lock().unwrap_or_else(|e| e.into_inner());
+        let h = height.as_u64();
+        hist.iter()
+            .rev()
+            .find(|(from, _)| *from <= h)
+            .map(|(_, set)| set.clone())
+    }
 
     /// Deterministic round-robin over (height, round) — same rule as the engine's
     /// reference context. Weighted/leader-lease selection is a later refinement.
@@ -707,6 +737,57 @@ impl Context for HkContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // HK-R6: per-height validator-set lookup
+    // -----------------------------------------------------------------------
+
+    fn set_with_power(power: u64) -> HkValidatorSet {
+        HkValidatorSet::new(vec![HkValidator::new(
+            vec![power as u8; 48],
+            HkPub(vec![power as u8; 64]),
+            power,
+        )])
+    }
+
+    #[test]
+    fn validator_set_at_answers_from_history() {
+        let history: SetHistory = Default::default();
+        {
+            let mut h = history.lock().unwrap();
+            h.push((1, set_with_power(1))); // genesis set, heights 1..=99
+            h.push((100, set_with_power(2))); // rotation committed at 99 → effective 100+
+            h.push((250, set_with_power(3))); // rotation committed at 249 → effective 250+
+        }
+        let ctx = HkContext::with_history(history);
+
+        let at = |h: u64| {
+            ctx.validator_set_at(HkHeight::new(h))
+                .expect("set expected")
+                .total_voting_power()
+        };
+        assert_eq!(at(1), 1);
+        assert_eq!(at(99), 1);
+        assert_eq!(at(100), 2);
+        assert_eq!(at(249), 2);
+        assert_eq!(at(250), 3);
+        assert_eq!(at(1_000_000), 3);
+    }
+
+    #[test]
+    fn validator_set_at_none_cases() {
+        // No history attached (plain new): always None — engine falls back to
+        // the current set, i.e. exactly the pre-R6 behavior.
+        assert!(HkContext::new().validator_set_at(HkHeight::new(42)).is_none());
+
+        // History attached but the height predates the first entry (a restored
+        // node is never asked about heights below its own snapshot).
+        let history: SetHistory = Default::default();
+        history.lock().unwrap().push((100, set_with_power(2)));
+        let ctx = HkContext::with_history(history);
+        assert!(ctx.validator_set_at(HkHeight::new(50)).is_none());
+        assert!(ctx.validator_set_at(HkHeight::new(100)).is_some());
+    }
 
     #[test]
     fn value_id_is_digest_of_txs() {

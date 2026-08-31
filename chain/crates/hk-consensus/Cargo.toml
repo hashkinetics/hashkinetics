@@ -12,6 +12,9 @@ async-trait = { workspace = true }
 serde = { workspace = true }
 hex = { workspace = true }
 tracing = "0.1"
+# HK-R5.2: parallel signature verification (already in the lock transitively via SP1 —
+# adding it directly costs no new crate).
+rayon = "1"
 
 # The vendored Malachite BFT engine (Apache-2.0; pinned in vendor/external/PINS.md).
 # Consensus-crypto is a generic type parameter — the seam for hash-based votes later.

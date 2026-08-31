@@ -249,17 +249,40 @@ impl State {
     /// Apply one block. Block-level violations are hard errors; per-tx failures are
     /// receipts (the "rejected by consensus" the demo shows).
     pub fn apply_block(&mut self, height: u64, time: Timestamp, txs: &[SignedTx]) -> Result<Vec<Receipt>, StateError> {
+        self.apply_block_verified(height, time, txs, None)
+    }
+
+    /// HK-R5.2: `apply_block` with optional PRECOMPUTED envelope-signature verdicts
+    /// (`verify_envelope`, one per tx, same order). The pure Lamport verification is
+    /// the bulk of a fat transparent block's apply cost and is order-free, so the
+    /// node runs it in parallel OUTSIDE the state lock and hands the verdicts in;
+    /// the state-dependent checks (account, nonce, auth-commit binding) and the
+    /// ratchet stay strictly ordered here. `None` = verify inline (identical to the
+    /// historical behavior, and what single-tx callers and tests use).
+    pub fn apply_block_verified(
+        &mut self,
+        height: u64,
+        time: Timestamp,
+        txs: &[SignedTx],
+        sig_verdicts: Option<&[bool]>,
+    ) -> Result<Vec<Receipt>, StateError> {
         if height != self.height + 1 {
             return Err(StateError::BadHeight);
         }
         if time < self.time {
             return Err(StateError::TimeBackwards);
         }
+        if let Some(v) = sig_verdicts {
+            if v.len() != txs.len() {
+                return Err(StateError::BadHeight); // caller bug — refuse rather than misattribute
+            }
+        }
         self.height = height;
         self.time = time;
         let mut receipts = Vec::with_capacity(txs.len());
         for (i, stx) in txs.iter().enumerate() {
-            let result = self.apply_tx(stx).map_err(|e| e.to_string());
+            let pre = sig_verdicts.map(|v| v[i]);
+            let result = self.apply_tx_at(stx, pre).map_err(|e| e.to_string());
             receipts.push(Receipt { index: i, result });
         }
         // Block end: this block's pool root becomes a spendable anchor (dedup + window),
@@ -278,6 +301,27 @@ impl State {
     /// Verify envelope (account, nonce, auth commitment, Lamport signature), then
     /// dispatch. Ratchets the account ONLY on success.
     pub fn apply_tx(&mut self, stx: &SignedTx) -> Result<Vec<Event>, StateError> {
+        self.apply_tx_at(stx, None)
+    }
+
+    /// HK-R5.2: the pure, state-free part of envelope verification — signing digest +
+    /// Lamport signature over the tx's OWN fields. Safe to evaluate in parallel for a
+    /// whole block; the binding of the key to the account (`auth_commit`) remains a
+    /// state-dependent check inside `apply_tx_at`, so precomputing this changes no
+    /// outcome, only where the CPU time is spent.
+    pub fn verify_envelope(stx: &SignedTx) -> bool {
+        match signing_digest(&stx.payload, &stx.sender, stx.nonce, &stx.next_auth) {
+            Some(digest) => lamport::verify(&stx.lamport_pk, &digest, &stx.sig).is_ok(),
+            None => false,
+        }
+    }
+
+    /// `apply_tx` with an optional precomputed `verify_envelope` verdict. Check order
+    /// is IDENTICAL to the historical inline path (account → nonce → auth-commit →
+    /// signature), so the success set and every receipt are byte-for-byte the same
+    /// whether verdicts were precomputed or not — determinism across the fleet does
+    /// not depend on which path a node took.
+    fn apply_tx_at(&mut self, stx: &SignedTx, pre_sig: Option<bool>) -> Result<Vec<Event>, StateError> {
         let acc = self.accounts.get(&stx.sender).ok_or(StateError::UnknownAccount)?;
         if stx.nonce != acc.nonce {
             return Err(StateError::BadNonce { expected: acc.nonce, got: stx.nonce });
@@ -285,9 +329,19 @@ impl State {
         if lamport::pk_commit(&stx.lamport_pk) != acc.auth_commit.0 {
             return Err(StateError::AuthMismatch);
         }
-        let digest = signing_digest(&stx.payload, &stx.sender, stx.nonce, &stx.next_auth)
-            .ok_or(StateError::Encode)?;
-        lamport::verify(&stx.lamport_pk, &digest, &stx.sig).map_err(|_| StateError::BadSignature)?;
+        let sig_ok = match pre_sig {
+            Some(v) => v,
+            None => Self::verify_envelope(stx),
+        };
+        if !sig_ok {
+            // Preserve the historical error split: an unencodable payload was Encode,
+            // a bad signature was BadSignature. `verify_envelope` folds both into
+            // `false`; distinguish them again here (cheap — digest only).
+            if signing_digest(&stx.payload, &stx.sender, stx.nonce, &stx.next_auth).is_none() {
+                return Err(StateError::Encode);
+            }
+            return Err(StateError::BadSignature);
+        }
 
         let events = self.dispatch(&stx.sender, &stx.payload)?;
 

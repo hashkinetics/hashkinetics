@@ -233,22 +233,29 @@ block). That is the property to preserve.
 - Per-epoch operational seeds via `op_seed(master, epoch)` (epoch 0 = genesis key).
 - Demo trigger `HK_ROTATE_EVERY=N` issues a self-rotation every N heights.
 
-**Remaining hardening — URGENCY FIELD-PROVEN (staging incident #1, 2026-08-28):**
-The staging testnet ran with no rotation trigger set; val-0's tree exhausted at height
-10,848 (~32.7K sigs ÷ ~3/height — leaf arithmetic, on schedule) and the chain halted
-6 h rather than reuse a leaf. The design held; the ops gap is exactly this list, now
-sequenced as the R-series (C-PROGRAM-PLAN.md §R; R1+R2+R4 = next binary rev):
-- **R1** — rotation on the real `remaining()` threshold (~20 % left), not the demo interval.
-- **R2** — exhausted-validator revival: the incident exposed the chicken-and-egg
-  (a dead-key validator can't propose its own cert; today a node includes only its own
-  pending certs). Fix: `issue-rotation` CLI (root signs offline) + `hk_submitRotation`
-  RPC so ANY peer carries the root-signed cert into a proposal — minimal cert gossip.
-- **R4** — leaf-budget gauge: `remaining()` in logs/RPC/explorer so operators see the fuse.
-- Restart-after-rotation: persist `current_epoch` so a restarted node reloads the right tree
-  (today it reloads epoch 0). Keygen off the hot path (pre-generate) to remove the brief
-  rotation stall.
+**Hardening status — R-series SHIPPED AND PRODUCTION-PROVEN (v0.10.5–v0.10.7):**
+Staging incident #1 (2026-08-28) field-proved the urgency: no rotation trigger armed,
+val-0's tree exhausted at height 10,848 and the chain halted 6 h rather than reuse a
+leaf. The design held; the R-series closed the ops gap (C-PROGRAM-PLAN.md §R):
+- **R1 ✅** — rotation fires itself at the `remaining()` <20% threshold; the fleet has
+  rotated through dozens of epochs unattended, zero blocks missed.
+- **R2 ✅** — exhausted-validator revival: `issue-rotation` CLI (root signs offline) +
+  `hk_submitRotation` RPC (any peer carries the cert into a proposal). **Three real
+  production revivals to date** (E1, E2, E3 — the third crossed live rotation
+  boundaries on the way home).
+- **R4 ✅** — leaf-budget gauge: `hk_chainInfo.signer {epoch, remaining, capacity}` +
+  tiered budget logs + explorer epoch badges.
+- **WS-F ✅** — restart-after-rotation: `adopt_epoch_signer` rebuilds the live signer at
+  the chain's epoch; per-epoch state files resume their own used-leaf counters.
+- **R6 ✅ (v0.10.7)** — commit certificates verify against the validator set AS OF their
+  height (shared set history at the HkContext/engine seam; decide-path de-panicked) —
+  sync/replay crosses every rotation boundary; external validators ungated.
+- Still open, ledgered: R3 engine resume-at-store-tip · R5.2 parallel cert verification ·
+  R8 abstain-while-behind (parked validators burn leaves on futile rounds) · R1.b
+  tick-based threshold check (commit-path-only check never fires while parked).
 - Operator hygiene learned in recovery: `consensus_state.bin` is the signer's spent-leaf
-  state — never copy it between nodes; chain-data restores take `blocks/` + `snapshot.bin` only.
+  state — never copy it between nodes; chain-data restores take `blocks/` + `snapshot.bin`
+  only, and transplant tars must pack `snapshot.bin` FIRST (ordering skew wedges the engine).
 
 **Mainnet crypto (P2/P3):**
 - STARK-aggregated commit certificates (proof of consensus).

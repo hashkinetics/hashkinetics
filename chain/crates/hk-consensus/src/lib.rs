@@ -14,6 +14,8 @@
 //! Ed25519 survives ONLY as libp2p transport identity, never ledger security.
 
 pub mod context;
+/// HK-R5.2: the dedicated verification thread pool (32 MiB stacks — hbs-lms needs them).
+pub mod par;
 pub mod provider;
 /// Hash-based consensus signing scheme (LMS/HSS over SHAKE-256) — LIVE as
 /// `HkContext::SigningScheme`.

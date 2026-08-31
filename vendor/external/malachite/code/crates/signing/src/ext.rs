@@ -231,7 +231,15 @@ where
         let mut signed_voting_power = 0;
         let mut seen_validators = Vec::new();
 
-        // For each commit signature, reconstruct the signed precommit and verify the signature
+        // HK-R5.2: one cheap ordered pass does the structural checks (duplicates,
+        // set membership) and reconstructs every signed precommit; the CPU-bound
+        // signature verifications are then handed to the provider's batch fast
+        // path (parallel in providers that implement it), falling back to the
+        // historical serial loop when the provider offers none. Semantics are
+        // unchanged: a failed signature contributes zero power, it does not abort.
+        let mut triples = Vec::with_capacity(certificate.commit_signatures.len());
+        let mut powers = Vec::with_capacity(certificate.commit_signatures.len());
+
         for commit_sig in &certificate.commit_signatures {
             let validator_address = &commit_sig.address;
 
@@ -246,11 +254,33 @@ where
                 .get_by_address(validator_address)
                 .ok_or_else(|| CertificateError::UnknownValidator(validator_address.clone()))?;
 
-            if let Ok(voting_power) = self
-                .verify_commit_signature(ctx, certificate, commit_sig, validator)
-                .await
-            {
-                signed_voting_power += voting_power;
+            let vote = ctx.new_precommit(
+                certificate.height,
+                certificate.round,
+                NilOrVal::Val(certificate.value_id.clone()),
+                validator.address().clone(),
+            );
+
+            triples.push((vote, commit_sig.signature.clone(), validator.public_key().clone()));
+            powers.push(validator.voting_power());
+        }
+
+        match self.verify_signed_votes_batch(&triples).await {
+            Some(results) => {
+                for (ok, power) in results.iter().zip(powers.iter()) {
+                    if *ok {
+                        signed_voting_power += power;
+                    }
+                }
+            }
+            None => {
+                for ((vote, signature, public_key), power) in triples.iter().zip(powers.iter()) {
+                    if let Ok(result) = self.verify_signed_vote(vote, signature, public_key).await {
+                        if result.is_valid() {
+                            signed_voting_power += power;
+                        }
+                    }
+                }
             }
         }
 

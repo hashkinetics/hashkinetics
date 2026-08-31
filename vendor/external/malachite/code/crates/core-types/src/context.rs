@@ -48,6 +48,18 @@ where
         round: Round,
     ) -> &'a Self::Validator;
 
+    /// HK-R6: the validator set AS OF the given height, if the integration tracks
+    /// set history (validator-key rotations change the set over a chain's life).
+    /// A commit certificate for height H must be verified against the set that
+    /// actually signed it — not the current set — or a node syncing/replaying
+    /// across a rotation boundary rejects perfectly valid history.
+    ///
+    /// The default returns `None`, which means "use the caller's current set"
+    /// (the pre-R6 behavior) — contexts without rotation need not implement this.
+    fn validator_set_at(&self, _height: Self::Height) -> Option<Self::ValidatorSet> {
+        None
+    }
+
     /// Build a new proposal for the given value at the given height, round and POL round.
     fn new_proposal(
         &self,

@@ -111,6 +111,20 @@ where
         signature: &Signature<Ctx>,
         public_key: &PublicKey<Ctx>,
     ) -> Result<VerificationResult, Error>;
+
+    /// HK-R5.2: batch-verify many (vote, signature, public key) triples at once — e.g.
+    /// every commit signature in a certificate — so a provider can parallelize the
+    /// CPU-bound work (hash-based signature verification is pure and order-free).
+    /// Returning `None` (the default) means "no fast path": callers fall back to the
+    /// historical per-signature calls. A `Some(results)` MUST be the same length and
+    /// order as `votes`, `true` = valid.
+    async fn verify_signed_votes_batch(
+        &self,
+        votes: &[(Ctx::Vote, Signature<Ctx>, PublicKey<Ctx>)],
+    ) -> Option<alloc::vec::Vec<bool>> {
+        let _ = votes;
+        None
+    }
 }
 
 #[async_trait]
@@ -185,5 +199,14 @@ where
         self.as_ref()
             .verify_signed_vote_extension(extension, signature, public_key)
             .await
+    }
+
+    /// HK-R5.2: delegate the batch fast path through the Box, otherwise a boxed
+    /// provider silently loses its override and every certificate goes serial again.
+    async fn verify_signed_votes_batch(
+        &self,
+        votes: &[(Ctx::Vote, Signature<Ctx>, PublicKey<Ctx>)],
+    ) -> Option<alloc::vec::Vec<bool>> {
+        (**self).verify_signed_votes_batch(votes).await
     }
 }

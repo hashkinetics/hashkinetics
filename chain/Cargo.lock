@@ -2162,6 +2162,7 @@ dependencies = [
  "informalsystems-malachitebft-core-types",
  "informalsystems-malachitebft-signing",
  "informalsystems-malachitebft-signing-ed25519",
+ "rayon",
  "serde",
  "tracing",
 ]

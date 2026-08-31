@@ -63,18 +63,44 @@ where
     assert_eq!(full_proposal.proposal.value().id(), decided_id);
     assert_eq!(full_proposal.validity, Validity::Valid);
 
-    // The certificate must be valid in Commit step
-    assert!(
-        verify_commit_certificate(
-            co,
-            certificate.clone(),
-            state.driver.validator_set().clone(),
-            state.params.threshold_params,
-        )
-        .await?
-        .is_ok(),
-        "Commit certificate is not valid"
-    );
+    // The certificate must be valid in Commit step.
+    //
+    // HK-R6: this was an `assert!` — a certificate failing verification (typically
+    // one checked against a rotated validator set) PANICKED and killed the whole
+    // consensus actor, poisoning shared state and leaving the node half-dead with
+    // its RPC still answering. Return the error instead: the sync path already
+    // treats `InvalidCommitCertificate` as a recoverable per-value failure, and
+    // with the engine's set-at-height lookup the legitimate case now verifies.
+    //
+    // HK-R5.2: during catch-up the sync path (handle/sync.rs) has ALREADY fully
+    // verified this exact certificate moments ago — re-verifying here doubled the
+    // hash-based signature cost of every synced block. Skip when the identity
+    // matches; live decides never set the memo for their height and verify as
+    // before.
+    let already_verified = state.last_verified_certificate.as_ref()
+        == Some(&(certificate.height, certificate.round, certificate.value_id.clone()));
+
+    if already_verified {
+        debug!(
+            height = %certificate.height,
+            round = %certificate.round,
+            "Commit certificate already verified on the sync path — skipping duplicate verification"
+        );
+    } else if let Err(e) = verify_commit_certificate(
+        co,
+        certificate.clone(),
+        state.driver.validator_set().clone(),
+        state.params.threshold_params,
+    )
+    .await?
+    {
+        error!(
+            height = %certificate.height,
+            round = %certificate.round,
+            "Commit certificate failed verification at decide: {e}"
+        );
+        return Err(Error::InvalidCommitCertificate(certificate, e));
+    }
 
     // Update metrics
     #[cfg(feature = "metrics")]

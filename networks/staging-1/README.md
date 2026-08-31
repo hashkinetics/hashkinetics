@@ -66,5 +66,9 @@ The `chain_id` and `app_hash` at any height must match what
 - Identity, not topology: nodes **refuse to peer across genesis**. A node whose genesis
   digest differs from ours is dropped at connect time, so an "island" chain cannot attach
   to the network — you are either syncing OUR genesis from block 1 or on your own chain.
-- Sync throughput is a known work item (R5): expect ~45 blocks/min today on deep
+- Syncing crosses validator-key-rotation boundaries (v0.10.7): certificates are
+  verified against the set as of their height, so a fresh node can walk the whole
+  chain from block 1 — including every epoch the validators have rotated through.
+- Sync throughput is a known work item (R5 shipped continuation-driven batching;
+  R5.2 parallel verify is next): expect ~45–130 blocks/min today on deep
   backlogs.

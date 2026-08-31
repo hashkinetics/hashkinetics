@@ -90,6 +90,14 @@ where
         return Err(Error::InvalidCommitCertificate(certificate, e));
     }
 
+    // HK-R5.2: remember that THIS certificate passed full verification, so the
+    // decide path doesn't pay for the identical verification a second time.
+    state.last_verified_certificate = Some((
+        certificate.height,
+        certificate.round,
+        certificate.value_id.clone(),
+    ));
+
     apply_driver_input(
         co,
         state,

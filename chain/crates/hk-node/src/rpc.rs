@@ -164,7 +164,7 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
         "hk_submitRotation" => match params.get("cert") {
             Some(c) => match serde_json::from_value::<hk_consensus::RotationCert>(c.clone()) {
                 Ok(cert) => {
-                    let check = { h.validators.lock().unwrap().apply_rotation(&cert) };
+                    let check = { h.validators.lock().unwrap_or_else(|e| e.into_inner()).apply_rotation(&cert) };
                     match check {
                         Ok(_) => {
                             let mut q = h.foreign_rotations.lock().unwrap();
@@ -349,7 +349,7 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
             None => json!({"error": "nullifier must be 64-char hex"}),
         },
         "hk_getValidators" => {
-            let vs = h.validators.lock().unwrap();
+            let vs = h.validators.lock().unwrap_or_else(|e| e.into_inner());
             json!({"result": {
                 "count": vs.len(),
                 "total_power": vs.total_voting_power(),

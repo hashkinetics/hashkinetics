@@ -140,7 +140,12 @@ impl Node for App {
         let op_handle =
             private_key.into_persistent(self.home_dir.join("consensus_state.bin"));
         *self.rotation_slot.lock().unwrap() = Some(op_handle.clone());
-        let ctx = HkContext::new();
+        // HK-R6: shared validator-set history. HkApp maintains it (genesis seed,
+        // snapshot reseed, append per committed rotation); the engine reads it via
+        // `HkContext::validator_set_at` so commit certificates are verified against
+        // the set AS OF their height — sync/replay now crosses rotation boundaries.
+        let set_history: hk_consensus::SetHistory = Default::default();
+        let ctx = HkContext::with_history(set_history.clone());
 
         let genesis = self.load_genesis()?;
 
@@ -213,6 +218,7 @@ impl Node for App {
             private_key_file,
             op_handle,
             self.home_dir.clone(),
+            set_history,
             pool_verifier,
         )?;
         // Genesis-gate: bind identity to genesis — sets the digest + derives chain_id

@@ -140,4 +140,20 @@ impl SigningProvider<HkContext> for HkSigningProvider {
             public_key,
         )))
     }
+
+    /// HK-R5.2: the batch fast path — every commit signature in a certificate is a
+    /// pure, order-free LMS/HSS verify, so run them all in parallel on the dedicated
+    /// 32 MiB-stack pool. This is what turns catch-up's per-block certificate cost
+    /// from N sequential verifies into max(one verify).
+    async fn verify_signed_votes_batch(
+        &self,
+        votes: &[(HkVote, HkSig, HkPub)],
+    ) -> Option<Vec<bool>> {
+        if votes.len() < 2 {
+            return None; // pool handoff costs more than one verify — go serial
+        }
+        Some(crate::par::par_bools(votes, |(vote, sig, pk)| {
+            hashsig_scheme::verify(&vote.to_sign_bytes(), sig, pk)
+        }))
+    }
 }

@@ -1,0 +1,59 @@
+# HashKinetics — Changelog
+
+All notable changes to this project. Versions are project-level (see `version.md` for per-crate status). Dates are IST-day of work.
+
+## [0.10.8] — 2026-08-30 — ⚡ R5.2: PARALLEL VERIFICATION — the join kit learns to outrun the chain
+The observer-from-genesis receipt exposed the truth: catch-up collapsed to ~2 blocks/min against a chain adding ~27/min — a joiner that can never converge. Recon found the floor was never one thing:
+### Fixed
+- **Duplicate certificate verification eliminated.** Every SYNCED block verified its commit certificate twice — once on the sync path, again on the decide path, same certificate. `State.last_verified_certificate` (height, round, value-id) memoizes the sync-path pass; `decide` skips the re-verify on match. Live decides never set the memo and verify exactly as before. Half the hash-based signature work per synced block, ~15 lines.
+- **One state-commitment walk per block, not two.** The post-apply `state_commitment()` (log line) and the next block's parent-hash check recomputed the SAME value — each an O(entire state, every nullifier ever) walk that GROWS with height (this, not constant-cost crypto, is why the observer's rate decayed). The post-apply hash is now cached and consumed by the next parent check; any error path drops the cache and recomputes honestly.
+### Added
+- **Batch signature verification hook** (`SigningProvider::verify_signed_votes_batch`, default `None` = serial fallback — same shape as R6's `validator_set_at`). The blanket `verify_commit_certificate` does one cheap ordered pass (duplicates, set membership, precommit reconstruction), then hands ALL LMS/HSS verifies to the provider's fast path. `HkSigningProvider` runs them on a dedicated **32 MiB-stack rayon pool** (`hk-consensus::par` — hbs-lms overflows default 2 MiB workers; capped at 8 threads). Boxed providers delegate, so the engine's `Box<dyn SigningProvider>` keeps the override.
+- **Parallel envelope pre-verification.** A fat load-test-era block paid thousands of Lamport verifies serially INSIDE the state lock. The pure part (signing digest + Lamport over the tx's own fields) now runs `par_bools` outside the lock; `apply_block_verified` consumes the verdicts with check order IDENTICAL to the inline path (account → nonce → auth-commit → signature), so the success set is byte-for-byte unchanged whichever path a node takes. The key→account binding stays ordered.
+- **Apply-cost telemetry** — `R5.2 apply-cost window` log every 100 blocks: pre/agg/apply/hash/save/snap ms. The 450 ms/block floor was an inference; now every node measures its own.
+- **`HK_SNAPSHOT_EVERY`** env (default 16): the full-image snapshot + fsync grows with state and taxes catch-up; a grinding observer can widen the cadence (crash cost = replaying a few more blocks).
+### Deliberately unchanged
+- Engine-level batch pre-verify of whole sync batches (20-way across certificates) parked as **R5.2b** — measure first; the per-block wins may already clear the ~27 blk/min convergence bar.
+### Proven in production, same day
+- **Observer hot-swapped to v0.10.8** (e2-standard-8): sustained **71 blocks/min** measured over 2 minutes (was ~2 blk/min — 35×), net +44 blk/min against the live chain. Telemetry window at the early era: `pre=0 agg=0 apply=0 hash=0 save_ms≈3.2/blk` — after R5.2 the measured bottleneck is the per-block fsync, not crypto.
+- **New failure mode found and fixed operationally: observer signer exhaustion.** A syncing non-validator SELF-SIGNS each synced proposal to drive the state machine (~1 LMS leaf/block; wedge-loops burn far more) — the original observer silently spent its ENTIRE 32,768-leaf tree (state file read `used = 0x8000` exactly), and every later sync value died as `Unexpected resume: Continue, expected Resume::SignedProposal`. Non-validators have no on-chain revival (their root isn't in the set), but their self-signatures are consumed only locally — so the remedy is: stop, rotate the spent `consensus_state.bin` aside, start (fresh tree). An **unwedge watchdog** (systemd timer, 2-min cadence) now does this automatically; the tree covers ~30k blocks per cycle. Proper fix parked as **R5.4: a syncing non-validator should not spend hash-based leaves at all** (accept sync values without self-signing, and let a failed SignProposal degrade gracefully instead of erroring the message).
+
+## [0.10.7] — 2026-08-30 — 🧠 R6: PER-HEIGHT VALIDATOR-SET VERIFICATION — the chain remembers who signed what
+### Added
+- **Commit certificates now verify against the validator set AS OF their height** (the set that actually signed them), not the current set. `Context::validator_set_at(height)` (default `None` = old behavior) + the engine's `VerifyCommitCertificate` handler swaps in the historical set keyed by `certificate.height` — one interception point fixes both the sync and decide paths, no wire changes. `HkContext` answers from a shared **set history** (`(effective_from_height, set)`), seeded at genesis, reseeded at snapshot restore, appended on every committed rotation (live and replay).
+- **`decide.rs` de-panicked:** a certificate failing verification used to `assert!` → kill the consensus actor → poison the shared validator mutex → half-dead node with a live RPC (the exact production corpse pose, twice). It now returns `InvalidCommitCertificate` with an error log; all `validators.lock()` sites recover poisoned guards.
+### Proven in production, same day
+- **val-0's THIRD revival:** E3 rotation cert issued offline + carried by a peer (`hk_submitRotation`), store transplant, then **organic sync across live rotation boundaries (E44/E7/E8) → adopted the fresh E3 tree mid-sync → voting. True 4/4 at 50,443+.**
+- **Observer-from-genesis receipt (in progress):** a brand-new VM joined via `networks/staging-1` (public seed DNS, published fingerprint verified: `557f2ea6c…`), reports `chain_id: hashkinetics-1-557f2ea6`, and is re-verifying the entire chain from block 1 — every rotation boundary, every STARK.
+### Operational findings (ledgered)
+- Transplant tars must pack `snapshot.bin` FIRST (blocks-then-snapshot ordering left the snapshot ahead of the blocks tail → engine/chain height skew → wedge).
+- Deep catch-up apply on e2-standard-2 cannot outrun the live chain (R5.2/R3 territory); interim cure = **thin teleport** (snapshot + newest ~400 blocks → 2-minute restore, lands at tip). R3 (resume-at-tip) is the real fix.
+
+## [0.10.6] — 2026-08-30 — 🪪 THE IDENTITY RELEASE — chain_id bound to genesis; islands refused
+### Added
+- **`chain_id` is derived from the genesis digest** (`hashkinetics-1-557f2ea6` for staging-1) instead of a hard-coded label — a node on a different genesis visibly reports a different chain.
+- **`hk_chainInfo` returns `genesis_digest`** — the full SHA-256 fingerprint, machine-checkable against `sha256sum genesis.json` and the public RPC.
+- **Nodes refuse to peer across genesis:** each node advertises its digest in the libp2p identify handshake (`agent_version`); consensus-protocol peers with a mismatched digest are disconnected. Pre-gate peers are graced, so rolling upgrades cannot partition. `protocol_version` untouched.
+- **R5 published:** continuation-driven value-sync (re-request at every capacity-freeing exit + stale-pending expiry; batch 5→20) — ~an order of magnitude on deep backlogs.
+### Fixed
+- Published staging-1 genesis fingerprint had a 3-nibble hand-transcription typo; now matches `sha256sum genesis.json` exactly.
+
+## [0.10.5] — 2026-08-28 — 🔁 R-SERIES: SURVIVABLE KEY ROTATION — keys that retire themselves
+### Added
+- **R1 — threshold rotation:** a validator whose HSS leaf budget crosses <20% (6,553 of 32,768) automatically issues a root-signed rotation cert that rides its next proposal. First unattended production rotations observed overnight (epoch badges climbing on the public explorer).
+- **R2 — survivable exhaustion + revival tooling:** an exhausted signer returns `Err` (engine swallows; node keeps syncing/serving) instead of halting; `hk-node issue-rotation` CLI + `hk_submitRotation` RPC let ANY peer carry a dead validator's revival cert (used in production for every revival since).
+- **R4 — leaf gauge:** `hk_chainInfo.signer {epoch, remaining, capacity}` + tiered budget logs — operators watch the fuse.
+- **WS-F closed:** `adopt_epoch_signer` — post-restore, the live signer rebuilds at the chain's epoch for our entry; per-epoch state files resume their own used-leaf counters (leaf reuse impossible across restarts).
+- `networks/staging-1/` join kit (pinned genesis + PEERS + README) · v0.10.5 released immutable on GitHub.
+### The incident that earned it (2026-08-27, staging)
+- A validator burned all 32,768 one-time signatures and the chain **halted rather than reuse a leaf** — hash-based consensus keeping its core promise the hard way. Recovery was the designed path (offline root-signed cert carried by a peer), not a patch. Full postmortem in the honesty ledger.
+
+## [0.10.4] — 2026-08-27 — ⚡ C2: THE THROUGHPUT LIFTS + GCP STAGING TESTNET LIVE
+### Added
+- **C2.1–C2.5:** admission pre-checks on submit · indexed mempool prune · tx gossip between mempools · block cap 256→1024 — **storm re-measure: 274 tx/s sustained** (2.2× the 0.10.3 baseline) · full test suite + demo suite green.
+- **Public staging testnet on GCP:** 4× e2-standard-2 (3 validators + gateway), nginx-fronted public RPC (`rpc.hashkinetics.org`), explorer wired to it, seed DNS (`seed.hashkinetics.org`), 2s cadence.
+- **C1p2.a measured (RTX 5090):** aggregation curve N=4…256 — `T_agg(N) = 2.66 s + 0.2882 s·N`, proof size CONSTANT (1,242 KB); 256 shielded spends → ONE proof in 75.4 s.
+
+---
+
+*Public log begins at the staging-testnet era (v0.10.4). Earlier internal build history is not part of the open-source release.*
