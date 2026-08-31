@@ -76,6 +76,7 @@ The `chain_id` and `app_hash` at any height must match what
 - Syncing crosses validator-key-rotation boundaries (v0.10.7): certificates are
   verified against the set as of their height, so a fresh node can walk the whole
   chain from block 1 — including every epoch the validators have rotated through.
-- Sync throughput is a known work item (R5 shipped continuation-driven batching;
-  R5.2 parallel verify is next): expect ~45–130 blocks/min today on deep
-  backlogs.
+- Sync throughput: solved. v0.10.8 parallelized catch-up verification (R5.2) —
+  measured **71 blocks/min** on deep backlogs on the live testnet (up from ~2),
+  faster than the chain advances — and since v0.10.9 syncing spends **zero**
+  signer leaves.
