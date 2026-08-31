@@ -1,6 +1,6 @@
 use crate::{
-    Address, Extension, Height, NilOrVal, Proposal, ProposalPart, Round, SigningScheme, Validator,
-    ValidatorSet, Value, ValueId, Vote,
+    Address, Extension, Height, NilOrVal, Proposal, ProposalPart, Round, Signature, SigningScheme,
+    Validator, ValidatorSet, Value, ValueId, Vote,
 };
 
 /// This trait allows to abstract over the various datatypes
@@ -57,6 +57,21 @@ where
     /// The default returns `None`, which means "use the caller's current set"
     /// (the pre-R6 behavior) — contexts without rotation need not implement this.
     fn validator_set_at(&self, _height: Self::Height) -> Option<Self::ValidatorSet> {
+        None
+    }
+
+    /// HK-R5.4: a placeholder signature for INTERNAL proposals that are never
+    /// verified by anyone. Synced values (and parts-only mode) fabricate a local
+    /// `SignedProposal` purely to satisfy the driver's types — upstream signs it
+    /// with this node's real key ("keep all happy", see the TODO in
+    /// `on_proposed_value`), which for a STATEFUL hash-based scheme burns one
+    /// irreplaceable one-time leaf per synced block: a syncing non-validator
+    /// eventually exhausts its tree and wedges (observed in production).
+    ///
+    /// Returning `Some(sig)` short-circuits that signing; the signature is a
+    /// dummy carried only inside this node. The default `None` keeps the
+    /// upstream behavior for contexts whose signatures are cheap.
+    fn placeholder_signature(&self) -> Option<Signature<Self>> {
         None
     }
 

@@ -12,7 +12,7 @@ use hk_crypto::hash::shake256_32;
 use malachitebft_core_types::{
     Context, NilOrVal, Round, SignedExtension, VoteType, VotingPower,
 };
-use crate::hashsig_scheme::{HkHashScheme, HkPub};
+use crate::hashsig_scheme::{HkHashScheme, HkPub, HkSig};
 
 // Frozen v1 domain tags for consensus objects.
 pub const DOM_VALIDATOR_ADDR: &str = "hk/v1/validator-address";
@@ -682,6 +682,16 @@ impl Context for HkContext {
             .map(|(_, set)| set.clone())
     }
 
+    /// HK-R5.4: synced values fabricate an internal-only `SignedProposal` that nobody
+    /// ever signature-verifies — upstream signs it with the node's REAL key, which for
+    /// LMS/HSS burns one irreplaceable one-time leaf per synced block (a syncing
+    /// non-validator spent its whole 32,768-leaf tree and wedged, in production).
+    /// Hand back an empty placeholder instead: zero leaves spent, sync never depends
+    /// on the local signer again.
+    fn placeholder_signature(&self) -> Option<HkSig> {
+        Some(HkSig(Vec::new()))
+    }
+
     /// Deterministic round-robin over (height, round) — same rule as the engine's
     /// reference context. Weighted/leader-lease selection is a later refinement.
     fn select_proposer<'a>(
@@ -772,6 +782,15 @@ mod tests {
         assert_eq!(at(249), 2);
         assert_eq!(at(250), 3);
         assert_eq!(at(1_000_000), 3);
+    }
+
+    #[test]
+    fn placeholder_signature_is_empty_and_free() {
+        // HK-R5.4: the context supplies a dummy signature for internal-only proposals —
+        // Some(empty) means the sync path spends ZERO one-time leaves.
+        use malachitebft_core_types::Context as _;
+        let sig = HkContext::new().placeholder_signature().expect("placeholder expected");
+        assert!(sig.0.is_empty(), "placeholder must be empty bytes, spent no leaf");
     }
 
     #[test]

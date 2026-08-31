@@ -75,7 +75,17 @@ where
 
         // TODO: Keep unsigned proposals in keeper.
         // For now we keep all happy by signing all "implicit" proposals with this node's key
-        let signed_proposal = sign_proposal(co, proposal).await?;
+        //
+        // HK-R5.4: for stateful hash-based signatures that "keep all happy" burns one
+        // irreplaceable one-time leaf PER SYNCED BLOCK — a syncing non-validator spends
+        // its whole tree and wedges (seen in production: `used = 0x8000`, every sync
+        // value then dying on the SignProposal effect). This proposal is internal-only
+        // and never signature-verified by anyone, so contexts may supply a placeholder
+        // signature instead; `None` keeps the upstream signing behavior.
+        let signed_proposal = match state.ctx.placeholder_signature() {
+            Some(sig) => SignedProposal::new(proposal, sig),
+            None => sign_proposal(co, proposal).await?,
+        };
 
         state.store_proposal(signed_proposal);
     }

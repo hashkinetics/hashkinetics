@@ -2,7 +2,15 @@
 
 All notable changes to this project. Versions are project-level (see `version.md` for per-crate status). Dates are IST-day of work.
 
-## [0.10.8] — 2026-08-30 — ⚡ R5.2: PARALLEL VERIFICATION — the join kit learns to outrun the chain
+## [0.10.9] — 2026-08-31 — 🍃 R5.4: SYNC SPENDS NO LEAVES — the join kit stops paying rent
+### Found in production, same day (deploy receipts)
+- **R3 CLOSED by measurement:** val-2 restarted on v0.10.9 and was back at tip, in lockstep with the gateway, in **under 4 minutes** (was: ~25 min rehydrate then trailing forever). R5.2's parallel apply cured deep-restart trailing as a side effect. Corollary observed: with 3/4 voters the chain slows to ~4 blk/min (zero timing margin) and self-heals at 4/4 — restarts stay one-at-a-time.
+- **Join-kit gap: a node without `HK_PROVER_URL` wedges at the first proof-carrying shielded tx.** The SP1 verifier wires only when the env points at an hk-prove endpoint (vks fetched once, checked against genesis `vk_pins`); without it the chain keeps the RejectAll default — correct refusal posture for TRAFFIC, but a SYNCING node then rejects a canonical block's shield tx and diverges (`app_hash divergence`, observed at height 2,389 on the observer: gateway `ok: 1 event(s)` vs observer `rejected: pool proof rejected`). Fixed operationally (fleet nodes point at an internal vk-cache; public joiners use `https://prover.hashkinetics.org`) and documented in the join kit + onboarding. Real fix queued: ship the verifying keys IN the join kit so verification needs no live prover.
+- **Leaf-freeze verified:** with R5.4 live the observer's signer `remaining` froze while height advanced — sync now spends zero leaves; the unwedge watchdog is dormant insurance.
+### Fixed
+- **Syncing no longer consumes one-time signature leaves.** Upstream malachite fabricates an internal `SignedProposal` for every synced value and signs it with the node's REAL key ("for now we keep all happy…", its own TODO admits) — harmless for Ed25519, but for stateful LMS/HSS that's one irreplaceable leaf per synced block: the first external observer spent its entire 32,768-leaf tree syncing and wedged. New `Context::placeholder_signature()` (default `None` = upstream behavior, same shape as R6's `validator_set_at`): `HkContext` returns an empty dummy for these internal-only, never-verified proposals — zero leaves spent, sync no longer depends on the local signer at all. The v0.10.8 unwedge watchdog becomes dormant insurance.
+
+## [0.10.8] — 2026-08-31 — ⚡ R5.2: PARALLEL VERIFICATION — the join kit learns to outrun the chain
 The observer-from-genesis receipt exposed the truth: catch-up collapsed to ~2 blocks/min against a chain adding ~27/min — a joiner that can never converge. Recon found the floor was never one thing:
 ### Fixed
 - **Duplicate certificate verification eliminated.** Every SYNCED block verified its commit certificate twice — once on the sync path, again on the decide path, same certificate. `State.last_verified_certificate` (height, round, value-id) memoizes the sync-path pass; `decide` skips the re-verify on match. Live decides never set the memo and verify exactly as before. Half the hash-based signature work per synced block, ~15 lines.

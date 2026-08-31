@@ -30,10 +30,17 @@ cp ../networks/staging-1/genesis.json ~/hk-staging/genesis.json
   --listen /ip4/0.0.0.0/tcp/27000 \
   --peers $(paste -sd, ../networks/staging-1/PEERS.txt)
 
-./target/release/hk-node start ~/hk-staging
+HK_PROVER_URL=https://prover.hashkinetics.org ./target/release/hk-node start ~/hk-staging
 ```
 
-Startup must print `verifying keys MATCH the genesis pins` and then sync heights.
+**`HK_PROVER_URL` is required to sync.** It wires the in-node SP1 STARK verifier
+(verifying keys are fetched once and checked against the genesis `vk_pins`).
+Without it your node keeps the refuse-all posture and will REJECT the first
+canonical block that carries a shielded proof — an `app_hash divergence` wedge
+at that height (we did this to ourselves once; see CHANGELOG 0.10.9). Shipping
+the verifying keys inside this kit, removing the live dependency, is queued.
+
+Startup must print `SP1 pool verifier wired` and `verifying keys MATCH the genesis pins`, then sync heights.
 Your RPC is at `:26000` — point `explorer/index.html` at it and you have your own
 window into the chain, served from your own verification.
 
