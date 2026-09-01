@@ -338,6 +338,67 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
             None => json!({"error": "txid must be 64-char hex"}),
         },
 
+        // ---- v0.11.2 search surface (node-local indexes; see state.rs::index_txs) ----
+        // A txid resolves to its block + full summary — the receipt ring may evict old
+        // entries, but the index + block log answer forever.
+        "hk_getTx" => match param_h256(params, "txid") {
+            Some(id) => {
+                let hit = h.tx_index.lock().unwrap_or_else(|e| e.into_inner()).get(&id.0).copied();
+                match hit {
+                    Some((height, idx)) => {
+                        let summary = h
+                            .store
+                            .as_ref()
+                            .and_then(|s| s.load_block(height).ok().flatten())
+                            .and_then(|sb| crate::batch::Batch::decode(&sb.value_bytes))
+                            .and_then(|b| b.txs.get(idx as usize).map(tx_summary));
+                        let receipt = h
+                            .receipts
+                            .lock()
+                            .unwrap()
+                            .get(&id.0)
+                            .cloned();
+                        json!({"result": {
+                            "found": true,
+                            "txid": hex::encode(id.0),
+                            "height": height,
+                            "index": idx,
+                            "summary": summary,
+                            "receipt": receipt,
+                        }})
+                    }
+                    None => json!({"result": {"found": false}}),
+                }
+            }
+            None => json!({"error": "txid must be 64-char hex"}),
+        },
+        // An account's transaction history (sender or counterparty), newest first.
+        "hk_getAccountTxs" => match param_h256(params, "id") {
+            Some(id) => {
+                let limit = params
+                    .get("limit")
+                    .and_then(|l| l.as_u64())
+                    .unwrap_or(25)
+                    .min(100) as usize;
+                let ai = h.acct_index.lock().unwrap_or_else(|e| e.into_inner());
+                let (total, txs): (usize, Vec<Value>) = match ai.get(&id) {
+                    Some(v) => (
+                        v.len(),
+                        v.iter()
+                            .rev()
+                            .take(limit)
+                            .map(|(t, ht, kind)| {
+                                json!({"txid": hex::encode(t), "height": ht, "kind": kind})
+                            })
+                            .collect(),
+                    ),
+                    None => (0, Vec::new()),
+                };
+                json!({"result": {"id": hex::encode(id.0), "total": total, "txs": txs}})
+            }
+            None => json!({"error": "id must be 64-char hex"}),
+        },
+
         // ---- P3.0b explorer surface ----
         "hk_nullifierSpent" => match param_h256(params, "nullifier") {
             // Wallets use this to tell spent notes from live ones (a nullifier reveals

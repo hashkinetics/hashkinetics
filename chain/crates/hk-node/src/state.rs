@@ -104,6 +104,12 @@ pub struct SharedHandles {
     pub foreign_rotations: Arc<Mutex<Vec<RotationCert>>>,
     /// R4: (epoch, remaining-leaves) of this node's live consensus signer.
     pub signer_gauge: Arc<Mutex<(u64, u64)>>,
+    /// v0.11.2 search: NODE-LOCAL indexes (never in C(Σ) — anyone rebuilds them by
+    /// replaying the chain). txid → (height, index-in-block).
+    pub tx_index: Arc<Mutex<std::collections::HashMap<[u8; 32], (u64, u32)>>>,
+    /// account → its transactions (as sender OR counterparty), commit order.
+    pub acct_index:
+        Arc<Mutex<std::collections::HashMap<hk_primitives::AccountId, Vec<([u8; 32], u64, &'static str)>>>>,
 }
 
 /// Bounded map of txid -> human receipt string ("ok: ..." / "rejected: ...").
@@ -207,6 +213,10 @@ pub struct HkApp {
     /// R4: (epoch, remaining-leaves) of OUR live signer, refreshed every commit — the RPC
     /// serves it so operators watch the fuse instead of discovering it at zero.
     signer_gauge: Arc<Mutex<(u64, u64)>>,
+    /// v0.11.2 search indexes (node-local; see SharedHandles for semantics).
+    tx_index: Arc<Mutex<std::collections::HashMap<[u8; 32], (u64, u32)>>>,
+    acct_index:
+        Arc<Mutex<std::collections::HashMap<hk_primitives::AccountId, Vec<([u8; 32], u64, &'static str)>>>>,
     /// P3.0/WS-B: durable store (block log + snapshots + mempool WAL). `None` = the
     /// old in-memory devnet behavior (`HK_NO_PERSIST=1`, and unit tests).
     store: Option<Arc<NodeStore>>,
@@ -282,6 +292,8 @@ impl HkApp {
             home_dir,
             rotate_every,
             pending_rotations: Vec::new(),
+            tx_index: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            acct_index: Arc::new(Mutex::new(std::collections::HashMap::new())),
             foreign_rotations: Arc::new(Mutex::new(Vec::new())),
             signer_gauge,
             store: None,
@@ -322,6 +334,32 @@ impl HkApp {
             gossip: None,
             foreign_rotations: self.foreign_rotations.clone(),
             signer_gauge: self.signer_gauge.clone(),
+            tx_index: self.tx_index.clone(),
+            acct_index: self.acct_index.clone(),
+        }
+    }
+
+    /// v0.11.2: record a block's transactions into the node-local search indexes.
+    /// Idempotent per txid (replay/rehydrate both call it — reinserts are skipped),
+    /// so an account's history never double-counts.
+    fn index_txs(&self, height: u64, txs: &[SignedTx]) {
+        if txs.is_empty() {
+            return;
+        }
+        let mut ti = self.tx_index.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ai = self.acct_index.lock().unwrap_or_else(|e| e.into_inner());
+        for (i, tx) in txs.iter().enumerate() {
+            let id = txid(tx);
+            if ti.insert(id, (height, i as u32)).is_some() {
+                continue;
+            }
+            let kind = tx_kind(&tx.payload);
+            ai.entry(tx.sender).or_default().push((id, height, kind));
+            if let Some(cp) = tx_counterparty(&tx.payload) {
+                if cp != tx.sender {
+                    ai.entry(cp).or_default().push((id, height, kind));
+                }
+            }
         }
     }
 
@@ -770,6 +808,8 @@ impl HkApp {
                 included.push((tx.sender, tx.nonce));
             }
             drop(rlog);
+            // v0.11.2: search indexes (live commits AND store replay both pass here).
+            self.index_txs(height, &txs);
             if !included.is_empty() {
                 // C2.2: indexed prune — one O(mempool) pass, O(1) membership tests.
                 self.mempool.lock().unwrap().remove_included(&included);
@@ -1187,6 +1227,11 @@ impl HkApp {
                 self.apply_rotations(h, &batch, true);
                 replayed += 1;
             } else {
+                // v0.11.2: rehydrated blocks skip the apply path — index them here so
+                // search covers the FULL history after a restart.
+                if let Some(b) = Batch::decode(&value.txs) {
+                    self.index_txs(h, &b.txs);
+                }
                 rehydrated += 1;
             }
             self.decided.insert(h, DecidedEntry { value, certificate });
@@ -1235,6 +1280,37 @@ fn certificate_value_mismatch(cert: &crate::codec::RawCommitCertificate, value: 
 /// Returns (due, threshold_hit). The PRODUCTION trigger is the leaf budget
 /// (< 20% remaining); the interval is a demo/ops override. Guards: never while our
 /// own cert is pending, never re-issuing an epoch at-or-below the highest issued.
+/// v0.11.2: the kind tag the explorer shows — matches rpc.rs's tx_summary kinds.
+fn tx_kind(tx: &hk_state::tx::Tx) -> &'static str {
+    use hk_state::tx::Tx;
+    match tx {
+        Tx::Transfer { .. } => "transfer",
+        Tx::MandateCreate { .. } => "mandate_create",
+        Tx::MandateSpend { .. } => "mandate_spend",
+        Tx::MandateRevoke { .. } => "mandate_revoke",
+        Tx::ChannelOpen { .. } => "channel_open",
+        Tx::ChannelSettle { .. } => "channel_settle",
+        Tx::ChannelRefund { .. } => "channel_refund",
+        Tx::MintToPool { .. } => "shield",
+        Tx::ShieldedSpend { .. } => "shielded_spend",
+        Tx::AccountCreate { .. } => "account_create",
+    }
+}
+
+/// v0.11.2: the transaction's primary counterparty (indexed alongside the sender so
+/// an account's history includes payments RECEIVED, not just sent).
+fn tx_counterparty(tx: &hk_state::tx::Tx) -> Option<hk_primitives::AccountId> {
+    use hk_state::tx::Tx;
+    match tx {
+        Tx::Transfer { to, .. } => Some(*to),
+        Tx::MandateSpend { to, .. } => Some(*to),
+        Tx::ChannelOpen { payee, .. } => Some(*payee),
+        Tx::AccountCreate { id, .. } => Some(*id),
+        Tx::ShieldedSpend { credit, .. } => *credit,
+        _ => None,
+    }
+}
+
 fn rotation_due(
     remaining: u64,
     capacity: u64,

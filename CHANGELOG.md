@@ -2,6 +2,14 @@
 
 All notable changes to this project. Versions are project-level (see `version.md` for per-crate status). Dates are IST-day of work.
 
+## [0.11.2] — 2026-09-02 — 🔎 SEARCH EVERYTHING — the explorer answers, the wallet links
+Non-consensus (RPC + UI only; wire untouched — only the public gateway needs this to serve search).
+### Added
+- **Node-local search indexes** (never in C(Σ) — anyone rebuilds them by replaying): txid → (block, index) and account → full history (as sender OR counterparty, with kind tags). Built on every commit AND on restart (replay path indexes via the shared apply path; rehydrated blocks are decoded and indexed explicitly), so search covers the whole chain after any restart. At current scale the indexes are a few thousand entries — in-memory by design; a dedicated indexer service is deliberately deferred to testnet-1 traffic levels.
+- **Two RPCs:** `hk_getTx {txid}` → block height, in-block index, full summary (from the block log — answers forever, even after the receipt ring evicts), receipt if still cached; `hk_getAccountTxs {id, limit}` → newest-first history with kinds + total.
+- **Explorer: search anything** — one box auto-detects block height / txid / account id / nullifier. Account view shows balance (with the honest "shielded holdings are invisible by design" note), ratchet index, and clickable history; tx view links to its block; every txid and sender in block details is clickable. **Deep links:** `#tx=…`, `#account=…`, `#block=…` — shareable, and the wallet uses them.
+- **Wallet v0.11.2:** every drip and payment in the activity log now carries a **"view ↗" link** straight to its transaction in the explorer, and the account header gains "view on explorer ↗".
+
 ## [0.11.1] — 2026-09-02 — 🖥️ THE WALLET RELEASE — the front door behind a double-click
 Non-consensus addition (new crate only; no protocol or wire changes — v0.11.0 nodes are unaffected).
 ### Added

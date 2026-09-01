@@ -33,6 +33,7 @@ use serde_json::{json, Value};
 
 const RPC: &str = "https://rpc.hashkinetics.org";
 const FAUCET: &str = "https://faucet.hashkinetics.org";
+const EXPLORER: &str = "https://www.hashkinetics.org/explorer/";
 const USD: H256 = H256([9u8; 32]);
 const CYAN: egui::Color32 = egui::Color32::from_rgb(0x4e, 0xf0, 0xd0);
 const GOLD: egui::Color32 = egui::Color32::from_rgb(0xf5, 0xc5, 0x18);
@@ -183,20 +184,26 @@ fn faucet_post(body: Value) -> Result<Value, String> {
 // ---------------------------------------------------------------------------
 
 enum Evt {
-    Log(String, egui::Color32),
+    /// (line, color, optional explorer link rendered as "view ↗")
+    Log(String, egui::Color32, Option<String>),
     Balance(Amount),
     OnChain(bool),
     Busy(bool),
 }
 
 fn log(tx: &Sender<Evt>, msg: impl Into<String>) {
-    let _ = tx.send(Evt::Log(msg.into(), DIM));
+    let _ = tx.send(Evt::Log(msg.into(), DIM, None));
 }
+#[allow(dead_code)] // success lines currently all carry tx links (log_tx); kept for linkless successes
 fn log_ok(tx: &Sender<Evt>, msg: impl Into<String>) {
-    let _ = tx.send(Evt::Log(msg.into(), CYAN));
+    let _ = tx.send(Evt::Log(msg.into(), CYAN, None));
 }
 fn log_err(tx: &Sender<Evt>, msg: impl Into<String>) {
-    let _ = tx.send(Evt::Log(msg.into(), RED));
+    let _ = tx.send(Evt::Log(msg.into(), RED, None));
+}
+/// A success line that carries a clickable explorer deep-link to its transaction.
+fn log_tx(tx: &Sender<Evt>, msg: impl Into<String>, txid: &str) {
+    let _ = tx.send(Evt::Log(msg.into(), CYAN, Some(format!("{EXPLORER}#tx={txid}"))));
 }
 
 /// Refresh balance + on-chain status.
@@ -241,7 +248,7 @@ fn spawn_faucet(tx: Sender<Evt>, seed: Vec<u8>, id: H256) {
             Ok(v) if v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) => {
                 let amt = v.get("amount_micro").map(|a| a.to_string()).unwrap_or_default();
                 let txid = v.get("txid").and_then(|t| t.as_str()).unwrap_or("?").to_string();
-                log_ok(&tx, format!("Faucet dripped {} micro — tx {}…", amt, &txid[..16.min(txid.len())]));
+                log_tx(&tx, format!("Faucet dripped {} micro — tx {}…", amt, &txid[..16.min(txid.len())]), &txid);
                 // Give the chain a couple of blocks, then refresh.
                 std::thread::sleep(Duration::from_secs(3));
                 let _ = tx.send(Evt::OnChain(true));
@@ -331,7 +338,7 @@ fn spawn_send(tx: Sender<Evt>, seed: Vec<u8>, id: H256, to: H256, amount: Amount
                     rollback(&mut file, &tx);
                     log_err(&tx, format!("Chain refused: {r} (nonce rolled back)"));
                 } else {
-                    log_ok(&tx, format!("Paid ✓  tx {}…  ({r})", &txid[..16.min(txid.len())]));
+                    log_tx(&tx, format!("Paid ✓  tx {}…  ({r})", &txid[..16.min(txid.len())]), &txid);
                 }
                 if let Ok(b) = chain_balance(&id) {
                     let _ = tx.send(Evt::Balance(b));
@@ -340,7 +347,11 @@ fn spawn_send(tx: Sender<Evt>, seed: Vec<u8>, id: H256, to: H256, amount: Amount
                 return;
             }
         }
-        log(&tx, format!("No receipt yet for {}… — check the explorer; nonce stays advanced.", &txid[..16.min(txid.len())]));
+        let _ = tx.send(Evt::Log(
+            format!("No receipt yet for {}… — nonce stays advanced.", &txid[..16.min(txid.len())]),
+            DIM,
+            Some(format!("{EXPLORER}#tx={txid}")),
+        ));
         let _ = tx.send(Evt::Busy(false));
     });
 }
@@ -357,7 +368,7 @@ struct App {
     to_input: String,
     amount_input: String,
     restore_input: String,
-    log_lines: Vec<(String, egui::Color32)>,
+    log_lines: Vec<(String, egui::Color32, Option<String>)>,
     evt_rx: Receiver<Evt>,
     evt_tx: Sender<Evt>,
     booted: bool,
@@ -397,7 +408,12 @@ impl App {
     }
 
     fn push_log(&mut self, line: String, color: egui::Color32) {
-        self.log_lines.insert(0, (line, color));
+        self.log_lines.insert(0, (line, color, None));
+        self.log_lines.truncate(80);
+    }
+
+    fn push_log_link(&mut self, line: String, color: egui::Color32, link: Option<String>) {
+        self.log_lines.insert(0, (line, color, link));
         self.log_lines.truncate(80);
     }
 
@@ -457,7 +473,7 @@ impl eframe::App for App {
         // Drain worker events.
         while let Ok(evt) = self.evt_rx.try_recv() {
             match evt {
-                Evt::Log(s, c) => self.push_log(s, c),
+                Evt::Log(s, c, link) => self.push_log_link(s, c, link),
                 Evt::Balance(b) => self.balance = Some(b),
                 Evt::OnChain(b) => self.on_chain = Some(b),
                 Evt::Busy(b) => self.busy = b,
@@ -513,10 +529,16 @@ impl eframe::App for App {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(&acct.id).monospace().size(11.0).color(CYAN));
                     });
-                    if ui.small_button("copy id").clicked() {
-                        ui.output_mut(|o| o.copied_text = acct.id.clone());
-                        self.push_log("Account id copied.".into(), DIM);
-                    }
+                    ui.horizontal(|ui| {
+                        if ui.small_button("copy id").clicked() {
+                            ui.output_mut(|o| o.copied_text = acct.id.clone());
+                            self.push_log("Account id copied.".into(), DIM);
+                        }
+                        ui.hyperlink_to(
+                            egui::RichText::new("view on explorer ↗").size(11.0),
+                            format!("{EXPLORER}#account={}", acct.id),
+                        );
+                    });
                     ui.add_space(10.0);
 
                     // Balance
@@ -607,8 +629,13 @@ impl eframe::App for App {
                     // Activity log
                     ui.label(egui::RichText::new("ACTIVITY").size(10.0).color(DIM));
                     egui::ScrollArea::vertical().max_height(150.0).auto_shrink([false, true]).show(ui, |ui| {
-                        for (line, color) in &self.log_lines {
-                            ui.label(egui::RichText::new(line).size(11.0).color(*color));
+                        for (line, color, link) in &self.log_lines {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(egui::RichText::new(line).size(11.0).color(*color));
+                                if let Some(url) = link {
+                                    ui.hyperlink_to(egui::RichText::new("view ↗").size(11.0), url);
+                                }
+                            });
                         }
                     });
                 }

@@ -100,16 +100,16 @@
 
   <header>
     <div class="logo">Hash<b>Kinetics</b> <span class="muted" style="font-weight:400">Explorer</span></div>
-    <span class="beta">devnet</span>
+    <span class="beta">staging testnet</span>
     <div class="conn">
-      <input id="rpcurl" value="http://127.0.0.1:26000" size="24" title="node RPC endpoint"/>
+      <input id="rpcurl" value="https://rpc.hashkinetics.org" size="26" title="node RPC endpoint"/>
       <span class="dot" id="conndot"></span>
     </div>
   </header>
-  <p class="tagline">The scanner that can't dox you — <b>no amounts, no parties, by construction.</b> Everything below is the transparent skeleton consensus already made public.</p>
+  <p class="tagline">The scanner that can't dox you — <b>no amounts, no parties, by construction.</b> Everything below is the transparent skeleton consensus already made public — live from the HashKinetics staging testnet on real hash-signed BFT.</p>
 
   <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px">
-    <input id="searchbox" placeholder="Search: block height · 64-hex txid"/>
+    <input id="searchbox" placeholder="Search anything: block height · txid · account id · nullifier"/>
     <button class="btn" onclick="doSearch()">Search</button>
     <span class="err" id="searcherr"></span>
   </div>
@@ -148,12 +148,12 @@
         <h2><span class="spark">⬢</span> Validators</h2>
         <table id="vals"><thead><tr><th>Address</th><th class="right">Power</th><th class="right">Epoch</th></tr></thead><tbody></tbody></table>
         <div class="kv" style="margin-top:8px"><div><span class="muted">External nodes (join kit)</span></div><div class="right"><span class="badge b-rot">1 observer — syncing from genesis</span></div></div>
-        <div class="privnote" style="border-color:var(--cyan)"><b style="color:var(--cyan)">Every vote is hash-based</b> (LMS/HSS over SHAKE-256) under an SLH-DSA root — the consensus itself is post-quantum, not just the wallets. Epoch badges climb when a validator rotates its signing tree — automatic since v0.10.5. External row: nodes that joined via <span class="mono">networks/staging-1</span> and independently verify the chain from block 1.</div>
+        <div class="privnote" style="border-color:var(--cyan)"><b style="color:var(--cyan)">Every vote is hash-based</b> (LMS/HSS over SHAKE-256) under an SLH-DSA root — the consensus itself is post-quantum, not just the wallets. Epoch badges climb when a validator rotates its signing tree — automatic since v0.10.5. The external row counts nodes that joined via the public join kit and independently verify the chain from block 1. These validators run on Google Cloud; the prover lives elsewhere entirely. Want a seat? <a href="/network" style="color:var(--cyan)">Join the validator program.</a></div>
       </div>
     </div>
   </div>
 
-  <p class="foot">HashKinetics devnet explorer · reads only the public transparent skeleton via node RPC · <a href="https://hashkinetics.org" target="_blank" rel="noopener">hashkinetics.org</a></p>
+  <p class="foot">HashKinetics staging-testnet explorer · reads only the public transparent skeleton via node RPC · <a href="/">hashkinetics.org</a> · <a href="https://github.com/hashkinetics/hashkinetics" target="_blank" rel="noopener">source</a></p>
 </div>
 
 <!-- block detail sheet -->
@@ -276,33 +276,88 @@ function txHtml(t){
   const rej = (r.found&&!r.ok)? `<div class="rej-detail">⛔ ${r.detail}</div>`:'';
   return `<div class="tx">
     <div class="h"><span class="badge b-kind ${t.kind}">${t.kind.replace(/_/g,' ')}</span> ${rb}
-      <span class="mono muted">tx ${short(t.txid,14)}</span>
-      <span class="mono muted" style="margin-left:auto">sender ${short(t.sender,12)} · n${t.nonce}</span></div>
+      <a class="mono muted" href="#tx=${t.txid}" onclick="openTx('${t.txid}');return false">tx ${short(t.txid,14)}</a>
+      <span class="mono muted" style="margin-left:auto">sender <a href="#account=${t.sender}" onclick="openAccount('${t.sender}');return false">${short(t.sender,12)}</a> · n${t.nonce}</span></div>
     <div class="fields">${f||'<span class="muted">—</span>'}</div>${rej}</div>`;
 }
 function closeDetail(){ $('detail').classList.remove('open'); }
 document.addEventListener('keydown',e=>{if(e.key==='Escape')closeDetail()});
 
-/* ── search ── */
+/* ── search — anything: block height · txid · account id · nullifier (v0.11.2) ── */
+const USD_HEX='09'.repeat(32);
+function searchFor(q){ $('searchbox').value=q; doSearch(); }
+
+async function openTx(txid){
+  const r=await rpc('hk_getTx',{txid});
+  if(!r||!r.found) return false;
+  location.hash='tx='+txid;
+  $('d-title').textContent='Transaction';
+  const rec=r.receipt;
+  $('d-kv').innerHTML=
+    kv('txid',`<span class="mono">${txid}</span>`)+
+    kv('block',`<a href="#block=${r.height}" onclick="openBlock(${r.height});return false">${Number(r.height).toLocaleString()}</a> <span class="muted">(index ${r.index} in block)</span>`)+
+    kv('consensus verdict', rec? (rec.startsWith('ok')?`<span class="badge b-ok">ok</span> <span class="mono muted">${rec}</span>`:`<span class="badge b-rej">rejected</span>`):'<span class="muted">receipt evicted from the ring — the block record below is authoritative</span>')+
+    (rec&&!rec.startsWith('ok')?kv('receipt',`<span class="rej-detail">⛔ ${rec}</span>`):'');
+  const s=r.summary;
+  $('d-txs').innerHTML = s? txHtml({...s, receipt:{found:!!rec, ok:!!rec&&rec.startsWith('ok'), detail:rec||''}}) : '<p class="muted" style="font-size:13px">summary unavailable (node has no block store for this height)</p>';
+  $('detail').classList.add('open');
+  return true;
+}
+
+async function openAccount(id){
+  const a=await rpc('hk_getAccount',{id});
+  if(!a||!a.found) return false;
+  const bal=await rpc('hk_balance',{id,asset:USD_HEX});
+  const hist=await rpc('hk_getAccountTxs',{id,limit:50});
+  location.hash='account='+id;
+  $('d-title').textContent='Account';
+  $('d-kv').innerHTML=
+    kv('id',`<span class="mono">${id}</span>`)+
+    kv('balance',`${usd(bal.amount||0)} <span class="muted">(${bal.amount||0} µ · transparent — shielded holdings are invisible by design)</span>`)+
+    kv('ratchet index (nonce)',a.nonce)+
+    kv('transactions indexed',(hist&&hist.total)||0);
+  $('d-txs').innerHTML = (hist&&hist.txs&&hist.txs.length)
+    ? hist.txs.map(t=>`<div class="tx"><div class="h"><span class="badge b-kind ${t.kind}">${t.kind.replace(/_/g,' ')}</span>
+        <a class="mono muted" href="#tx=${t.txid}" onclick="openTx('${t.txid}');return false">tx ${short(t.txid,16)}</a>
+        <a class="mono muted" style="margin-left:auto" href="#block=${t.height}" onclick="openBlock(${t.height});return false">block ${Number(t.height).toLocaleString()}</a></div></div>`).join('')
+    : '<p class="muted" style="font-size:13px">no transactions indexed for this account</p>';
+  $('detail').classList.add('open');
+  return true;
+}
+
 async function doSearch(){
-  const q=$('searchbox').value.trim();
+  const q=$('searchbox').value.trim().toLowerCase().replace(/^0x/,'');
   const err=$('searcherr'); err.style.display='none';
-  if(/^\d+$/.test(q)){ openBlock(parseInt(q,10)); return; }
-  if(/^[0-9a-fA-F]{64}$/.test(q)){
+  if(/^\d+$/.test(q)){ location.hash='block='+q; openBlock(parseInt(q,10)); return; }
+  if(/^[0-9a-f]{64}$/.test(q)){
     try{
-      const r=await rpc('hk_getReceipt',{txid:q.toLowerCase()});
-      if(r.found){
-        $('d-title').textContent='Transaction receipt';
-        $('d-kv').innerHTML=kv('txid',`<span class="mono">${q.toLowerCase()}</span>`)+kv('consensus verdict', r.detail.startsWith('ok')?`<span class="badge b-ok">ok</span> <span class="mono muted">${r.detail}</span>`:`<span class="badge b-rej">rejected</span>`)+(r.detail.startsWith('ok')?'':kv('receipt',`<span class="rej-detail">⛔ ${r.detail}</span>`));
-        $('d-txs').innerHTML='';
-        $('detail').classList.add('open');
-      } else { err.textContent='txid not found (or receipt evicted)'; err.style.display='inline'; }
+      if(await openTx(q)) return;
+      if(await openAccount(q)) return;
+      const nf=await rpc('hk_nullifierSpent',{nullifier:q});
+      if(nf&&nf.spent===true){
+        $('d-title').textContent='Nullifier';
+        $('d-kv').innerHTML=kv('nullifier',`<span class="mono">${q}</span>`)+kv('status','<span class="badge b-ok">SPENT</span> <span class="muted">a hidden note was consumed — which one is unknowable by design</span>');
+        $('d-txs').innerHTML=''; $('detail').classList.add('open'); return;
+      }
+      err.textContent='no transaction, account, or spent nullifier matches that hash'; err.style.display='inline';
     }catch(e){ err.textContent=String(e.message||e); err.style.display='inline'; }
     return;
   }
-  err.textContent='enter a block height or a 64-hex txid'; err.style.display='inline';
+  err.textContent='enter a block height, txid, account id, or nullifier'; err.style.display='inline';
 }
 $('searchbox').addEventListener('keydown',e=>{if(e.key==='Enter')doSearch()});
+
+/* deep links: #tx=… · #account=… · #block=… */
+function routeHash(){
+  const h=location.hash.slice(1); if(!h) return;
+  const i=h.indexOf('='); if(i<0) return;
+  const k=h.slice(0,i), v=h.slice(i+1);
+  if(k==='block'&&/^\d+$/.test(v)) openBlock(parseInt(v,10));
+  else if(k==='tx'&&/^[0-9a-f]{64}$/i.test(v)) openTx(v.toLowerCase());
+  else if(k==='account'&&/^[0-9a-f]{64}$/i.test(v)) openAccount(v.toLowerCase());
+}
+window.addEventListener('hashchange',routeHash);
+setTimeout(routeHash,700);
 
 /* ── boot ── */
 pollInfo(); pollPanels();
