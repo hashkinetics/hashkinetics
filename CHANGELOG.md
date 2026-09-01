@@ -2,6 +2,17 @@
 
 All notable changes to this project. Versions are project-level (see `version.md` for per-crate status). Dates are IST-day of work.
 
+## [0.11.1] — 2026-09-02 — 🖥️ THE WALLET RELEASE — the front door behind a double-click
+Non-consensus addition (new crate only; no protocol or wire changes — v0.11.0 nodes are unaffected).
+### Added
+- **HashKinetics Wallet for Windows** (`chain/crates/hk-wallet-gui` → `HashKinetics-Wallet.exe`): create or restore a post-quantum keychain, tap the faucet (auto-detects create-and-fund vs top-up), watch your balance, and pay any account id — against the live staging network, no CLI required. Native Rust (egui) — no browser runtime, no installer; one `cargo build --release -p hk-wallet-gui` produces the .exe.
+- Same custody discipline as everything else in this repo: keys are generated locally and never leave the machine (the faucet only sees a commitment); the L-ratchet nonce is persisted BEFORE submit and rolled back only on a definitive on-chain refusal; the chain's nonce is adopted when a restored backup drifts. The wallet file is byte-compatible with the CLI's `account.json` — CLI and GUI share a wallet.
+- v1 is the transparent journey (join → get funded → pay). Shielded operations via the public prover are the next wallet milestone.
+### The gate (live staging chain, 2026-09-02)
+- Wallet created → the second-ever public faucet drip → balance 0.100000 → a payment **signed at ratchet index 0**, receipt `ok`, publicly visible in the explorer (block 86,063, round 0, hash-based commit certificate).
+### Honesty
+- The distributed .exe is an **unsigned testnet build** — Windows SmartScreen will warn on first run. Verify the published sha256 instead of trusting the popup; code signing arrives with the production testnet.
+
 ## [0.11.0] — 2026-09-02 — 🚪 U1+U2: THE FRONT DOOR — anyone can join, get funded, and pay
 The usage sprint opens. Until today, accounts were genesis-only: the chain was something you could *verify* but not *join*. v0.11.0 adds runtime account creation, a public faucet, and a self-custody CLI — a stranger goes from nothing to paying on-chain in under a minute.
 ### ⚠ CONSENSUS-BREAKING — upgrade before use

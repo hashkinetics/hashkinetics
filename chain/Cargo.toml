@@ -10,6 +10,7 @@ members = [
     "crates/hk-rpc",
     "crates/hk-node",
     "crates/hk-facilitator",
+    "crates/hk-wallet-gui",
 ]
 
 [workspace.package]

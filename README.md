@@ -80,9 +80,11 @@ cd hashkinetics/chain && cargo build --release
 
 Every claim in the table above has a command that reproduces it.
 
-## Get ON the chain (v0.11.0 — the front door)
+## Get ON the chain (v0.11 — the front door)
 
-You no longer need a genesis seat. Generate a keychain locally, paste one string into the faucet, and you hold a funded, spendable account whose id nobody can squat (`id = H(auth commit)`, checked in consensus):
+You no longer need a genesis seat — and you no longer need a terminal. **Windows users: download `HashKinetics-Wallet.exe` from the latest release** (unsigned testnet build — SmartScreen will warn; verify the published sha256): create a wallet, tap the faucet, pay anyone. Your keys never leave your machine, and your first payment signs with your own hash-based one-time key at index 0.
+
+Prefer the CLI? Generate a keychain locally, paste one string into the faucet, and you hold a funded, spendable account whose id nobody can squat (`id = H(auth commit)`, checked in consensus):
 
 ```bash
 # 1 · keys are born on YOUR machine and never leave it
