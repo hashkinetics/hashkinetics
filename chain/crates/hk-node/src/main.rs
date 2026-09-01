@@ -11,8 +11,10 @@
 //! restart never reuses a leaf; exhaustion rotates under the stateless SLH-DSA root.
 //! See docs/MAINNET-KEY-MANAGEMENT.md. Ed25519 remains ONLY as libp2p transport identity.
 
+mod account;
 mod app;
 mod batch;
+mod faucet;
 mod bench_agg;
 mod codec;
 mod config;
@@ -169,6 +171,78 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
             let nodes = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(4);
             storm::run(&url, rate, dur, nodes)
         }
+        // ---- U1/U2: self-custodied accounts + the faucet ----------------------
+        Some("account-new") => {
+            let dir = PathBuf::from(args.get(2).cloned().ok_or_else(|| eyre::eyre!("usage: hk-node account-new <DIR>"))?);
+            account::cmd_new(&dir)
+        }
+        Some("account-info") => {
+            let dir = PathBuf::from(args.get(2).cloned().ok_or_else(|| eyre::eyre!("usage: hk-node account-info <DIR>"))?);
+            account::cmd_info(&dir)
+        }
+        Some("account-balance") => {
+            let rpc = args.get(2).cloned().ok_or_else(|| eyre::eyre!("usage: hk-node account-balance <RPC> <ID-hex|DIR>"))?;
+            let who = args.get(3).cloned().ok_or_else(|| eyre::eyre!("usage: hk-node account-balance <RPC> <ID-hex|DIR>"))?;
+            account::cmd_balance(&rpc, &who)
+        }
+        Some("account-send") => {
+            let usage = "usage: hk-node account-send <DIR> <RPC> <TO-hex> <AMOUNT-micro> [ASSET-hex]";
+            let dir = PathBuf::from(args.get(2).cloned().ok_or_else(|| eyre::eyre!(usage))?);
+            let rpc = args.get(3).cloned().ok_or_else(|| eyre::eyre!(usage))?;
+            let to = args.get(4).cloned().ok_or_else(|| eyre::eyre!(usage))?;
+            let amount: u128 = args.get(5).and_then(|s| s.parse().ok()).ok_or_else(|| eyre::eyre!(usage))?;
+            account::cmd_send(&dir, &rpc, &to, amount, args.get(6).map(|s| s.as_str()))
+        }
+        Some("account-create") => {
+            let usage = "usage: hk-node account-create <DIR> <RPC> <AUTH-COMMIT-hex> <AMOUNT-micro> [ASSET-hex]";
+            let dir = PathBuf::from(args.get(2).cloned().ok_or_else(|| eyre::eyre!(usage))?);
+            let rpc = args.get(3).cloned().ok_or_else(|| eyre::eyre!(usage))?;
+            let auth = args.get(4).cloned().ok_or_else(|| eyre::eyre!(usage))?;
+            let amount: u128 = args.get(5).and_then(|s| s.parse().ok()).ok_or_else(|| eyre::eyre!(usage))?;
+            account::cmd_create(&dir, &rpc, &auth, amount, args.get(6).map(|s| s.as_str()))
+        }
+        Some("account-adopt-demo") => {
+            let usage = "usage: hk-node account-adopt-demo <DIR> <NAME> [RPC]";
+            let dir = PathBuf::from(args.get(2).cloned().ok_or_else(|| eyre::eyre!(usage))?);
+            let name = args.get(3).cloned().ok_or_else(|| eyre::eyre!(usage))?;
+            let rpc = args.get(4).cloned().unwrap_or_else(|| "http://127.0.0.1:26000".into());
+            account::cmd_adopt_demo(&dir, &name, &rpc)
+        }
+        Some("faucet-serve") => {
+            let usage = "usage: hk-node faucet-serve <WALLET-DIR> <RPC> [--listen 127.0.0.1:9922] [--drip MICRO] [--asset HEX] [--cooldown-secs N] [--daily-cap N]";
+            let dir = PathBuf::from(args.get(2).cloned().ok_or_else(|| eyre::eyre!(usage))?);
+            let rpc = args.get(3).cloned().ok_or_else(|| eyre::eyre!(usage))?;
+            let mut listen = "127.0.0.1:9922".to_string();
+            let mut drip: u128 = 100_000; // $0.10 default — staging supply is tiny
+            let mut asset: Option<String> = None;
+            let mut cooldown: u64 = 86_400;
+            let mut daily_cap: u32 = 200;
+            let rest: Vec<String> = args[4..].to_vec();
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--listen" => { listen = rest.get(i + 1).cloned().ok_or_else(|| eyre::eyre!(usage))?; i += 2 }
+                    "--drip" => { drip = rest.get(i + 1).and_then(|s| s.parse().ok()).ok_or_else(|| eyre::eyre!(usage))?; i += 2 }
+                    "--asset" => { asset = rest.get(i + 1).cloned(); i += 2 }
+                    "--cooldown-secs" => { cooldown = rest.get(i + 1).and_then(|s| s.parse().ok()).ok_or_else(|| eyre::eyre!(usage))?; i += 2 }
+                    "--daily-cap" => { daily_cap = rest.get(i + 1).and_then(|s| s.parse().ok()).ok_or_else(|| eyre::eyre!(usage))?; i += 2 }
+                    _ => return Err(eyre::eyre!(usage)),
+                }
+            }
+            let asset = match asset {
+                Some(a) => account::parse_h256(&a)?,
+                None => demo::usd(),
+            };
+            faucet::serve(faucet::FaucetCfg {
+                wallet_dir: dir,
+                node_rpc: rpc,
+                listen,
+                drip,
+                asset,
+                cooldown: std::time::Duration::from_secs(cooldown),
+                daily_cap,
+            })
+        }
         Some("verify-disclosure") => {
             // OFFLINE: reads one JSON file, touches no network, needs no node.
             let path = args
@@ -197,6 +271,7 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
             eprintln!("HashKinetics node v0.10 (hash-based consensus + shielded pool + disclosure + durable store)");
             eprintln!("usage: hk-node testnet <N> <HOME> | start <NODE_HOME> | wallet <CMD …> | keygen <HOME> [MONIKER] | issue-rotation <HOME> [EPOCH] [VALID_FROM] | genesis-build <VALIDATORS.json> <OUT.json> | config-gen <HOME> --listen … --peers … | storm <RPC> [RATE] [DURATION_S] | demo <RPC> | demo-economy <RPC> <PROVER> | demo-shielded <RPC> <PROVER> | demo-disclose <RPC> <PROVER> | demo-agg <RPC> <PROVER> | demo-mandates <RPC> <PROVER> | verify-disclosure <package.json>");
             eprintln!("join a testnet: docs/VALIDATOR-ONBOARDING.md (keygen → send validator.json → receive genesis → config-gen → start)");
+            eprintln!("accounts (U1): account-new DIR · account-info DIR · account-balance RPC ID|DIR · account-send DIR RPC TO MICRO [ASSET] · account-create DIR RPC AUTH_COMMIT MICRO [ASSET] · faucet-serve DIR RPC [--drip …]");
             eprintln!("wallet: init DIR ACCOUNT [RPC] · status DIR [RPC] · address DIR [RPC] · scan DIR [RPC] · transfer DIR TO USD [RPC] · shield DIR USD [RPC] [PROVER] · unshield DIR USD [RPC] [PROVER] · pay DIR HKADDR USD [MEMO] [RPC] [PROVER] · disclose DIR COMMITMENT OUT.json [RPC]");
             Ok(())
         }

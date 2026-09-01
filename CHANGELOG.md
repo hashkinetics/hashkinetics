@@ -2,6 +2,20 @@
 
 All notable changes to this project. Versions are project-level (see `version.md` for per-crate status). Dates are IST-day of work.
 
+## [0.11.0] — 2026-09-02 — 🚪 U1+U2: THE FRONT DOOR — anyone can join, get funded, and pay
+The usage sprint opens. Until today, accounts were genesis-only: the chain was something you could *verify* but not *join*. v0.11.0 adds runtime account creation, a public faucet, and a self-custody CLI — a stranger goes from nothing to paying on-chain in under a minute.
+### ⚠ CONSENSUS-BREAKING — upgrade before use
+- A new transaction variant is appended to the wire format. Nodes **below v0.11.0 cannot decode any block containing an `AccountCreate`** and will refuse the batch. All validators and syncing nodes must upgrade BEFORE the first account creation commits; the staging-1 join kit now pins v0.11.0 as the minimum.
+### Added
+- **`Tx::AccountCreate { id, auth_commit, asset, amount }`** — permissionless, squat-proof runtime accounts: consensus enforces `id = H(DOM_ACCOUNT_ID ‖ auth_commit)`, so an identity can only be claimed by whoever holds the key material behind it, and no existing account can ever be overwritten. The sender funds the opening balance from its own (0 allowed); structural refusals run before money moves, so a failed create never debits. New refusals: `account already exists`, `account id does not match H(auth_commit)`. Explorer shows creations as `account_create`.
+- **Self-custody account CLI** — `account-new` (32 bytes of OS entropy → keychain + derived id, refuses to overwrite key material), `account-info`, `account-balance`, `account-send`, `account-create` (sponsor anyone onto the chain from your own funds). The L-ratchet nonce follows the consensus signer's reserve-then-sign discipline: persisted BEFORE submit, rolled back (and persisted) only on a definitive on-chain refusal, and re-synced from the chain when the local file drifts — a crash can never re-sign a spent index.
+- **`faucet-serve` — the public faucet** (`POST /drip {auth_commit}` creates+funds; `{account}` tops up; `GET /health`). Per-IP cooldown + global daily cap (X-Forwarded-For aware, failed drips refund the stamp); CORS-by-construction (every response carries the header, and the website calls it with no custom headers — a simple request needs no preflight). Until fees land, rate limits are the anti-spam floor.
+- **hashkinetics.org/faucet** — three steps on one page: generate a keychain locally, paste the auth commit, spend. Keys never leave the user's machine; the faucet only ever sees a commitment.
+### The gate (devnet, 2026-09-02 — the first complete user journey)
+- `account-new` → id `00c6b30e…` · POST /drip → **AccountCreate committed** (txid `0d7a5f93…`) · balance $0.25 · the newcomer's OWN first signature (ratchet index 0) paid $0.05 back — receipt `ok: 1 event(s)` · balance $0.20. Squat, duplicate, and overdraft refusals covered by `u1_runtime_account_creation_faucet_flow` (hk-state 12/12, hk-node 16/16).
+### Honesty
+- Staging drips are deliberately tiny — the staging genesis carries a ~$50 total transparent supply. The production testnet (testnet-1) launches with a real faucet treasury (private seed) baked into genesis.
+
 ## [0.10.10] — 2026-09-01 — 🛡️ R8 + R1.b: a validator can nap without eating its keychain
 Built for the external-validator era: strangers' nodes WILL go offline, fall behind, and wedge — ours only survived because we babysat them. Two shipped fixes make a parked validator boring instead of fatal.
 ### The gate (devnet, 2026-09-01 — the val-0 scenario, reproduced and cured)

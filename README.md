@@ -80,6 +80,25 @@ cd hashkinetics/chain && cargo build --release
 
 Every claim in the table above has a command that reproduces it.
 
+## Get ON the chain (v0.11.0 — the front door)
+
+You no longer need a genesis seat. Generate a keychain locally, paste one string into the faucet, and you hold a funded, spendable account whose id nobody can squat (`id = H(auth commit)`, checked in consensus):
+
+```bash
+# 1 · keys are born on YOUR machine and never leave it
+./target/release/hk-node account-new ~/my-account       # prints your account id + auth commit
+
+# 2 · paste the AUTH COMMIT at https://www.hashkinetics.org/faucet  (or curl the faucet directly)
+
+# 3 · you're a chain user — check, then pay anyone:
+./target/release/hk-node account-balance https://rpc.hashkinetics.org ~/my-account
+./target/release/hk-node account-send ~/my-account https://rpc.hashkinetics.org <TO-ID> 50000
+# or sponsor a friend onto the chain from your own balance:
+./target/release/hk-node account-create ~/my-account https://rpc.hashkinetics.org <THEIR-AUTH-COMMIT> 10000
+```
+
+Your first spend signs with your own hash-based ratchet at index 0 — the same one-time-signature discipline the validators live by, in your hands. ⚠ v0.11.0 is a consensus-breaking upgrade: nodes below it cannot decode blocks containing an account creation.
+
 ## Run a full node on the staging network (now, no permission needed)
 
 `networks/staging-1/` holds the pinned genesis and bootstrap peers — clone, build, point your node at them, and you're syncing and independently verifying the live chain, serving your own RPC and explorer. One screen of commands, no GPU, no stake: `networks/staging-1/README.md`. The genesis digest is the network's fingerprint; your node's `app_hash` at any height must equal what `rpc.hashkinetics.org` reports — same input, same hash, no trust required.
@@ -112,7 +131,7 @@ This section is load-bearing. If it ever disappears, assume the worst.
 - **Rotation hardening (R-series) is production-proven, not just built:** automatic threshold rotation has fired unattended across 45+ epochs; the peer-carried revival path has resurrected a fully-exhausted validator three times; certificates verify against the set as of their height, so syncing across rotation boundaries works (v0.10.7); catch-up verification is parallel (v0.10.8 — a joining machine measured 2→71 blocks/min, converging on a chain that adds ~27); since v0.10.9 syncing spends **zero** signing leaves — proven end-to-end when an independent observer re-verified the entire chain from genesis (~76,000 blocks, every vote and STARK) and reported the byte-identical state commitment with zero leaves spent; and since v0.10.10 a validator that falls behind **abstains instead of burning keys** (corroborated peer evidence gates all vote/proposal signing; gate receipt: a deliberately-wedged voter spent 2 leaves where the old behavior cost a fresh tree ~1,700, then rejoined byte-identical and voted at the first possible height) and the rotation threshold is checked on a **timer as well as on commits** — a parked node now rotates itself before exhaustion instead of after. Still open and ledgered: engine resume at store tip (deep restarts spend ~10 minutes rehydrating the decided-log before rejoining — measured and acceptable, but on the list).
 - All throughput numbers are **single-machine or single-datacenter**; WAN pacing is unmeasured until the soak.
 - Transparent (Lamport-signed) transactions are wire-heavy at scale — block-log segmentation and the WOTS account scheme are queued; the shielded path (2.7 KB/tx + one aggregate) is the product path.
-- A faucet waits on the account-creation transaction (accounts are genesis-only today).
+- The faucet is live but deliberately stingy: the staging genesis carries a ~$50 total transparent supply, so drips are cents and rate-limited. The production testnet (testnet-1) launches with a real faucet treasury in genesis. No fee market yet — rate limits are the anti-spam floor until it lands.
 - Explorer and wallet are devnet-grade surfaces; in-circuit WOTS awaits its KAT campaign; agent-side proving assumes GPU-class hardware.
 
 What "LIVE" means above: demonstrated on a running chain with a receipt you can reproduce from this repo. Nothing here is a projection wearing a demo's clothes.

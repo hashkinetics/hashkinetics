@@ -648,3 +648,85 @@ fn snapshot_roundtrip_identical_commitment_and_keeps_running() {
     st2.apply_block(3, 1_030, &txs3).unwrap();
     assert_eq!(st.state_commitment(), st2.state_commitment(), "replays stay in lockstep");
 }
+
+/// U1 — THE FAUCET FLOW, AS A TEST: a funded account creates + funds a brand-new
+/// runtime account (id derived from its auth commitment), and the newcomer can spend
+/// immediately with its own L-ratchet. Squat, duplicate, and overdraft all refuse
+/// without moving money.
+#[test]
+fn u1_runtime_account_creation_faucet_flow() {
+    const M: Amount = 1_000_000;
+    let usd = h(9);
+    let mut faucet = Keychain::new(b"faucet-treasury");
+    let genesis = Genesis {
+        time: 1_000,
+        accounts: vec![faucet.genesis()],
+        alloc: vec![(faucet.id, usd, 100 * M)],
+    };
+    let mut st = State::from_genesis(&genesis).unwrap();
+    let bal = |st: &State, id: H256| st.balances.get(&(id, usd)).copied().unwrap_or(0);
+
+    // The newcomer generates keys FIRST; the id derives from the auth commitment.
+    let mut alice = Keychain::new(b"alice-fresh-entropy");
+    let alice_auth0 = alice.commit_at(0);
+    let alice_id = H256(shake256_32(DOM_ACCOUNT_ID, &[&alice_auth0.0]));
+    alice.id = alice_id; // envelopes must be sent as the DERIVED id
+
+    // 1) Squat attempt: id ≠ H(auth_commit) → refused, faucet not debited.
+    let squat = faucet.sign(Tx::AccountCreate {
+        id: h(0xAA),
+        auth_commit: alice_auth0,
+        asset: usd,
+        amount: 5 * M,
+    });
+    let r = st.apply_block(1, 1_010, &[squat]).unwrap();
+    assert!(r[0].result.is_err(), "squatted id must refuse");
+    assert_eq!(bal(&st, faucet.id), 100 * M, "failed create must not debit");
+    faucet.rollback();
+
+    // 2) The real create + fund.
+    let create = faucet.sign(Tx::AccountCreate {
+        id: alice_id,
+        auth_commit: alice_auth0,
+        asset: usd,
+        amount: 5 * M,
+    });
+    let r = st.apply_block(2, 1_020, &[create]).unwrap();
+    assert!(r[0].result.is_ok(), "{:?}", r[0].result);
+    assert_eq!(bal(&st, alice_id), 5 * M);
+    assert_eq!(bal(&st, faucet.id), 95 * M);
+
+    // 3) Duplicate create of the same id → refused, no double-debit.
+    let dup = faucet.sign(Tx::AccountCreate {
+        id: alice_id,
+        auth_commit: alice_auth0,
+        asset: usd,
+        amount: 5 * M,
+    });
+    let r = st.apply_block(3, 1_030, &[dup]).unwrap();
+    assert!(r[0].result.is_err(), "duplicate id must refuse");
+    assert_eq!(bal(&st, faucet.id), 95 * M);
+    faucet.rollback();
+
+    // 4) The newcomer spends immediately — her ratchet starts at nonce 0.
+    let pay = alice.sign(Tx::Transfer { to: faucet.id, asset: usd, amount: 2 * M });
+    let r = st.apply_block(4, 1_040, &[pay]).unwrap();
+    assert!(r[0].result.is_ok(), "{:?}", r[0].result);
+    assert_eq!(bal(&st, alice_id), 3 * M);
+    assert_eq!(bal(&st, faucet.id), 97 * M);
+
+    // 5) Unfunded creation (amount = 0) is legal — account exists, balance zero.
+    let mut bob = Keychain::new(b"bob-fresh-entropy");
+    let bob_auth0 = bob.commit_at(0);
+    let bob_id = H256(shake256_32(DOM_ACCOUNT_ID, &[&bob_auth0.0]));
+    bob.id = bob_id;
+    let create0 = faucet.sign(Tx::AccountCreate {
+        id: bob_id,
+        auth_commit: bob_auth0,
+        asset: usd,
+        amount: 0,
+    });
+    let r = st.apply_block(5, 1_050, &[create0]).unwrap();
+    assert!(r[0].result.is_ok(), "{:?}", r[0].result);
+    assert_eq!(bal(&st, bob_id), 0);
+}

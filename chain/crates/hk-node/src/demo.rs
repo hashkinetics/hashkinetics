@@ -35,7 +35,7 @@ pub(crate) fn account_id(name: &str) -> H256 {
     H256(shake256_32(DOM_ACCOUNT_ID, &[name.as_bytes()]))
 }
 
-fn commit_at(seed: &[u8], nonce: u64) -> H256 {
+pub(crate) fn commit_at(seed: &[u8], nonce: u64) -> H256 {
     let (_, pk) = lamport::keygen(seed, nonce);
     H256(lamport::pk_commit(&pk))
 }
@@ -71,6 +71,12 @@ pub(crate) struct Wallet {
 impl Wallet {
     pub(crate) fn new(name: &str) -> Self {
         Self { seed: name.as_bytes().to_vec(), id: account_id(name), next_nonce: 0 }
+    }
+
+    /// U1/U2: a wallet over an ARBITRARY seed + id at a given ratchet position —
+    /// the self-custodied account files (`account-new`) and the faucet use this.
+    pub(crate) fn from_seed(seed: Vec<u8>, id: H256, next_nonce: u64) -> Self {
+        Self { seed, id, next_nonce }
     }
 
     pub(crate) fn sign(&mut self, payload: Tx) -> SignedTx {

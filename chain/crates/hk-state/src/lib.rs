@@ -16,7 +16,7 @@ pub mod tx;
 #[cfg(test)]
 mod tests;
 
-use hk_crypto::hash::{shake256_32, DOM_CHANNEL_ID, DOM_STATE_COMMIT};
+use hk_crypto::hash::{shake256_32, DOM_ACCOUNT_ID, DOM_CHANNEL_ID, DOM_STATE_COMMIT};
 use hk_crypto::{lamport, payword};
 use hk_mandate::{MandateTree, SpendError};
 use hk_primitives::{
@@ -78,6 +78,10 @@ pub enum Event {
         fee: Amount,
         credit: Option<AccountId>,
     },
+    /// U1: a runtime account was created (and possibly funded) by `creator`.
+    /// APPENDED LAST: `Receipt.result` carries `Vec<Event>` through bincode snapshots —
+    /// variant tags before this one must never shift.
+    AccountCreated { id: AccountId, creator: AccountId, asset: AssetId, funded: Amount },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -146,6 +150,10 @@ pub enum StateError {
     PoolFeeNeedsCredit,
     #[error("commitment tree full")]
     PoolFull,
+    #[error("account already exists")]
+    AccountExists,
+    #[error("account id does not match H(auth_commit)")]
+    AccountIdMismatch,
 }
 
 pub struct State {
@@ -355,6 +363,9 @@ impl State {
     fn dispatch(&mut self, sender: &AccountId, tx: &Tx) -> Result<Vec<Event>, StateError> {
         match tx {
             Tx::Transfer { to, asset, amount } => self.do_transfer(sender, to, asset, *amount),
+            Tx::AccountCreate { id, auth_commit, asset, amount } => {
+                self.do_account_create(sender, id, auth_commit, asset, *amount)
+            }
             Tx::MandateCreate { id, parent, holder, asset, rate_per_sec, buffer_max, per_tx_max, initial_buffer, expiry, tier } => {
                 self.do_mandate_create(sender, *id, *parent, *holder, *asset, *rate_per_sec, *buffer_max, *per_tx_max, *initial_buffer, *expiry, *tier)
             }
@@ -401,6 +412,38 @@ impl State {
         self.debit(from, asset, amount)?;
         self.credit(to, asset, amount);
         Ok(vec![Event::Transferred { from: *from, to: *to, asset: *asset, amount }])
+    }
+
+    /// U1: runtime account creation. The id is DERIVED from the auth commitment
+    /// (`H(DOM_ACCOUNT_ID ‖ auth_commit)`) — permissionless, squat-proof: only whoever
+    /// holds the key material behind `auth_commit` can produce a matching id, and an
+    /// existing account (genesis-named or derived) can never be overwritten. The SENDER
+    /// pays the opening balance from its own funds (`amount` may be 0); check order
+    /// mirrors the rest of the state machine — structural refusals before money moves,
+    /// so a failed create never debits.
+    fn do_account_create(
+        &mut self,
+        sender: &AccountId,
+        id: &AccountId,
+        auth_commit: &H256,
+        asset: &AssetId,
+        amount: Amount,
+    ) -> Result<Vec<Event>, StateError> {
+        let derived = H256(shake256_32(DOM_ACCOUNT_ID, &[&auth_commit.0]));
+        if *id != derived {
+            return Err(StateError::AccountIdMismatch);
+        }
+        if self.accounts.contains_key(id) {
+            return Err(StateError::AccountExists);
+        }
+        if amount > 0 {
+            self.debit(sender, asset, amount)?;
+        }
+        self.accounts.insert(*id, Account { auth_commit: *auth_commit, nonce: 0 });
+        if amount > 0 {
+            self.credit(id, asset, amount);
+        }
+        Ok(vec![Event::AccountCreated { id: *id, creator: *sender, asset: *asset, funded: amount }])
     }
 
     // ---- mandates ----

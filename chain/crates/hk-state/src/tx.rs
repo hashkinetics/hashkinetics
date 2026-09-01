@@ -94,6 +94,16 @@ pub enum Tx {
         #[serde(with = "serde_bytes_vec", default)]
         stealth_ct2: Vec<u8>,
     },
+    /// U1 (the usage sprint): create a new account at RUNTIME — the unblocker for the
+    /// faucet and for anyone joining the chain (accounts were genesis-only before this).
+    /// Permissionless and squat-proof by construction: `id` must equal
+    /// `H(DOM_ACCOUNT_ID ‖ auth_commit)` (checked in consensus), so an id can only be
+    /// claimed by whoever holds the key material behind its auth commitment. The SENDER
+    /// funds the new account's opening balance from its own — the faucet flow; `amount`
+    /// may be 0 to create unfunded. ⚠ CONSENSUS-BREAKING ADDITION (appended LAST so
+    /// existing bincode variant tags are untouched): nodes must be ≥ v0.11.0 before the
+    /// first AccountCreate commits, or they fail to decode the batch.
+    AccountCreate { id: AccountId, auth_commit: H256, asset: AssetId, amount: Amount },
 }
 
 /// Account-signed transaction envelope — the L-ratchet (hk-crypto::lamport docs):

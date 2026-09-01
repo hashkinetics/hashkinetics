@@ -500,6 +500,10 @@ fn tx_summary(stx: &SignedTx) -> Value {
             "mandate": mandate.map(|m| hex::encode(m.0)),
             "via_aggregate": proof.is_empty(),
         })),
+        // U1: runtime account creation (the faucet flow) — visible in the explorer.
+        Tx::AccountCreate { id, asset, amount, .. } => ("account_create", json!({
+            "id": hex::encode(id.0), "asset": hex::encode(asset.0), "amount": amount.to_string(),
+        })),
     };
     json!({
         "txid": hex::encode(txid(stx)),

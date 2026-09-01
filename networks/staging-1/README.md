@@ -1,5 +1,9 @@
 # HashKinetics staging network — join as a full node
 
+> **⚠ Minimum node version: v0.11.0.** The account-creation transaction (v0.11.0) is a
+> consensus-breaking wire addition — older nodes cannot decode blocks that contain one
+> and will refuse to sync past it. Build from a tag ≥ v0.11.0.
+
 The public staging testnet (the chain behind [hashkinetics.org/explorer](https://www.hashkinetics.org/explorer)
 and `https://rpc.hashkinetics.org`). Four founder-operated validators run it; anyone
 can run a **full node** that syncs it, verifies every block, and serves its own RPC
