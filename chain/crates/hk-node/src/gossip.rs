@@ -99,7 +99,8 @@ fn est_json_size(t: &SignedTx) -> usize {
 }
 
 /// Minimal HTTP/1.1 POST — the client twin of rpc.rs's hand-rolled server.
-async fn post(base: &str, body: &str) -> eyre::Result<()> {
+/// `pub(crate)`: R1.b's rotation tick reuses it to push certs to peer RPCs.
+pub(crate) async fn post(base: &str, body: &str) -> eyre::Result<()> {
     let hostport = base
         .trim()
         .strip_prefix("http://")

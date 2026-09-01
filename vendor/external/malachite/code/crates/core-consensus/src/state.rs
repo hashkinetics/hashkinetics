@@ -46,6 +46,17 @@ where
     /// the identity matches; live decides (no sync verify ran) miss and verify
     /// exactly as before.
     pub last_verified_certificate: Option<(Ctx::Height, Round, ValueId<Ctx>)>,
+
+    /// HK-R8: highest height claimed by each peer via future-height consensus
+    /// messages (votes/proposals buffered above our height). Only claims from
+    /// members of the CURRENT validator set are recorded, so gossip spam from
+    /// arbitrary peers cannot populate this. Small linear vec: bounded by the
+    /// validator-set size. Feeds `should_abstain()`.
+    pub peer_height_claims: Vec<(Ctx::Address, Ctx::Height)>,
+
+    /// HK-R8: last height at which we logged the abstain notice (once per
+    /// height, not once per futile round — abstaining can last hours).
+    pub last_abstain_logged: Option<Ctx::Height>,
 }
 
 impl<Ctx> State<Ctx>
@@ -71,7 +82,60 @@ where
             last_signed_prevote: None,
             last_signed_precommit: None,
             last_verified_certificate: None,
+            peer_height_claims: Vec::new(),
+            last_abstain_logged: None,
         }
+    }
+
+    /// HK-R8: record a peer's implicit height claim (it sent a consensus message
+    /// for a height above ours). Ignored unless the claimed sender is in the
+    /// current validator set. Claims only ratchet upward.
+    pub fn note_future_height_claim(&mut self, addr: &Ctx::Address, height: Ctx::Height) {
+        use malachitebft_core_types::ValidatorSet as _;
+        if self.driver.validator_set().get_by_address(addr).is_none() {
+            return;
+        }
+        match self.peer_height_claims.iter_mut().find(|(a, _)| a == addr) {
+            Some((_, h)) => {
+                if height > *h {
+                    *h = height;
+                }
+            }
+            None => self.peer_height_claims.push((addr.clone(), height)),
+        }
+    }
+
+    /// HK-R8: corroborated network-tip evidence — the SECOND-highest height
+    /// claimed by distinct current-set validators. One faulty validator cannot
+    /// fabricate it; a lone ahead-of-quorum node cannot stall the majority.
+    pub fn corroborated_peer_tip(&self) -> Option<Ctx::Height> {
+        use malachitebft_core_types::ValidatorSet as _;
+        let set = self.driver.validator_set();
+        let mut heights: Vec<Ctx::Height> = self
+            .peer_height_claims
+            .iter()
+            .filter(|(a, _)| set.get_by_address(a).is_some())
+            .map(|(_, h)| *h)
+            .collect();
+        if heights.len() < 2 {
+            return None;
+        }
+        heights.sort_unstable();
+        Some(heights[heights.len() - 2])
+    }
+
+    /// HK-R8: should this validator abstain from signing right now?
+    /// True only when the context opts in AND corroborated evidence puts the
+    /// network at least `gap` heights ahead. Signing while that is true spends
+    /// irreplaceable one-time leaves on votes the network will never count.
+    pub fn should_abstain(&self) -> bool {
+        let Some(gap) = self.ctx.abstain_threshold() else {
+            return false;
+        };
+        let Some(tip) = self.corroborated_peer_tip() else {
+            return false;
+        };
+        tip.as_u64() >= self.height().as_u64().saturating_add(gap)
     }
 
     pub fn height(&self) -> Ctx::Height {

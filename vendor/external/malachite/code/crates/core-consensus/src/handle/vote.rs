@@ -45,6 +45,9 @@ where
             "Received vote for higher height, queuing for later"
         );
 
+        // HK-R8: a vote above our height is peer evidence the network is ahead.
+        state.note_future_height_claim(validator_address, vote_height);
+
         state.buffer_input(vote_height, Input::Vote(signed_vote), metrics);
 
         return Ok(());

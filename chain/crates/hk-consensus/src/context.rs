@@ -692,6 +692,28 @@ impl Context for HkContext {
         Some(HkSig(Vec::new()))
     }
 
+    /// HK-R8: abstain-while-behind, ON by default for hash-based signers.
+    /// While ≥2 distinct current-set validators have sent consensus messages
+    /// ≥ gap heights above us, we stop signing votes/proposals: they are
+    /// worthless at a height the network has passed, and each would burn an
+    /// irreplaceable one-time leaf (val-0's fresh 32,768-leaf tree burned to
+    /// zero in ~20 h of exactly this). `HK_ABSTAIN_GAP` overrides the gap;
+    /// `HK_ABSTAIN_GAP=0` disables. Default 20 heights (~40 s of chain time —
+    /// far above any live round-lag, far below any real parked/wedged state).
+    fn abstain_threshold(&self) -> Option<u64> {
+        static GAP: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        *GAP.get_or_init(|| {
+            match std::env::var("HK_ABSTAIN_GAP")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+            {
+                Some(0) => None,      // explicit opt-out
+                Some(n) => Some(n),   // operator override
+                None => Some(20),     // default: on
+            }
+        })
+    }
+
     /// Deterministic round-robin over (height, round) — same rule as the engine's
     /// reference context. Weighted/leader-lease selection is a later refinement.
     fn select_proposer<'a>(
@@ -782,6 +804,13 @@ mod tests {
         assert_eq!(at(249), 2);
         assert_eq!(at(250), 3);
         assert_eq!(at(1_000_000), 3);
+    }
+
+    #[test]
+    fn abstain_threshold_defaults_on() {
+        // R8 is ON by default for hash-based signers: 20 heights (~40 s).
+        // HK_ABSTAIN_GAP overrides; =0 disables. (Env is unset under cargo test.)
+        assert_eq!(HkContext::new().abstain_threshold(), Some(20));
     }
 
     #[test]

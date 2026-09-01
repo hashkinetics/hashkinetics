@@ -75,6 +75,26 @@ where
         None
     }
 
+    /// HK-R8: abstain-while-behind. When `Some(gap)`, an active validator STOPS
+    /// signing votes and proposals while corroborated peer evidence shows the
+    /// network at least `gap` heights ahead of it — votes at a height the
+    /// network has already passed are worthless by construction, yet for a
+    /// STATEFUL hash-based scheme each one burns an irreplaceable one-time
+    /// leaf (observed in production: a freshly-rotated 32,768-leaf tree burned
+    /// to ZERO in ~20 h of futile nil-votes below tip). Abstaining is
+    /// protocol-safe: it is indistinguishable from the node being offline,
+    /// which BFT already tolerates.
+    ///
+    /// "Corroborated" = the SECOND-highest height claimed by DISTINCT members
+    /// of the current validator set (via buffered future-height votes and
+    /// proposals) — one faulty or malicious validator cannot fabricate the
+    /// signal alone, and a lone ahead-of-quorum node cannot stall the others.
+    ///
+    /// The default `None` disables the feature (upstream behavior unchanged).
+    fn abstain_threshold(&self) -> Option<u64> {
+        None
+    }
+
     /// Build a new proposal for the given value at the given height, round and POL round.
     fn new_proposal(
         &self,

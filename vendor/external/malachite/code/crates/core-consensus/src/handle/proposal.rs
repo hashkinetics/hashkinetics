@@ -62,6 +62,9 @@ where
             "Received proposal for higher height {proposal_height}, queuing for later"
         );
 
+        // HK-R8: a proposal above our height is peer evidence the network is ahead.
+        state.note_future_height_claim(proposer_address, proposal_height);
+
         state.buffer_input(proposal_height, Input::Proposal(signed_proposal), metrics);
 
         return Ok(());

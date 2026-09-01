@@ -231,8 +231,11 @@ where
                 "Proposing value"
             );
 
-            // Only sign and publish if we're an active validator
-            if state.is_active_validator() {
+            // Only sign and publish if we're an active validator.
+            // HK-R8: and only if we're not abstaining-while-behind — signing a
+            // proposal for a height the network has already passed burns an
+            // irreplaceable one-time leaf for nothing.
+            if state.is_active_validator() && !state.should_abstain() {
                 let signed_proposal = sign_proposal(co, proposal.clone()).await?;
 
                 if signed_proposal.pol_round().is_defined() {
@@ -356,7 +359,25 @@ where
                 }
             }
 
-            if state.is_active_validator() {
+            if state.is_active_validator() && state.should_abstain() {
+                // HK-R8: corroborated peer evidence puts the network at least
+                // `abstain_threshold` heights ahead — a vote at our stale height
+                // is worthless by construction, but for a stateful hash-based
+                // signer it burns an irreplaceable one-time leaf (a fresh
+                // 32,768-leaf tree died in ~20 h of exactly this, in
+                // production). Stay silent — indistinguishable from being
+                // offline, which BFT tolerates — sync first, vote when caught
+                // up. Logged once per height, not once per futile round.
+                if state.last_abstain_logged != Some(state.height()) {
+                    let our_height = state.height();
+                    state.last_abstain_logged = Some(our_height);
+                    info!(
+                        height = %our_height,
+                        peer_tip = ?state.corroborated_peer_tip().map(|h| h.as_u64()),
+                        "R8: behind the network — abstaining from voting, preserving signer leaves"
+                    );
+                }
+            } else if state.is_active_validator() {
                 info!(
                     vote_type = ?vote.vote_type(),
                     value = %PrettyVal(vote.value().as_ref()),
@@ -409,8 +430,10 @@ where
         }
 
         DriverOutput::GetValue(height, round, timeout) => {
-            // Only request values if we're an active validator
-            if state.is_active_validator() {
+            // Only request values if we're an active validator.
+            // HK-R8: skip while abstaining-behind — don't build a value we will
+            // refuse to sign a proposal for.
+            if state.is_active_validator() && !state.should_abstain() {
                 if let Some(full_proposal) =
                     state.full_proposal_at_round_and_proposer(&height, round, state.address())
                 {

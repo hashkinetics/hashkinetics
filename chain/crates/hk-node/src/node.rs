@@ -262,6 +262,11 @@ impl Node for App {
             }
         }
 
+        // R1.b: tick-based rotation-threshold check — the commit-path R1 check
+        // is blind when this node isn't committing (parked / wedged / minority),
+        // which is exactly when a validator historically burned its tree to zero.
+        state.spawn_rotation_tick(config.hk_rpc.gossip_peers.clone());
+
         let span = tracing::error_span!("node", moniker = %config.moniker);
         let app_handle = tokio::spawn(
             async move {

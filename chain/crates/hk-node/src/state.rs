@@ -330,6 +330,107 @@ impl HkApp {
         self.validators.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// R1.b: tick-based rotation-threshold check. The commit-path check (R1) is
+    /// blind exactly when it matters most — a node that isn't committing
+    /// (parked, wedged below tip, minority partition) never evaluates its leaf
+    /// budget, and val-0 burned a fresh 32,768-leaf tree to ZERO overnight with
+    /// R1 armed (2026-08-29). Every 60 s: read the live gauge; when the budget
+    /// crosses the R1 threshold and the next epoch isn't already in flight,
+    /// issue the root-signed cert OURSELVES and hand it to (a) our own foreign
+    /// queue (drained into the next batch we build, if any) and (b) every
+    /// gossip peer via `hk_submitRotation` — the R2 revival path, self-served:
+    /// no commit, no human, no exhaustion. Pairs with R8 (abstain-while-behind),
+    /// which preserves the leaves this tick then rotates while they still exist.
+    /// Duplicate issuance vs. the commit path is harmless by construction:
+    /// every acceptor is epoch-monotone (same-epoch re-submissions are refused).
+    pub fn spawn_rotation_tick(&self, peers: Vec<String>) {
+        // Only validators rotate: an observer's root isn't in the set, and
+        // peers would (correctly) refuse its certs.
+        let in_set = {
+            let set = self.validators.lock().unwrap_or_else(|e| e.into_inner());
+            set.validators.iter().any(|v| v.root_pk == self.my_root_pk)
+        };
+        if !in_set {
+            info!("R1.b rotation tick not started — this node's root is not in the validator set (observer)");
+            return;
+        }
+        let gauge = self.signer_gauge.clone();
+        let foreign = self.foreign_rotations.clone();
+        let my_root_pk = self.my_root_pk.clone();
+        let master_seed = self.master_seed;
+        let mut highest_issued = self.highest_issued_epoch;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // First tick fires immediately; skip it so a freshly-booted node
+            // reads a settled gauge.
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                let (epoch, remaining) =
+                    *gauge.lock().unwrap_or_else(|e| e.into_inner());
+                let capacity = hk_crypto::hashsig::CONSENSUS_CAPACITY;
+                if highest_issued < epoch {
+                    // Rotations have applied since we last looked.
+                    highest_issued = epoch;
+                }
+                let next_epoch = epoch + 1;
+                let mine_pending = {
+                    let q = foreign.lock().unwrap_or_else(|e| e.into_inner());
+                    q.iter().any(|c| c.root_pk == my_root_pk && c.epoch >= next_epoch)
+                };
+                // height=0 + rotate_every=None ⇒ only the leaf-budget threshold
+                // clause of the SAME production trigger can fire here.
+                let (due, _) = rotation_due(
+                    remaining,
+                    capacity,
+                    0,
+                    None,
+                    mine_pending,
+                    next_epoch,
+                    highest_issued,
+                );
+                if !due {
+                    continue;
+                }
+                warn!(
+                    remaining,
+                    epoch,
+                    next_epoch,
+                    "R1.b tick: leaf budget under threshold and no commit is carrying the trigger — issuing rotation cert out-of-band"
+                );
+                let root = RootSecret::from_seed(&master_seed);
+                let seed = op_seed(&master_seed, next_epoch);
+                let new_op_pk = HkPriv::from_seed(seed).public();
+                let cert = RotationCert::issue(&root, new_op_pk, next_epoch, 0);
+                highest_issued = next_epoch;
+                {
+                    // Self-enqueue with the RPC handler's exact dedup shape.
+                    let mut q = foreign.lock().unwrap_or_else(|e| e.into_inner());
+                    let dup = q
+                        .iter()
+                        .any(|x| x.root_pk == cert.root_pk && x.epoch >= cert.epoch);
+                    if !dup {
+                        q.retain(|x| !(x.root_pk == cert.root_pk && x.epoch < cert.epoch));
+                        q.push(cert.clone());
+                    }
+                }
+                let body = serde_json::json!({
+                    "method": "hk_submitRotation",
+                    "params": { "cert": cert }
+                })
+                .to_string();
+                for p in &peers {
+                    if let Err(e) = crate::gossip::post(p, &body).await {
+                        warn!(peer = %p, %e, "R1.b cert push failed (best-effort; cert stays queued locally)");
+                    } else {
+                        info!(peer = %p, epoch = next_epoch, "R1.b: rotation cert pushed to peer");
+                    }
+                }
+            }
+        });
+    }
+
     pub fn start_height(&self) -> HkHeight {
         self.decided
             .keys()
@@ -1169,6 +1270,19 @@ mod rotation_trigger_tests {
         assert_eq!(rotation_due(6_552, CAP, 10_777, None, false, 1, 0), (true, true));
         assert_eq!(rotation_due(6_553, CAP, 10_777, None, false, 1, 0), (false, false));
         assert_eq!(rotation_due(0, CAP, 3, None, false, 1, 0), (true, true));
+    }
+
+    #[test]
+    fn r1b_tick_shape_threshold_fires_without_a_height() {
+        // R1.b calls rotation_due with height=0 and no interval override — a node
+        // that never commits must still fire the SAME leaf-budget clause…
+        assert_eq!(rotation_due(6_552, CAP, 0, None, false, 1, 0), (true, true));
+        assert_eq!(rotation_due(6_553, CAP, 0, None, false, 1, 0), (false, false));
+        // …must not re-issue when the next epoch is already in flight
+        // (threshold still reports hit — the gauge is honest, the action is gated)…
+        assert_eq!(rotation_due(6_552, CAP, 0, None, true, 1, 0), (false, true));
+        // …and must not re-issue an epoch it already issued.
+        assert_eq!(rotation_due(6_552, CAP, 0, None, false, 1, 1), (false, true));
     }
 
     #[test]
