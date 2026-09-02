@@ -125,11 +125,13 @@ publishes the URL) should list your address under Validators.
   (three production revivals to date).
 - **Syncing across rotation history works (v0.10.7):** commit certificates are
   verified against the validator set as of their height, so a new or restarted
-  node syncs from genesis (or any snapshot) across every epoch boundary. Deep
-  restarts on small instances rehydrate slowly and may trail the live chain for
-  a while (engine resume-at-tip is a ledgered work item); the interim cure for a
-  validator in a hurry is restoring from a snapshot near tip (`blocks/` +
-  `snapshot.bin` from a peer — snapshot.bin FIRST in the tar).
+  node syncs from genesis (or any snapshot) across every epoch boundary. Since
+  v0.13.0 (R10 v2) a restart resumes at the CHAIN height from its snapshot + the
+  few blocks after it — no rehydration of history, voting within seconds; older
+  history is served to peers from your block log (only the gap-free suffix that
+  reaches your tip is advertised). A validator in a hurry can still restore from
+  a peer's snapshot near tip (`blocks/` + `snapshot.bin` — snapshot.bin FIRST in
+  the tar; never the peer's `consensus_state*.bin`).
 - Your key exhausting or your node dying is a **liveness** fault only — the chain continues;
   key rotation under your SLH-DSA root brings you back (SCMS; cert flow is live —
   a rotated validator shows its new epoch badge on the explorer).
