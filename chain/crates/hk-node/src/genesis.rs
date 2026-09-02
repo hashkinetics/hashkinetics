@@ -58,6 +58,12 @@ impl HkGenesis {
             time: self.chain_start_time,
             accounts: vec![],
             alloc: vec![],
+            fee: None,
         })
+    }
+
+    /// U4.b: the genesis-bound fee policy, if this network pins one.
+    pub fn fee(&self) -> Option<hk_state::GenesisFee> {
+        self.chain.as_ref().and_then(|c| c.fee.clone())
     }
 }

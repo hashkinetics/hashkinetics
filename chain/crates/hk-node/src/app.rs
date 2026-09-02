@@ -7,7 +7,6 @@ use tracing::{error, info};
 use malachitebft_app_channel::app::engine::host::Next;
 use malachitebft_app_channel::app::streaming::StreamContent;
 use malachitebft_app_channel::app::types::core::Round;
-use malachitebft_app_channel::app::types::sync::RawDecidedValue;
 use malachitebft_app_channel::app::types::LocallyProposedValue;
 use malachitebft_app_channel::{AppMsg, Channels, NetworkMsg};
 
@@ -147,10 +146,8 @@ pub async fn run(state: &mut HkApp, channels: &mut Channels<HkContext>) -> eyre:
             }
 
             AppMsg::GetDecidedValue { height, reply } => {
-                let raw = state.decided.get(&height.as_u64()).map(|entry| RawDecidedValue {
-                    certificate: entry.certificate.clone(),
-                    value_bytes: HkCodec.encode(&entry.value).unwrap_or_default(),
-                });
+                // R10 v2: RAM window first, then the on-disk block log.
+                let raw = state.decided_value(height.as_u64());
                 if reply.send(raw).is_err() {
                     error!("Failed to send GetDecidedValue reply");
                 }

@@ -4,7 +4,7 @@
 
 [**hashkinetics.org**](https://www.hashkinetics.org) · [**Live explorer**](https://www.hashkinetics.org/explorer) · [**Public RPC**](https://rpc.hashkinetics.org) · [**X @hashkinetics**](https://x.com/hashkinetics) · [**Discord**](https://discord.gg/RsSfb9gn3) · validators@hashkinetics.org
 
-`staging testnet: LIVE` · `spend proof: 1.24 s (GPU)` · `274 tx/s storm-measured` · `256 proofs → ONE 1.24 MB STARK: measured` · `nothing is for sale`
+`testnet-1: LIVE (fees from block 1)` · `spend proof: 1.24 s (GPU)` · `274 tx/s storm-measured` · `256 proofs → ONE 1.24 MB STARK: measured` · `nothing is for sale`
 
 ---
 
@@ -22,7 +22,7 @@ HashKinetics moves the cap into consensus:
 
 ## Live right now
 
-A 4-validator **staging testnet** runs in public — real hash-signed BFT, pinned genesis, shielded pool active:
+A 4-validator public **testnet-1** runs since 2026-09-02 — real hash-signed BFT, pinned genesis, protocol fee bound into the genesis from block 1, shielded pool active (its predecessor staging-1 ran 107k blocks and is archived):
 
 - **Explorer:** [hashkinetics.org/explorer](https://www.hashkinetics.org/explorer) — "the scanner that can't dox you": commitments, nullifiers, one running total. No amounts, no parties, by construction.
 - **RPC:** `https://rpc.hashkinetics.org` (JSON-RPC over POST; try `{"method":"hk_chainInfo","params":{}}`).
@@ -101,15 +101,15 @@ Prefer the CLI? Generate a keychain locally, paste one string into the faucet, a
 
 Your first spend signs with your own hash-based ratchet at index 0 — the same one-time-signature discipline the validators live by, in your hands. ⚠ v0.11.0 is a consensus-breaking upgrade: nodes below it cannot decode blocks containing an account creation.
 
-Then **watch it land**: the explorer at [hashkinetics.org/explorer](https://www.hashkinetics.org/explorer) now answers *anything* — paste a block height, a transaction id, an account id, or a nullifier into one search box and get the full picture, with shareable deep links (`#tx=…`, `#account=…`, `#block=…`). The wallet links every payment straight to its proof on-chain. Shielded holdings stay invisible by design — the scanner that can't dox you. (v0.11.2)
+Then **watch it land**: the explorer at [hashkinetics.org/explorer](https://www.hashkinetics.org/explorer) now answers *anything* — paste a block height, a transaction id, an account id, or a nullifier into one search box and get the full picture, with shareable deep links (`#tx=…`, `#account=…`, `#block=…`). The wallet links every payment straight to its proof on-chain. Shielded holdings stay invisible by design — the scanner that can't dox you. (v0.11.2) **Since v0.13.0 the wallet is fee-aware and shielded:** it shows the chain's fee, refuses locally what the chain would refuse, and can shield, unshield, pay a stealth address and export a one-time disclosure — proofs made on the public prover.
 
-## Run a full node on the staging network (now, no permission needed)
+## Run a full node on testnet-1 (now, no permission needed)
 
-`networks/staging-1/` holds the pinned genesis and bootstrap peers — clone, build, point your node at them, and you're syncing and independently verifying the live chain, serving your own RPC and explorer. One screen of commands, no GPU, no stake: `networks/staging-1/README.md`. The genesis digest is the network's fingerprint; your node's `app_hash` at any height must equal what `rpc.hashkinetics.org` reports — same input, same hash, no trust required.
+`networks/testnet-1/` holds the pinned genesis and bootstrap peers — clone, build, point your node at them, and you're syncing and independently verifying the live chain, serving your own RPC and explorer. One screen of commands, no GPU, no stake: `networks/testnet-1/README.md` (minimum node version v0.13.0). The genesis digest is the network's fingerprint; your node's `app_hash` at any height must equal what `rpc.hashkinetics.org` reports — same input, same hash, no trust required.
 
 ## Run a validator
 
-The staging network recruits external validators now — one Linux box, **no GPU, no stake, no cost**. Your keys are generated on your machine and never leave it; your permanent identity is a stateless SLH-DSA root; exhaustion and downtime are liveness faults only, never fund-loss — proven the hard way: this network's val-0 ran its tree to zero, was revived by a root-signed cert carried through a peer (`issue-rotation` → `hk_submitRotation`), and rejoined with a fresh tree. The whole flow is in this repo.
+The testnet recruits external validators now — one Linux box, **no GPU, no stake, no cost**. Your keys are generated on your machine and never leave it; your permanent identity is a stateless SLH-DSA root; exhaustion and downtime are liveness faults only, never fund-loss — proven the hard way: this network's val-0 ran its tree to zero, was revived by a root-signed cert carried through a peer (`issue-rotation` → `hk_submitRotation`), and rejoined with a fresh tree. The whole flow is in this repo.
 
 Read `docs/VALIDATOR-ONBOARDING.md`, then mail **validators@hashkinetics.org** with your `validator.json`. The next genesis ceremony forms testnet-1 with external operators from day one.
 
@@ -131,11 +131,11 @@ Protocol papers (whitepaper + formal yellowpaper with the state transition, proo
 This section is load-bearing. If it ever disappears, assume the worst.
 
 - **Nothing is audited.** Scope is prepared (`docs/AUDIT-SCOPE.md`); the audit campaign is a gate before any mainnet.
-- **No 30-day public soak yet** — the staging net is young; the soak clock starts with external validators aboard.
+- **No 30-day public soak yet** — testnet-1 is a day old (staging-1 before it ran six days and 107k blocks); the soak clock starts with external validators aboard.
 - **Rotation hardening (R-series) is production-proven, not just built:** automatic threshold rotation has fired unattended across 45+ epochs; the peer-carried revival path has resurrected a fully-exhausted validator three times; certificates verify against the set as of their height, so syncing across rotation boundaries works (v0.10.7); catch-up verification is parallel (v0.10.8 — a joining machine measured 2→71 blocks/min, converging on a chain that adds ~27); since v0.10.9 syncing spends **zero** signing leaves — proven end-to-end when an independent observer re-verified the entire chain from genesis (~76,000 blocks, every vote and STARK) and reported the byte-identical state commitment with zero leaves spent; and since v0.10.10 a validator that falls behind **abstains instead of burning keys** (corroborated peer evidence gates all vote/proposal signing; gate receipt: a deliberately-wedged voter spent 2 leaves where the old behavior cost a fresh tree ~1,700, then rejoined byte-identical and voted at the first possible height) and the rotation threshold is checked on a **timer as well as on commits** — a parked node now rotates itself before exhaustion instead of after. Still open and ledgered: engine resume at store tip (deep restarts spend ~10 minutes rehydrating the decided-log before rejoining — measured and acceptable, but on the list).
 - All throughput numbers are **single-machine or single-datacenter**; WAN pacing is unmeasured until the soak.
 - Transparent (Lamport-signed) transactions are wire-heavy at scale — block-log segmentation and the WOTS account scheme are queued; the shielded path (2.7 KB/tx + one aggregate) is the product path.
-- The faucet is live but deliberately stingy: the staging genesis carries a ~$50 total transparent supply, so drips are cents and rate-limited. The production testnet (testnet-1) launches with a real faucet treasury in genesis. No fee market yet — rate limits are the anti-spam floor until it lands.
+- The faucet drips test units with no monetary value; the treasury was allocated in the testnet-1 genesis. Every transaction pays a flat 100-micro protocol fee (burned) — an anti-spam floor and a mechanism rehearsal, not a fee market.
 - Explorer and wallet are devnet-grade surfaces; in-circuit WOTS awaits its KAT campaign; agent-side proving assumes GPU-class hardware.
 
 What "LIVE" means above: demonstrated on a running chain with a receipt you can reproduce from this repo. Nothing here is a projection wearing a demo's clothes.

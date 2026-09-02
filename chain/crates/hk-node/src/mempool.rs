@@ -242,7 +242,7 @@ mod tests {
         let accounts = (1..=n)
             .map(|i| hk_state::GenesisAccount { id: acct(i), auth_commit: H256([i; 32]) })
             .collect();
-        hk_state::State::from_genesis(&hk_state::Genesis { time: 0, accounts, alloc: vec![] })
+        hk_state::State::from_genesis(&hk_state::Genesis { time: 0, accounts, alloc: vec![], fee: None })
             .expect("mini genesis")
     }
 

@@ -1,6 +1,6 @@
 # HashKinetics — Validator Onboarding (public testnet)
 
-**v0.10.x · P3.0c.** How an external operator joins a HashKinetics network: generate a key,
+**v0.11.2 · P3.0c.** Minimum node version to sync staging-1 is **v0.11.0** (v0.11.2 recommended for the search RPCs); build from a tag ≥ v0.11.0. How an external operator joins a HashKinetics network: generate a key,
 send one public JSON blob, receive genesis, start. Every consensus signature you will ever
 produce is hash-based (LMS/HSS over SHAKE-256 under a stateless SLH-DSA-192s root) — you are
 operating post-quantum BFT.
@@ -144,9 +144,18 @@ jq -s '.' collected/*.validator.json > validators.json
 python3 -c "import json,glob; print(json.dumps([json.load(open(f)) for f in sorted(glob.glob('collected/*.validator.json'))], indent=1))" > validators.json
 
 export HK_PROVER_URL=http://<prover-host>:9911             # ALWAYS pin a public testnet
-hk-node genesis-build validators.json genesis.json
+export HK_CHAIN_START_TIME=$(date +%s)
+# v0.13.0 (U4.b): the fee policy and the allocations are GENESIS facts —
+#   --fee-micro 100 --fee-from 1          flat envelope fee (burned) from the first block; 0 = none
+#   --alloc <AUTH0-hex>:<micro>           fund a self-custodied account (id derived from its nonce-0
+#                                         auth commitment; `hk-node account-info` prints it as "genesis auth")
+#   --demo-accounts [ORG-USD]             the five PUBLIC-seed demo accounts (demo money only)
+hk-node genesis-build validators.json genesis.json \
+  --fee-micro 100 --fee-from 1 --alloc <TREASURY-AUTH0>:1000000000000 --demo-accounts 50
 sha256sum genesis.json                                      # publish this digest + the file
 ```
+The full procedure, the rules behind each step, and the testnet-1 record live in
+`docs/CEREMONY-TESTNET-1.md`; `chain/rehearsal.sh` runs the whole ceremony locally first.
 Coordinator also runs: the seed node (stable public multiaddr), the hosted prover (vk
 endpoint + proving for demo traffic), and the public explorer. **G3 soak clock**: starts
 when ≥4 external validators hold ≥⅓ of voting power; 30 days incident-free.

@@ -131,11 +131,12 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
         }
         Some("genesis-build") => {
             // P3.0c coordinator-side: validators.json (array) → genesis.json.
+            // U4.b: fee policy + allocations are genesis facts (see cmd_genesis_build).
             let vals = args.get(2).cloned().ok_or_else(|| {
-                eyre::eyre!("usage: hk-node genesis-build <VALIDATORS.json> <OUT-genesis.json>  (env: HK_PROVER_URL to pin, HK_CHAIN_START_TIME)")
+                eyre::eyre!("usage: hk-node genesis-build <VALIDATORS.json> <OUT-genesis.json> [--fee-micro N] [--fee-from H] [--alloc AUTH0:MICRO ...] [--demo-accounts [ORG-USD]]  (env: HK_PROVER_URL to pin, HK_CHAIN_START_TIME)")
             })?;
             let out = args.get(3).cloned().unwrap_or_else(|| "genesis.json".into());
-            cmd_genesis_build(&vals, &out)
+            cmd_genesis_build(&vals, &out, &args[4.min(args.len())..])
         }
         Some("config-gen") => {
             // P3.0c operator-side: WAN-ready config.toml.
@@ -538,7 +539,21 @@ fn cmd_issue_rotation(home: &PathBuf, epoch: Option<u64>, valid_from: u64) -> ey
 /// Coordinator-side: assemble genesis from the collected validator.json blobs
 /// (a JSON array). Set HK_PROVER_URL to pin the proof system (public testnets
 /// must ALWAYS pin); HK_CHAIN_START_TIME overrides the deterministic clock epoch.
-fn cmd_genesis_build(validators_path: &str, out_path: &str) -> eyre::Result<()> {
+/// Coordinator-side genesis. U4.b (v0.13.0): the fee policy and the allocations are
+/// GENESIS facts — pinned in the bytes whose digest is the chain id — so a network
+/// launches with fees from block 1 and a funded faucet treasury, no coordinated
+/// activation roll, no operator environment to agree on.
+///
+///   --fee-micro N        envelope fee in micro-units (default 100; 0 = no fee)
+///   --fee-from H         first height charged (default 1)
+///   --alloc AUTH0:MICRO  fund a self-custodied account at genesis. AUTH0 is the
+///                        account's auth commitment at nonce 0 (`hk-node account-info`
+///                        prints it as "genesis auth"); the id is DERIVED from it
+///                        (squat-proof, exactly like `Tx::AccountCreate`). Repeatable.
+///   --demo-accounts [$]  include the five PUBLIC-seed demo accounts (org funded, default
+///                        $50) so the showreel/demos run against this network. They are
+///                        public by design — never fund them beyond demo money.
+fn cmd_genesis_build(validators_path: &str, out_path: &str, rest: &[String]) -> eyre::Result<()> {
     let raw = std::fs::read_to_string(validators_path)?;
     let validators: Vec<GenesisValidator> = serde_json::from_str(&raw)?;
     if validators.is_empty() {
@@ -548,22 +563,84 @@ fn cmd_genesis_build(validators_path: &str, out_path: &str) -> eyre::Result<()> 
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(CHAIN_START_TIME);
+
+    let (mut fee_micro, mut fee_from) = (100u128, 1u64);
+    let mut allocs: Vec<(hk_primitives::H256, hk_primitives::Amount)> = Vec::new();
+    let mut demo_org_usd: Option<u128> = None;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--fee-micro" => {
+                fee_micro = rest.get(i + 1).and_then(|s| s.parse().ok()).ok_or_else(|| eyre::eyre!("--fee-micro N"))?;
+                i += 2;
+            }
+            "--fee-from" => {
+                fee_from = rest.get(i + 1).and_then(|s| s.parse().ok()).ok_or_else(|| eyre::eyre!("--fee-from H"))?;
+                i += 2;
+            }
+            "--alloc" => {
+                let spec = rest.get(i + 1).ok_or_else(|| eyre::eyre!("--alloc AUTH0:MICRO"))?;
+                let (auth_hex, amt) = spec
+                    .split_once(':')
+                    .ok_or_else(|| eyre::eyre!("--alloc wants AUTH0-hex:AMOUNT-micro, got '{spec}'"))?;
+                let auth = account::parse_h256(auth_hex)?;
+                let amount: u128 = amt.parse().map_err(|_| eyre::eyre!("bad amount '{amt}'"))?;
+                allocs.push((auth, amount));
+                i += 2;
+            }
+            "--demo-accounts" => {
+                let usd = rest.get(i + 1).filter(|s| !s.starts_with("--")).and_then(|s| s.parse::<u128>().ok());
+                demo_org_usd = Some(usd.unwrap_or(50));
+                i += if usd.is_some() { 2 } else { 1 };
+            }
+            other => eyre::bail!("unknown flag {other}"),
+        }
+    }
+    if fee_from == 0 {
+        eyre::bail!("--fee-from must be ≥ 1 (heights start at 1)");
+    }
+
+    let mut chain = hk_state::Genesis { time: start_time, accounts: vec![], alloc: vec![], fee: None };
+    if let Some(org_usd) = demo_org_usd {
+        chain.accounts = demo::genesis_accounts();
+        chain.alloc = vec![(demo::account_id("org"), demo::usd(), org_usd * 1_000_000)];
+    }
+    for (auth0, amount) in &allocs {
+        let id = account::derived_id(auth0);
+        if chain.accounts.iter().any(|a| a.id == id) {
+            eyre::bail!("duplicate allocation for {}", hex::encode(id.0));
+        }
+        chain.accounts.push(hk_state::GenesisAccount { id, auth_commit: *auth0 });
+        chain.alloc.push((id, demo::usd(), *amount));
+    }
+    chain.fee = Some(hk_state::GenesisFee { micro: fee_micro, from_height: fee_from });
+
     let vk_pins = fetch_vk_pins();
     if vk_pins.is_none() {
         eprintln!("WARN: building an UNPINNED genesis — set HK_PROVER_URL; a public testnet must always pin");
     }
-    let genesis = HkGenesis {
-        chain_start_time: start_time,
-        validators,
-        chain: Some(demo::genesis(start_time)),
-        vk_pins,
+    let genesis = HkGenesis { chain_start_time: start_time, validators, chain: Some(chain), vk_pins };
+    let bytes = serde_json::to_string_pretty(&genesis)?;
+    std::fs::write(out_path, &bytes)?;
+    let digest = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(bytes.as_bytes()))
     };
-    std::fs::write(out_path, serde_json::to_string_pretty(&genesis)?)?;
     println!(
         "✓ genesis written to {out_path} — {} validators · chain_start_time {start_time} · vk pins: {}",
         genesis.validators.len(),
         if genesis.vk_pins.is_some() { "YES" } else { "NO (devnet only!)" }
     );
+    println!("  fee policy       : {fee_micro} micro per envelope from height {fee_from} (genesis-bound)");
+    let c = genesis.chain.as_ref().expect("set above");
+    for (id, _asset, amount) in &c.alloc {
+        println!("  allocation       : {} ← {amount} micro", hex::encode(id.0));
+    }
+    if demo_org_usd.is_some() {
+        println!("  demo accounts    : org/agent-a/agent-b/agent-c/merchant (PUBLIC seeds — demo money only)");
+    }
+    println!("  genesis digest   : {digest}");
+    println!("  chain id         : hashkinetics-1-{}", &digest[..8]);
     println!("  Distribute this EXACT file to every operator — byte-identical, or app hashes fork at height 1.");
     Ok(())
 }

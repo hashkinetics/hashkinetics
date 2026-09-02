@@ -13,10 +13,15 @@
 //!   send the chain's nonce is adopted if the local file drifted (restored
 //!   backups follow the chain, never the other way).
 //! - All network work runs on worker threads; the UI thread never blocks.
-//! - Transparent path only in v1 — shielded ops ride the public prover in a
-//!   later release; this version is the "join, get funded, pay" story.
+//! - U4: the wallet reads the chain's fee policy and refuses locally what the chain
+//!   would refuse (amount + fee > balance), so a ratchet index is never burned on a
+//!   doomed envelope. "max" = balance − fee.
+//! - U3v2 (`shielded.rs`): shield / unshield / stealth pay / scan / disclose over the
+//!   public prover — the same lib code the CLI wallet and the P2 demos proved.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod shielded;
 
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -183,12 +188,47 @@ fn faucet_post(body: Value) -> Result<Value, String> {
 // Worker → UI events
 // ---------------------------------------------------------------------------
 
+/// U4: the chain's fee policy as the wallet sees it (from `hk_chainInfo`).
+#[derive(Clone, Copy, Debug)]
+struct FeeInfo {
+    micro: Amount,
+    from_height: u64,
+    chain_height: u64,
+}
+
+impl FeeInfo {
+    /// The fee charged on a transaction sent NOW (0 before activation).
+    fn current(&self) -> Amount {
+        if self.micro > 0 && self.chain_height + 1 >= self.from_height { self.micro } else { 0 }
+    }
+}
+
 enum Evt {
     /// (line, color, optional explorer link rendered as "view ↗")
     Log(String, egui::Color32, Option<String>),
     Balance(Amount),
     OnChain(bool),
     Busy(bool),
+    /// (chain id, fee policy) — refreshed with the balance.
+    Chain(String, Option<FeeInfo>),
+    /// U3v2: every note the scanner found for this wallet (all epochs), spent status included.
+    Notes(Vec<shielded::NoteView>),
+    /// U3v2: our current-epoch stealth address.
+    StealthAddr(String),
+}
+
+/// `hk_chainInfo` → (chain id, fee policy). Fee fields are strings on the wire (u128).
+fn chain_info() -> Result<(String, Option<FeeInfo>), String> {
+    let v = rpc_call("hk_chainInfo", json!({}))?;
+    let r = v.get("result").ok_or("rpc: no result")?;
+    let chain_id = r.get("chain_id").and_then(|c| c.as_str()).unwrap_or("?").to_string();
+    let height = r.get("height").and_then(|h| h.as_u64()).unwrap_or(0);
+    let fee = r.get("fee").map(|f| FeeInfo {
+        micro: f.get("micro").and_then(|m| m.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0),
+        from_height: f.get("from_height").and_then(|h| h.as_u64()).unwrap_or(u64::MAX),
+        chain_height: height,
+    });
+    Ok((chain_id, fee))
 }
 
 fn log(tx: &Sender<Evt>, msg: impl Into<String>) {
@@ -210,6 +250,12 @@ fn log_tx(tx: &Sender<Evt>, msg: impl Into<String>, txid: &str) {
 fn spawn_refresh(tx: Sender<Evt>, id: H256) {
     std::thread::spawn(move || {
         let _ = tx.send(Evt::Busy(true));
+        match chain_info() {
+            Ok((cid, fee)) => {
+                let _ = tx.send(Evt::Chain(cid, fee));
+            }
+            Err(e) => log_err(&tx, e),
+        }
         match chain_nonce(&id) {
             Ok(Some(_)) => {
                 let _ = tx.send(Evt::OnChain(true));
@@ -275,85 +321,117 @@ fn spawn_faucet(tx: Sender<Evt>, seed: Vec<u8>, id: H256) {
 fn spawn_send(tx: Sender<Evt>, seed: Vec<u8>, id: H256, to: H256, amount: Amount) {
     std::thread::spawn(move || {
         let _ = tx.send(Evt::Busy(true));
-        // 1) The chain's nonce is the truth (restored backups follow the chain).
-        let nonce = match chain_nonce(&id) {
-            Ok(Some(n)) => n,
-            Ok(None) => {
-                log_err(&tx, "This wallet isn't on-chain yet — get test funds first.");
+        // 0) U4: the fee is charged on top of the amount, from the same balance. Refuse
+        //    locally with the exact number instead of burning a ratchet index on a tx
+        //    the chain will refuse ("a refusal never moves money", but it costs a leaf).
+        if let (Ok((_, Some(fee))), Ok(bal)) = (chain_info(), chain_balance(&id)) {
+            let f = fee.current();
+            if f > 0 && amount.saturating_add(f) > bal {
+                log_err(
+                    &tx,
+                    format!(
+                        "Not enough for amount + network fee ({}). Balance {} → max sendable {}.",
+                        fmt_amount(f),
+                        fmt_amount(bal),
+                        fmt_amount(bal.saturating_sub(f))
+                    ),
+                );
                 let _ = tx.send(Evt::Busy(false));
                 return;
             }
-            Err(e) => {
-                log_err(&tx, e);
-                let _ = tx.send(Evt::Busy(false));
-                return;
-            }
-        };
-        // 2) RESERVE-THEN-SIGN: persist nonce+1 before the network sees the tx.
-        let mut file = match load_account() {
-            Some(f) => f,
-            None => {
-                log_err(&tx, "account file vanished — restart the wallet");
-                let _ = tx.send(Evt::Busy(false));
-                return;
-            }
-        };
-        file.next_nonce = nonce + 1;
-        if let Err(e) = save_account(&file) {
-            log_err(&tx, format!("could not persist nonce (refusing to sign): {e}"));
-            let _ = tx.send(Evt::Busy(false));
-            return;
         }
-        let signed = sign_tx(&seed, id, nonce, Tx::Transfer { to, asset: USD, amount });
         log(&tx, format!("Sending {} to {}…", fmt_amount(amount), &hex::encode(to.0)[..12]));
-        // 3) Submit.
-        let rollback = |file: &mut AccountFile, tx: &Sender<Evt>| {
-            file.next_nonce = nonce;
-            if let Err(e) = save_account(file) {
-                log_err(tx, format!("rollback persist failed: {e}"));
-            }
-        };
-        let txid = match rpc_call("hk_submitTx", json!({ "tx": serde_json::to_value(&signed).unwrap() })) {
-            Ok(v) => match v.get("result").and_then(|r| r.get("txid")).and_then(|t| t.as_str()) {
-                Some(t) => t.to_string(),
-                None => {
-                    rollback(&mut file, &tx);
-                    log_err(&tx, format!("submit refused (nonce rolled back): {v}"));
-                    let _ = tx.send(Evt::Busy(false));
-                    return;
-                }
-            },
-            Err(e) => {
-                rollback(&mut file, &tx);
-                log_err(&tx, format!("submit failed (nonce rolled back): {e}"));
-                let _ = tx.send(Evt::Busy(false));
-                return;
-            }
-        };
-        // 4) Receipt.
-        for _ in 0..24 {
-            std::thread::sleep(Duration::from_millis(800));
-            if let Some(r) = chain_receipt(&txid) {
-                if r.starts_with("rejected") {
-                    rollback(&mut file, &tx);
-                    log_err(&tx, format!("Chain refused: {r} (nonce rolled back)"));
-                } else {
-                    log_tx(&tx, format!("Paid ✓  tx {}…  ({r})", &txid[..16.min(txid.len())]), &txid);
-                }
-                if let Ok(b) = chain_balance(&id) {
-                    let _ = tx.send(Evt::Balance(b));
-                }
-                let _ = tx.send(Evt::Busy(false));
-                return;
-            }
+        let _ = send_payload(&tx, &seed, id, Tx::Transfer { to, asset: USD, amount }, "Paid ✓");
+        if let Ok(b) = chain_balance(&id) {
+            let _ = tx.send(Evt::Balance(b));
         }
-        let _ = tx.send(Evt::Log(
-            format!("No receipt yet for {}… — nonce stays advanced.", &txid[..16.min(txid.len())]),
-            DIM,
-            Some(format!("{EXPLORER}#tx={txid}")),
-        ));
         let _ = tx.send(Evt::Busy(false));
     });
+}
+
+/// The one way this wallet puts a transaction on the chain — shared by the transparent
+/// send and every shielded operation (U3v2): chain-nonce sync → RESERVE-THEN-SIGN →
+/// submit → receipt, with the nonce rolled back (and persisted) only on a definitive
+/// refusal. Returns the txid of a committed-ok transaction; every failure is logged.
+pub(crate) fn send_payload(
+    tx: &Sender<Evt>,
+    seed: &[u8],
+    id: H256,
+    payload: Tx,
+    ok_label: &str,
+) -> Result<String, ()> {
+    // 1) The chain's nonce is the truth (restored backups follow the chain).
+    let nonce = match chain_nonce(&id) {
+        Ok(Some(n)) => n,
+        Ok(None) => {
+            log_err(tx, "This wallet isn't on-chain yet — get test funds first.");
+            return Err(());
+        }
+        Err(e) => {
+            log_err(tx, e);
+            return Err(());
+        }
+    };
+    // 2) RESERVE-THEN-SIGN: persist nonce+1 before the network sees the tx.
+    let mut file = match load_account() {
+        Some(f) => f,
+        None => {
+            log_err(tx, "account file vanished — restart the wallet");
+            return Err(());
+        }
+    };
+    file.next_nonce = nonce + 1;
+    if let Err(e) = save_account(&file) {
+        log_err(tx, format!("could not persist nonce (refusing to sign): {e}"));
+        return Err(());
+    }
+    let signed = sign_tx(seed, id, nonce, payload);
+    // 3) Submit.
+    let rollback = |file: &mut AccountFile, tx: &Sender<Evt>| {
+        file.next_nonce = nonce;
+        if let Err(e) = save_account(file) {
+            log_err(tx, format!("rollback persist failed: {e}"));
+        }
+    };
+    let txid = match rpc_call("hk_submitTx", json!({ "tx": serde_json::to_value(&signed).unwrap() })) {
+        Ok(v) => match v.get("result").and_then(|r| r.get("txid")).and_then(|t| t.as_str()) {
+            Some(t) => t.to_string(),
+            None => {
+                rollback(&mut file, tx);
+                log_err(tx, format!("submit refused (nonce rolled back): {v}"));
+                return Err(());
+            }
+        },
+        Err(e) => {
+            rollback(&mut file, tx);
+            log_err(tx, format!("submit failed (nonce rolled back): {e}"));
+            return Err(());
+        }
+    };
+    // 4) Receipt.
+    for _ in 0..24 {
+        std::thread::sleep(Duration::from_millis(800));
+        if let Some(r) = chain_receipt(&txid) {
+            if r.starts_with("rejected") {
+                rollback(&mut file, tx);
+                let why = if r.contains("protocol fee") {
+                    "the network fee could not be paid — keep a little transparent balance back for it".to_string()
+                } else {
+                    r.clone()
+                };
+                log_err(tx, format!("Chain refused: {why} (nonce rolled back)"));
+                return Err(());
+            }
+            log_tx(tx, format!("{ok_label}  tx {}…  ({r})", &txid[..16.min(txid.len())]), &txid);
+            return Ok(txid);
+        }
+    }
+    let _ = tx.send(Evt::Log(
+        format!("No receipt yet for {}… — nonce stays advanced.", &txid[..16.min(txid.len())]),
+        DIM,
+        Some(format!("{EXPLORER}#tx={txid}")),
+    ));
+    Err(())
 }
 
 // ---------------------------------------------------------------------------
@@ -364,10 +442,22 @@ struct App {
     account: Option<AccountFile>,
     balance: Option<Amount>,
     on_chain: Option<bool>,
+    /// U4: the chain id + fee policy the wallet is talking to (None until first refresh).
+    chain_id: Option<String>,
+    fee: Option<FeeInfo>,
     busy: bool,
     to_input: String,
     amount_input: String,
     restore_input: String,
+    // U3v2 — shielded
+    notes: Vec<shielded::NoteView>,
+    stealth_addr: Option<String>,
+    shield_amount: String,
+    unshield_amount: String,
+    pay_to: String,
+    pay_amount: String,
+    pay_memo: String,
+    prover_input: String,
     log_lines: Vec<(String, egui::Color32, Option<String>)>,
     evt_rx: Receiver<Evt>,
     evt_tx: Sender<Evt>,
@@ -388,10 +478,20 @@ impl App {
             account: load_account(),
             balance: None,
             on_chain: None,
+            chain_id: None,
+            fee: None,
             busy: false,
             to_input: String::new(),
             amount_input: String::new(),
             restore_input: String::new(),
+            notes: Vec::new(),
+            stealth_addr: None,
+            shield_amount: String::new(),
+            unshield_amount: String::new(),
+            pay_to: String::new(),
+            pay_amount: String::new(),
+            pay_memo: String::new(),
+            prover_input: shielded::PROVER_DEFAULT.to_string(),
             log_lines: Vec::new(),
             evt_rx,
             evt_tx,
@@ -477,6 +577,12 @@ impl eframe::App for App {
                 Evt::Balance(b) => self.balance = Some(b),
                 Evt::OnChain(b) => self.on_chain = Some(b),
                 Evt::Busy(b) => self.busy = b,
+                Evt::Chain(cid, fee) => {
+                    self.chain_id = Some(cid);
+                    self.fee = fee;
+                }
+                Evt::Notes(n) => self.notes = n,
+                Evt::StealthAddr(a) => self.stealth_addr = Some(a),
             }
         }
         // First frame: kick a refresh if a wallet exists.
@@ -493,7 +599,8 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("HASH").strong().size(20.0));
                 ui.label(egui::RichText::new("KINETICS").strong().size(20.0).color(CYAN));
-                ui.label(egui::RichText::new("  wallet · staging-1").size(12.0).color(DIM));
+                let net = self.chain_id.clone().unwrap_or_else(|| "connecting…".into());
+                ui.label(egui::RichText::new(format!("  wallet · {net}")).size(12.0).color(DIM));
             });
             ui.add_space(4.0);
             ui.separator();
@@ -549,6 +656,17 @@ impl eframe::App for App {
                         _ => "…".into(),
                     };
                     ui.label(egui::RichText::new(bal_txt).size(30.0).strong());
+                    // U4: say what a transaction costs BEFORE the user finds out.
+                    if let Some(fee) = self.fee {
+                        let line = if fee.current() > 0 {
+                            format!("network fee {} per transaction (burned)", fmt_amount(fee.micro))
+                        } else if fee.micro > 0 && fee.from_height != u64::MAX {
+                            format!("network fee {} per transaction from height {}", fmt_amount(fee.micro), fee.from_height)
+                        } else {
+                            "no network fee on this chain".to_string()
+                        };
+                        ui.label(egui::RichText::new(line).size(10.0).color(DIM));
+                    }
                     ui.add_space(8.0);
 
                     // Actions
@@ -586,11 +704,28 @@ impl eframe::App for App {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("Amount:").color(DIM).size(11.0));
                         ui.add(egui::TextEdit::singleline(&mut self.amount_input).desired_width(90.0));
-                        let preview = parse_amount(&self.amount_input).map(|m| format!("= {} micro", m));
+                        // U4: "Max" = balance minus the fee the chain will charge now.
+                        let fee_now = self.fee.map(|f| f.current()).unwrap_or(0);
+                        if let Some(b) = self.balance {
+                            if ui.small_button("max").on_hover_text("balance minus the network fee").clicked() {
+                                self.amount_input = fmt_amount(b.saturating_sub(fee_now));
+                            }
+                        }
+                        let preview = parse_amount(&self.amount_input).map(|m| {
+                            if fee_now > 0 { format!("= {m} micro + {fee_now} fee") } else { format!("= {m} micro") }
+                        });
                         if let Some(p) = preview.clone() {
                             ui.label(egui::RichText::new(p).color(DIM).size(10.0));
                         }
+                        let over = match (parse_amount(&self.amount_input), self.balance) {
+                            (Some(a), Some(b)) => a.saturating_add(fee_now) > b,
+                            _ => false,
+                        };
+                        if over {
+                            ui.label(egui::RichText::new("exceeds balance + fee").color(RED).size(10.0));
+                        }
                         let can_send = !self.busy
+                            && !over
                             && parse_amount(&self.amount_input).map(|a| a > 0).unwrap_or(false)
                             && parse_h256(&self.to_input).is_ok();
                         if ui.add_enabled(can_send, egui::Button::new(" Send ")).clicked() {
@@ -603,6 +738,124 @@ impl eframe::App for App {
                                 spawn_send(self.evt_tx.clone(), seed, id, to, amount);
                             }
                         }
+                    });
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    // ---- U3v2: SHIELDED ----------------------------------------------
+                    let shielded_total: Amount = self.notes.iter().filter(|n| !n.spent).map(|n| n.value).sum();
+                    let unspent_n = self.notes.iter().filter(|n| !n.spent).count();
+                    egui::CollapsingHeader::new(
+                        egui::RichText::new(format!("SHIELDED  ·  {} in {unspent_n} note(s)", fmt_amount(shielded_total))).size(11.0),
+                    )
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        let busy = self.busy;
+                        let ready = self.on_chain == Some(true) && !busy;
+                        ui.label(
+                            egui::RichText::new(
+                                "Post-quantum shielded pool: amounts and parties are hidden; proofs are made on the public prover \
+                                 (each one takes a while). The network fee is paid from your transparent balance.",
+                            )
+                            .color(DIM)
+                            .size(10.0),
+                        );
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(ready, egui::Button::new("↻ Scan pool")).clicked() {
+                                if let Some(id) = self.id_h256() {
+                                    shielded::spawn_scan(self.evt_tx.clone(), id);
+                                }
+                            }
+                            if let Some(a) = self.stealth_addr.clone() {
+                                if ui.small_button("copy my stealth address").clicked() {
+                                    ui.output_mut(|o| o.copied_text = a.clone());
+                                    self.push_log("Stealth address copied — hand it to whoever pays you.".into(), DIM);
+                                }
+                            }
+                        });
+                        if let Some(a) = &self.stealth_addr {
+                            ui.label(egui::RichText::new(format!("{}…{}", &a[..22.min(a.len())], &a[a.len().saturating_sub(10)..])).monospace().size(10.0).color(CYAN));
+                        }
+
+                        // Notes
+                        if !self.notes.is_empty() {
+                            ui.add_space(4.0);
+                            egui::ScrollArea::vertical().max_height(90.0).auto_shrink([false, true]).show(ui, |ui| {
+                                let mut disclose: Option<String> = None;
+                                for n in &self.notes {
+                                    ui.horizontal(|ui| {
+                                        let tag = if n.spent { "SPENT" } else { "LIVE " };
+                                        let col = if n.spent { DIM } else { CYAN };
+                                        ui.label(egui::RichText::new(format!("{tag} {}", fmt_amount(n.value))).monospace().size(10.0).color(col));
+                                        if !n.memo.is_empty() {
+                                            ui.label(egui::RichText::new(format!("“{}”", n.memo)).size(10.0).color(DIM));
+                                        }
+                                        ui.label(egui::RichText::new(format!("#{} {}…", n.leaf_index, &n.commitment[..8])).size(10.0).color(DIM));
+                                        if ui.add_enabled(!busy, egui::Button::new(egui::RichText::new("disclose").size(10.0))).on_hover_text("write a one-time disclosure package for this payment").clicked() {
+                                            disclose = Some(n.commitment.clone());
+                                        }
+                                    });
+                                }
+                                if let (Some(cm), Some(id)) = (disclose, self.id_h256()) {
+                                    shielded::spawn_disclose(self.evt_tx.clone(), id, cm);
+                                }
+                            });
+                        }
+
+                        ui.add_space(6.0);
+                        // Shield
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Shield").color(DIM).size(11.0));
+                            ui.add(egui::TextEdit::singleline(&mut self.shield_amount).desired_width(80.0).hint_text("amount"));
+                            let ok = ready && parse_amount(&self.shield_amount).map(|a| a > 0).unwrap_or(false);
+                            if ui.add_enabled(ok, egui::Button::new(" Shield → pool ")).clicked() {
+                                if let (Some(seed), Some(id), Some(a)) = (self.seed_bytes(), self.id_h256(), parse_amount(&self.shield_amount)) {
+                                    shielded::spawn_shield(self.evt_tx.clone(), seed, id, a, self.prover_input.trim().to_string());
+                                }
+                            }
+                        });
+                        // Unshield
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Unshield").color(DIM).size(11.0));
+                            ui.add(egui::TextEdit::singleline(&mut self.unshield_amount).desired_width(80.0).hint_text("amount"));
+                            let ok = ready && unspent_n > 0 && parse_amount(&self.unshield_amount).map(|a| a > 0).unwrap_or(false);
+                            if ui.add_enabled(ok, egui::Button::new(" Pool → me ")).clicked() {
+                                if let (Some(seed), Some(id), Some(a)) = (self.seed_bytes(), self.id_h256(), parse_amount(&self.unshield_amount)) {
+                                    shielded::spawn_unshield(self.evt_tx.clone(), seed, id, a, self.prover_input.trim().to_string());
+                                }
+                            }
+                        });
+                        // Pay
+                        ui.label(egui::RichText::new("Pay shielded to (hkaddr:…):").color(DIM).size(11.0));
+                        ui.add(egui::TextEdit::singleline(&mut self.pay_to).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY));
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::singleline(&mut self.pay_amount).desired_width(80.0).hint_text("amount"));
+                            ui.add(egui::TextEdit::singleline(&mut self.pay_memo).desired_width(140.0).hint_text("memo (optional)"));
+                            let ok = ready
+                                && unspent_n > 0
+                                && parse_amount(&self.pay_amount).map(|a| a > 0).unwrap_or(false)
+                                && shielded::addr_decode(&self.pay_to).is_ok();
+                            if ui.add_enabled(ok, egui::Button::new(" Pay shielded ")).clicked() {
+                                if let (Some(seed), Some(id), Some(a)) = (self.seed_bytes(), self.id_h256(), parse_amount(&self.pay_amount)) {
+                                    shielded::spawn_pay(self.evt_tx.clone(), seed, id, self.pay_to.trim().to_string(), a, self.pay_memo.clone(), self.prover_input.trim().to_string());
+                                }
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Prover:").color(DIM).size(10.0));
+                            ui.add(egui::TextEdit::singleline(&mut self.prover_input).desired_width(220.0).font(egui::TextStyle::Monospace));
+                        });
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "⚠ shield.json (next to account.json) holds the shielded keys + one-time counters — back it up too. {}",
+                                shielded::shield_path().display()
+                            ))
+                            .color(GOLD)
+                            .size(10.0),
+                        );
                     });
 
                     ui.add_space(10.0);

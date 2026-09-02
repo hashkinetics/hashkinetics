@@ -161,6 +161,13 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
                     "from_height": chain.fee_from,
                     "burned_micro": chain.fees_burned.to_string(),
                 },
+                // R10 v2: what this node serves to syncing peers from disk (gap-free
+                // suffix floor; null until the first block lands) + its RAM window.
+                "history": {
+                    "disk_from": h.store.as_ref().map(|s| s.disk_min()).filter(|m| *m > 0),
+                    "ram_window": crate::state::decided_window(),
+                    "indexed_txs": h.tx_index.lock().unwrap_or_else(|e| e.into_inner()).len(),
+                },
             }})
         }
         // R2: accept a root-signed RotationCert on behalf of ANOTHER validator (an
@@ -388,16 +395,23 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
                     .min(100) as usize;
                 let ai = h.acct_index.lock().unwrap_or_else(|e| e.into_inner());
                 let (total, txs): (usize, Vec<Value>) = match ai.get(&id) {
-                    Some(v) => (
-                        v.len(),
-                        v.iter()
-                            .rev()
-                            .take(limit)
-                            .map(|(t, ht, kind)| {
-                                json!({"txid": hex::encode(t), "height": ht, "kind": kind})
-                            })
-                            .collect(),
-                    ),
+                    Some(v) => {
+                        // R10 v2: the background history pass appends OLD heights
+                        // after live commits already landed — order by height, not
+                        // by insertion, so "newest first" stays true mid-pass.
+                        let mut sorted: Vec<&([u8; 32], u64, &'static str)> = v.iter().collect();
+                        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                        (
+                            v.len(),
+                            sorted
+                                .into_iter()
+                                .take(limit)
+                                .map(|(t, ht, kind)| {
+                                    json!({"txid": hex::encode(t), "height": ht, "kind": kind})
+                                })
+                                .collect(),
+                        )
+                    }
                     None => (0, Vec::new()),
                 };
                 json!({"result": {"id": hex::encode(id.0), "total": total, "txs": txs}})
@@ -500,13 +514,21 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(20)
                 .min(50) as usize;
-            let heights = match store.block_heights() {
-                Ok(hs) => hs,
-                Err(e) => return json!({"error": format!("block list failed: {e}")}),
+            // R10 v2: walk DOWN from the chain tip over the gap-free disk suffix —
+            // no per-call directory listing (that was a 100k-entry scan on every
+            // explorer poll). `earliest` is the suffix floor restore measured.
+            let latest = h.chain.lock().unwrap_or_else(|e| e.into_inner()).height;
+            let earliest = store.disk_min();
+            let (earliest_v, latest_v) = if earliest == 0 || earliest > latest {
+                (Value::Null, Value::Null)
+            } else {
+                (json!(earliest), json!(latest))
             };
             let mut blocks = Vec::with_capacity(limit);
-            for hgt in heights.iter().rev().filter(|hh| **hh < before).take(limit) {
-                if let Ok(Some(sb)) = store.load_block(*hgt) {
+            let mut hgt = before.saturating_sub(1).min(latest);
+            let floor = earliest.max(1);
+            while blocks.len() < limit && earliest != 0 && hgt >= floor {
+                if let Ok(Some(sb)) = store.load_block(hgt) {
                     let batch = Batch::decode(&sb.value_bytes);
                     blocks.push(json!({
                         "height": sb.height,
@@ -517,8 +539,12 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
                         "value_id": hex::encode(&sb.certificate.value_id.as_bytes()[..8]),
                     }));
                 }
+                if hgt == 0 {
+                    break;
+                }
+                hgt -= 1;
             }
-            json!({"result": {"blocks": blocks, "earliest": heights.first(), "latest": heights.last()}})
+            json!({"result": {"blocks": blocks, "earliest": earliest_v, "latest": latest_v}})
         }
 
         other => json!({"error": format!("unknown method: {other}")}),

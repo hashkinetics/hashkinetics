@@ -16,6 +16,7 @@ use tracing::{error, info, warn};
 
 use malachitebft_app_channel::app::streaming::{StreamContent, StreamId, StreamMessage};
 use malachitebft_app_channel::app::types::core::{CommitCertificate, Round, Validity, VoteExtensions};
+use malachitebft_app_channel::app::types::sync::RawDecidedValue;
 use malachitebft_app_channel::app::types::{LocallyProposedValue, PeerId, ProposedValue};
 use malachitebft_core_types::Height as _;
 
@@ -156,6 +157,37 @@ pub struct DecidedEntry {
     pub certificate: CommitCertificate<HkContext>,
 }
 
+/// R10 v2: how many decided heights stay in RAM as a serving cache (`HK_DECIDED_WINDOW`,
+/// default [`DECIDED_WINDOW_DEFAULT`], 0 = unbounded). Everything older is served to
+/// syncing peers straight from the on-disk block log. Read once per process.
+pub const DECIDED_WINDOW_DEFAULT: u64 = 512;
+pub fn decided_window() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("HK_DECIDED_WINDOW")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(DECIDED_WINDOW_DEFAULT)
+    })
+}
+
+/// R10 v2: the lowest height of the longest CONTIGUOUS run of block files that ends at
+/// the highest one on disk (`None` for an empty log). A syncing peer walks heights one
+/// by one, so only a gap-free suffix is honestly advertisable as servable history —
+/// a node revived by thin teleport (val-0: files from 49,929) must not claim block 1.
+pub fn contiguous_suffix_min(heights_ascending: &[u64]) -> Option<u64> {
+    let mut it = heights_ascending.iter().rev();
+    let mut min = *it.next()?;
+    for h in it {
+        if *h + 1 == min {
+            min = *h;
+        } else {
+            break;
+        }
+    }
+    Some(min)
+}
+
 /// U4: the flat protocol fee activates at this height on staging-1 (a rolling fleet
 /// upgrade must complete BEFORE any fee is charged — behavior is byte-identical to
 /// v0.11 until then). Override per-network/devnet with `HK_FEE_FROM`; fee size with
@@ -163,11 +195,11 @@ pub struct DecidedEntry {
 /// against the VOTER tips (never the RPC edge — the gateway can lag its own voters);
 /// this default is deliberately a placeholder that must be overridden via HK_FEE_FROM
 /// during the coordinated roll.
-/// ⚠ v0.12 HISTORY: v0.12.0/0.12.1 shipped R10 (bounded decided window + disk-served
-/// value-sync) alongside U4/R9 and it BROKE restore on the staging nodes (their block
-/// logs are sparse — only block #1 on disk — so R10's start_height began the engine
-/// at height 0). v0.12.2 ships U4 + R9 WITHOUT R10; R10 is being redesigned to respect
-/// nodes that value-sync from peers rather than replay a full local block log.
+/// ⚠ v0.12 HISTORY: v0.12.0/0.12.1 shipped a first R10 (bounded decided window +
+/// disk-served value-sync) alongside U4/R9 and it BROKE restore on a live validator
+/// (engine started at height 0). v0.12.2 shipped U4 + R9 without it. v0.13.0 ships
+/// R10 v2: the engine's start height comes from the CHAIN (snapshot + replay), never
+/// from the shape of the block log; disk serves whatever contiguous suffix it holds.
 pub const FEE_ACTIVATION_HEIGHT: u64 = 110_000;
 pub const FEE_MICRO_DEFAULT: u128 = 100;
 
@@ -204,7 +236,15 @@ pub struct HkApp {
 
     streams: PartStreamsMap,
     undecided: BTreeMap<(u64, i64), Vec<ProposedValue<HkContext>>>,
+    /// R10 v2: a bounded RAM cache of the newest decided heights (`decided_window()`
+    /// entries; 0 = unbounded). Value-sync requests below the window are served from
+    /// the block log on disk. Restore no longer rehydrates history into this map —
+    /// that rehydrate was 5.4 GB per node at 104k heights (2026-09-02 census).
     pub decided: BTreeMap<u64, DecidedEntry>,
+    /// R10 v2: lowest height of the gap-free block-file suffix that reaches the tip
+    /// (0 = no disk history yet). Restore measures it; a failed block write moves it
+    /// past the hole. `earliest_height()` advertises min(RAM window, this) to peers.
+    history_min: u64,
     /// R9: when we last issued a rotation cert (either path). Not persisted — a
     /// restart deliberately clears it, so a wedged guard re-arms on the next trigger.
     last_issue_time: Option<std::time::Instant>,
@@ -275,16 +315,28 @@ impl HkApp {
         }
         let mut chain = hk_state::State::from_genesis(&genesis.chain_genesis())
             .map_err(|e| eyre!("chain genesis: {e}"))?;
-        // U4: inject the fee policy (config, never snapshotted — same posture as the
-        // verifier). Identical fleet-wide by default; devnets override via env.
-        chain.fee_micro = std::env::var("HK_FEE_MICRO")
-            .ok()
-            .and_then(|s| s.parse::<u128>().ok())
-            .unwrap_or(FEE_MICRO_DEFAULT);
-        chain.fee_from = std::env::var("HK_FEE_FROM")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(FEE_ACTIVATION_HEIGHT);
+        // U4: the fee policy. U4.b: a genesis that pins one is AUTHORITATIVE (from_genesis
+        // already applied it; env overrides are refused loudly — a node must not be able
+        // to talk itself onto a fork). Otherwise it is config, never snapshotted — same
+        // posture as the verifier: identical fleet-wide by default, devnets override via env.
+        let env_micro = std::env::var("HK_FEE_MICRO").ok().and_then(|s| s.parse::<u128>().ok());
+        let env_from = std::env::var("HK_FEE_FROM").ok().and_then(|s| s.parse::<u64>().ok());
+        match genesis.fee() {
+            Some(f) => {
+                if env_micro.is_some() || env_from.is_some() {
+                    warn!(
+                        genesis_micro = %f.micro,
+                        genesis_from = f.from_height,
+                        "HK_FEE_MICRO/HK_FEE_FROM ignored — the fee policy is bound to this genesis"
+                    );
+                }
+                info!(micro = %f.micro, from_height = f.from_height, "fee policy is genesis-bound (U4.b)");
+            }
+            None => {
+                chain.fee_micro = env_micro.unwrap_or(FEE_MICRO_DEFAULT);
+                chain.fee_from = env_from.unwrap_or(FEE_ACTIVATION_HEIGHT);
+            }
+        }
         // WS2: inject the real STARK verifier. None ⇒ hk-state's RejectAll default stays —
         // this node refuses shielded traffic rather than trusting anything.
         let agg = verifiers.as_ref().map(|v| (v.agg.clone(), v.spend_vk_hash, v.mint_vk_hash));
@@ -316,6 +368,7 @@ impl HkApp {
             streams: PartStreamsMap::new(),
             undecided: BTreeMap::new(),
             decided: BTreeMap::new(),
+            history_min: 0,
             last_issue_time: None,
             master_seed,
             root,
@@ -377,24 +430,7 @@ impl HkApp {
     /// Idempotent per txid (replay/rehydrate both call it — reinserts are skipped),
     /// so an account's history never double-counts.
     fn index_txs(&self, height: u64, txs: &[SignedTx]) {
-        if txs.is_empty() {
-            return;
-        }
-        let mut ti = self.tx_index.lock().unwrap_or_else(|e| e.into_inner());
-        let mut ai = self.acct_index.lock().unwrap_or_else(|e| e.into_inner());
-        for (i, tx) in txs.iter().enumerate() {
-            let id = txid(tx);
-            if ti.insert(id, (height, i as u32)).is_some() {
-                continue;
-            }
-            let kind = tx_kind(&tx.payload);
-            ai.entry(tx.sender).or_default().push((id, height, kind));
-            if let Some(cp) = tx_counterparty(&tx.payload) {
-                if cp != tx.sender {
-                    ai.entry(cp).or_default().push((id, height, kind));
-                }
-            }
-        }
+        index_txs_into(&self.tx_index, &self.acct_index, height, txs);
     }
 
     /// Owned snapshot of the current validator set (engine replies + RPC share it).
@@ -506,20 +542,56 @@ impl HkApp {
         });
     }
 
+    /// R10 v2: the engine resumes at the CHAIN's next height — snapshot + replay decide
+    /// it, never the block log's shape. (v0.12.0 derived this from disk and a validator
+    /// restarted at height 0.) Genesis: chain height 0 → INITIAL.
     pub fn start_height(&self) -> HkHeight {
-        self.decided
-            .keys()
-            .next_back()
-            .map(|h| HkHeight::new(h + 1))
-            .unwrap_or(HkHeight::INITIAL)
+        HkHeight::new(self.chain.lock().unwrap_or_else(|e| e.into_inner()).height + 1)
     }
 
+    /// R10 v2: the lowest height this node can serve to a syncing peer WITHOUT a gap up
+    /// to its tip — the RAM window and the disk suffix both end at the tip, so the
+    /// answer is the lower of their starts. Advertised in sync Status; an honest floor
+    /// keeps peers from asking us for heights we'd answer with nothing.
     pub fn earliest_height(&self) -> HkHeight {
-        self.decided
-            .keys()
-            .next()
-            .map(|h| HkHeight::new(*h))
-            .unwrap_or(HkHeight::INITIAL)
+        let ram_min = self.decided.keys().next().copied();
+        let disk_min = (self.history_min > 0).then_some(self.history_min);
+        match (ram_min, disk_min) {
+            (Some(a), Some(b)) => HkHeight::new(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => HkHeight::new(a),
+            (None, None) => HkHeight::INITIAL,
+        }
+    }
+
+    /// R10 v2: a decided value for value-sync — RAM window first, then the block log.
+    /// A disk block is re-checked against its certificate before it is served (the
+    /// value id is the content hash), so a corrupt file is refused, never propagated.
+    pub fn decided_value(&self, height: u64) -> Option<RawDecidedValue<HkContext>> {
+        use malachitebft_codec::Codec as _;
+        if let Some(entry) = self.decided.get(&height) {
+            return Some(RawDecidedValue {
+                certificate: entry.certificate.clone(),
+                value_bytes: crate::codec::HkCodec.encode(&entry.value).unwrap_or_default(),
+            });
+        }
+        let store = self.store.as_ref()?;
+        let sb = match store.load_block(height) {
+            Ok(Some(sb)) => sb,
+            Ok(None) => return None,
+            Err(e) => {
+                error!(%e, height, "block file unreadable — not serving it");
+                return None;
+            }
+        };
+        let value = HkValue::new(Bytes::from(sb.value_bytes));
+        if certificate_value_mismatch(&sb.certificate, &value) {
+            error!(height, "block file certificate != content hash — refusing to serve corrupt history");
+            return None;
+        }
+        Some(RawDecidedValue {
+            certificate: sb.certificate.into(),
+            value_bytes: crate::codec::HkCodec.encode(&value).unwrap_or_default(),
+        })
     }
 
     // ---- proposing ----
@@ -1062,6 +1134,14 @@ impl HkApp {
         let value_bytes = value.txs.to_vec();
 
         self.decided.insert(height, DecidedEntry { value, certificate });
+        // R10 v2: keep only the newest `decided_window()` heights in RAM — older ones
+        // are on disk (persisted below, BEFORE any peer can ask for them by tip).
+        let window = decided_window();
+        if window > 0 {
+            while self.decided.len() as u64 > window {
+                self.decided.pop_first();
+            }
+        }
         self.undecided.retain(|(h, _), _| *h > height);
         self.current_height = HkHeight::new(height + 1);
 
@@ -1145,10 +1225,21 @@ impl HkApp {
         // simply replays less / value-syncs the gap).
         if let Some(store) = self.store.clone() {
             let t_save = std::time::Instant::now();
-            if let Err(e) =
-                store.save_block(&StoredBlock { height, value_bytes, certificate: cert_dto, agg_valid })
+            match store.save_block(&StoredBlock { height, value_bytes, certificate: cert_dto, agg_valid })
             {
-                error!(%e, height, "failed to persist block — restart will value-sync this height");
+                Ok(()) => {
+                    if self.history_min == 0 {
+                        self.history_min = height;
+                        store.set_disk_min(height);
+                    }
+                }
+                Err(e) => {
+                    error!(%e, height, "failed to persist block — restart will value-sync this height");
+                    // R10 v2: the disk suffix now starts past this hole; the RAM window
+                    // still covers it for `decided_window()` heights.
+                    self.history_min = height + 1;
+                    store.set_disk_min(height + 1);
+                }
             }
             self.timers.save_ms += t_save.elapsed().as_millis() as u64;
             // HK-R5.2: cadence is env-tunable (`HK_SNAPSHOT_EVERY`) — the full-image
@@ -1208,10 +1299,15 @@ impl HkApp {
 
     /// Resume from disk: snapshot (verified against its recorded C(Σ) —
     /// refuse-on-mismatch, the vk-pin posture) → replay newer block files through the
-    /// SAME apply path → rehydrate the decided log (value-sync serves history again)
-    /// → reload WAL'd mempool admissions. Call AFTER construction (verifier already
-    /// injected), BEFORE the engine asks `start_height()`.
-    pub fn restore_from_store(&mut self, store: &NodeStore) -> Result<()> {
+    /// SAME apply path → reload WAL'd mempool admissions. Call AFTER construction
+    /// (verifier already injected), BEFORE the engine asks `start_height()`.
+    ///
+    /// R10 v2: history at-or-below the snapshot is NOT rehydrated into RAM any more —
+    /// value-sync serves it from the block log (`decided_value`), and the v0.11.2
+    /// search indexes over it are rebuilt by a background pass that never blocks the
+    /// engine (a validator votes seconds after restart; search fills in behind it).
+    /// The engine's start height is the chain's, whatever the block log looks like.
+    pub fn restore_from_store(&mut self, store: &Arc<NodeStore>) -> Result<()> {
         if let Some(snap) = store.load_snapshot()? {
             // Config survives the image swap (a snapshot must not smuggle in policy):
             // the verifier AND the U4 fee parameters are re-injected from the running
@@ -1273,10 +1369,22 @@ impl HkApp {
             );
         }
 
-        // Block files: rehydrate history at-or-below the snapshot (value-sync serves
-        // it again); REPLAY anything beyond it through the normal apply path.
-        let (mut replayed, mut rehydrated) = (0u64, 0u64);
-        for h in store.block_heights()? {
+        // Block files: one directory listing. REPLAY the gap-free run just beyond the
+        // snapshot through the normal apply path (those few blocks also seed the RAM
+        // window); everything at-or-below the snapshot stays on disk.
+        let heights = store.block_heights()?;
+        let snap_height = self.chain.lock().unwrap().height;
+        let mut replayed = 0u64;
+        for &h in heights.iter().filter(|h| **h > snap_height) {
+            let chain_height = self.chain.lock().unwrap().height;
+            if h != chain_height + 1 {
+                error!(
+                    height = h,
+                    chain_height,
+                    "gap in the block log — stopping replay here; value-sync fills the rest"
+                );
+                break;
+            }
             let Some(sb) = store.load_block(h)? else { continue };
             let value = HkValue::new(Bytes::from(sb.value_bytes));
             if certificate_value_mismatch(&sb.certificate, &value) {
@@ -1285,30 +1393,74 @@ impl HkApp {
                 ));
             }
             let certificate: CommitCertificate<HkContext> = sb.certificate.into();
-            let chain_height = self.chain.lock().unwrap().height;
-            if h > chain_height {
-                if h != chain_height + 1 {
-                    error!(
-                        height = h,
-                        chain_height,
-                        "gap in the block log — stopping replay here; value-sync fills the rest"
-                    );
-                    break;
-                }
-                let batch = Batch::decode(&value.txs);
-                self.apply_batch_to_chain(h, &batch, false, sb.agg_valid)?;
-                self.apply_rotations(h, &batch, true);
-                replayed += 1;
-            } else {
-                // v0.11.2: rehydrated blocks skip the apply path — index them here so
-                // search covers the FULL history after a restart.
-                if let Some(b) = Batch::decode(&value.txs) {
-                    self.index_txs(h, &b.txs);
-                }
-                rehydrated += 1;
-            }
+            let batch = Batch::decode(&value.txs);
+            self.apply_batch_to_chain(h, &batch, false, sb.agg_valid)?;
+            self.apply_rotations(h, &batch, true);
             self.decided.insert(h, DecidedEntry { value, certificate });
-            self.current_height = HkHeight::new(h + 1);
+            replayed += 1;
+        }
+        let tip = self.chain.lock().unwrap().height;
+        self.current_height = HkHeight::new(tip + 1);
+
+        // R10 v2: what can this disk serve without a gap up to the tip? Only a suffix
+        // that actually reaches the tip counts (a snapshot written AHEAD of the block
+        // tail — the 08-30 transplant artifact — leaves nothing servable until the
+        // next commit lands on disk).
+        let disk_tip = heights.last().copied().unwrap_or(0);
+        self.history_min = match contiguous_suffix_min(&heights) {
+            Some(min) if disk_tip == tip => min,
+            _ => tip + 1,
+        };
+        store.set_disk_min(self.history_min);
+        let files_below = heights.iter().filter(|h| **h <= snap_height).count();
+        info!(
+            tip,
+            disk_files = heights.len(),
+            servable_from = self.history_min,
+            ram_window = decided_window(),
+            "R10 v2: history stays on disk (no rehydrate) — serving value-sync from the block log"
+        );
+
+        // v0.11.2 search indexes over the on-disk history, rebuilt in the BACKGROUND:
+        // decode → index → drop, one file at a time, oldest first. Replayed and live
+        // blocks index themselves on the apply path; `index_txs_into` is idempotent per
+        // txid, so the two never double-count. `HK_INDEX_HISTORY=0` skips it (a voter
+        // that serves no explorer). RSS stays O(window), not O(height).
+        let index_history = std::env::var("HK_INDEX_HISTORY").map(|v| v != "0").unwrap_or(true);
+        if index_history && files_below > 0 {
+            let store = store.clone();
+            let ti = self.tx_index.clone();
+            let ai = self.acct_index.clone();
+            let todo: Vec<u64> = heights.iter().copied().filter(|h| *h <= snap_height).collect();
+            let _detached = std::thread::Builder::new()
+                .name("hk-index-history".into())
+                .spawn(move || {
+                    let t0 = std::time::Instant::now();
+                    let (mut done, mut txs_seen) = (0u64, 0u64);
+                    for h in todo {
+                        match store.load_block(h) {
+                            Ok(Some(sb)) => {
+                                if let Some(b) = Batch::decode(&sb.value_bytes) {
+                                    txs_seen += b.txs.len() as u64;
+                                    index_txs_into(&ti, &ai, h, &b.txs);
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => warn!(%e, height = h, "index pass: unreadable block file (skipped)"),
+                        }
+                        done += 1;
+                        if done % 20_000 == 0 {
+                            info!(done, txs_seen, "index pass: progress");
+                        }
+                    }
+                    info!(
+                        blocks = done,
+                        txs = txs_seen,
+                        secs = t0.elapsed().as_secs(),
+                        "index pass COMPLETE — search covers the full on-disk history"
+                    );
+                })
+                .map_err(|e| eyre!("spawning index pass: {e}"))?;
         }
 
         // Mempool WAL: admissions since the last snapshot, re-run through the SAME
@@ -1325,13 +1477,12 @@ impl HkApp {
             }
         }
 
-        let tip = self.chain.lock().unwrap().height;
-        if tip > 0 || replayed > 0 || rehydrated > 0 {
+        if tip > 0 || replayed > 0 {
             let app_hash = self.chain.lock().unwrap().state_commitment();
             info!(
                 tip,
                 replayed,
-                rehydrated,
+                on_disk_below_snapshot = files_below,
                 mempool_restored = wal_restored,
                 app_hash = %hex::encode(&app_hash.0[..8]),
                 "PERSISTENCE RESTORE COMPLETE — resuming, not resyncing"
@@ -1347,6 +1498,56 @@ impl HkApp {
 /// content hash, so this pins the block file to what consensus signed).
 fn certificate_value_mismatch(cert: &crate::codec::RawCommitCertificate, value: &HkValue) -> bool {
     cert.value_id != value.id()
+}
+
+/// v0.11.2 search indexes, shared by the live apply path and the R10 v2 background
+/// history pass. Idempotent per txid (a reinsert is skipped), so the two can overlap
+/// on a height without an account's history double-counting. Locks are held per
+/// block only — the RPC reads between blocks.
+#[allow(clippy::type_complexity)]
+fn index_txs_into(
+    tx_index: &Mutex<std::collections::HashMap<[u8; 32], (u64, u32)>>,
+    acct_index: &Mutex<
+        std::collections::HashMap<hk_primitives::AccountId, Vec<([u8; 32], u64, &'static str)>>,
+    >,
+    height: u64,
+    txs: &[SignedTx],
+) {
+    if txs.is_empty() {
+        return;
+    }
+    let mut ti = tx_index.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ai = acct_index.lock().unwrap_or_else(|e| e.into_inner());
+    for (i, tx) in txs.iter().enumerate() {
+        let id = txid(tx);
+        if ti.insert(id, (height, i as u32)).is_some() {
+            continue;
+        }
+        let kind = tx_kind(&tx.payload);
+        ai.entry(tx.sender).or_default().push((id, height, kind));
+        if let Some(cp) = tx_counterparty(&tx.payload) {
+            if cp != tx.sender {
+                ai.entry(cp).or_default().push((id, height, kind));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod r10_history_tests {
+    use super::contiguous_suffix_min;
+
+    #[test]
+    fn suffix_min_follows_the_gap_free_tail_only() {
+        assert_eq!(contiguous_suffix_min(&[]), None, "empty log serves nothing");
+        assert_eq!(contiguous_suffix_min(&[1]), Some(1));
+        assert_eq!(contiguous_suffix_min(&[1, 2, 3, 4]), Some(1), "full log serves from 1");
+        // val-0's shape after the thin teleport: block 1 alone, then a suffix.
+        assert_eq!(contiguous_suffix_min(&[1, 49_929, 49_930, 49_931]), Some(49_929));
+        // A hole inside the tail: only what is above the hole is servable.
+        assert_eq!(contiguous_suffix_min(&[10, 11, 13, 14]), Some(13));
+        assert_eq!(contiguous_suffix_min(&[7, 9]), Some(9));
+    }
 }
 
 /// R1: should this validator issue a rotation cert at this commit?

@@ -55,7 +55,7 @@ pub fn alloc() -> Vec<(H256, H256, Amount)> {
 
 /// Complete demo genesis (embedded in the devnet by `hk-node testnet`).
 pub fn genesis(time: u64) -> Genesis {
-    Genesis { time, accounts: genesis_accounts(), alloc: alloc() }
+    Genesis { time, accounts: genesis_accounts(), alloc: alloc(), fee: None }
 }
 
 // ---------------------------------------------------------------------------

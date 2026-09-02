@@ -1,21 +1,12 @@
-# HashKinetics staging network — RETIRED 2026-09-02 (archived)
+# HashKinetics testnet-1 — join as a full node
 
-> **staging-1 (`hashkinetics-1-557f2ea6`) ran 2026-08-27 → 2026-09-02 and stopped at
-> height 107,182** (validators 107,176–107,182 at the stop). It was replaced by
-> **testnet-1** — fresh genesis, protocol fee from block 1, faucet treasury at genesis —
-> see [`../testnet-1/`](../testnet-1/README.md). This kit stays as the record: the genesis
-> below is still the one every archived block chains back to, and the full block log
-> (snapshot + 107k blocks) is retained by the operators so THE RECEIPT (independent
-> byte-for-byte re-verification, 2026-08-31) remains reproducible on request.
-> The join instructions below no longer connect to a live network.
+> **Minimum node version: v0.13.0.** testnet-1 launched 2026-09-02 from a fresh
+> genesis with the protocol fee (100 micro per envelope, burned) **bound in the genesis
+> from height 1** and the faucet treasury allocated at genesis — no activation heights,
+> no coordinated rolls. Build from a tag ≥ v0.13.0. (Its predecessor, `staging-1`, ran
+> 2026-08-27 → 2026-09-02, stopped at height 107,182 and is archived — see `../staging-1/`.)
 
-> **⚠ Minimum node version: v0.12.2 from height 110,000.** The flat protocol fee
-> activates at height 110,000 — nodes below v0.12.2 compute different balances from
-> that height and will refuse on app_hash divergence. Also inherited: the account-
-> creation wire addition (v0.11.0) means pre-v0.11 nodes cannot decode recent history.
-> Build from a tag ≥ v0.12.2.
-
-The public staging testnet (the chain behind [hashkinetics.org/explorer](https://www.hashkinetics.org/explorer)
+The public testnet (the chain behind [hashkinetics.org/explorer](https://www.hashkinetics.org/explorer)
 and `https://rpc.hashkinetics.org`). Four founder-operated validators run it; anyone
 can run a **full node** that syncs it, verifies every block, and serves its own RPC
 and explorer. Validator seats are ceremony-fixed until testnet-1 (see
@@ -38,12 +29,12 @@ cd hashkinetics/chain && cargo build --release
 ./target/release/hk-node keygen ~/hk-staging my-observer
 
 # the network artifacts (this directory):
-cp ../networks/staging-1/genesis.json ~/hk-staging/genesis.json
+cp ../networks/testnet-1/genesis.json ~/hk-staging/genesis.json
 
 # config with the published bootstrap peers:
 ./target/release/hk-node config-gen ~/hk-staging \
   --listen /ip4/0.0.0.0/tcp/27000 \
-  --peers $(paste -sd, ../networks/staging-1/PEERS.txt)
+  --peers $(paste -sd, ../networks/testnet-1/PEERS.txt)
 
 HK_PROVER_URL=https://prover.hashkinetics.org ./target/release/hk-node start ~/hk-staging
 ```
@@ -64,7 +55,7 @@ window into the chain, served from your own verification.
 The genesis fingerprint (SHA-256 of `genesis.json` in this directory):
 
 ```
-557f2ea6c55713ae1a820043baf3900707101e6fceaccc34b05e44f1a5f62a22
+4e4ea68d48cba1ad4cc7155c19e7768f1fa2cbc99ba0f2b47c58948ec9e971c7
 ```
 
 Check it (`sha256sum genesis.json`) before starting your node. Then, running:
@@ -82,7 +73,7 @@ The `chain_id` and `app_hash` at any height must match what
   set: you sync and verify, you don't vote. No stake, no cost, no GPU.
 - Bootstrap peers are DNS-based (`PEERS.txt`) — IPs may change; the names won't.
 - The chain id is bound to genesis: a node reports `hashkinetics-1-<first 8 hex of
-  the genesis digest>` — for this network, `hashkinetics-1-557f2ea6`. A node on a
+  the genesis digest>` — for this network, `hashkinetics-1-4e4ea68d`. A node on a
   different genesis reports a different id and is visibly not this chain. `hk_chainInfo`
   also returns the full `genesis_digest` (the fingerprint above).
 - Identity, not topology: nodes **refuse to peer across genesis**. A node whose genesis
@@ -91,6 +82,13 @@ The `chain_id` and `app_hash` at any height must match what
 - Syncing crosses validator-key-rotation boundaries (v0.10.7): certificates are
   verified against the set as of their height, so a fresh node can walk the whole
   chain from block 1 — including every epoch the validators have rotated through.
+- Fees: every transaction envelope pays **100 micro** of the test asset (burned). Keep a
+  little balance back — a full-balance sweep refuses honestly. `hk_chainInfo.fee` shows
+  the policy and the running burn counter.
+- Memory (v0.13.0, R10 v2): a node keeps only the newest 512 decided heights in RAM
+  (`HK_DECIDED_WINDOW`) and serves older history to syncing peers straight from its
+  block log; a restart resumes at the chain's height whatever the block log looks like.
+  `hk_chainInfo.history` shows what a node can serve from disk.
 - Sync throughput: solved. v0.10.8 parallelized catch-up verification (R5.2) —
   measured **71 blocks/min** on deep backlogs on the live testnet (up from ~2),
   faster than the chain advances — and since v0.10.9 syncing spends **zero**

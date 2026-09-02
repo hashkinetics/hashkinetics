@@ -5,7 +5,7 @@
 //! the identical state commitment (the determinism consensus needs).
 
 use crate::tx::{signing_digest, SignedTx, Tx};
-use crate::{Genesis, GenesisAccount, State};
+use crate::{Genesis, GenesisAccount, GenesisFee, State};
 use hk_crypto::hash::{shake256_32, DOM_ACCOUNT_ID};
 use hk_crypto::lamport;
 use hk_crypto::payword::PaywordChain;
@@ -69,7 +69,7 @@ fn p0_demo_storyline() {
     let genesis = Genesis {
         time: 1_000,
         accounts: vec![org.genesis(), a.genesis(), b.genesis(), c.genesis(), merchant.genesis()],
-        alloc: vec![(org.id, usd, 50 * M)],
+        alloc: vec![(org.id, usd, 50 * M)], fee: None
     };
     let mut st = State::from_genesis(&genesis).unwrap();
 
@@ -180,7 +180,7 @@ fn channel_refund_after_expiry() {
     let genesis = Genesis {
         time: 100,
         accounts: vec![org.genesis(), merchant.genesis()],
-        alloc: vec![(org.id, usd, 10 * M)],
+        alloc: vec![(org.id, usd, 10 * M)], fee: None
     };
     let mut st = State::from_genesis(&genesis).unwrap();
 
@@ -227,7 +227,7 @@ fn attenuation_enforced_at_creation() {
     const M: Amount = 1_000_000;
     let usd = h(9);
     let mut org = Keychain::new(b"org3");
-    let genesis = Genesis { time: 100, accounts: vec![org.genesis()], alloc: vec![(org.id, usd, M)] };
+    let genesis = Genesis { time: 100, accounts: vec![org.genesis()], alloc: vec![(org.id, usd, M)], fee: None };
     let mut st = State::from_genesis(&genesis).unwrap();
     let (m0, bad) = (h(0xC0), h(0xC1));
     let txs = vec![
@@ -281,7 +281,7 @@ fn aggregated_coverage_accepts_proofless_txs() {
     let genesis = Genesis {
         time: 100,
         accounts: vec![org.genesis()],
-        alloc: vec![(org.id, usd, 10 * M)],
+        alloc: vec![(org.id, usd, 10 * M)], fee: None
     };
     let mut st = State::from_genesis(&genesis).unwrap(); // verifier = RejectAll
 
@@ -339,7 +339,7 @@ fn mandated_unshield_respects_the_envelope() {
     let genesis = Genesis {
         time: 100,
         accounts: vec![org.genesis(), agent.genesis(), merchant.genesis()],
-        alloc: vec![(org.id, usd, 50 * M)],
+        alloc: vec![(org.id, usd, 50 * M)], fee: None
     };
     let mut st = State::from_genesis(&genesis).unwrap();
     st.verifier = Arc::new(JsonEchoVerifier);
@@ -438,7 +438,7 @@ fn shielded_pool_storyline() {
     let genesis = Genesis {
         time: 100,
         accounts: vec![org.genesis(), merchant.genesis()],
-        alloc: vec![(org.id, usd, 10 * M)],
+        alloc: vec![(org.id, usd, 10 * M)], fee: None
     };
     let mut st = State::from_genesis(&genesis).unwrap();
 
@@ -589,7 +589,7 @@ fn snapshot_roundtrip_identical_commitment_and_keeps_running() {
     let genesis = Genesis {
         time: 1_000,
         accounts: vec![org.genesis(), a.genesis(), merchant.genesis()],
-        alloc: vec![(org.id, usd, 50 * M)],
+        alloc: vec![(org.id, usd, 50 * M)], fee: None
     };
     let mut st = State::from_genesis(&genesis).unwrap();
 
@@ -661,7 +661,7 @@ fn u1_runtime_account_creation_faucet_flow() {
     let genesis = Genesis {
         time: 1_000,
         accounts: vec![faucet.genesis()],
-        alloc: vec![(faucet.id, usd, 100 * M)],
+        alloc: vec![(faucet.id, usd, 100 * M)], fee: None
     };
     let mut st = State::from_genesis(&genesis).unwrap();
     let bal = |st: &State, id: H256| st.balances.get(&(id, usd)).copied().unwrap_or(0);
@@ -740,7 +740,7 @@ fn u4_flat_protocol_fee_burn_refund_and_activation() {
     let genesis = Genesis {
         time: 1_000,
         accounts: vec![org.genesis(), bob.genesis()],
-        alloc: vec![(org.id, usd, 10 * M), (bob.id, usd, 150)],
+        alloc: vec![(org.id, usd, 10 * M), (bob.id, usd, 150)], fee: None
     };
     let mut st = State::from_genesis(&genesis).unwrap();
     st.fee_micro = 100;
@@ -803,4 +803,42 @@ fn u4_flat_protocol_fee_burn_refund_and_activation() {
     // Fee CONFIG is deliberately not snapshotted — the node re-injects it.
     assert_eq!(back.fee_from, u64::MAX);
     let _ = c_after_burn;
+}
+
+#[test]
+fn u4b_genesis_bound_fee_policy_applies_from_block_one() {
+    const M: Amount = 1_000_000;
+    let usd = h(9); // == FEE_ASSET
+    let mut org = Keychain::new(b"u4b-org");
+    let bob = Keychain::new(b"u4b-bob");
+    let genesis = Genesis {
+        time: 1_000,
+        accounts: vec![org.genesis(), bob.genesis()],
+        alloc: vec![(org.id, usd, 10 * M)],
+        fee: Some(GenesisFee { micro: 100, from_height: 1 }),
+    };
+    let st0 = State::from_genesis(&genesis).unwrap();
+    assert_eq!((st0.fee_micro, st0.fee_from), (100, 1), "genesis pins the policy");
+    // The pinned policy is NOT part of C(Σ) at genesis (fees_burned is still 0), so a
+    // genesis with a fee field and one without agree on the empty chain's commitment —
+    // policy lives in the genesis DIGEST (the chain id), the state hashes outcomes.
+    let plain = State::from_genesis(&Genesis { fee: None, ..genesis.clone() }).unwrap();
+    assert_eq!(st0.state_commitment(), plain.state_commitment());
+
+    let mut st = st0;
+    let bal = |st: &State, id: H256| st.balances.get(&(id, usd)).copied().unwrap_or(0);
+    let t = org.sign(Tx::Transfer { to: bob.id, asset: usd, amount: 1 * M });
+    let r = st.apply_block(1, 1_010, &[t]).unwrap();
+    assert!(r[0].result.is_ok(), "{:?}", r[0].result);
+    assert_eq!(bal(&st, org.id), 9 * M - 100, "fee charged on the very first block");
+    assert_eq!(st.fees_burned, 100);
+
+    // JSON round-trip keeps the field; a genesis without it deserializes to None.
+    let js = serde_json::to_string(&genesis).unwrap();
+    assert!(js.contains("\"fee\""));
+    let back: Genesis = serde_json::from_str(&js).unwrap();
+    assert_eq!(back.fee, genesis.fee);
+    let legacy: Genesis = serde_json::from_str(r#"{"time":1,"accounts":[],"alloc":[]}"#).unwrap();
+    assert!(legacy.fee.is_none(), "pre-v0.13 genesis files still parse");
+    assert!(!serde_json::to_string(&legacy).unwrap().contains("fee"), "None is not serialized");
 }

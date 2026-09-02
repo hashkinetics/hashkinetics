@@ -106,6 +106,9 @@ pub(crate) fn cmd_info(dir: &Path) -> eyre::Result<()> {
     println!("account id   : {}", f.id);
     println!("next nonce   : {}", f.next_nonce);
     println!("auth commit  : {}", hex::encode(demo::commit_at(&seed, f.next_nonce).0));
+    // U4.b: the nonce-0 commitment is what a genesis allocation binds to
+    // (`genesis-build --alloc <this>:<micro>`); the id derives from it.
+    println!("genesis auth : {}  (nonce 0 — for genesis-build --alloc)", hex::encode(demo::commit_at(&seed, 0).0));
     Ok(())
 }
 
@@ -235,10 +238,14 @@ pub(crate) fn cmd_adopt_demo(dir: &Path, name: &str, rpc: &str) -> eyre::Result<
 }
 
 pub(crate) fn health_json(rpc: &str, faucet_id: &H256, drip: Amount) -> serde_json::Value {
+    // U4: surface the chain's fee so the site can say "each drip pays N micro in fees".
+    let info = demo::rpc(rpc, "hk_chainInfo", json!({}));
+    let fee = info.get("result").and_then(|r| r.get("fee")).cloned().unwrap_or(serde_json::Value::Null);
     json!({
         "ok": true,
         "faucet_account": hex::encode(faucet_id.0),
         "faucet_balance_micro": demo::balance(rpc, faucet_id),
         "drip_micro": drip,
+        "fee": fee,
     })
 }

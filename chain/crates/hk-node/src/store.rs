@@ -149,6 +149,10 @@ pub struct NodeStore {
     snapshot_path: PathBuf,
     legacy_snapshot_path: PathBuf,
     wal_path: PathBuf,
+    /// R10 v2: lowest height of the gap-free block-file suffix reaching the tip
+    /// (0 = unknown / nothing yet). Set by restore, advanced past any failed write;
+    /// the explorer's `hk_getBlocks` reads it instead of listing 100k+ files per call.
+    disk_min: std::sync::atomic::AtomicU64,
 }
 
 impl NodeStore {
@@ -161,7 +165,17 @@ impl NodeStore {
             snapshot_path: home.join("snapshot2.bin"),
             legacy_snapshot_path: home.join("snapshot.bin"),
             wal_path: home.join("mempool.wal"),
+            disk_min: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    pub fn set_disk_min(&self, h: u64) {
+        self.disk_min.store(h, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 0 = unknown (persistence just opened, or nothing servable yet).
+    pub fn disk_min(&self) -> u64 {
+        self.disk_min.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn block_path(&self, height: u64) -> PathBuf {

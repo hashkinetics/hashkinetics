@@ -1,0 +1,2 @@
+/dns4/seed.hashkinetics.org/tcp/27000
+/ip4/34.45.10.191/tcp/27000

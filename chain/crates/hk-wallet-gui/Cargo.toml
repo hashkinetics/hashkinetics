@@ -15,8 +15,11 @@ path = "src/main.rs"
 
 [dependencies]
 hk-primitives = { path = "../hk-primitives" }
-hk-crypto = { path = "../hk-crypto" }
+hk-crypto = { path = "../hk-crypto", features = ["mlkem"] }
 hk-state = { path = "../hk-state" }
+# U3v2: the shielded side — the SAME lib the CLI wallet and every demo proved.
+hk-wallet = { path = "../hk-wallet" }
+hk-spend-circuit = { path = "../../../zkvm-bakeoff/circuit" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }

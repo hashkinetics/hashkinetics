@@ -50,11 +50,26 @@ pub struct GenesisAccount {
     pub auth_commit: H256,
 }
 
+/// U4.b: the flat envelope fee as a GENESIS fact — every node on the network derives
+/// the same policy from the same bytes (the genesis digest IS the chain id), instead
+/// of trusting each operator's environment to agree.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GenesisFee {
+    /// Micro-units of the fee asset charged per transaction envelope (0 = no fee).
+    pub micro: Amount,
+    /// First height at which the fee is charged (1 = from the first block).
+    pub from_height: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Genesis {
     pub time: Timestamp,
     pub accounts: Vec<GenesisAccount>,
     pub alloc: Vec<(AccountId, AssetId, Amount)>,
+    /// U4.b: genesis-bound fee policy. `None` = the node's configuration decides
+    /// (pre-v0.13 networks such as staging-1 activated fees by a coordinated roll).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee: Option<GenesisFee>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -267,6 +282,11 @@ impl State {
         for (id, asset, amount) in &g.alloc {
             let e = s.balances.entry((*id, *asset)).or_insert(0);
             *e = e.saturating_add(*amount);
+        }
+        // U4.b: a genesis-bound fee policy is applied here, before any config can.
+        if let Some(f) = &g.fee {
+            s.fee_micro = f.micro;
+            s.fee_from = f.from_height;
         }
         s.pool.seal_anchor(); // genesis anchor: the empty-tree root
         Ok(s)
