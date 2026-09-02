@@ -595,6 +595,9 @@ impl eframe::App for App {
         ctx.request_repaint_after(Duration::from_millis(400));
 
         egui::CentralPanel::default().show(ctx, |ui| {
+          // v0.13.1: the whole page scrolls, so the activity log stays reachable when the
+          // SHIELDED section is open in the default 660-px window.
+          egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("HASH").strong().size(20.0));
@@ -747,9 +750,13 @@ impl eframe::App for App {
                     // ---- U3v2: SHIELDED ----------------------------------------------
                     let shielded_total: Amount = self.notes.iter().filter(|n| !n.spent).map(|n| n.value).sum();
                     let unspent_n = self.notes.iter().filter(|n| !n.spent).count();
+                    // The title carries the live total, so the header needs a STABLE id —
+                    // egui derives it from the title by default, and a changed title reads
+                    // as a brand-new (collapsed) header after every operation (v0.13.0 bug).
                     egui::CollapsingHeader::new(
                         egui::RichText::new(format!("SHIELDED  ·  {} in {unspent_n} note(s)", fmt_amount(shielded_total))).size(11.0),
                     )
+                    .id_source("shielded-section")
                     .default_open(false)
                     .show(ui, |ui| {
                         let busy = self.busy;
@@ -894,17 +901,17 @@ impl eframe::App for App {
                 }
             }
 
-            // Footer
-            ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.hyperlink_to("explorer", "https://www.hashkinetics.org/explorer/");
-                    ui.label(egui::RichText::new("·").color(DIM));
-                    ui.hyperlink_to("hashkinetics.org", "https://www.hashkinetics.org");
-                    ui.label(egui::RichText::new("·").color(DIM));
-                    ui.label(egui::RichText::new("hash-based keys · your first spend signs at ratchet index 0").size(10.0).color(DIM));
-                });
+            // Footer (flows after the content now that the page scrolls)
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                ui.hyperlink_to("explorer", "https://www.hashkinetics.org/explorer/");
+                ui.label(egui::RichText::new("·").color(DIM));
+                ui.hyperlink_to("hashkinetics.org", "https://www.hashkinetics.org");
+                ui.label(egui::RichText::new("·").color(DIM));
+                ui.label(egui::RichText::new("hash-based keys · your first spend signs at ratchet index 0").size(10.0).color(DIM));
             });
+            ui.add_space(8.0);
+          });
         });
     }
 }

@@ -39,9 +39,13 @@ USD=$(printf '09%.0s' {1..32})
 
 start_node() { # start_node <i> [extra env assignments...]
     local i=$1; shift
-    ( cd "$H" && env HK_PROVER_URL="$PROVER" HK_DECIDED_WINDOW=8 RUST_LOG=info "$@" \
-        nohup "$BIN" start "$H/v$i" >> "$H/v$i.log" 2>&1 & )
+    # `exec` matters: without it a forked copy of this script sits between us and the node
+    # holding OUR stdout — and `./rehearsal.sh | grep` then blocks until the nodes exit
+    # (they never do: they are left running for inspection). Run 3 hung 25 min on that.
+    ( cd "$H" && exec env HK_PROVER_URL="$PROVER" HK_DECIDED_WINDOW=8 RUST_LOG=info "$@" \
+        nohup "$BIN" start "$H/v$i" < /dev/null >> "$H/v$i.log" 2>&1 ) &
 }
+noansi() { sed 's/\x1b\[[0-9;]*m//g'; }   # hk-node's tracing output carries ANSI colour even into files; strip before parsing fields
 stop_node() { pkill -f "hk-node start $H/v$1" 2>/dev/null; sleep 2; }
 wait_height() { # wait_height <port> <min-height> <secs>
     local port=$1 want=$2 secs=$3 h=0
@@ -167,10 +171,10 @@ find "$H/v3/blocks" -name 'b*.bin' ! -name 'b000000000001.bin' -delete
 echo "v3 block files now: $(ls "$H/v3/blocks")"
 start_node 3
 caught_up 26003 "shape B (only block 1)"
-RL=$(grep "R10 v2: history stays on disk" "$H/v3.log" | tail -1)
+RL=$(grep "R10 v2: history stays on disk" "$H/v3.log" | tail -1 | noansi)   # field names are colour-wrapped in the raw log: tip=… only exists after noansi (run 3 FAILed on exactly this)
 RT=$(echo "$RL" | grep -o 'tip=[0-9]*' | cut -d= -f2); RF=$(echo "$RL" | grep -o 'disk_files=[0-9]*' | cut -d= -f2)
 [[ -n "$RT" && "$RT" -ge 16 && "$RF" == "1" ]] && pass "restore resumed at the CHAIN height (tip=$RT) with only $RF block file on disk (the log said nothing; the snapshot did)" || fail "restore line: $RL"
-grep -q "Consensus is ready" "$H/v3.log" && echo "  engine: $(grep 'Consensus is ready' "$H/v3.log" | tail -1 | sed 's/.*INFO//')"
+grep -q "Consensus is ready" "$H/v3.log" && echo "  engine: $(grep 'Consensus is ready' "$H/v3.log" | tail -1 | noansi | sed 's/.*INFO//')"
 
 say "R10 v2 — shape C: suffix-only log (delete everything below tip-6)"
 stop_node 3

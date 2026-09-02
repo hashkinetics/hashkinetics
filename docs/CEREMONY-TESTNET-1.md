@@ -1,7 +1,7 @@
 # testnet-1 genesis ceremony — procedure and record
 
 > Status: **rehearsed on devnet (chain/rehearsal.sh) → executed on the fleet 2026-09-02 — testnet-1 is live.**
-> One deviation from the script: the VM service accounts have read-only object-storage scope, so the genesis was distributed host-to-host over ssh (base64) instead of via a relay bucket, and the staging-1 archive tar stays on the gateway until the scope is widened.
+> One deviation from the script: the VM service accounts have read-only object-storage scope, so the genesis was distributed host-to-host over ssh (base64) instead of via a relay bucket, and the staging-1 archive tar could not be pushed by the VM's own identity — it went to object storage from the gateway with a one-hour operator token passed over ssh stdin (never on disk, never in an argument), 2,932,293,982 bytes, 2026-09-02 18:21 UTC. Lesson for the next ceremony: widen the scope (needs a VM stop) or plan the token route from the start.
 
 ## What a ceremony is, here
 
@@ -71,5 +71,5 @@ disk path serves everything else). Receipt: see CHANGELOG [0.13.0].
 | fee policy | 100 micro per envelope from height 1, burned |
 | treasury | `6c0466c5a22e8c003550165a8aadd8a868aca4657e4c7e9fb48ab14d4df264ad` — 1,000,000,000,000 micro at genesis (seed stays on the gateway) |
 | demo accounts | org / agent-a / agent-b / agent-c / merchant (public seeds; org $50) |
-| predecessor | staging-1 (`hashkinetics-1-557f2ea6`), 2026-08-27 → 2026-09-02, stopped at height 107,182; full homes retained on every host, gateway tar of the complete log (2.79 GB) |
+| predecessor | staging-1 (`hashkinetics-1-557f2ea6`), 2026-08-27 → 2026-09-02, stopped at height 107,182; full homes retained on every host; the gateway's complete log + final snapshot archived to object storage (`staging-1-gateway.tgz`, 2,932,293,982 bytes) — a copy of the tar also stays on the gateway |
 | node version | v0.13.0 minimum |
