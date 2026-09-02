@@ -87,9 +87,67 @@ pub struct NodeSnapshot {
     pub highest_issued_epoch: u64,
 }
 
+/// U4/v0.12: pre-fee `StateSnapshot` layout (no `fees_burned`) — read-only mirror
+/// so a node upgrading in place restores its existing `snapshot.bin` instead of
+/// replaying from genesis. New snapshots are written as `snapshot2.bin` (bincode is
+/// positional — appending a field silently breaks old bytes, so the FILENAME is the
+/// version tag).
+#[derive(Deserialize)]
+struct LegacyStateSnapshot {
+    pub height: u64,
+    pub time: hk_primitives::Timestamp,
+    pub accounts: std::collections::BTreeMap<hk_primitives::AccountId, hk_state::Account>,
+    pub balances:
+        std::collections::BTreeMap<(hk_primitives::AccountId, hk_primitives::AssetId), hk_primitives::Amount>,
+    pub mandates: hk_mandate::MandateTree,
+    pub root_funding: std::collections::BTreeMap<hk_primitives::MandateId, hk_primitives::AccountId>,
+    pub channels: std::collections::BTreeMap<hk_primitives::ChannelId, hk_state::Channel>,
+    pub pool: hk_state::pool::PoolState,
+}
+
+#[derive(Deserialize)]
+struct LegacyNodeSnapshot {
+    pub app_hash: [u8; 32],
+    pub height: u64,
+    pub state: LegacyStateSnapshot,
+    pub pool_notes: Vec<(H256, Vec<u8>)>,
+    pub receipts: Vec<([u8; 32], String)>,
+    pub mempool: Vec<SignedTx>,
+    pub validators: Vec<ValidatorDto>,
+    pub current_epoch: u64,
+    pub highest_issued_epoch: u64,
+}
+
+impl From<LegacyNodeSnapshot> for NodeSnapshot {
+    fn from(l: LegacyNodeSnapshot) -> Self {
+        NodeSnapshot {
+            app_hash: l.app_hash,
+            height: l.height,
+            state: StateSnapshot {
+                height: l.state.height,
+                time: l.state.time,
+                accounts: l.state.accounts,
+                balances: l.state.balances,
+                mandates: l.state.mandates,
+                root_funding: l.state.root_funding,
+                channels: l.state.channels,
+                pool: l.state.pool,
+                fees_burned: 0, // pre-fee history by definition
+            },
+            pool_notes: l.pool_notes,
+            receipts: l.receipts,
+            mempool: l.mempool,
+            validators: l.validators,
+            current_epoch: l.current_epoch,
+            highest_issued_epoch: l.highest_issued_epoch,
+        }
+    }
+}
+
 pub struct NodeStore {
     blocks_dir: PathBuf,
     snapshot_path: PathBuf,
+    legacy_snapshot_path: PathBuf,
     wal_path: PathBuf,
 }
 
@@ -100,7 +158,8 @@ impl NodeStore {
             .wrap_err_with(|| format!("creating block dir {}", blocks_dir.display()))?;
         Ok(Self {
             blocks_dir,
-            snapshot_path: home.join("snapshot.bin"),
+            snapshot_path: home.join("snapshot2.bin"),
+            legacy_snapshot_path: home.join("snapshot.bin"),
             wal_path: home.join("mempool.wal"),
         })
     }
@@ -152,13 +211,31 @@ impl NodeStore {
     }
 
     pub fn load_snapshot(&self) -> Result<Option<NodeSnapshot>> {
-        if !self.snapshot_path.exists() {
-            return Ok(None);
-        }
-        let bytes = std::fs::read(&self.snapshot_path)?;
-        let snap: NodeSnapshot =
-            bincode::deserialize(&bytes).wrap_err("corrupt snapshot.bin")?;
-        Ok(Some(snap))
+        // Both formats may coexist on a node that has run v0.11 and v0.12 binaries
+        // (e.g. a rolled-back voter: a stale snapshot2.bin from the newer binary next
+        // to a FRESHER snapshot.bin written by the older one afterwards). Never let
+        // the file format decide — load whatever is present and resume from the
+        // HIGHEST height. (Lesson from the aborted v0.12.1 roll, 2026-09-02.)
+        let v2: Option<NodeSnapshot> = if self.snapshot_path.exists() {
+            let bytes = std::fs::read(&self.snapshot_path)?;
+            Some(bincode::deserialize(&bytes).wrap_err("corrupt snapshot2.bin")?)
+        } else {
+            None
+        };
+        let legacy: Option<NodeSnapshot> = if self.legacy_snapshot_path.exists() {
+            let bytes = std::fs::read(&self.legacy_snapshot_path)?;
+            let snap: LegacyNodeSnapshot =
+                bincode::deserialize(&bytes).wrap_err("corrupt snapshot.bin (legacy)")?;
+            Some(snap.into())
+        } else {
+            None
+        };
+        Ok(match (v2, legacy) {
+            (Some(a), Some(b)) => Some(if b.height > a.height { b } else { a }),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        })
     }
 
     // ---- mempool WAL ----

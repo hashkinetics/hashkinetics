@@ -730,3 +730,77 @@ fn u1_runtime_account_creation_faucet_flow() {
     assert!(r[0].result.is_ok(), "{:?}", r[0].result);
     assert_eq!(bal(&st, bob_id), 0);
 }
+
+#[test]
+fn u4_flat_protocol_fee_burn_refund_and_activation() {
+    const M: Amount = 1_000_000;
+    let usd = h(9); // == FEE_ASSET
+    let mut org = Keychain::new(b"u4-org");
+    let mut bob = Keychain::new(b"u4-bob");
+    let genesis = Genesis {
+        time: 1_000,
+        accounts: vec![org.genesis(), bob.genesis()],
+        alloc: vec![(org.id, usd, 10 * M), (bob.id, usd, 150)],
+    };
+    let mut st = State::from_genesis(&genesis).unwrap();
+    st.fee_micro = 100;
+    st.fee_from = 3; // activation boundary: heights 1–2 are free
+    let bal = |st: &State, id: H256| st.balances.get(&(id, usd)).copied().unwrap_or(0);
+    let pre_fee_commitment_is_v11_shaped = st.fees_burned == 0;
+    assert!(pre_fee_commitment_is_v11_shaped);
+
+    // 1) PRE-ACTIVATION: a transfer at height 1 pays no fee.
+    let t = org.sign(Tx::Transfer { to: bob.id, asset: usd, amount: 1 * M });
+    let r = st.apply_block(1, 1_010, &[t]).unwrap();
+    assert!(r[0].result.is_ok());
+    assert_eq!(bal(&st, org.id), 9 * M, "no fee before activation");
+    assert_eq!(st.fees_burned, 0);
+
+    // 2) Empty block crosses the boundary.
+    st.apply_block(2, 1_020, &[]).unwrap();
+
+    // 3) POST-ACTIVATION: fee charged and BURNED on success.
+    let t = org.sign(Tx::Transfer { to: bob.id, asset: usd, amount: 1 * M });
+    let r = st.apply_block(3, 1_030, &[t]).unwrap();
+    assert!(r[0].result.is_ok());
+    assert_eq!(bal(&st, org.id), 8 * M - 100, "amount + fee left the sender");
+    assert_eq!(st.fees_burned, 100);
+    let c_after_burn = st.state_commitment();
+
+    // 4) REFUSAL REFUNDS: an overdraft refuses and the fee comes back.
+    let before = bal(&st, org.id);
+    let t = org.sign(Tx::Transfer { to: bob.id, asset: usd, amount: 100 * M });
+    let r = st.apply_block(4, 1_040, &[t]).unwrap();
+    assert!(r[0].result.is_err(), "overdraft must refuse");
+    assert_eq!(bal(&st, org.id), before, "refused tx must not cost the fee");
+    assert_eq!(st.fees_burned, 100, "no burn on refusal");
+    org.rollback();
+
+    // 5) The tx's own spend sees the post-fee balance: a full-balance sweep refuses.
+    let sweep = org.sign(Tx::Transfer { to: bob.id, asset: usd, amount: before });
+    let r = st.apply_block(5, 1_050, &[sweep]).unwrap();
+    assert!(r[0].result.is_err(), "full-balance sweep can no longer pay amount+fee");
+    assert_eq!(bal(&st, org.id), before);
+    org.rollback();
+
+    // 6) Too poor for the fee itself → InsufficientFee (bob holds 150 + 2M received).
+    //    Drain bob down first so only 50 micro remain.
+    let drain = bob.sign(Tx::Transfer { to: org.id, asset: usd, amount: 2 * M });
+    let r = st.apply_block(6, 1_060, &[drain]).unwrap();
+    assert!(r[0].result.is_ok());
+    assert_eq!(bal(&st, bob.id), 150 - 100, "bob paid the fee on his drain tx");
+    let broke = bob.sign(Tx::Transfer { to: org.id, asset: usd, amount: 1 });
+    let r = st.apply_block(7, 1_070, &[broke]).unwrap();
+    let msg = r[0].result.clone().unwrap_err();
+    assert!(msg.contains("protocol fee"), "expected the fee refusal, got: {msg}");
+    bob.rollback();
+
+    // 7) Snapshot v2 roundtrip preserves the burn counter AND the commitment.
+    let snap = st.to_snapshot();
+    let mut back = State::from_snapshot(snap);
+    assert_eq!(back.fees_burned, st.fees_burned);
+    assert_eq!(back.state_commitment(), st.state_commitment());
+    // Fee CONFIG is deliberately not snapshotted — the node re-injects it.
+    assert_eq!(back.fee_from, u64::MAX);
+    let _ = c_after_burn;
+}

@@ -156,6 +156,26 @@ pub struct DecidedEntry {
     pub certificate: CommitCertificate<HkContext>,
 }
 
+/// U4: the flat protocol fee activates at this height on staging-1 (a rolling fleet
+/// upgrade must complete BEFORE any fee is charged — behavior is byte-identical to
+/// v0.11 until then). Override per-network/devnet with `HK_FEE_FROM`; fee size with
+/// `HK_FEE_MICRO` (0 disables). Set the real staging activation height at roll time
+/// against the VOTER tips (never the RPC edge — the gateway can lag its own voters);
+/// this default is deliberately a placeholder that must be overridden via HK_FEE_FROM
+/// during the coordinated roll.
+/// ⚠ v0.12 HISTORY: v0.12.0/0.12.1 shipped R10 (bounded decided window + disk-served
+/// value-sync) alongside U4/R9 and it BROKE restore on the staging nodes (their block
+/// logs are sparse — only block #1 on disk — so R10's start_height began the engine
+/// at height 0). v0.12.2 ships U4 + R9 WITHOUT R10; R10 is being redesigned to respect
+/// nodes that value-sync from peers rather than replay a full local block log.
+pub const FEE_ACTIVATION_HEIGHT: u64 = 110_000;
+pub const FEE_MICRO_DEFAULT: u128 = 100;
+
+/// R9: if we issued a rotation cert and our on-chain epoch still hasn't advanced
+/// after this long, the cert evidently died in flight — re-arm and issue again
+/// (acceptors are epoch-monotone, so a duplicate is refused harmlessly).
+const REISSUE_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+
 pub struct HkApp {
     pub address: HkAddress,
     /// Live validator set behind a lock: consensus reads/rotates it here, and the RPC
@@ -185,6 +205,9 @@ pub struct HkApp {
     streams: PartStreamsMap,
     undecided: BTreeMap<(u64, i64), Vec<ProposedValue<HkContext>>>,
     pub decided: BTreeMap<u64, DecidedEntry>,
+    /// R9: when we last issued a rotation cert (either path). Not persisted — a
+    /// restart deliberately clears it, so a wedged guard re-arms on the next trigger.
+    last_issue_time: Option<std::time::Instant>,
 
     // ---- SCMS operational-key rotation ----
     /// This validator's 32-byte master seed (derives root + every operational tree).
@@ -252,6 +275,16 @@ impl HkApp {
         }
         let mut chain = hk_state::State::from_genesis(&genesis.chain_genesis())
             .map_err(|e| eyre!("chain genesis: {e}"))?;
+        // U4: inject the fee policy (config, never snapshotted — same posture as the
+        // verifier). Identical fleet-wide by default; devnets override via env.
+        chain.fee_micro = std::env::var("HK_FEE_MICRO")
+            .ok()
+            .and_then(|s| s.parse::<u128>().ok())
+            .unwrap_or(FEE_MICRO_DEFAULT);
+        chain.fee_from = std::env::var("HK_FEE_FROM")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(FEE_ACTIVATION_HEIGHT);
         // WS2: inject the real STARK verifier. None ⇒ hk-state's RejectAll default stays —
         // this node refuses shielded traffic rather than trusting anything.
         let agg = verifiers.as_ref().map(|v| (v.agg.clone(), v.spend_vk_hash, v.mint_vk_hash));
@@ -283,6 +316,7 @@ impl HkApp {
             streams: PartStreamsMap::new(),
             undecided: BTreeMap::new(),
             decided: BTreeMap::new(),
+            last_issue_time: None,
             master_seed,
             root,
             my_root_pk,
@@ -403,6 +437,7 @@ impl HkApp {
             // First tick fires immediately; skip it so a freshly-booted node
             // reads a settled gauge.
             tick.tick().await;
+            let mut last_issue: Option<std::time::Instant> = None;
             loop {
                 tick.tick().await;
                 let (epoch, remaining) =
@@ -417,6 +452,10 @@ impl HkApp {
                     let q = foreign.lock().unwrap_or_else(|e| e.into_inner());
                     q.iter().any(|c| c.root_pk == my_root_pk && c.epoch >= next_epoch)
                 };
+                // R9: same staleness re-arm as the commit path — a pushed cert that
+                // never applies must not gate this loop forever.
+                let issue_stale =
+                    last_issue.map(|t| t.elapsed() >= REISSUE_AFTER).unwrap_or(true);
                 // height=0 + rotate_every=None ⇒ only the leaf-budget threshold
                 // clause of the SAME production trigger can fire here.
                 let (due, _) = rotation_due(
@@ -427,6 +466,7 @@ impl HkApp {
                     mine_pending,
                     next_epoch,
                     highest_issued,
+                    issue_stale,
                 );
                 if !due {
                     continue;
@@ -441,17 +481,14 @@ impl HkApp {
                 let seed = op_seed(&master_seed, next_epoch);
                 let new_op_pk = HkPriv::from_seed(seed).public();
                 let cert = RotationCert::issue(&root, new_op_pk, next_epoch, 0);
-                highest_issued = next_epoch;
+                highest_issued = highest_issued.max(next_epoch);
+                last_issue = Some(std::time::Instant::now());
                 {
-                    // Self-enqueue with the RPC handler's exact dedup shape.
+                    // Self-enqueue; a re-issue REPLACES any same-or-older own cert
+                    // (R9: the old entry is what wedged us — never stack beside it).
                     let mut q = foreign.lock().unwrap_or_else(|e| e.into_inner());
-                    let dup = q
-                        .iter()
-                        .any(|x| x.root_pk == cert.root_pk && x.epoch >= cert.epoch);
-                    if !dup {
-                        q.retain(|x| !(x.root_pk == cert.root_pk && x.epoch < cert.epoch));
-                        q.push(cert.clone());
-                    }
+                    q.retain(|x| !(x.root_pk == cert.root_pk && x.epoch <= cert.epoch));
+                    q.push(cert.clone());
                 }
                 let body = serde_json::json!({
                     "method": "hk_submitRotation",
@@ -1050,6 +1087,13 @@ impl HkApp {
             let mine_pending =
                 self.pending_rotations.iter().any(|c| c.root_pk == self.my_root_pk);
             let next_epoch = self.current_epoch + 1;
+            // R9: an issue with no on-chain effect after REISSUE_AFTER is presumed
+            // dead — the guards below stop blocking. `None` (fresh boot) counts as
+            // stale BY DESIGN: a restart clears a wedged snapshot-restored guard.
+            let issue_stale = self
+                .last_issue_time
+                .map(|t| t.elapsed() >= REISSUE_AFTER)
+                .unwrap_or(true);
             let (due, threshold_hit) = rotation_due(
                 remaining,
                 capacity,
@@ -1058,18 +1102,39 @@ impl HkApp {
                 mine_pending,
                 next_epoch,
                 self.highest_issued_epoch,
+                issue_stale,
             );
             if due {
                 let seed = op_seed(&self.master_seed, next_epoch);
                 let new_op_pk = HkPriv::from_seed(seed).public();
                 let cert = RotationCert::issue(&self.root, new_op_pk, next_epoch, height + 1);
-                self.highest_issued_epoch = next_epoch;
+                self.highest_issued_epoch = self.highest_issued_epoch.max(next_epoch);
+                // R9: a re-issue replaces any stale same-or-older own cert instead of
+                // stacking beside it.
+                let mine = self.my_root_pk.clone();
+                self.pending_rotations
+                    .retain(|c| !(c.root_pk == mine && c.epoch <= next_epoch));
                 self.pending_rotations.push(cert);
+                self.last_issue_time = Some(std::time::Instant::now());
                 info!(
                     epoch = next_epoch,
                     remaining,
                     trigger = if threshold_hit { "leaf-threshold" } else { "interval" },
                     "Issued rotation cert (applies once committed)"
+                );
+            } else if threshold_hit && height % 100 == 0 {
+                // R9: the gauge is screaming but issuance is gated — say so instead
+                // of burning silently to zero (the val-0 incident, 2026-09-02).
+                warn!(
+                    remaining,
+                    next_epoch,
+                    highest_issued = self.highest_issued_epoch,
+                    mine_pending,
+                    reissue_in_s = REISSUE_AFTER
+                        .checked_sub(self.last_issue_time.map(|t| t.elapsed()).unwrap_or_default())
+                        .unwrap_or_default()
+                        .as_secs(),
+                    "rotation threshold hit but issuance is gated — will re-arm"
                 );
             }
         }
@@ -1148,9 +1213,17 @@ impl HkApp {
     /// injected), BEFORE the engine asks `start_height()`.
     pub fn restore_from_store(&mut self, store: &NodeStore) -> Result<()> {
         if let Some(snap) = store.load_snapshot()? {
-            let verifier = self.chain.lock().unwrap().verifier.clone();
+            // Config survives the image swap (a snapshot must not smuggle in policy):
+            // the verifier AND the U4 fee parameters are re-injected from the running
+            // configuration, exactly as `HkApp::new` set them.
+            let (verifier, fee_micro, fee_from) = {
+                let c = self.chain.lock().unwrap();
+                (c.verifier.clone(), c.fee_micro, c.fee_from)
+            };
             let mut st = hk_state::State::from_snapshot(snap.state);
             st.verifier = verifier;
+            st.fee_micro = fee_micro;
+            st.fee_from = fee_from;
             let got = st.state_commitment().0;
             if got != snap.app_hash {
                 return Err(eyre!(
@@ -1319,10 +1392,15 @@ fn rotation_due(
     mine_pending: bool,
     next_epoch: u64,
     highest_issued: u64,
+    issue_stale: bool,
 ) -> (bool, bool) {
     let threshold_hit = remaining < capacity / 5;
     let interval_hit = rotate_every.is_some_and(|n| height > 0 && height % n == 0);
-    let due = (threshold_hit || interval_hit) && !mine_pending && next_epoch > highest_issued;
+    // R9: the pending/already-issued guards only hold while a previous issue is
+    // FRESH. Once stale (or after a restart), a trigger fires again — a lost cert
+    // must never wedge a validator into burning its tree to zero (val-0, 2026-09-02).
+    let guards_pass = (!mine_pending && next_epoch > highest_issued) || issue_stale;
+    let due = (threshold_hit || interval_hit) && guards_pass;
     (due, threshold_hit)
 }
 
@@ -1335,7 +1413,7 @@ mod rotation_trigger_tests {
     fn fresh_tree_never_rotates_without_interval() {
         // The staging fleet's pre-incident config (no env) must now be SAFE by default:
         for h in [1u64, 500, 10_848] {
-            assert_eq!(rotation_due(CAP, CAP, h, None, false, 1, 0), (false, false));
+            assert_eq!(rotation_due(CAP, CAP, h, None, false, 1, 0, false), (false, false));
         }
     }
 
@@ -1343,39 +1421,53 @@ mod rotation_trigger_tests {
     fn threshold_fires_below_twenty_percent_regardless_of_height() {
         // 20% of 32,768 = 6,553; the incident's tree would have triggered ~2.2K
         // heights (>1 hour) before the halt instead of dying at leaf zero.
-        assert_eq!(rotation_due(6_552, CAP, 10_777, None, false, 1, 0), (true, true));
-        assert_eq!(rotation_due(6_553, CAP, 10_777, None, false, 1, 0), (false, false));
-        assert_eq!(rotation_due(0, CAP, 3, None, false, 1, 0), (true, true));
+        assert_eq!(rotation_due(6_552, CAP, 10_777, None, false, 1, 0, false), (true, true));
+        assert_eq!(rotation_due(6_553, CAP, 10_777, None, false, 1, 0, false), (false, false));
+        assert_eq!(rotation_due(0, CAP, 3, None, false, 1, 0, false), (true, true));
     }
 
     #[test]
     fn r1b_tick_shape_threshold_fires_without_a_height() {
         // R1.b calls rotation_due with height=0 and no interval override — a node
         // that never commits must still fire the SAME leaf-budget clause…
-        assert_eq!(rotation_due(6_552, CAP, 0, None, false, 1, 0), (true, true));
-        assert_eq!(rotation_due(6_553, CAP, 0, None, false, 1, 0), (false, false));
+        assert_eq!(rotation_due(6_552, CAP, 0, None, false, 1, 0, false), (true, true));
+        assert_eq!(rotation_due(6_553, CAP, 0, None, false, 1, 0, false), (false, false));
         // …must not re-issue when the next epoch is already in flight
         // (threshold still reports hit — the gauge is honest, the action is gated)…
-        assert_eq!(rotation_due(6_552, CAP, 0, None, true, 1, 0), (false, true));
+        assert_eq!(rotation_due(6_552, CAP, 0, None, true, 1, 0, false), (false, true));
         // …and must not re-issue an epoch it already issued.
-        assert_eq!(rotation_due(6_552, CAP, 0, None, false, 1, 1), (false, true));
+        assert_eq!(rotation_due(6_552, CAP, 0, None, false, 1, 1, false), (false, true));
     }
 
     #[test]
     fn interval_override_still_works() {
-        assert_eq!(rotation_due(CAP, CAP, 500, Some(500), false, 1, 0), (true, false));
-        assert_eq!(rotation_due(CAP, CAP, 501, Some(500), false, 1, 0), (false, false));
-        assert_eq!(rotation_due(CAP, CAP, 0, Some(500), false, 1, 0), (false, false));
+        assert_eq!(rotation_due(CAP, CAP, 500, Some(500), false, 1, 0, false), (true, false));
+        assert_eq!(rotation_due(CAP, CAP, 501, Some(500), false, 1, 0, false), (false, false));
+        assert_eq!(rotation_due(CAP, CAP, 0, Some(500), false, 1, 0, false), (false, false));
+    }
+
+    #[test]
+    fn r9_stale_issue_rearms_wedged_guards() {
+        // The val-0 wedge (2026-09-02): threshold screaming, but a snapshot-restored
+        // highest_issued (and/or a stale pending cert) gated issuance forever.
+        // FRESH issue (stale=false): guards hold exactly as before…
+        assert_eq!(rotation_due(10, CAP, 100, None, true, 4, 4, false), (false, true));
+        assert_eq!(rotation_due(10, CAP, 100, None, false, 4, 4, false), (false, true));
+        // …STALE issue (or fresh boot): the same trigger fires through both guards.
+        assert_eq!(rotation_due(10, CAP, 100, None, true, 4, 4, true), (true, true));
+        assert_eq!(rotation_due(10, CAP, 100, None, false, 4, 7, true), (true, true));
+        // Staleness alone never fires without a trigger — a healthy budget stays quiet.
+        assert_eq!(rotation_due(CAP, CAP, 100, None, false, 4, 4, true), (false, false));
     }
 
     #[test]
     fn guards_suppress_double_issue() {
         // Our cert already pending → never re-issue, however low the budget runs.
-        assert_eq!(rotation_due(10, CAP, 100, None, true, 1, 0), (false, true));
+        assert_eq!(rotation_due(10, CAP, 100, None, true, 1, 0, false), (false, true));
         // Epoch already issued (e.g. included but we replayed past the bookkeeping).
-        assert_eq!(rotation_due(10, CAP, 100, None, false, 1, 1), (false, true));
+        assert_eq!(rotation_due(10, CAP, 100, None, false, 1, 1, false), (false, true));
         // After the rotation applies (fresh tree, epoch advanced), the cycle re-arms.
-        assert_eq!(rotation_due(CAP, CAP, 101, None, false, 2, 1), (false, false));
-        assert_eq!(rotation_due(6_000, CAP, 200, None, false, 2, 1), (true, true));
+        assert_eq!(rotation_due(CAP, CAP, 101, None, false, 2, 1, false), (false, false));
+        assert_eq!(rotation_due(6_000, CAP, 200, None, false, 2, 1, false), (true, true));
     }
 }

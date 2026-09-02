@@ -101,6 +101,8 @@ Prefer the CLI? Generate a keychain locally, paste one string into the faucet, a
 
 Your first spend signs with your own hash-based ratchet at index 0 — the same one-time-signature discipline the validators live by, in your hands. ⚠ v0.11.0 is a consensus-breaking upgrade: nodes below it cannot decode blocks containing an account creation.
 
+Then **watch it land**: the explorer at [hashkinetics.org/explorer](https://www.hashkinetics.org/explorer) now answers *anything* — paste a block height, a transaction id, an account id, or a nullifier into one search box and get the full picture, with shareable deep links (`#tx=…`, `#account=…`, `#block=…`). The wallet links every payment straight to its proof on-chain. Shielded holdings stay invisible by design — the scanner that can't dox you. (v0.11.2)
+
 ## Run a full node on the staging network (now, no permission needed)
 
 `networks/staging-1/` holds the pinned genesis and bootstrap peers — clone, build, point your node at them, and you're syncing and independently verifying the live chain, serving your own RPC and explorer. One screen of commands, no GPU, no stake: `networks/staging-1/README.md`. The genesis digest is the network's fingerprint; your node's `app_hash` at any height must equal what `rpc.hashkinetics.org` reports — same input, same hash, no trust required.

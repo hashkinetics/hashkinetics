@@ -154,7 +154,15 @@ pub enum StateError {
     AccountExists,
     #[error("account id does not match H(auth_commit)")]
     AccountIdMismatch,
+    /// U4: the flat protocol fee could not be paid. Charged BEFORE dispatch and
+    /// refunded on refusal, so a refused tx never costs money — this error means
+    /// the sender couldn't even cover the envelope fee.
+    #[error("insufficient balance for the protocol fee (have {have}, need {need})")]
+    InsufficientFee { have: Amount, need: Amount },
 }
+
+/// U4: the asset the flat protocol fee is charged in (the staging USD test asset).
+pub const FEE_ASSET: AssetId = H256([9u8; 32]);
 
 pub struct State {
     pub height: u64,
@@ -176,6 +184,15 @@ pub struct State {
     /// at every block end. TRANSIENT — not part of the state commitment (all honest
     /// nodes derive the same set from the same batch, same vks).
     pub agg_cover: std::collections::BTreeSet<[u8; 32]>,
+    /// U4: flat per-envelope protocol fee in micro-units of [`FEE_ASSET`]. 0 = off.
+    /// CONFIG, not state — set identically fleet-wide (consensus constant), never
+    /// snapshotted (a snapshot must not smuggle in a fee policy).
+    pub fee_micro: Amount,
+    /// U4: first height at which the fee is charged (activation boundary — lets a
+    /// rolling upgrade complete before behavior diverges). u64::MAX = never.
+    pub fee_from: u64,
+    /// U4: running total of burned fees — REAL state (in Σ once nonzero), snapshotted.
+    pub fees_burned: Amount,
 }
 
 /// The persistent image of [`State`] (P3.0/WS-B): every field that feeds the state
@@ -193,6 +210,8 @@ pub struct StateSnapshot {
     pub root_funding: BTreeMap<MandateId, AccountId>,
     pub channels: BTreeMap<ChannelId, Channel>,
     pub pool: PoolState,
+    /// U4 (snapshot format v2 — see `NodeStore`): total protocol fees burned.
+    pub fees_burned: Amount,
 }
 
 impl Default for State {
@@ -208,6 +227,9 @@ impl Default for State {
             pool: PoolState::default(),
             verifier: Arc::new(RejectAllVerifier),
             agg_cover: std::collections::BTreeSet::new(),
+            fee_micro: 0,
+            fee_from: u64::MAX,
+            fees_burned: 0,
         }
     }
 }
@@ -351,7 +373,33 @@ impl State {
             return Err(StateError::BadSignature);
         }
 
-        let events = self.dispatch(&stx.sender, &stx.payload)?;
+        // U4: flat envelope fee — charged FIRST (so the tx's own spend sees the
+        // post-fee balance), refunded in full if dispatch refuses (a refused tx
+        // never moves money — the existing atomicity contract holds). Burned on
+        // success: debited, never credited anywhere.
+        let fee = if self.height >= self.fee_from { self.fee_micro } else { 0 };
+        if fee > 0 {
+            let have = self.balance(&stx.sender, &FEE_ASSET);
+            if have < fee {
+                return Err(StateError::InsufficientFee { have, need: fee });
+            }
+            self.debit(&stx.sender, &FEE_ASSET, fee).expect("balance checked above");
+        }
+
+        let events = match self.dispatch(&stx.sender, &stx.payload) {
+            Ok(ev) => ev,
+            Err(e) => {
+                if fee > 0 {
+                    // Every dispatch arm checks before it mutates, so a refusal left
+                    // the state untouched — refunding the fee restores it exactly.
+                    self.credit(&stx.sender, &FEE_ASSET, fee);
+                }
+                return Err(e);
+            }
+        };
+        if fee > 0 {
+            self.fees_burned = self.fees_burned.saturating_add(fee);
+        }
 
         // Ratchet (the leaf-index=nonce discipline, plan §3.3): key consumed, next committed.
         let acc = self.accounts.get_mut(&stx.sender).expect("checked above");
@@ -765,6 +813,7 @@ impl State {
             root_funding: self.root_funding.clone(),
             channels: self.channels.clone(),
             pool: self.pool.clone(),
+            fees_burned: self.fees_burned,
         }
     }
 
@@ -784,6 +833,9 @@ impl State {
             pool: s.pool,
             verifier: Arc::new(RejectAllVerifier),
             agg_cover: std::collections::BTreeSet::new(),
+            fee_micro: 0,
+            fee_from: u64::MAX,
+            fees_burned: s.fees_burned,
         }
     }
 
@@ -840,6 +892,14 @@ impl State {
             buf.extend_from_slice(nf);
         }
         buf.extend_from_slice(&self.pool.total_shielded.to_le_bytes());
+        // U4: fees enter the commitment ONLY once nonzero. A zero counter keeps the
+        // buffer byte-identical to the pre-fee layout, so upgraded and pre-upgrade
+        // nodes agree on every block until the activation height actually burns a
+        // fee — a rolling fleet upgrade cannot fork before activation.
+        if self.fees_burned > 0 {
+            buf.push(0xFE); // fee-section tag (cannot collide: the buffer is length-structured)
+            buf.extend_from_slice(&self.fees_burned.to_le_bytes());
+        }
         H256(shake256_32(DOM_STATE_COMMIT, &[&buf]))
     }
 }

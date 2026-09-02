@@ -1,8 +1,10 @@
 # HashKinetics staging network — join as a full node
 
-> **⚠ Minimum node version: v0.11.0.** The account-creation transaction (v0.11.0) is a
-> consensus-breaking wire addition — older nodes cannot decode blocks that contain one
-> and will refuse to sync past it. Build from a tag ≥ v0.11.0.
+> **⚠ Minimum node version: v0.12.2 from height 110,000.** The flat protocol fee
+> activates at height 110,000 — nodes below v0.12.2 compute different balances from
+> that height and will refuse on app_hash divergence. Also inherited: the account-
+> creation wire addition (v0.11.0) means pre-v0.11 nodes cannot decode recent history.
+> Build from a tag ≥ v0.12.2.
 
 The public staging testnet (the chain behind [hashkinetics.org/explorer](https://www.hashkinetics.org/explorer)
 and `https://rpc.hashkinetics.org`). Four founder-operated validators run it; anyone

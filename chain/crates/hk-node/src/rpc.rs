@@ -155,6 +155,12 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
                     "remaining": remaining,
                     "capacity": hk_crypto::hashsig::CONSENSUS_CAPACITY,
                 },
+                // U4: the flat envelope fee — policy this node enforces + total burned.
+                "fee": {
+                    "micro": chain.fee_micro.to_string(),
+                    "from_height": chain.fee_from,
+                    "burned_micro": chain.fees_burned.to_string(),
+                },
             }})
         }
         // R2: accept a root-signed RotationCert on behalf of ANOTHER validator (an
