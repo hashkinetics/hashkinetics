@@ -28,7 +28,7 @@ A 4-validator public **testnet-1** runs since 2026-09-02 — real hash-signed BF
 - **RPC:** `https://rpc.hashkinetics.org` (JSON-RPC over POST; try `{"method":"hk_chainInfo","params":{}}`).
 - The pool shows a **$8 shielded economy** placed by the public demo suite: mandate-fed purchases, stealth bonuses wallets discovered by scanning, a rogue agent refused on-chain, and a disclosure package verified offline.
 - Validator epochs are public: when a validator rotates its consensus tree under its SLH-DSA root, the explorer shows the new epoch badge. Rotations are **automatic** since v0.10.5 (leaf-budget threshold) — the fleet has rotated itself through dozens of epochs unattended, zero blocks missed.
-- **The chain's identity is cryptographic:** `chain_id` is derived from the genesis digest (`hashkinetics-1-557f2ea6`), `hk_chainInfo` returns the full fingerprint, and nodes **refuse to peer across genesis** — you are either verifying this history from block 1 or you're on your own chain, by construction (v0.10.6).
+- **The chain's identity is cryptographic:** `chain_id` is derived from the genesis digest (testnet-1: `hashkinetics-1-4e4ea68d`; staging-1 was `hashkinetics-1-557f2ea6`), `hk_chainInfo` returns the full fingerprint, and nodes **refuse to peer across genesis** — you are either verifying this history from block 1 or you're on your own chain, by construction (v0.10.6).
 - Since v0.10.7, commit certificates verify against the validator set **as of their height** — a new node syncs from genesis across every key-rotation boundary in the chain's history. That's what makes external validators possible on a chain whose keys retire themselves.
 
 ## Field report: the chain that refused to reuse a leaf

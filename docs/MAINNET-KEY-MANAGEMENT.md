@@ -233,7 +233,7 @@ block). That is the property to preserve.
 - Per-epoch operational seeds via `op_seed(master, epoch)` (epoch 0 = genesis key).
 - Demo trigger `HK_ROTATE_EVERY=N` issues a self-rotation every N heights.
 
-**Hardening status — R-series SHIPPED AND PRODUCTION-PROVEN (v0.10.5–v0.10.7):**
+**Hardening status — R-series SHIPPED AND PRODUCTION-PROVEN (v0.10.5 → v0.13.0):**
 Staging incident #1 (2026-08-28) field-proved the urgency: no rotation trigger armed,
 val-0's tree exhausted at height 10,848 and the chain halted 6 h rather than reuse a
 leaf. The design held; the R-series closed the ops gap (C-PROGRAM-PLAN.md §R):
@@ -250,9 +250,23 @@ leaf. The design held; the R-series closed the ops gap (C-PROGRAM-PLAN.md §R):
 - **R6 ✅ (v0.10.7)** — commit certificates verify against the validator set AS OF their
   height (shared set history at the HkContext/engine seam; decide-path de-panicked) —
   sync/replay crosses every rotation boundary; external validators ungated.
-- Still open, ledgered: R3 engine resume-at-store-tip · R5.2 parallel cert verification ·
-  R8 abstain-while-behind (parked validators burn leaves on futile rounds) · R1.b
-  tick-based threshold check (commit-path-only check never fires while parked).
+- **R5.2 ✅ (v0.10.8)** — parallel certificate verification: catch-up went from 2 to 71
+  blocks/min; **v0.10.9** made sync spend ZERO signer leaves (a syncing node never votes
+  on futile rounds).
+- **R8 + R1.b ✅ (v0.10.10)** — abstain-while-behind (a validator that is provably behind
+  its peers stops spending leaves on rounds it cannot win) and the tick-based threshold
+  check (rotation fires even while parked, not only on the commit path).
+- **R9 ✅ (v0.12.2)** — stale-issue re-arm: a rotation certificate that never landed is
+  re-issued instead of wedging the validator; production-proven the day it shipped (a
+  validator that had burned its tree to zero healed itself).
+- **R3 ✅ as R10 v2 (v0.13.0)** — the engine resumes at the CHAIN height (snapshot + replay),
+  never at a height inferred from the block log; only a bounded window of decided heights
+  stays in RAM, older history is served to peers from disk with a certificate re-check.
+- **Fresh trees per chain (testnet-1 ceremony, 2026-09-02)** — a stateful tree that signed
+  on one chain is never restarted from a reset counter on another; every seat generated
+  new keys into a new home and the old home is kept only as an archive.
+- Open: R11 (verify-only proof-system client — the node's memory floor is the verifier
+  client's init footprint, not history) · STARK-aggregated commit certificates (below).
 - Operator hygiene learned in recovery: `consensus_state.bin` is the signer's spent-leaf
   state — never copy it between nodes; chain-data restores take `blocks/` + `snapshot.bin`
   only, and transplant tars must pack `snapshot.bin` FIRST (ordering skew wedges the engine).

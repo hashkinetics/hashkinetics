@@ -1,6 +1,6 @@
 # HashKinetics — Validator Onboarding (public testnet)
 
-**v0.11.2 · P3.0c.** Minimum node version to sync staging-1 is **v0.11.0** (v0.11.2 recommended for the search RPCs); build from a tag ≥ v0.11.0. How an external operator joins a HashKinetics network: generate a key,
+**v0.13.0 · testnet-1.** Minimum node version to sync **testnet-1** (`hashkinetics-1-4e4ea68d`) is **v0.13.0** — the fee policy lives in its genesis, so older nodes cannot decode it; build from a tag ≥ v0.13.0. (staging-1 is retired and archived: `networks/staging-1/`.) How an external operator joins a HashKinetics network: generate a key,
 send one public JSON blob, receive genesis, start. Every consensus signature you will ever
 produce is hash-based (LMS/HSS over SHAKE-256 under a stateless SLH-DSA-192s root) — you are
 operating post-quantum BFT.

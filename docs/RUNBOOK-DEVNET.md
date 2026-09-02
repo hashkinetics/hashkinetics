@@ -1,8 +1,14 @@
 # HashKinetics Devnet Runbook
 
-**v0.10.0 (2026-08-26).** The operational manual for running, demoing, debugging, and
-recording the devnet — every failure mode in the troubleshooting table was actually hit
+**v0.13.0 (2026-09-02).** The operational manual for running, demoing, debugging, and
+recording the local devnet (the public network is testnet-1 — `networks/testnet-1/`; the fleet ceremony is `CEREMONY-TESTNET-1.md`; `chain/rehearsal.sh` runs the whole ceremony + restore-shape gate on one box) — every failure mode in the troubleshooting table was actually hit
 and diagnosed on ASUS-SERVER. Read this before touching a terminal after time away.
+Since v0.11 the devnet also carries the usage-sprint surfaces: `account-new/-info/-balance/-send/-create`
+(self-custody CLI), `faucet-serve` (the public drip service), and the `HashKinetics-Wallet.exe`
+GUI — all against the same live chain. Fleet-roll canon (learned the hard way, 2026-09-02):
+roll ONE voter at a time and confirm it is actually **voting** (`journalctl | grep -c Voting` > 0
+over 20–30s), not merely `active`, before touching the next; size any consensus-activation
+height against VOTER tips, never the public RPC edge (the gateway can lag its own voters).
 
 **P3.0 notes:** the node is DURABLE — restart WITHOUT `--fresh` = resume (see §7 for the
 restart/crash-kill procedure); the explorer lives at `../explorer/index.html` (open in
