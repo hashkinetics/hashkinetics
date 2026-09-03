@@ -7,11 +7,12 @@ members = [
     "crates/hk-state",
     "crates/hk-wallet",
     "crates/hk-consensus",
-    "crates/hk-rpc",
     "crates/hk-node",
     "crates/hk-facilitator",
     "crates/hk-wallet-gui",
 ]
+# v0.13.2 (H11): the 0.7-era DTO stub nothing depends on; deleted at the next housekeeping commit.
+exclude = ["crates/hk-rpc"]
 
 [workspace.package]
 version = "0.0.1"

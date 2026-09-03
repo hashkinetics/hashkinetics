@@ -7,3 +7,6 @@ e2ffcb8e674b128a569d4cef7b2e171ce13bb6e667f8f2265f0b6059bbf73544  hk-node-v0.13.
 5c355fd55f3066adece591580907a816372f68da576b93a9d22874f43c5f86af  HashKinetics-Wallet.exe   # v0.13.0 (superseded)
 # v0.13.1 release — wallet only (the node binary above is unchanged)
 fb330c291c656e71a7d3473f9cffabb7a449a98ea7f8ddbcc09bd7062e16fb15  HashKinetics-Wallet.exe   # v0.13.1
+# v0.13.2 release — node hardening (H-batch) + R12; state-compatible, recommended for every public-facing node (minimum stays v0.13.0)
+b94b89f08fa80e04d0d112036a1497be110f7db7c4e5d2b4f9cfa72a697003b7  hk-node-v0.13.2.gz
+b7601e846176cafb8de575305d82e3ee182172a6def0444cadf8359d002b0f37  hk-node-v0.13.2

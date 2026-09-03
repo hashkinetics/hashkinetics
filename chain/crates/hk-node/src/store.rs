@@ -263,6 +263,12 @@ impl NodeStore {
             .open(&self.wal_path)?;
         f.write_all(&(frame.len() as u32).to_le_bytes())?;
         f.write_all(&frame)?;
+        // H6 (v0.13.2): an admission the client was told "accepted" survives a power
+        // cut. One fdatasync per admission by default; `HK_WAL_FSYNC=0` trades that
+        // for throughput on benches (the storm harness) — never on a public node.
+        if wal_fsync_enabled() {
+            f.sync_data()?;
+        }
         Ok(())
     }
 
@@ -440,4 +446,10 @@ mod tests {
         assert_eq!(txs[0].nonce, 9);
         std::fs::remove_dir_all(&home).ok();
     }
+}
+
+/// H6: WAL durability policy (read once). Default ON.
+fn wal_fsync_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("HK_WAL_FSYNC").map(|v| v != "0").unwrap_or(true))
 }

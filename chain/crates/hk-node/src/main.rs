@@ -11,6 +11,10 @@
 //! restart never reuses a leaf; exhaustion rotates under the stateless SLH-DSA root.
 //! See docs/MAINNET-KEY-MANAGEMENT.md. Ed25519 remains ONLY as libp2p transport identity.
 
+/// The release label this binary reports (`hk-node --version`, the usage banner).
+/// Bump with every node release; the crate version is workspace-wide and not it.
+pub const NODE_VERSION: &str = "v0.13.2";
+
 mod account;
 mod app;
 mod batch;
@@ -70,6 +74,10 @@ fn main() -> eyre::Result<()> {
 
 fn real_main(args: Vec<String>) -> eyre::Result<()> {
     match args.get(1).map(String::as_str) {
+        Some("--version") | Some("version") => {
+            println!("hk-node {NODE_VERSION}");
+            Ok(())
+        }
         Some("testnet") => {
             let n: usize = args.get(2).map(|s| s.parse()).transpose()?.unwrap_or(4);
             let home = PathBuf::from(args.get(3).cloned().unwrap_or_else(|| "devnet".into()));
@@ -269,7 +277,7 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
             }
         }
         _ => {
-            eprintln!("HashKinetics node v0.10 (hash-based consensus + shielded pool + disclosure + durable store)");
+            eprintln!("HashKinetics node {NODE_VERSION} (hash-based consensus + shielded pool + disclosure + durable store)");
             eprintln!("usage: hk-node testnet <N> <HOME> | start <NODE_HOME> | wallet <CMD …> | keygen <HOME> [MONIKER] | issue-rotation <HOME> [EPOCH] [VALID_FROM] | genesis-build <VALIDATORS.json> <OUT.json> | config-gen <HOME> --listen … --peers … | storm <RPC> [RATE] [DURATION_S] | demo <RPC> | demo-economy <RPC> <PROVER> | demo-shielded <RPC> <PROVER> | demo-disclose <RPC> <PROVER> | demo-agg <RPC> <PROVER> | demo-mandates <RPC> <PROVER> | verify-disclosure <package.json>");
             eprintln!("join a testnet: docs/VALIDATOR-ONBOARDING.md (keygen → send validator.json → receive genesis → config-gen → start)");
             eprintln!("accounts (U1): account-new DIR · account-info DIR · account-balance RPC ID|DIR · account-send DIR RPC TO MICRO [ASSET] · account-create DIR RPC AUTH_COMMIT MICRO [ASSET] · faucet-serve DIR RPC [--drip …]");
@@ -318,7 +326,8 @@ fn fetch_vk_pins() -> Option<crate::genesis::VkPins> {
 fn cmd_testnet(n: usize, home: &PathBuf) -> eyre::Result<()> {
     // Each validator gets a 32-byte master seed; the consensus (LMS/HSS) public key is
     // derived from it. Keygen is done once per validator here (a second or two each).
-    let seeds: Vec<[u8; 32]> = (0..n).map(|_| rand::random::<[u8; 32]>()).collect();
+    // H12 (v0.13.2): the highest-value key in the system comes straight from the OS CSPRNG.
+    let seeds: Vec<[u8; 32]> = (0..n).map(|_| os_seed()).collect();
     println!("generating {n} hash-based validator keys (LMS/HSS keygen — a moment each)...");
 
     let vk_pins = fetch_vk_pins();
@@ -477,7 +486,7 @@ fn cmd_keygen(home: &PathBuf, moniker: &str) -> eyre::Result<()> {
         eyre::bail!("{} already exists — refusing to overwrite a validator key", key_path.display());
     }
     println!("generating hash-based validator key (LMS/HSS keygen — a moment)...");
-    let seed: [u8; 32] = rand::random();
+    let seed: [u8; 32] = os_seed(); // H12: OS CSPRNG, no userspace generator state
     std::fs::write(&key_path, serde_json::to_string_pretty(&seed)?)?;
     let gv = GenesisValidator {
         root_pk: RootSecret::from_seed(&seed).public_bytes().to_vec(),
@@ -697,4 +706,14 @@ fn cmd_config_gen(rest: &[String]) -> eyre::Result<()> {
     println!("  Place the coordinator's genesis.json beside it, then:  hk-node start {}", home.display());
     println!("  (RPC binds {rpc_addr} — keep it loopback unless fronted by a proxy: it has NO auth.)");
     Ok(())
+}
+
+/// H12 (v0.13.2): 32 bytes straight from the operating system's CSPRNG (the same
+/// source `account-new` has always used); validator master seeds never come from a
+/// userspace generator.
+fn os_seed() -> [u8; 32] {
+    use rand::RngCore;
+    let mut seed = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut seed);
+    seed
 }

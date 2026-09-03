@@ -15,15 +15,19 @@
 //!   moment. We still answer OPTIONS 204 defensively.
 //! - Reserve-then-sign: the faucet wallet's nonce persists BEFORE submit; rollback
 //!   (persisted) only on refusal — a crash can never re-sign a spent L-ratchet index.
-//! - Rate limiting is the anti-spam floor until U4 fees land: per-IP cooldown +
-//!   a global daily cap, honoring X-Forwarded-For (we sit behind nginx).
+//! - Rate limiting is the anti-spam floor alongside the U4 fee: per-IP cooldown +
+//!   a global daily cap. X-Forwarded-For is honored ONLY from a loopback/private peer
+//!   (the nginx in front of us) — a direct caller cannot forge its own address (H9).
+//! - Cooldowns persist (`faucet-cooldowns.json` next to the wallet) and the map is
+//!   bounded: a restart no longer hands everyone a fresh drip, and a scan of a
+//!   million addresses no longer grows memory without limit (H9, v0.13.2).
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use hk_primitives::{Amount, H256};
 use hk_state::tx::Tx;
@@ -47,8 +51,9 @@ struct FaucetState {
     faucet_id: H256,
     /// (wallet, dir) under one lock: sign + persist are atomic w.r.t. other drips.
     signer: Mutex<(Wallet, AccountFile)>,
-    /// ip → last successful drip.
-    last_drip: Mutex<HashMap<String, Instant>>,
+    /// ip → last successful drip (unix seconds; persisted, bounded).
+    last_drip: Mutex<HashMap<String, u64>>,
+    cooldown_path: PathBuf,
     /// (day-stamp, count) global cap.
     daily: Mutex<(u64, u32)>,
 }
@@ -69,10 +74,14 @@ pub(crate) fn serve(cfg: FaucetCfg) -> eyre::Result<()> {
     }
 
     let listener = TcpListener::bind(&cfg.listen)?;
+    let cooldown_path = cfg.wallet_dir.join("faucet-cooldowns.json");
+    let restored = load_cooldowns(&cooldown_path, cfg.cooldown);
+    println!("   cooldowns restored: {} address(es) still inside the window", restored.len());
     let state = std::sync::Arc::new(FaucetState {
         faucet_id: id,
         signer: Mutex::new((wallet, file)),
-        last_drip: Mutex::new(HashMap::new()),
+        last_drip: Mutex::new(restored),
+        cooldown_path,
         daily: Mutex::new((0, 0)),
         cfg,
     });
@@ -144,23 +153,23 @@ fn handle(st: std::sync::Arc<FaucetState>, mut stream: TcpStream) -> eyre::Resul
     }
 
     // ---- rate limits ------------------------------------------------------
-    let ip = text
+    // H9: X-Forwarded-For is trusted only when the TCP peer is the local reverse
+    // proxy; anyone reaching us directly is rated by the address they came from.
+    let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
+    let peer_is_proxy = peer_ip.map(|ip| ip.is_loopback() || is_private(ip)).unwrap_or(false);
+    let forwarded = text
         .lines()
         .find(|l| l.to_ascii_lowercase().starts_with("x-forwarded-for:"))
         .and_then(|l| l.split(':').nth(1))
         .map(|v| v.split(',').next().unwrap_or("").trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            stream.peer_addr().map(|a| a.ip().to_string()).unwrap_or_else(|_| "?".into())
-        });
+        .filter(|s| !s.is_empty());
+    let ip = match (peer_is_proxy, forwarded) {
+        (true, Some(f)) => f,
+        _ => peer_ip.map(|a| a.to_string()).unwrap_or_else(|| "?".into()),
+    };
     {
-        let day = Instant::now(); // day bucketing via elapsed on a fixed epoch below
-        let _ = day;
-        let now_day = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            / 86_400;
+        let now_secs = unix_now();
+        let now_day = now_secs / 86_400;
         let mut daily = st.daily.lock().unwrap_or_else(|e| e.into_inner());
         if daily.0 != now_day {
             *daily = (now_day, 0);
@@ -170,17 +179,23 @@ fn handle(st: std::sync::Arc<FaucetState>, mut stream: TcpStream) -> eyre::Resul
             return Ok(());
         }
         let mut last = st.last_drip.lock().unwrap_or_else(|e| e.into_inner());
+        let cooldown_secs = st.cfg.cooldown.as_secs();
         if let Some(t) = last.get(&ip) {
-            let since = t.elapsed();
-            if since < st.cfg.cooldown {
-                let wait = (st.cfg.cooldown - since).as_secs();
+            let since = now_secs.saturating_sub(*t);
+            if since < cooldown_secs {
+                let wait = cooldown_secs - since;
                 respond(&mut stream, "429 Too Many Requests", &json!({"error":"cooldown", "retry_after_secs": wait}));
                 return Ok(());
             }
         }
+        // H9: bounded map — drop expired entries whenever it gets large.
+        if last.len() >= COOLDOWN_MAP_MAX {
+            last.retain(|_, t| now_secs.saturating_sub(*t) < cooldown_secs);
+        }
         // Optimistically stamp both (rolled back on failure below via re-lock).
-        last.insert(ip.clone(), Instant::now());
+        last.insert(ip.clone(), now_secs);
         daily.1 += 1;
+        save_cooldowns(&st.cooldown_path, &last);
     }
 
     // ---- parse target -----------------------------------------------------
@@ -292,7 +307,52 @@ fn handle(st: std::sync::Arc<FaucetState>, mut stream: TcpStream) -> eyre::Resul
 
 /// A refused/failed drip should not burn the caller's cooldown or the daily budget.
 fn undo_stamp(st: &FaucetState, ip: &str) {
-    st.last_drip.lock().unwrap_or_else(|e| e.into_inner()).remove(ip);
+    {
+        let mut last = st.last_drip.lock().unwrap_or_else(|e| e.into_inner());
+        last.remove(ip);
+        save_cooldowns(&st.cooldown_path, &last);
+    }
     let mut daily = st.daily.lock().unwrap_or_else(|e| e.into_inner());
     daily.1 = daily.1.saturating_sub(1);
+}
+
+/// H9: never more than this many addresses in the cooldown map (expired ones are
+/// pruned first; the window is 24 h, so this is far above any honest load).
+const COOLDOWN_MAP_MAX: usize = 100_000;
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// RFC 1918 / link-local / unique-local — "the proxy is on this box or this LAN".
+fn is_private(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0xfc00 || (v6.segments()[0] & 0xffc0) == 0xfe80,
+    }
+}
+
+/// Cooldowns on disk: `{ "<ip>": <unix secs>, ... }`. Entries outside the window are
+/// dropped on load; a missing or corrupt file is an empty map (never fatal).
+fn load_cooldowns(path: &std::path::Path, cooldown: Duration) -> HashMap<String, u64> {
+    let Ok(bytes) = std::fs::read(path) else { return HashMap::new() };
+    let Ok(map) = serde_json::from_slice::<HashMap<String, u64>>(&bytes) else { return HashMap::new() };
+    let now = unix_now();
+    map.into_iter().filter(|(_, t)| now.saturating_sub(*t) < cooldown.as_secs()).collect()
+}
+
+/// Best-effort atomic write (tmp + rename); a failure is logged, never fatal — the
+/// in-memory map still protects the running process.
+fn save_cooldowns(path: &std::path::Path, map: &HashMap<String, u64>) {
+    let tmp = path.with_extension("json.tmp");
+    let res = serde_json::to_vec(map)
+        .map_err(|e| e.to_string())
+        .and_then(|b| std::fs::write(&tmp, b).map_err(|e| e.to_string()))
+        .and_then(|_| std::fs::rename(&tmp, path).map_err(|e| e.to_string()));
+    if let Err(e) = res {
+        eprintln!("faucet: could not persist cooldowns: {e}");
+    }
 }

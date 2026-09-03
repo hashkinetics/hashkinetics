@@ -200,7 +200,12 @@ pub fn contiguous_suffix_min(heights_ascending: &[u64]) -> Option<u64> {
 /// (engine started at height 0). v0.12.2 shipped U4 + R9 without it. v0.13.0 ships
 /// R10 v2: the engine's start height comes from the CHAIN (snapshot + replay), never
 /// from the shape of the block log; disk serves whatever contiguous suffix it holds.
-pub const FEE_ACTIVATION_HEIGHT: u64 = 110_000;
+/// v0.13.2 (H10): the placeholder default is gone — a genesis without a fee policy
+/// runs fee-free unless BOTH env overrides are set. Kept as documentation of the
+/// staging-1 era value; nothing reads it.
+#[allow(dead_code)]
+pub const FEE_ACTIVATION_HEIGHT_STAGING1: u64 = 110_000;
+#[allow(dead_code)]
 pub const FEE_MICRO_DEFAULT: u128 = 100;
 
 /// R9: if we issued a rotation cert and our on-chain epoch still hasn't advanced
@@ -333,8 +338,24 @@ impl HkApp {
                 info!(micro = %f.micro, from_height = f.from_height, "fee policy is genesis-bound (U4.b)");
             }
             None => {
-                chain.fee_micro = env_micro.unwrap_or(FEE_MICRO_DEFAULT);
-                chain.fee_from = env_from.unwrap_or(FEE_ACTIVATION_HEIGHT);
+                // H10 (v0.13.2): a genesis that carries no fee policy gets NO fee unless the
+                // operator says so explicitly — the old placeholder height (110,000) could
+                // have armed a fee on a public network nobody had coordinated.
+                match (env_micro, env_from) {
+                    (Some(m), Some(f)) => {
+                        chain.fee_micro = m;
+                        chain.fee_from = f;
+                        warn!(micro = %m, from_height = f, "fee policy from HK_FEE_MICRO/HK_FEE_FROM (genesis carries none) — every validator must run the same values");
+                    }
+                    (None, None) => {
+                        chain.fee_micro = 0;
+                        chain.fee_from = u64::MAX;
+                        warn!("genesis carries no fee policy and HK_FEE_MICRO/HK_FEE_FROM are unset — running FEE-FREE (bind a policy into the genesis for any public network)");
+                    }
+                    _ => {
+                        eyre::bail!("HK_FEE_MICRO and HK_FEE_FROM must be set together when the genesis carries no fee policy");
+                    }
+                }
             }
         }
         // WS2: inject the real STARK verifier. None ⇒ hk-state's RejectAll default stays —
@@ -496,7 +517,7 @@ impl HkApp {
                 // clause of the SAME production trigger can fire here.
                 let (due, _) = rotation_due(
                     remaining,
-                    capacity,
+                    rotation_threshold(capacity, &my_root_pk),
                     0,
                     None,
                     mine_pending,
@@ -1158,10 +1179,10 @@ impl HkApp {
                 let pct = remaining * 100 / capacity;
                 if pct < 5 {
                     error!(remaining, pct, epoch = self.current_epoch, "signer leaf budget CRITICAL");
-                } else if pct < 20 {
-                    warn!(remaining, pct, epoch = self.current_epoch, "signer leaf budget low — rotation should be in flight");
+                } else if remaining < rotation_threshold(capacity, &self.my_root_pk) {
+                    warn!(remaining, pct, epoch = self.current_epoch, "signer leaf budget under this seat's rotation threshold — rotation should be in flight");
                 } else {
-                    info!(remaining, pct, epoch = self.current_epoch, "signer leaf budget");
+                    info!(remaining, pct, epoch = self.current_epoch, threshold = rotation_threshold(capacity, &self.my_root_pk), "signer leaf budget");
                 }
             }
             let mine_pending =
@@ -1174,9 +1195,10 @@ impl HkApp {
                 .last_issue_time
                 .map(|t| t.elapsed() >= REISSUE_AFTER)
                 .unwrap_or(true);
+            let threshold = rotation_threshold(capacity, &self.my_root_pk);
             let (due, threshold_hit) = rotation_due(
                 remaining,
-                capacity,
+                threshold,
                 height,
                 self.rotate_every,
                 mine_pending,
@@ -1585,9 +1607,22 @@ fn tx_counterparty(tx: &hk_state::tx::Tx) -> Option<hk_primitives::AccountId> {
     }
 }
 
+/// R12: the per-validator rotation threshold, in leaves. Seats whose trees start
+/// together cross a fixed 20% line together (testnet-1, 2026-09-03: all four
+/// rotated within eleven blocks of each other), so a rotation-path bug would hit
+/// every seat in the same minute. Each seat therefore rotates somewhere in
+/// [15%, 25%] of its capacity, the exact point derived from its (public, permanent)
+/// root key — deterministic across restarts, different per seat, reproducible by
+/// anyone. `capacity * 1500..=2500 / 10000`.
+pub fn rotation_threshold(capacity: u64, root_pk: &[u8]) -> u64 {
+    let h = hk_crypto::hash::shake256_32("hk/v1/rotation-jitter", &[root_pk]);
+    let jitter = u16::from_le_bytes([h[0], h[1]]) as u64 % 1001; // 0..=1000 → 15.00%..25.00%
+    capacity.saturating_mul(1500 + jitter) / 10_000
+}
+
 fn rotation_due(
     remaining: u64,
-    capacity: u64,
+    threshold: u64,
     height: u64,
     rotate_every: Option<u64>,
     mine_pending: bool,
@@ -1595,7 +1630,7 @@ fn rotation_due(
     highest_issued: u64,
     issue_stale: bool,
 ) -> (bool, bool) {
-    let threshold_hit = remaining < capacity / 5;
+    let threshold_hit = remaining < threshold;
     let interval_hit = rotate_every.is_some_and(|n| height > 0 && height % n == 0);
     // R9: the pending/already-issued guards only hold while a previous issue is
     // FRESH. Once stale (or after a restart), a trigger fires again — a lost cert
@@ -1607,14 +1642,14 @@ fn rotation_due(
 
 #[cfg(test)]
 mod rotation_trigger_tests {
-    use super::rotation_due;
+    use super::{rotation_due, rotation_threshold};
     const CAP: u64 = 32_768; // hk_crypto::hashsig::CONSENSUS_CAPACITY
 
     #[test]
     fn fresh_tree_never_rotates_without_interval() {
         // The staging fleet's pre-incident config (no env) must now be SAFE by default:
         for h in [1u64, 500, 10_848] {
-            assert_eq!(rotation_due(CAP, CAP, h, None, false, 1, 0, false), (false, false));
+            assert_eq!(rotation_due(CAP, CAP / 5, h, None, false, 1, 0, false), (false, false));
         }
     }
 
@@ -1622,29 +1657,29 @@ mod rotation_trigger_tests {
     fn threshold_fires_below_twenty_percent_regardless_of_height() {
         // 20% of 32,768 = 6,553; the incident's tree would have triggered ~2.2K
         // heights (>1 hour) before the halt instead of dying at leaf zero.
-        assert_eq!(rotation_due(6_552, CAP, 10_777, None, false, 1, 0, false), (true, true));
-        assert_eq!(rotation_due(6_553, CAP, 10_777, None, false, 1, 0, false), (false, false));
-        assert_eq!(rotation_due(0, CAP, 3, None, false, 1, 0, false), (true, true));
+        assert_eq!(rotation_due(6_552, CAP / 5, 10_777, None, false, 1, 0, false), (true, true));
+        assert_eq!(rotation_due(6_553, CAP / 5, 10_777, None, false, 1, 0, false), (false, false));
+        assert_eq!(rotation_due(0, CAP / 5, 3, None, false, 1, 0, false), (true, true));
     }
 
     #[test]
     fn r1b_tick_shape_threshold_fires_without_a_height() {
         // R1.b calls rotation_due with height=0 and no interval override — a node
         // that never commits must still fire the SAME leaf-budget clause…
-        assert_eq!(rotation_due(6_552, CAP, 0, None, false, 1, 0, false), (true, true));
-        assert_eq!(rotation_due(6_553, CAP, 0, None, false, 1, 0, false), (false, false));
+        assert_eq!(rotation_due(6_552, CAP / 5, 0, None, false, 1, 0, false), (true, true));
+        assert_eq!(rotation_due(6_553, CAP / 5, 0, None, false, 1, 0, false), (false, false));
         // …must not re-issue when the next epoch is already in flight
         // (threshold still reports hit — the gauge is honest, the action is gated)…
-        assert_eq!(rotation_due(6_552, CAP, 0, None, true, 1, 0, false), (false, true));
+        assert_eq!(rotation_due(6_552, CAP / 5, 0, None, true, 1, 0, false), (false, true));
         // …and must not re-issue an epoch it already issued.
-        assert_eq!(rotation_due(6_552, CAP, 0, None, false, 1, 1, false), (false, true));
+        assert_eq!(rotation_due(6_552, CAP / 5, 0, None, false, 1, 1, false), (false, true));
     }
 
     #[test]
     fn interval_override_still_works() {
-        assert_eq!(rotation_due(CAP, CAP, 500, Some(500), false, 1, 0, false), (true, false));
-        assert_eq!(rotation_due(CAP, CAP, 501, Some(500), false, 1, 0, false), (false, false));
-        assert_eq!(rotation_due(CAP, CAP, 0, Some(500), false, 1, 0, false), (false, false));
+        assert_eq!(rotation_due(CAP, CAP / 5, 500, Some(500), false, 1, 0, false), (true, false));
+        assert_eq!(rotation_due(CAP, CAP / 5, 501, Some(500), false, 1, 0, false), (false, false));
+        assert_eq!(rotation_due(CAP, CAP / 5, 0, Some(500), false, 1, 0, false), (false, false));
     }
 
     #[test]
@@ -1652,23 +1687,43 @@ mod rotation_trigger_tests {
         // The val-0 wedge (2026-09-02): threshold screaming, but a snapshot-restored
         // highest_issued (and/or a stale pending cert) gated issuance forever.
         // FRESH issue (stale=false): guards hold exactly as before…
-        assert_eq!(rotation_due(10, CAP, 100, None, true, 4, 4, false), (false, true));
-        assert_eq!(rotation_due(10, CAP, 100, None, false, 4, 4, false), (false, true));
+        assert_eq!(rotation_due(10, CAP / 5, 100, None, true, 4, 4, false), (false, true));
+        assert_eq!(rotation_due(10, CAP / 5, 100, None, false, 4, 4, false), (false, true));
         // …STALE issue (or fresh boot): the same trigger fires through both guards.
-        assert_eq!(rotation_due(10, CAP, 100, None, true, 4, 4, true), (true, true));
-        assert_eq!(rotation_due(10, CAP, 100, None, false, 4, 7, true), (true, true));
+        assert_eq!(rotation_due(10, CAP / 5, 100, None, true, 4, 4, true), (true, true));
+        assert_eq!(rotation_due(10, CAP / 5, 100, None, false, 4, 7, true), (true, true));
         // Staleness alone never fires without a trigger — a healthy budget stays quiet.
-        assert_eq!(rotation_due(CAP, CAP, 100, None, false, 4, 4, true), (false, false));
+        assert_eq!(rotation_due(CAP, CAP / 5, 100, None, false, 4, 4, true), (false, false));
     }
 
     #[test]
     fn guards_suppress_double_issue() {
         // Our cert already pending → never re-issue, however low the budget runs.
-        assert_eq!(rotation_due(10, CAP, 100, None, true, 1, 0, false), (false, true));
+        assert_eq!(rotation_due(10, CAP / 5, 100, None, true, 1, 0, false), (false, true));
         // Epoch already issued (e.g. included but we replayed past the bookkeeping).
-        assert_eq!(rotation_due(10, CAP, 100, None, false, 1, 1, false), (false, true));
+        assert_eq!(rotation_due(10, CAP / 5, 100, None, false, 1, 1, false), (false, true));
         // After the rotation applies (fresh tree, epoch advanced), the cycle re-arms.
-        assert_eq!(rotation_due(CAP, CAP, 101, None, false, 2, 1, false), (false, false));
-        assert_eq!(rotation_due(6_000, CAP, 200, None, false, 2, 1, false), (true, true));
+        assert_eq!(rotation_due(CAP, CAP / 5, 101, None, false, 2, 1, false), (false, false));
+        assert_eq!(rotation_due(6_000, CAP / 5, 200, None, false, 2, 1, false), (true, true));
+    }
+
+    #[test]
+    fn r12_threshold_is_per_seat_inside_15_to_25_percent() {
+        // Four seats keyed together must NOT share a threshold; every threshold sits
+        // in [15%, 25%] of capacity; the same key always yields the same threshold.
+        let seats: Vec<Vec<u8>> = (0u8..4).map(|i| vec![i; 48]).collect();
+        let ts: Vec<u64> = seats.iter().map(|pk| rotation_threshold(CAP, pk)).collect();
+        for t in &ts {
+            assert!(*t >= CAP * 15 / 100 && *t <= CAP * 25 / 100, "threshold {t} outside 15–25%");
+        }
+        let mut uniq = ts.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), ts.len(), "seats collided on a threshold: {ts:?}");
+        assert_eq!(rotation_threshold(CAP, &seats[0]), ts[0]);
+        // The trigger honours the per-seat line, not the old 20% constant.
+        let t = ts[0];
+        assert_eq!(rotation_due(t - 1, t, 0, None, false, 1, 0, false), (true, true));
+        assert_eq!(rotation_due(t, t, 0, None, false, 1, 0, false), (false, false));
     }
 }

@@ -85,6 +85,6 @@ curl -s -X POST https://rpc.hashkinetics.org -d '{"method":"hk_getTx","params":{
 # → {"result":{"found":true,"height":2199,"summary":{"kind":"transfer","fields":{"amount":"1000000000",…}},"receipt":"ok: 1 event(s)"}}
 ```
 
-## Known limits (ledgered — `docs/P3.2-IMPLEMENTATION-PLAN.md` §hardening)
+## Limits and refusals (v0.13.2)
 
-No auth, no rate limit, no read timeout on the RPC listener · `hk_getPoolNotes`/`hk_getPoolLeaves` return the whole pool · `hk_submitBundle` queue and `hk_gossipTxs` batches are unbounded · error strings can include filesystem paths · `hk_getAccountTxs` turns any account id into its full transparent payment graph (by design of the transparent skeleton; shield if you need privacy).
+Per request: 10 s to arrive in full (`408 request timed out`), 8 MiB body (`413`), 256 concurrent connections per node (`503 rpc busy`). **Operator methods are not browser-callable:** `hk_submitRotation`, `hk_gossipTxs` and `hk_submitBundle` answer `403` when the request carries an `Origin` header (a web page cannot drive a node's operator surface even when it can reach it); every other method, including `hk_submitTx`, keeps CORS `*`. `hk_submitBundle` queues at most 64 bundles and refuses a duplicate aggregate; `hk_gossipTxs` takes at most 1,024 txs per call. Still ledgered (`docs/P3.2-IMPLEMENTATION-PLAN.md`): no auth, no per-client rate limit · `hk_getPoolNotes`/`hk_getPoolLeaves` return the whole pool (pagination = H3) · `hk_getAccountTxs` turns any account id into its full transparent payment graph (by design of the transparent skeleton; shield if you need privacy).

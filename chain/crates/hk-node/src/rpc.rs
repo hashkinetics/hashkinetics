@@ -31,6 +31,8 @@
 //! All 32-byte ids are lowercase hex (64 chars).
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -43,9 +45,17 @@ use hk_state::tx::SignedTx;
 use crate::batch::{txid, Batch};
 use crate::state::SharedHandles;
 
+/// H1 (v0.13.2): a request must arrive within this window, headers and body — a
+/// half-open connection used to pin a task and up to 1 MiB of buffer forever.
+const RPC_CONN_TIMEOUT: Duration = Duration::from_secs(10);
+/// H1: at most this many connections are served concurrently; the rest get a fast
+/// 503 instead of queueing behind a slowloris.
+const RPC_MAX_CONNS: usize = 256;
+
 pub async fn serve(addr: SocketAddr, h: SharedHandles) -> eyre::Result<()> {
     let listener = TcpListener::bind(addr).await?;
-    info!(%addr, "RPC listening");
+    info!(%addr, timeout_s = RPC_CONN_TIMEOUT.as_secs(), max_conns = RPC_MAX_CONNS, "RPC listening");
+    let slots = Arc::new(tokio::sync::Semaphore::new(RPC_MAX_CONNS));
     loop {
         let (mut sock, _peer) = match listener.accept().await {
             Ok(x) => x,
@@ -55,12 +65,32 @@ pub async fn serve(addr: SocketAddr, h: SharedHandles) -> eyre::Result<()> {
             }
         };
         let h = h.clone();
+        let slots = slots.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(&mut sock, &h).await {
-                warn!(%e, "rpc conn error");
+            let Ok(_permit) = slots.try_acquire() else {
+                let _ = respond(&mut sock, 503, &json!({"error":"rpc busy — try again"})).await;
+                return;
+            };
+            match tokio::time::timeout(RPC_CONN_TIMEOUT, handle_conn(&mut sock, &h)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!(%e, "rpc conn error"),
+                Err(_) => {
+                    let _ = respond(&mut sock, 408, &json!({"error":"request timed out"})).await;
+                }
             }
         });
     }
+}
+
+/// H2 (v0.13.2): operator methods a web page must never be able to drive. A browser
+/// always sends `Origin` on a cross-site POST; CORS only hides the RESPONSE, the
+/// request still runs — so these are refused outright when an Origin is present.
+/// Read methods and `hk_submitTx` stay browser-callable (the explorer, the site,
+/// the wallet). Override for a deliberately browser-driven devnet: HK_RPC_ALLOW_BROWSER_OPS=1.
+const OPERATOR_METHODS: &[&str] = &["hk_submitRotation", "hk_gossipTxs", "hk_submitBundle"];
+
+fn browser_ops_allowed() -> bool {
+    std::env::var("HK_RPC_ALLOW_BROWSER_OPS").map(|v| v == "1").unwrap_or(false)
 }
 
 /// C2.1: the shared admission gate for `hk_submitTx` AND `hk_gossipTxs`.
@@ -69,8 +99,8 @@ pub async fn serve(addr: SocketAddr, h: SharedHandles) -> eyre::Result<()> {
 /// what was never admissible is never persisted.
 fn admit_one(h: &SharedHandles, tx: &SignedTx) -> Result<[u8; 32], String> {
     let admitted = {
-        let chain = h.chain.lock().unwrap();
-        let mut mp = h.mempool.lock().unwrap();
+        let chain = h.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let mut mp = h.mempool.lock().unwrap_or_else(|e| e.into_inner());
         mp.try_admit(tx.clone(), &chain)
     };
     match admitted {
@@ -111,6 +141,12 @@ async fn handle_conn(sock: &mut tokio::net::TcpStream, h: &SharedHandles) -> eyr
         .find_map(|l| l.strip_prefix("content-length:"))
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(0);
+    // H1: the body cap is enforced before reading it, not after.
+    if content_len > 8_388_608 {
+        return respond(sock, 413, &json!({"error":"body too large"})).await;
+    }
+    // H2: a browser page is calling (cross-site POSTs always carry Origin).
+    let from_browser = headers.split("\r\n").any(|l| l.starts_with("origin:"));
 
     while buf.len() < header_end + content_len {
         let n = sock.read(&mut tmp).await?;
@@ -132,16 +168,24 @@ async fn handle_conn(sock: &mut tokio::net::TcpStream, h: &SharedHandles) -> eyr
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(Value::Null);
 
+    if from_browser && OPERATOR_METHODS.contains(&method) && !browser_ops_allowed() {
+        warn!(method, "operator RPC method refused: called from a browser origin");
+        return respond(sock, 403, &json!({"error": format!("{method} is an operator method and cannot be called from a browser page")})).await;
+    }
     let result = dispatch(method, &params, h);
     let status = if result.get("error").is_some() { 400 } else { 200 };
     respond(sock, status, &result).await
 }
 
+/// H4/H5 (v0.13.2) bounds on unauthenticated ingress.
+const BUNDLE_QUEUE_MAX: usize = 64;
+const GOSSIP_MAX_TXS: usize = 1_024;
+
 fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
     match method {
         "hk_chainInfo" => {
-            let (epoch, remaining) = *h.signer_gauge.lock().unwrap();
-            let chain = h.chain.lock().unwrap();
+            let (epoch, remaining) = *h.signer_gauge.lock().unwrap_or_else(|e| e.into_inner());
+            let chain = h.chain.lock().unwrap_or_else(|e| e.into_inner());
             json!({"result": {
                 "chain_id": h.chain_id,
                 // Genesis-gate: the network's identity fingerprint (== `sha256sum
@@ -180,7 +224,7 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
                     let check = { h.validators.lock().unwrap_or_else(|e| e.into_inner()).apply_rotation(&cert) };
                     match check {
                         Ok(_) => {
-                            let mut q = h.foreign_rotations.lock().unwrap();
+                            let mut q = h.foreign_rotations.lock().unwrap_or_else(|e| e.into_inner());
                             let dup = q
                                 .iter()
                                 .any(|x| x.root_pk == cert.root_pk && x.epoch >= cert.epoch);
@@ -203,7 +247,7 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
         },
         "hk_getAccount" => match param_h256(params, "id") {
             Some(id) => {
-                let chain = h.chain.lock().unwrap();
+                let chain = h.chain.lock().unwrap_or_else(|e| e.into_inner());
                 match chain.accounts.get(&id) {
                     Some(acc) => json!({"result": {
                         "found": true,
@@ -217,7 +261,7 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
         },
         "hk_balance" => match (param_h256(params, "id"), param_h256(params, "asset")) {
             (Some(id), Some(asset)) => {
-                let chain = h.chain.lock().unwrap();
+                let chain = h.chain.lock().unwrap_or_else(|e| e.into_inner());
                 // AccountId/AssetId are aliases of H256 — pass the H256 values directly.
                 json!({"result": {"amount": chain.balance(&id, &asset).to_string()}})
             }
@@ -225,7 +269,7 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
         },
         "hk_mandateAvailable" => match param_h256(params, "leaf") {
             Some(leaf) => {
-                let chain = h.chain.lock().unwrap();
+                let chain = h.chain.lock().unwrap_or_else(|e| e.into_inner());
                 let at = params.get("at").and_then(|v| v.as_u64()).unwrap_or(chain.time);
                 match chain.mandates.available(&leaf, at) {
                     Ok(a) => json!({"result": {"available": a.to_string()}}),
@@ -262,6 +306,12 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
                 .cloned()
                 .and_then(|v| serde_json::from_value(v).ok())
                 .unwrap_or_default();
+            // H5 (v0.13.2): one gossip call carries at most a block's worth; a peer
+            // that floods gets refused, not served. Duplicates are already refused by
+            // the mempool's admission gate (the seen-set is the mempool itself).
+            if txs.len() > GOSSIP_MAX_TXS {
+                return json!({"error": format!("too many txs in one gossip call (max {GOSSIP_MAX_TXS})")});
+            }
             let (mut admitted, mut dropped) = (0usize, 0usize);
             for tx in txs {
                 match admit_one(h, &tx) {
@@ -273,7 +323,7 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
         }
         "hk_getChannel" => match param_h256(params, "id") {
             Some(id) => {
-                let chain = h.chain.lock().unwrap();
+                let chain = h.chain.lock().unwrap_or_else(|e| e.into_inner());
                 match chain.channels.get(&id) {
                     Some(ch) => json!({"result": {
                         "found": true,
@@ -301,8 +351,18 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
             let agg_hex = params.get("agg_proof").and_then(|p| p.as_str()).unwrap_or("");
             match (serde_json::from_value::<Vec<SignedTx>>(txs_val), hex::decode(agg_hex)) {
                 (Ok(txs), Ok(agg)) if !txs.is_empty() && !agg.is_empty() => {
+                    // H4 (v0.13.2): the queue is bounded and de-duplicated by the
+                    // aggregate bytes — an unauthenticated push can no longer grow
+                    // memory or block the proposer's head-of-line behind copies.
+                    let mut q = h.bundles.lock().unwrap_or_else(|e| e.into_inner());
+                    if q.len() >= BUNDLE_QUEUE_MAX {
+                        return json!({"error": format!("bundle queue full (max {BUNDLE_QUEUE_MAX}) — retry after the next block")});
+                    }
+                    if q.iter().any(|(_, a)| *a == agg) {
+                        return json!({"error": "duplicate bundle (same aggregate proof already queued)"});
+                    }
                     let ids: Vec<String> = txs.iter().map(|t| hex::encode(txid(t))).collect();
-                    h.bundles.lock().unwrap().push((txs, agg));
+                    q.push((txs, agg));
                     json!({"result": {"accepted": true, "txids": ids}})
                 }
                 (Err(e), _) => json!({"error": format!("bad txs: {e}")}),
@@ -311,7 +371,7 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
             }
         }
         "hk_getPoolInfo" => {
-            let chain = h.chain.lock().unwrap();
+            let chain = h.chain.lock().unwrap_or_else(|e| e.into_inner());
             let p = &chain.pool;
             json!({"result": {
                 "version": p.version,
@@ -324,14 +384,14 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
             }})
         }
         "hk_getPoolLeaves" => {
-            let notes = h.pool_notes.lock().unwrap();
+            let notes = h.pool_notes.lock().unwrap_or_else(|e| e.into_inner());
             json!({"result": {
                 "leaves": notes.iter().map(|(l, _)| hex::encode(l.0)).collect::<Vec<_>>(),
             }})
         }
         "hk_getPoolNotes" => {
             // For scanners: (leaf index, commitment, stealth payload).
-            let notes = h.pool_notes.lock().unwrap();
+            let notes = h.pool_notes.lock().unwrap_or_else(|e| e.into_inner());
             json!({"result": {
                 "notes": notes.iter().enumerate().map(|(i, (l, ct))| json!({
                     "index": i,
@@ -342,7 +402,7 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
         }
         "hk_getReceipt" => match param_h256(params, "txid") {
             Some(id) => {
-                let rlog = h.receipts.lock().unwrap();
+                let rlog = h.receipts.lock().unwrap_or_else(|e| e.into_inner());
                 match rlog.get(&id.0) {
                     Some(detail) => json!({"result": {"found": true, "detail": detail}}),
                     None => json!({"result": {"found": false}}),
@@ -424,7 +484,7 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
             // Wallets use this to tell spent notes from live ones (a nullifier reveals
             // nothing by itself — it is unlinkable to any commitment without nk).
             Some(nf) => {
-                let chain = h.chain.lock().unwrap();
+                let chain = h.chain.lock().unwrap_or_else(|e| e.into_inner());
                 json!({"result": {"spent": chain.pool.nullifiers.contains(&nf.0)}})
             }
             None => json!({"error": "nullifier must be 64-char hex"}),
@@ -443,7 +503,7 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
             }})
         }
         "hk_getMempool" => {
-            let mp = h.mempool.lock().unwrap();
+            let mp = h.mempool.lock().unwrap_or_else(|e| e.into_inner());
             json!({"result": {
                 "count": mp.len(),
                 "txids": mp.iter().take(100).map(|t| hex::encode(txid(t))).collect::<Vec<_>>(),
@@ -457,7 +517,7 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
                 Some(height) => match store.load_block(height) {
                     Ok(Some(sb)) => {
                         let batch = Batch::decode(&sb.value_bytes);
-                        let rlog = h.receipts.lock().unwrap();
+                        let rlog = h.receipts.lock().unwrap_or_else(|e| e.into_inner());
                         let txs: Vec<Value> = batch
                             .as_ref()
                             .map(|b| {
@@ -499,7 +559,10 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
                         }})
                     }
                     Ok(None) => json!({"result": {"found": false}}),
-                    Err(e) => json!({"error": format!("block load failed: {e}")}),
+                    Err(e) => {
+                        warn!(height, %e, "block load failed");
+                        json!({"error": "block load failed (see node log)"})
+                    }
                 },
                 None => json!({"error": "height (number) required"}),
             }

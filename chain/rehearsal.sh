@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# rehearsal.sh — the v0.13.0 GATE, run locally on WSL before anything touches the fleet:
+# rehearsal.sh — the release GATE (first written for v0.13.0), run locally on WSL before anything touches the fleet:
 #
 #   1. testnet-1 CEREMONY REHEARSAL: 4 independent `keygen`s → `genesis-build` with the
 #      U4.b fee policy (100 micro from height 1) + a funded faucet treasury + the public
@@ -222,7 +222,7 @@ for i in 0 1 2 3; do printf "  v%s  %s kB\n" "$i" "$(ps -o rss= -p "$(pgrep -f "
 # ---- 5. verdict ----------------------------------------------------------------------
 say "verdict"
 if [[ $FAILS -eq 0 ]]; then
-    echo "GATE GREEN — v0.13.0 rehearsal passed every check. binary: $(sha256sum "$BIN" | cut -c1-16)…  genesis digest (rehearsal): $DIGEST"
+    echo "GATE GREEN — $("$BIN" --version 2>/dev/null || echo "hk-node (pre-0.13.2, no --version)") rehearsal passed every check. binary: $(sha256sum "$BIN" | cut -c1-16)…  genesis digest (rehearsal): $DIGEST"
 else
     echo "GATE RED — $FAILS failing check(s). Logs: $H/v*.log"
 fi
