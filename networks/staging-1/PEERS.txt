@@ -1,2 +1,3 @@
-/dns4/seed.hashkinetics.org/tcp/27000
-/ip4/34.45.10.191/tcp/27000
+# staging-1 (hashkinetics-1-557f2ea6) — RETIRED 2026-09-02 at height 107,182. No live peers: the hosts that served this
+# network now run testnet-1 (networks/testnet-1/PEERS.txt). This kit is an archive; its block log is retained by the
+# operators and in object storage for byte-for-byte re-verification on request.

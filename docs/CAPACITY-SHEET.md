@@ -48,4 +48,4 @@ Landed by the soak itself: real interval distribution from the public testnet ex
 
 ## Quote discipline
 
-Until the M1 row is green: public materials keep saying "183 TPS at today's measured config" (Tier-1 arithmetic from the 256/1.4s measured pair) and "183,000/s effective via channels" — both already provenance-labeled. The first storm report upgrades nothing publicly by itself; **the 30-min public-testnet run is what turns M1 into a quotable fact.**
+Until the M1 row is green: public materials quote **"274 tx/s sustained (storm harness, 1,024-tx blocks, 4-validator devnet — measured)"** and may still say "183 TPS at today's measured config" (Tier-1 arithmetic from the 256/1.4s measured pair) and "183,000/s effective via channels" — both already provenance-labeled. The first storm report upgrades nothing publicly by itself; **the 30-min public-testnet run is what turns M1 into a quotable fact.**

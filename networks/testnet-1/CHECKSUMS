@@ -1,0 +1,9 @@
+# testnet-1 — hashkinetics-1-4e4ea68d — verify before you run anything
+# sha256sum -c CHECKSUMS   (from this directory; the release assets after download)
+4e4ea68d48cba1ad4cc7155c19e7768f1fa2cbc99ba0f2b47c58948ec9e971c7  genesis.json
+# v0.13.0 release assets — https://github.com/hashkinetics/hashkinetics/releases/tag/v0.13.0 (immutable)
+e2ffcb8e674b128a569d4cef7b2e171ce13bb6e667f8f2265f0b6059bbf73544  hk-node-v0.13.0.gz
+071e86dab1bdef5ccb8b04e7c12505870cff1833609510dc19e51b7f19681fb1  hk-node-v0.13.0
+5c355fd55f3066adece591580907a816372f68da576b93a9d22874f43c5f86af  HashKinetics-Wallet.exe   # v0.13.0 (superseded)
+# v0.13.1 release — wallet only (the node binary above is unchanged)
+fb330c291c656e71a7d3473f9cffabb7a449a98ea7f8ddbcc09bd7062e16fb15  HashKinetics-Wallet.exe   # v0.13.1

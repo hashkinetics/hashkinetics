@@ -19,22 +19,22 @@ demo (six acts, run on a FRESH devnet, best watched beside the explorer).
 from the five genesis senders, one home node each (v0 has no tx gossip between mempools —
 submit to the node you want proposing your txs), prints the capacity report for
 `CAPACITY-SHEET.md`. Best on a fresh devnet (leftover mempools skew the interval — the
-prune cost scales with queue depth). Clean devnet baseline: **123.1 tx/s** at the 256-cap.
+prune cost scales with queue depth). Clean devnet baseline: **123.1 tx/s** at the 256-cap; **274 tx/s** at the 1,024-cap with `HK_NONCE_WINDOW=256` (C2.4).
 
 **Wallet v1 quickstart** (`hk-node wallet` — full loop gated 0.10.1):
 ```bash
 HK=~/hk-target-chain/release/hk-node; W=~/my-wallet
-$HK wallet init $W org                 # bind to a genesis account (WS-F lifts this)
+$HK wallet init $W org                 # bind to a demo account — or `hk-node account-new` + the faucet for a fresh one
 $HK wallet shield $W 3                 # transparent → hidden (mint proof ~1.3 s)
 $HK wallet scan $W                     # discover your notes (LIVE/SPENT, full commitments)
 ADDR=$($HK wallet address $W 2>/dev/null)
-$HK wallet pay $W "$ADDR" 1 "memo"     # fee-0 stealth payment (zero transparent trace)
+$HK wallet pay $W "$ADDR" 1 "memo"     # stealth payment (zero transparent trace; the 100-micro envelope fee is paid transparently)
 $HK wallet unshield $W 1               # hidden → transparent
 $HK wallet disclose $W <COMMITMENT> d.json && $HK verify-disclosure d.json
 ```
 Truths: one input note per spend (consolidate by paying yourself) · 64 one-time spend
 leaves per wallet (then rotate the master) · back up `wallet.json` (holds the shield
-master + your disclosure capabilities) · faucet arrives with WS-F account-creation.
+master + your disclosure capabilities) · faucet live since v0.11.0 (`faucet-serve`; public: faucet.hashkinetics.org).
 
 **P2.5 notes:** the consensus wire is BINCODE (proofs ride at ~1×; any codec change ⇒
 `--fresh`), and genesis generated with `--prover-url` embeds **vk pins** — expect

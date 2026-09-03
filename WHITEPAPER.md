@@ -17,7 +17,7 @@ This whitepaper describes the complete HashKinetics protocol in the present tens
 
 - **Measured** numbers (proof latencies, block cadence, aggregate sizes, test counts, demo transcripts) originate from the 2026 development network on documented hardware (AMD Threadripper PRO 7995WX, NVIDIA RTX 5090, WSL2), recorded in the repository's engineering logs (`docs/MASTER-BUILD-PLAN.md`, `zkvm-bakeoff/RESULTS.md`). They are facts about that environment.
 - **Configured** numbers (block capacity, timeout pacing, tree depths, window sizes) are protocol constants chosen deliberately and changeable by the documented upgrade paths.
-- **Design targets** (mainnet-scale throughput, validator-set size, market behavior of fee and bond mechanisms) are engineering projections with named assumptions, validated progressively through the gate process described in §17.
+- **Design targets** (mainnet-scale throughput, validator-set size, market behavior of fee and bond mechanisms) are engineering projections with named assumptions, validated progressively through the gate process described in §16.
 
 Nothing in this document is an offer of tokens or securities. The honesty ledger that accompanied every development release remains a maintained artifact in the repository.
 
@@ -133,7 +133,7 @@ Hash-based votes are kilobytes, not bytes. At mainnet scale the answer is struct
 
 ### 6.1 Accounts
 
-A transparent account is an identifier, a balance map, a nonce, and a hash commitment to its current authentication key. Transactions open the commitment, sign the payload together with the commitment to the *next* key, and advance the nonce — the leaf-index-equals-nonce rule making one-time-ness a ledger property. Account creation, fee mechanics, and the merkleized global commitment follow the hardening track (§17.4).
+A transparent account is an identifier, a balance map, a nonce, and a hash commitment to its current authentication key. Transactions open the commitment, sign the payload together with the commitment to the *next* key, and advance the nonce — the leaf-index-equals-nonce rule making one-time-ness a ledger property. Account creation (`Tx::AccountCreate`, v0.11.0) and the flat protocol fee (v0.12.2; bound into the genesis since v0.13.0) have shipped; the merkleized global commitment follows the hardening track (§16).
 
 ### 6.2 MandateTree v2 — spending hierarchies in consensus
 

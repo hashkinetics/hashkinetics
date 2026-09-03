@@ -7,8 +7,9 @@ operating post-quantum BFT.
 
 ## 0 · What you need
 
-- Linux (bare or WSL2), 4+ cores, 8 GB RAM, 20 GB+ disk (the node is durable: per-height
-  block log + snapshots — plan for growth).
+- Linux (bare or WSL2), 4+ cores, **8 GB RAM minimum** (the node's steady RSS is ~6.7 GB —
+  the proof-system verifier's fixed footprint — until R11 lands; 16 GB is comfortable),
+  20 GB+ disk (the node is durable: per-height block log + snapshots — plan for growth).
 - **No GPU.** Validators VERIFY STARKs in-node on CPU; GPUs are for people *making*
   payments, not validating them.
 - Rust (stable) + the public repo: `git clone https://github.com/hashkinetics/hashkinetics`.
@@ -40,7 +41,7 @@ That address is also the operator channel for incidents once you're running.
 ## 3 · Receive and VERIFY genesis
 
 The coordinator assembles every validator.json into `genesis.json` and publishes its
-SHAKE-256 hash out-of-band. Verify before using — a byte different and app hashes fork at
+SHA-256 hash out-of-band. Verify before using — a byte different and app hashes fork at
 height 1:
 ```bash
 sha256sum genesis.json      # compare to the published digest
@@ -56,7 +57,7 @@ trustless.
 ```bash
 hk-node config-gen ~/hk-validator \
   --listen /ip4/0.0.0.0/tcp/27000 \
-  --peers /ip4/COORD.IP/tcp/27000,/ip4/PEER2.IP/tcp/27000 \
+  --peers <multiaddrs from networks/testnet-1/PEERS.txt, comma-separated> \
   --moniker my-moniker \
   --gossip-peers http://PEER1.IP:26000,http://PEER2.IP:26000   # optional, see below
 ```
@@ -73,7 +74,7 @@ Skipping gossip is safe: your node still validates everything; only tx relay is 
 ## 5 · Start (and keep started)
 
 ```bash
-export HK_PROVER_URL=<coordinator's prover URL>     # vk fetch, pin-verified
+export HK_PROVER_URL=https://prover.hashkinetics.org   # vk fetch, pin-verified
 hk-node start ~/hk-validator
 ```
 As a service, `/etc/systemd/system/hk-node.service`:
@@ -103,7 +104,7 @@ Startup log must show, in order: `verifying keys MATCH the genesis pins` →
 `SP1 pool verifier wired` → `Consensus is ready` → `Committed block` lines whose `app_hash`
 matches other validators'. On restarts you'll also see
 `PERSISTENCE RESTORE COMPLETE — resuming, not resyncing`. The network explorer (coordinator
-publishes the URL) should list your address under Validators.
+— https://www.hashkinetics.org/explorer/ — lists your address under Validators (observers show without a vote).
 
 ## 7 · Operating rules
 

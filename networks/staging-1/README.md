@@ -9,17 +9,17 @@
 > byte-for-byte re-verification, 2026-08-31) remains reproducible on request.
 > The join instructions below no longer connect to a live network.
 
-> **⚠ Minimum node version: v0.12.2 from height 110,000.** The flat protocol fee
+> **⚠ Minimum node version: v0.12.2 from height 110,000** (never reached — the network was archived at 107,182). The flat protocol fee
 > activates at height 110,000 — nodes below v0.12.2 compute different balances from
 > that height and will refuse on app_hash divergence. Also inherited: the account-
 > creation wire addition (v0.11.0) means pre-v0.11 nodes cannot decode recent history.
 > Build from a tag ≥ v0.12.2.
 
 The public staging testnet (the chain behind [hashkinetics.org/explorer](https://www.hashkinetics.org/explorer)
-and `https://rpc.hashkinetics.org`). Four founder-operated validators run it; anyone
+and `https://rpc.hashkinetics.org`). Four founder-operated validators ran it; anyone
 can run a **full node** that syncs it, verifies every block, and serves its own RPC
-and explorer. Validator seats are ceremony-fixed until testnet-1 (see
-`docs/VALIDATOR-ONBOARDING.md` to join the next genesis).
+and explorer. Validator seats were ceremony-fixed (see `docs/VALIDATOR-ONBOARDING.md`
+for how seats are added on the live network).
 
 **Identity, not topology, defines the network.** The `genesis.json` here — chain id,
 validator roots, vk pins — IS the network. A node on this genesis with these peers is
@@ -73,8 +73,9 @@ Check it (`sha256sum genesis.json`) before starting your node. Then, running:
 curl -s -X POST http://127.0.0.1:26000 -d '{"method":"hk_chainInfo","params":{}}'
 ```
 
-The `chain_id` and `app_hash` at any height must match what
-`https://rpc.hashkinetics.org` reports — same input, same hash, no trust required.
+The `chain_id` and `app_hash` at any height must match the archived block log's
+(`https://rpc.hashkinetics.org` now serves testnet-1) — same input, same hash, no trust
+required; the final commitment at 107,182 is in CHANGELOG [0.13.0].
 
 ## Notes
 
@@ -91,7 +92,7 @@ The `chain_id` and `app_hash` at any height must match what
 - Syncing crosses validator-key-rotation boundaries (v0.10.7): certificates are
   verified against the set as of their height, so a fresh node can walk the whole
   chain from block 1 — including every epoch the validators have rotated through.
-- Sync throughput: solved. v0.10.8 parallelized catch-up verification (R5.2) —
+- Sync throughput: solved (as measured on staging-1). v0.10.8 parallelized catch-up verification (R5.2) —
   measured **71 blocks/min** on deep backlogs on the live testnet (up from ~2),
   faster than the chain advances — and since v0.10.9 syncing spends **zero**
   signer leaves.

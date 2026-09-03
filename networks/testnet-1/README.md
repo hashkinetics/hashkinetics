@@ -9,8 +9,11 @@
 The public testnet (the chain behind [hashkinetics.org/explorer](https://www.hashkinetics.org/explorer)
 and `https://rpc.hashkinetics.org`). Four founder-operated validators run it; anyone
 can run a **full node** that syncs it, verifies every block, and serves its own RPC
-and explorer. Validator seats are ceremony-fixed until testnet-1 (see
-`docs/VALIDATOR-ONBOARDING.md` to join the next genesis).
+and explorer. Validator seats were fixed at the testnet-1 ceremony — there is no
+validator-set-change transaction yet (plan item V1) — so external operators run
+**observers** now and take a seat at the next genesis or when V1 ships
+(`docs/VALIDATOR-ONBOARDING.md`). Just want to use it? `https://www.hashkinetics.org/faucet`
+and the Windows wallet (`docs/WALLET-GUIDE.md`); every transaction pays 100 micro.
 
 **Identity, not topology, defines the network.** The `genesis.json` here — chain id,
 validator roots, vk pins — IS the network. A node on this genesis with these peers is
@@ -26,17 +29,17 @@ git clone https://github.com/hashkinetics/hashkinetics
 cd hashkinetics/chain && cargo build --release
 
 # your node identity (never leaves your machine):
-./target/release/hk-node keygen ~/hk-staging my-observer
+./target/release/hk-node keygen ~/hk-testnet-1 my-observer
 
 # the network artifacts (this directory):
-cp ../networks/testnet-1/genesis.json ~/hk-staging/genesis.json
+cp ../networks/testnet-1/genesis.json ~/hk-testnet-1/genesis.json
 
 # config with the published bootstrap peers:
-./target/release/hk-node config-gen ~/hk-staging \
+./target/release/hk-node config-gen ~/hk-testnet-1 \
   --listen /ip4/0.0.0.0/tcp/27000 \
   --peers $(paste -sd, ../networks/testnet-1/PEERS.txt)
 
-HK_PROVER_URL=https://prover.hashkinetics.org ./target/release/hk-node start ~/hk-staging
+HK_PROVER_URL=https://prover.hashkinetics.org ./target/release/hk-node start ~/hk-testnet-1
 ```
 
 **`HK_PROVER_URL` is required to sync.** It wires the in-node SP1 STARK verifier
@@ -90,6 +93,6 @@ The `chain_id` and `app_hash` at any height must match what
   block log; a restart resumes at the chain's height whatever the block log looks like.
   `hk_chainInfo.history` shows what a node can serve from disk.
 - Sync throughput: solved. v0.10.8 parallelized catch-up verification (R5.2) —
-  measured **71 blocks/min** on deep backlogs on the live testnet (up from ~2),
+  measured **71 blocks/min** on deep backlogs on staging-1 (up from ~2),
   faster than the chain advances — and since v0.10.9 syncing spends **zero**
   signer leaves.

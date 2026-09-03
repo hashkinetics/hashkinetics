@@ -72,9 +72,14 @@ pub fn load_shield() -> Option<ShieldFile> {
 fn save_shield(f: &ShieldFile) -> Result<(), String> {
     std::fs::create_dir_all(wallet_dir()).map_err(|e| e.to_string())?;
     let tmp = wallet_dir().join("shield.json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(f).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, shield_path()).map_err(|e| e.to_string())
+    let bytes = serde_json::to_string_pretty(f).map_err(|e| e.to_string())?;
+    // v0.13.1: fsync before rename — the OTS index and note tag are never-reuse counters.
+    crate::write_atomic(&shield_path(), &tmp, bytes.as_bytes())
+}
+
+/// v0.13.1: how many of the 64 one-time spend keys this shield master has reserved.
+pub fn ots_budget() -> Option<(u32, u32)> {
+    load_shield().map(|f| (f.next_ots_index, OTS_CAPACITY))
 }
 
 /// First shielded use creates the master; later uses load it. Never overwrites.
@@ -141,14 +146,20 @@ pub fn addr_decode(s: &str) -> Result<Address, String> {
     Ok(Address { tag: b[..32].try_into().unwrap(), kem_pk: b[32..].to_vec() })
 }
 
-fn chain_height() -> u64 {
-    chain_info().map(|(_, f)| f.map(|f| f.chain_height).unwrap_or(0)).unwrap_or(0)
+/// v0.13.1: an RPC failure is an error, not "height 0" — deriving the epoch-0
+/// stealth address (and sealing change notes to it) on a network blip was wrong.
+fn chain_height() -> Result<u64, String> {
+    let v = rpc_call("hk_chainInfo", serde_json::json!({}))?;
+    v.get("result")
+        .and_then(|r| r.get("height"))
+        .and_then(|h| h.as_u64())
+        .ok_or_else(|| "rpc: chain info carried no height".to_string())
 }
 
 /// Our receiving address for the chain's CURRENT epoch (scanning covers every epoch).
 pub fn my_address(f: &ShieldFile) -> Result<String, String> {
     let k = keys(f)?;
-    Ok(addr_encode(&k.address_at(epoch_of(chain_height()))))
+    Ok(addr_encode(&k.address_at(epoch_of(chain_height()?))))
 }
 
 // ---------------------------------------------------------------------------
@@ -198,7 +209,7 @@ pub struct NoteView {
 /// Every note ever paid to this wallet (all epochs), with spent status.
 fn my_notes(k: &WalletKeys) -> Result<(Vec<Hash>, Vec<(Discovered, bool)>), String> {
     let (leaves, entries) = pool_notes()?;
-    let cur = epoch_of(chain_height());
+    let cur = epoch_of(chain_height()?);
     let nk = k.nk();
     let mut out: Vec<(Discovered, bool)> = Vec::new();
     for e in 0..=cur {
@@ -356,7 +367,7 @@ pub fn spawn_shield(tx: Sender<Evt>, seed: Vec<u8>, id: H256, amount: Amount, pr
             let tag = reserve_tag(&mut f)?;
             let note = k.self_note(amount as u64, tag);
             let (witness, public) = build_mint(&note);
-            let epoch = epoch_of(chain_height());
+            let epoch = epoch_of(chain_height()?);
             let (ct, _) = seal_note(&note, &k.address_at(epoch), &fresh32(), b"shield").ok_or("seal failed")?;
             log(&tx, format!("Proving the mint of {} on the prover… (a STARK; this can take a while)", fmt_amount(amount)));
             let (proof, ms) = prove(&prover, "prove_mint", serde_json::to_value(&witness).map_err(|e| e.to_string())?)?;
@@ -405,7 +416,7 @@ pub fn spawn_unshield(tx: Sender<Evt>, seed: Vec<u8>, id: H256, amount: Amount, 
             let tag = reserve_tag(&mut f)?;
             let ots = reserve_ots(&mut f)?;
             let change = k.self_note(change_v as u64, tag);
-            let epoch = epoch_of(chain_height());
+            let epoch = epoch_of(chain_height()?);
             let (change_ct, _) = seal_note(&change, &k.address_at(epoch), &fresh32(), b"change").ok_or("seal failed")?;
             let plan = build_spend(&leaves, input.leaf_index, input.note.clone(), &k, ots, change, dummy_note(), amount as u64, id.0)
                 .map_err(|e| format!("build_spend: {e}"))?;
@@ -470,7 +481,7 @@ pub fn spawn_pay(tx: Sender<Evt>, seed: Vec<u8>, id: H256, to: String, amount: A
             let tag = reserve_tag(&mut f)?;
             let ots = reserve_ots(&mut f)?;
             let change = k.self_note(change_v as u64, tag);
-            let epoch = epoch_of(chain_height());
+            let epoch = epoch_of(chain_height()?);
             let (change_ct, _) = seal_note(&change, &k.address_at(epoch), &fresh32(), b"change").ok_or("seal failed")?;
             let plan = build_spend(&leaves, input.leaf_index, input.note.clone(), &k, ots, out.note.clone(), change, 0, [0; 32])
                 .map_err(|e| format!("build_spend: {e}"))?;
@@ -518,7 +529,7 @@ pub fn spawn_disclose(tx: Sender<Evt>, id: H256, commitment_hex: String) {
             let (idx, _, ct) = entries.iter().find(|(_, c, _)| *c == cm).cloned().ok_or("commitment not found in the pool")?;
             // ML-KEM decapsulation never fails (implicit rejection) — VALIDATE each epoch's
             // candidate key by opening the AEAD before packaging anything.
-            let cur = epoch_of(chain_height());
+            let cur = epoch_of(chain_height()?);
             let key = (0..=cur)
                 .filter_map(|e| note_key_as_recipient(&k, e, &cm, &ct))
                 .find(|key| {

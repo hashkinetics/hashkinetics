@@ -1,2 +1,3 @@
+# testnet-1 — hashkinetics-1-4e4ea68d — bootstrap peers (consensus tcp/27000); RPC gossip peers on :26000 where listed
 /dns4/seed.hashkinetics.org/tcp/27000
 /ip4/34.45.10.191/tcp/27000

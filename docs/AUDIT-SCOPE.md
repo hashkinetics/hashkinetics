@@ -84,13 +84,13 @@ Invariant: no two uses share a domain; auditors should verify the registry is to
 
 ## 5 · Known-unaudited / deliberate shortcuts (dated, tracked)
 
-JSON wire codec (binary codec = WS8; double-hex tax measured) · vk fetch-at-startup on
-devnet (mainnet: genesis-pinned vk hashes) · single-asset pool v1 · wallet state
-(ots_index, notes) in-memory · node note/leaf indexes in-memory · demo randomness
+binary bincode wire codec (v0.9.11; the JSON codec's double-hex tax was measured and retired) · vk fetch-at-startup on
+(genesis-pinned vk hashes enforced on testnet-1; an unpinned genesis only warns — devnet posture) · single-asset pool v1 · wallet state
+persisted reserve-then-advance (`shield.json`; wallet.json for the CLI) · node search indexes rebuilt from replay/background pass (R10 v2), unbounded in RAM · demo randomness
 deterministic · plain W-OTS (not WOTS+ masks) in-circuit — acceptable for bench/devnet,
 revisit at audit · L-ratchet rejected-tx retry hygiene (documented in tests) · rotation
-hardening list (epoch persistence across restart-after-rotation, pre-gen trees, cert
-gossip, real threshold) · per-proof in-node verify until aggregation (P2.3) · no fee
+hardening: pre-generated trees only (epoch persistence, cert
+gossip, real threshold) · flat 100-micro burned fee live (genesis-bound); no fee
 market, no slashing path yet (WS8).
 
 ## 6 · Suggested audit work-packages (P3)

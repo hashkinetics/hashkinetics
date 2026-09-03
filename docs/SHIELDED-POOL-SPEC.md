@@ -1,7 +1,11 @@
 # HashKinetics Shielded Pool — Protocol Specification
 
-**Status: v0.9.7 (2026-08-17) · everything in this document is BUILT and LIVE on the devnet
-unless marked otherwise.** This is the single source of truth for the pool as implemented —
+**Status: v0.9.7 (2026-08-17) · everything in this document is BUILT and LIVE — on the public
+testnet since 2026-08-27 (staging-1) and on testnet-1 since 2026-09-02 — unless marked otherwise.
+Since this revision: the consensus wire is bincode (0.9.11), verifying keys are pinned in the
+genesis (P2.5), one aggregate STARK covers a block's spends (0.9.9), a flat 100-micro envelope
+fee applies to every transaction including pool ones (0.12.2; genesis-bound 0.13.0 —
+`FEES.md`), and the Windows wallet drives every operation here (0.13.0).** This is the single source of truth for the pool as implemented —
 the reference for auditors (P3), integrating partners, wallet implementers, and the future
 public protocol spec. Code is authoritative where they disagree; file an issue in
 `CLAUDE.md` decisions if you find such a disagreement.

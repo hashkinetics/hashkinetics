@@ -36,9 +36,22 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-const RPC: &str = "https://rpc.hashkinetics.org";
-const FAUCET: &str = "https://faucet.hashkinetics.org";
+/// Shown in the footer; bump with every release (the crate version is workspace-wide).
+pub const WALLET_VERSION: &str = "v0.13.1";
+const RPC_DEFAULT: &str = "https://rpc.hashkinetics.org";
+const FAUCET_DEFAULT: &str = "https://faucet.hashkinetics.org";
 const EXPLORER: &str = "https://www.hashkinetics.org/explorer/";
+
+/// v0.13.1: the endpoints can be pointed at a devnet without a rebuild —
+/// `HK_WALLET_RPC` / `HK_WALLET_FAUCET` (read once, on first use).
+fn rpc_url() -> &'static str {
+    static URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    URL.get_or_init(|| std::env::var("HK_WALLET_RPC").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| RPC_DEFAULT.to_string())).as_str()
+}
+fn faucet_url() -> &'static str {
+    static URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    URL.get_or_init(|| std::env::var("HK_WALLET_FAUCET").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| FAUCET_DEFAULT.to_string())).as_str()
+}
 const USD: H256 = H256([9u8; 32]);
 const CYAN: egui::Color32 = egui::Color32::from_rgb(0x4e, 0xf0, 0xd0);
 const GOLD: egui::Color32 = egui::Color32::from_rgb(0xf5, 0xc5, 0x18);
@@ -72,12 +85,24 @@ fn load_account() -> Option<AccountFile> {
     serde_json::from_str(&s).ok()
 }
 
+/// v0.13.1: write → fsync → rename. Both key files are reserve-then-advance
+/// counters; a crash right after a reservation must never roll a counter back
+/// (a reused one-time key leaks spend authority), so the bytes have to be on
+/// disk before the rename makes them the live file.
+pub fn write_atomic(path: &std::path::Path, tmp: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(tmp).map_err(|e| e.to_string())?;
+    f.write_all(bytes).map_err(|e| e.to_string())?;
+    f.sync_all().map_err(|e| e.to_string())?;
+    drop(f);
+    std::fs::rename(tmp, path).map_err(|e| e.to_string())
+}
+
 fn save_account(f: &AccountFile) -> Result<(), String> {
     std::fs::create_dir_all(wallet_dir()).map_err(|e| e.to_string())?;
     let tmp = wallet_dir().join("account.json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(f).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, account_path()).map_err(|e| e.to_string())
+    let bytes = serde_json::to_string_pretty(f).map_err(|e| e.to_string())?;
+    write_atomic(&account_path(), &tmp, bytes.as_bytes())
 }
 
 fn commit_at(seed: &[u8], nonce: u64) -> H256 {
@@ -134,7 +159,7 @@ fn fmt_amount(micro: Amount) -> String {
 // ---------------------------------------------------------------------------
 
 fn rpc_call(method: &str, params: Value) -> Result<Value, String> {
-    ureq::post(RPC)
+    ureq::post(rpc_url())
         .timeout(Duration::from_secs(8))
         .send_json(json!({ "method": method, "params": params }))
         .map_err(|e| format!("rpc: {e}"))?
@@ -174,7 +199,7 @@ fn chain_receipt(txid: &str) -> Option<String> {
 /// POST to the faucet. Success and refusal both come back as JSON; non-2xx
 /// statuses (cooldown, bad input) carry their explanation in the body.
 fn faucet_post(body: Value) -> Result<Value, String> {
-    let req = ureq::post(&format!("{FAUCET}/drip")).timeout(Duration::from_secs(30));
+    let req = ureq::post(&format!("{}/drip", faucet_url())).timeout(Duration::from_secs(30));
     match req.send_json(body) {
         Ok(resp) => resp.into_json().map_err(|e| format!("faucet parse: {e}")),
         Err(ureq::Error::Status(_, resp)) => {
@@ -408,8 +433,9 @@ pub(crate) fn send_payload(
             return Err(());
         }
     };
-    // 4) Receipt.
-    for _ in 0..24 {
+    // 4) Receipt. v0.13.1: wait up to ~60 s — a slow block must not strand a ratchet index
+    //    (the nonce stays advanced either way; the wallet just kept giving up too early).
+    for _ in 0..75 {
         std::thread::sleep(Duration::from_millis(800));
         if let Some(r) = chain_receipt(&txid) {
             if r.starts_with("rejected") {
@@ -427,7 +453,7 @@ pub(crate) fn send_payload(
         }
     }
     let _ = tx.send(Evt::Log(
-        format!("No receipt yet for {}… — nonce stays advanced.", &txid[..16.min(txid.len())]),
+        format!("No receipt after 60 s for {}… — it is probably still pending; ↻ Refresh in a minute (the nonce stays advanced; nothing to redo).", &txid[..16.min(txid.len())]),
         DIM,
         Some(format!("{EXPLORER}#tx={txid}")),
     ));
@@ -474,6 +500,7 @@ impl App {
         visuals.selection.bg_fill = CYAN.gamma_multiply(0.35);
         cc.egui_ctx.set_visuals(visuals);
         let (evt_tx, evt_rx) = channel();
+        install_panic_hook(evt_tx.clone(), cc.egui_ctx.clone());
         Self {
             account: load_account(),
             balance: None,
@@ -786,6 +813,15 @@ impl eframe::App for App {
                         if let Some(a) = &self.stealth_addr {
                             ui.label(egui::RichText::new(format!("{}…{}", &a[..22.min(a.len())], &a[a.len().saturating_sub(10)..])).monospace().size(10.0).color(CYAN));
                         }
+                        // v0.13.1: the one-time spend-key budget is visible before it runs out.
+                        if let Some((used, cap)) = shielded::ots_budget() {
+                            let warn = used.saturating_mul(4) >= cap.saturating_mul(3);
+                            ui.label(
+                                egui::RichText::new(format!("one-time spend keys used: {used} / {cap}{}", if warn { " — move shield.json aside and shield again soon (old notes stay spendable from the old file)" } else { "" }))
+                                    .size(10.0)
+                                    .color(if warn { GOLD } else { DIM }),
+                            );
+                        }
 
                         // Notes
                         if !self.notes.is_empty() {
@@ -908,12 +944,38 @@ impl eframe::App for App {
                 ui.label(egui::RichText::new("·").color(DIM));
                 ui.hyperlink_to("hashkinetics.org", "https://www.hashkinetics.org");
                 ui.label(egui::RichText::new("·").color(DIM));
-                ui.label(egui::RichText::new("hash-based keys · your first spend signs at ratchet index 0").size(10.0).color(DIM));
+                ui.label(egui::RichText::new(format!("{WALLET_VERSION} · hash-based keys · your first spend signs at ratchet index 0")).size(10.0).color(DIM));
             });
             ui.add_space(8.0);
           });
         });
     }
+}
+
+/// v0.13.1: a panic on a worker thread used to kill that job silently — the
+/// spinner stayed on and every button stayed disabled until a restart. The hook
+/// reports it in ACTIVITY and clears the busy flag; the default hook still prints.
+static PANIC_TX: std::sync::Mutex<Option<Sender<Evt>>> = std::sync::Mutex::new(None);
+
+fn install_panic_hook(tx: Sender<Evt>, ctx: egui::Context) {
+    if let Ok(mut g) = PANIC_TX.lock() {
+        *g = Some(tx);
+    }
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Ok(g) = PANIC_TX.lock() {
+            if let Some(tx) = g.as_ref() {
+                let _ = tx.send(Evt::Log(
+                    format!("Internal error in a background job — nothing was sent, you can retry: {info}"),
+                    RED,
+                    None,
+                ));
+                let _ = tx.send(Evt::Busy(false));
+                ctx.request_repaint();
+            }
+        }
+        prev(info);
+    }));
 }
 
 fn main() -> eframe::Result<()> {

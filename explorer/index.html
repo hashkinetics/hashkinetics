@@ -100,13 +100,13 @@
 
   <header>
     <div class="logo">Hash<b>Kinetics</b> <span class="muted" style="font-weight:400">Explorer</span></div>
-    <span class="beta">staging testnet</span>
+    <span class="beta">testnet-1</span>
     <div class="conn">
       <input id="rpcurl" value="https://rpc.hashkinetics.org" size="26" title="node RPC endpoint"/>
       <span class="dot" id="conndot"></span>
     </div>
   </header>
-  <p class="tagline">The scanner that can't dox you — <b>no amounts, no parties, by construction.</b> Everything below is the transparent skeleton consensus already made public — live from the HashKinetics staging testnet on real hash-signed BFT.</p>
+  <p class="tagline">The scanner that can't dox you — <b>no amounts, no parties, by construction.</b> Everything below is the transparent skeleton consensus already made public — live from HashKinetics testnet-1 on real hash-signed BFT — protocol fees bound into the genesis from block 1.</p>
 
   <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px">
     <input id="searchbox" placeholder="Search anything: block height · txid · account id · nullifier"/>
@@ -115,13 +115,17 @@
   </div>
 
   <div class="stats">
-    <div class="stat"><div class="k">Height</div><div class="v" id="s-height">—</div><div class="sub" id="s-time"></div></div>
+    <div class="stat"><div class="k">Height</div><div class="v" id="s-height">—</div><div class="sub" id="s-time">latest block time</div></div>
+    <div class="stat"><div class="k">Chain id</div><div class="v mono" id="s-chainid">—</div><div class="sub">hashkinetics-1-&lt;first 8 hex of SHA-256(genesis)&gt;</div></div>
+    <div class="stat"><div class="k">Fees burned</div><div class="v" id="s-burned">—</div><div class="sub" id="s-feesub">100 µ per tx · from block 1 · burned</div></div>
+    <div class="stat"><div class="k">Signer fuse</div><div class="v" id="s-fuse">—</div><div class="sub" id="s-fusesub">this node&#39;s one-time keys left · epoch</div></div>
     <div class="stat"><div class="k">State commitment</div><div class="v mono" id="s-apphash">—</div><div class="sub">SHAKE-256 over all of Σ</div></div>
     <div class="stat"><div class="k">Shielded pool</div><div class="v" id="s-shielded">—</div><div class="sub" id="s-poolsub">value hidden inside</div></div>
     <div class="stat"><div class="k">Nullifiers</div><div class="v" id="s-nulls">—</div><div class="sub">spends nobody can trace</div></div>
     <div class="stat"><div class="k">Validators</div><div class="v" id="s-vals">—</div><div class="sub" id="s-power"></div></div>
     <div class="stat"><div class="k">Mempool</div><div class="v" id="s-mempool">—</div><div class="sub">pending admissions</div></div>
     <div class="stat"><div class="k">Genesis fingerprint</div><div class="v mono" id="s-genesis" title="Full SHA-256 of genesis.json — verify with: sha256sum genesis.json">—</div><div class="sub">identity, not topology — nodes refuse to peer across genesis</div></div>
+    <div class="stat"><div class="k">History served</div><div class="v" id="s-history">—</div><div class="sub" id="s-historysub">from disk · RAM window · indexed txs</div></div>
   </div>
 
   <div class="cols">
@@ -147,13 +151,13 @@
       <div class="card">
         <h2><span class="spark">⬢</span> Validators</h2>
         <table id="vals"><thead><tr><th>Address</th><th class="right">Power</th><th class="right">Epoch</th></tr></thead><tbody></tbody></table>
-        <div class="kv" style="margin-top:8px"><div><span class="muted">External nodes (join kit)</span></div><div class="right"><span class="badge b-rot">1 observer — syncing from genesis</span></div></div>
-        <div class="privnote" style="border-color:var(--cyan)"><b style="color:var(--cyan)">Every vote is hash-based</b> (LMS/HSS over SHAKE-256) under an SLH-DSA root — the consensus itself is post-quantum, not just the wallets. Epoch badges climb when a validator rotates its signing tree — automatic since v0.10.5. The external row counts nodes that joined via the public join kit and independently verify the chain from block 1. These validators run on Google Cloud; the prover lives elsewhere entirely. Want a seat? <a href="/network" style="color:var(--cyan)">Join the validator program.</a></div>
+        <div class="kv" style="margin-top:8px"><div><span class="muted">External nodes (join kit)</span></div><div class="right"><span class="badge b-rot" id="s-observers">observers welcome — see /network#join</span></div></div>
+        <div class="privnote" style="border-color:var(--cyan)"><b style="color:var(--cyan)">Every vote is hash-based</b> (LMS/HSS over SHAKE-256) under an SLH-DSA root — the consensus itself is post-quantum, not just the wallets. Epoch badges climb when a validator rotates its signing tree — automatic since v0.10.5; on testnet-1 all four seats rotated unattended on 2026-09-03 (heights 11,584–11,595). The external row counts nodes that joined via the public join kit and independently verify the chain from block 1. These validators run on Google Cloud; the prover lives elsewhere entirely. Want a seat? <a href="/network#join" style="color:var(--cyan)">Join as an observer now; seats follow.</a></div>
       </div>
     </div>
   </div>
 
-  <p class="foot">HashKinetics staging-testnet explorer · reads only the public transparent skeleton via node RPC · <a href="/">hashkinetics.org</a> · <a href="https://github.com/hashkinetics/hashkinetics" target="_blank" rel="noopener">source</a></p>
+  <p class="foot">HashKinetics testnet-1 explorer · reads only the public transparent skeleton via node RPC · <a href="/">hashkinetics.org</a> · <a href="/wallet">wallet</a> · <a href="/faucet">faucet</a> · <a href="https://github.com/hashkinetics/hashkinetics/blob/main/docs/RPC.md" target="_blank" rel="noopener">RPC reference</a> · <a href="https://github.com/hashkinetics/hashkinetics" target="_blank" rel="noopener">source</a></p>
 </div>
 
 <!-- block detail sheet -->
@@ -190,7 +194,10 @@ async function pollInfo(){
     latestHeight=info.height;
     $('s-height').textContent=info.height.toLocaleString();
     $('s-apphash').textContent=short(info.app_hash,18);
-    $('s-time').textContent=info.chain_id;
+    $('s-chainid').textContent=info.chain_id||'—';
+    if(info.fee){ const b=Number(info.fee.burned_micro||0); $('s-burned').textContent=(b/1e6).toLocaleString(undefined,{minimumFractionDigits:6,maximumFractionDigits:6}); $('s-feesub').textContent=`${info.fee.micro} µ per tx · from block ${info.fee.from_height} · burned`; }
+    if(info.signer){ const sg=info.signer; $('s-fuse').textContent=`${Number(sg.remaining).toLocaleString()} / ${Number(sg.capacity).toLocaleString()}`; $('s-fusesub').textContent=`one-time keys left · epoch ${sg.epoch} — exhaustion halts a seat, rotation refills it`; }
+    if(info.history){ const h=info.history; $('s-history').textContent=`from ${Number(h.disk_from).toLocaleString()}`; $('s-historysub').textContent=`served from disk · ${h.ram_window} heights in RAM · ${Number(h.indexed_txs).toLocaleString()} txs indexed`; }
     if(info.genesis_digest){ const g=$('s-genesis'); g.textContent=short(info.genesis_digest,18); g.title='SHA-256 of genesis.json (verify: sha256sum genesis.json):\n'+info.genesis_digest; }
     if(pageBefore===null) loadBlocks();
   }catch(e){ $('conndot').classList.remove('on'); }
@@ -228,6 +235,7 @@ async function loadBlocks(){
   try{
     const params = pageBefore===null? {limit:14} : {before:pageBefore, limit:14};
     const res=await rpc('hk_getBlocks',params);
+    if(pageBefore===null && res.blocks.length && res.blocks[0].time){ const t=new Date(res.blocks[0].time*1000); $('s-time').textContent='latest block '+t.toUTCString().replace(' GMT',' UTC'); }
     const tb=$('blocks').querySelector('tbody');
     tb.innerHTML=res.blocks.map(b=>{
       const badges=(b.tx_count>0?'':'')+(b.aggregate?' <span class="badge b-agg" title="ONE aggregate STARK covered this block’s shielded txs">agg</span>':'')+(b.rotations>0?' <span class="badge b-rot">rotation</span>':'');
