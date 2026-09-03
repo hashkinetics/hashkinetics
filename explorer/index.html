@@ -47,6 +47,7 @@
 
   .cols{display:grid;grid-template-columns:1.5fr 1fr;gap:16px;align-items:start}
   @media(max-width:900px){.cols{grid-template-columns:1fr}}
+  
   .card{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:18px 18px 14px;backdrop-filter:blur(8px);margin-bottom:16px}
   .card h2{font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);font-weight:700;margin-bottom:12px;display:flex;align-items:center;gap:8px}
   .card h2 .spark{color:var(--cyan)}
@@ -92,6 +93,8 @@
   .btn:disabled{opacity:.35;cursor:default}
   #searchbox{width:min(420px,100%)}
   .err{color:var(--danger);font-size:12.5px;margin-top:6px;display:none}
+/* phone overrides — kept last so they win every same-specificity base rule above */
+@media(max-width:600px){.wrap{padding:18px 14px 60px}.cols>*,.card,.stats>*{min-width:0}.stats{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.kv{grid-template-columns:96px minmax(0,1fr);gap:4px 10px}.mono{overflow-wrap:anywhere;word-break:break-all}.card{padding:14px 14px 12px;overflow:hidden}table{table-layout:fixed;width:100%}td,th{overflow-wrap:anywhere}}
 </style>
 </head>
 <body>
