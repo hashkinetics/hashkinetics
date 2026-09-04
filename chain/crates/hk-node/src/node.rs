@@ -210,6 +210,23 @@ impl Node for App {
         #[cfg(not(feature = "sp1-verify"))]
         let pool_verifier: Option<crate::state::PoolVerifiers> = None;
 
+        // K5 (2026-09-04, from the first external operator's wedge at height 479): on a
+        // network that PINS its proof system (genesis.vk_pins), running without the
+        // verifier is not a mode — it is a guaranteed app_hash divergence at the first
+        // shielded block (the node refuses a valid proof, computes a different state and
+        // wedges; CHANGELOG 0.10.9 tells the story from our own fleet). Refuse to start
+        // instead: loudly, with the fix in the message. Devnets built without pins are
+        // unaffected; `HK_ALLOW_UNVERIFIED=1` overrides for deliberate experiments.
+        let allow_unverified = std::env::var("HK_ALLOW_UNVERIFIED").map(|v| v == "1").unwrap_or(false);
+        if pool_verifier.is_none() && genesis.vk_pins.is_some() && !allow_unverified {
+            eyre::bail!(
+                "this network pins its proof system (genesis.vk_pins) but no STARK verifier is wired: \
+                 set HK_PROVER_URL=https://prover.hashkinetics.org (the prover must be reachable at \
+                 startup) — starting without it wedges the node at the first shielded block \
+                 (app_hash divergence). HK_ALLOW_UNVERIFIED=1 overrides for experiments."
+            );
+        }
+
         // `op_handle` (built above, shared with the engine's provider) lets HkApp rotate the
         // live operational key when a RotationCert commits.
         let mut state = HkApp::new(

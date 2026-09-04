@@ -111,7 +111,7 @@ Then **watch it land**: the explorer at [hashkinetics.org/explorer](https://www.
 
 The testnet recruits external validators now — one Linux box, **no GPU, no stake, no cost**. Your keys are generated on your machine and never leave it; your permanent identity is a stateless SLH-DSA root; exhaustion and downtime are liveness faults only, never fund-loss — proven the hard way: this network's val-0 ran its tree to zero, was revived by a root-signed cert carried through a peer (`issue-rotation` → `hk_submitRotation`), and rejoined with a fresh tree. The whole flow is in this repo.
 
-Read `docs/VALIDATOR-ONBOARDING.md`, then mail **validators@hashkinetics.org** with your `validator.json`. Honest framing: testnet-1's four seats were fixed at its genesis (there is no validator-set-change transaction yet — plan item V1); external operators run **observers** today (full verification, own RPC + explorer — same binary, minus the vote) and take a voting seat at the next genesis or when V1 ships, whichever comes first. How a genesis is run, with the record of this one: `docs/CEREMONY-TESTNET-1.md`.
+Read `docs/VALIDATOR-ONBOARDING.md`, then mail **validators@hashkinetics.org** with your `validator.json`. Honest framing: external operators start as **observers** (full verification, own RPC + explorer — same binary, minus the vote); since v0.14.0 a voting seat is **admitted on the running chain** by a certificate approved by more than ⅔ of the current seats' root keys — no new genesis (`docs/V1-VALIDATOR-SET-CHANGES.md`). An observer at the tip with our `app_hash` is the precondition; the first external seat is being admitted on 2026-09-04. How a genesis is run, with the record of this one: `docs/CEREMONY-TESTNET-1.md`.
 
 ## What this repo is
 

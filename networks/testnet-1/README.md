@@ -9,9 +9,9 @@
 The public testnet (the chain behind [hashkinetics.org/explorer](https://www.hashkinetics.org/explorer)
 and `https://rpc.hashkinetics.org`). Four founder-operated validators run it; anyone
 can run a **full node** that syncs it, verifies every block, and serves its own RPC
-and explorer. Validator seats were fixed at the testnet-1 ceremony — there is no
-validator-set-change transaction yet (plan item V1) — so external operators run
-**observers** now and take a seat at the next genesis or when V1 ships
+and explorer. External operators start as **observers**; since v0.14.0 a voting seat
+is admitted on the RUNNING chain by a certificate approved by more than ⅔ of the
+current seats' root keys — no new genesis (`docs/V1-VALIDATOR-SET-CHANGES.md`)
 (`docs/VALIDATOR-ONBOARDING.md`). Just want to use it? `https://www.hashkinetics.org/faucet`
 and the Windows wallet (`docs/WALLET-GUIDE.md`); every transaction pays 100 micro.
 
@@ -73,7 +73,9 @@ The `chain_id` and `app_hash` at any height must match what
 ## Notes
 
 - Observers hold a validator keypair (from `keygen`) but are not in the validator
-  set: you sync and verify, you don't vote. No stake, no cost, no GPU.
+  set: you sync and verify, you don't vote. No stake, no cost, no GPU. Keep that
+  key: it is exactly what a seat admission (v0.14.0) registers, and the seated node
+  starts voting from the next height with no restart.
 - Bootstrap peers are DNS-based (`PEERS.txt`) — IPs may change; the names won't.
 - The chain id is bound to genesis: a node reports `hashkinetics-1-<first 8 hex of
   the genesis digest>` — for this network, `hashkinetics-1-4e4ea68d`. A node on a

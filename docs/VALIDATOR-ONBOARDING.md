@@ -162,3 +162,7 @@ The full procedure, the rules behind each step, and the testnet-1 record live in
 Coordinator also runs: the seed node (stable public multiaddr), the hosted prover (vk
 endpoint + proving for demo traffic), and the public explorer. **G3 soak clock**: starts
 when ≥4 external validators hold ≥⅓ of voting power; 30 days incident-free.
+
+## 8 · From observer to seat (v0.14.0)
+
+A seat is admitted on the running chain by a `SetChangeCert` approved by more than ⅔ of the current seats' root keys; it takes effect one height after it commits and your node starts voting with no restart. Preconditions: your observer is at the tip with the canonical `app_hash`, ran with `HK_PROVER_URL` from the first block (a node on this genesis refuses to start without the verifier since v0.14.0), and you sent `validator.json` (public halves only) to validators@hashkinetics.org. Procedure and receipts: `docs/V1-VALIDATOR-SET-CHANGES.md`.

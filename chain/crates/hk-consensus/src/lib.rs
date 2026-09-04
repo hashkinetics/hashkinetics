@@ -23,11 +23,15 @@ pub mod hashsig_scheme;
 /// SCMS validator key rotation — the stateless SLH-DSA-192s root certifies fresh
 /// stateful operational trees before they exhaust (docs/MAINNET-KEY-MANAGEMENT.md).
 pub mod rotation;
+/// V1: validator-set changes on a running chain — a seat admitted or removed by a
+/// supermajority of the current seats' roots (docs/V1-VALIDATOR-SET-CHANGES.md).
+pub mod setchange;
 
 pub use context::*;
 pub use hashsig_scheme::{op_seed, HkHashScheme, HkPriv, HkPub, HkSig};
 pub use provider::HkSigningProvider;
 pub use rotation::RotationCert;
+pub use setchange::{apply_set_change, Approval, SetChange, SetChangeBody, SetChangeCert};
 
 /// The stateless SLH-DSA-192s validator root (re-exported for the node's genesis + rotation
 /// issuance). Certifies operational trees; never exhausts (docs/MAINNET-KEY-MANAGEMENT.md).
