@@ -22,7 +22,7 @@ use malachitebft_core_types::Height as _;
 
 use hk_consensus::{
     op_seed, HkAddress, HkContext, HkHeight, HkPriv, HkProposalFin, HkProposalInit, HkProposalPart,
-    HkValidatorSet, HkValue, RootSecret, RotationCert,
+    HkValidatorSet, HkValue, RootSecret, RotationCert, SetChange, SetChangeCert,
 };
 use hk_state::tx::{SignedTx, Tx};
 
@@ -103,6 +103,9 @@ pub struct SharedHandles {
     /// R2: foreign rotation certs queued by `hk_submitRotation` — an exhausted validator
     /// can't propose its own revival cert, so any peer accepts + carries it.
     pub foreign_rotations: Arc<Mutex<Vec<RotationCert>>>,
+    /// V1: validator-set change certificates queued by `hk_submitSetChange` — they ride
+    /// this node's next proposal (re-validated against the live set at propose + commit).
+    pub pending_set_changes: Arc<Mutex<Vec<SetChangeCert>>>,
     /// R4: (epoch, remaining-leaves) of this node's live consensus signer.
     pub signer_gauge: Arc<Mutex<(u64, u64)>>,
     /// v0.11.2 search: NODE-LOCAL indexes (never in C(Σ) — anyone rebuilds them by
@@ -278,6 +281,9 @@ pub struct HkApp {
     /// an exhausted validator can't propose its own revival, so peers carry it.
     /// Shared with the RPC server; drained (validated) into every batch we build.
     foreign_rotations: Arc<Mutex<Vec<RotationCert>>>,
+    /// V1: set-change certificates submitted via `hk_submitSetChange` (shared with RPC).
+    /// Drained (validated) into the batches we build; retired when seen committed.
+    pending_set_changes: Arc<Mutex<Vec<SetChangeCert>>>,
     /// R4: (epoch, remaining-leaves) of OUR live signer, refreshed every commit — the RPC
     /// serves it so operators watch the fuse instead of discovering it at zero.
     signer_gauge: Arc<Mutex<(u64, u64)>>,
@@ -403,6 +409,7 @@ impl HkApp {
             tx_index: Arc::new(Mutex::new(std::collections::HashMap::new())),
             acct_index: Arc::new(Mutex::new(std::collections::HashMap::new())),
             foreign_rotations: Arc::new(Mutex::new(Vec::new())),
+            pending_set_changes: Arc::new(Mutex::new(Vec::new())),
             signer_gauge,
             store: None,
             set_history,
@@ -441,6 +448,7 @@ impl HkApp {
             chain_start_time: self.chain_start_time,
             gossip: None,
             foreign_rotations: self.foreign_rotations.clone(),
+            pending_set_changes: self.pending_set_changes.clone(),
             signer_gauge: self.signer_gauge.clone(),
             tx_index: self.tx_index.clone(),
             acct_index: self.acct_index.clone(),
@@ -620,7 +628,7 @@ impl HkApp {
     /// Build the block payload: parent app_hash (this node's current commitment) +
     /// up to N transactions PEEKED (not removed) from the mempool. Txs are removed
     /// only on successful commit, so a round change never drops them.
-    fn build_batch(&self) -> Bytes {
+    fn build_batch(&self, height: u64) -> Bytes {
         let parent_app_hash = self.chain.lock().unwrap().state_commitment().0;
         // P2.3: a pending aggregation bundle rides whole (proof-less txs + ONE aggregate).
         let (mut txs, agg_proof) = {
@@ -656,7 +664,33 @@ impl HkApp {
                 }
             }
         }
-        Bytes::from(Batch { parent_app_hash, txs, rotations, agg_proof }.encode())
+        // V1: queued validator-set changes ride this proposal if they are valid against the
+        // CURRENT set at THIS height (window + supermajority + not already applied). A cert
+        // whose window has not opened stays queued; one that is stale, already applied or
+        // no longer approved by a supermajority of the current seats is dropped in place.
+        let set_changes = {
+            let validators = self.validators.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let mut queue = self.pending_set_changes.lock().unwrap_or_else(|e| e.into_inner());
+            let mut include = Vec::new();
+            queue.retain(|cert| {
+                if cert.body.not_before > height {
+                    return true; // not yet — keep
+                }
+                match hk_consensus::apply_set_change(&validators, cert, height, &self.chain_id) {
+                    Ok(Some(_)) => {
+                        include.push(cert.clone());
+                        true // keep until we SEE it committed (a lost round must not lose it)
+                    }
+                    Ok(None) => false, // already applied
+                    Err(e) => {
+                        warn!(%e, "dropping queued set change");
+                        false
+                    }
+                }
+            });
+            include
+        };
+        Bytes::from(Batch { parent_app_hash, txs, rotations, agg_proof, set_changes }.encode())
     }
 
     pub fn previously_built(
@@ -673,7 +707,7 @@ impl HkApp {
     }
 
     pub fn propose_value(&mut self, height: HkHeight, round: Round) -> LocallyProposedValue<HkContext> {
-        let value = HkValue::new(self.build_batch());
+        let value = HkValue::new(self.build_batch(height.as_u64()));
         let proposed = ProposedValue {
             height,
             round,
@@ -1084,6 +1118,75 @@ impl HkApp {
         }
     }
 
+    /// V1: apply validator-set changes committed in a block. Every node re-verifies each
+    /// certificate against the set AS IT STANDS (sequentially — a block may carry several)
+    /// and at THIS height (freshness window), so the outcome is deterministic across the
+    /// network; a certificate that fails here is logged and ignored (the proposer already
+    /// filtered, so this only fires on a malicious or racing proposal). A change takes
+    /// effect for `height + 1` — recorded in the HK-R6 history exactly like a rotation, so
+    /// commit certificates on either side of the boundary verify against the right set.
+    /// Runs on live commits AND on replay (restore-from-store) — same code, same answer.
+    fn apply_set_changes(&mut self, height: u64, batch: &Option<Batch>, replay: bool) {
+        let mut any_applied = false;
+        if let Some(b) = &batch {
+            for cert in &b.set_changes {
+                let current = self.validators.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                match hk_consensus::apply_set_change(&current, cert, height, &self.chain_id) {
+                    Ok(Some(new_set)) => {
+                        *self.validators.lock().unwrap_or_else(|e| e.into_inner()) = new_set.clone();
+                        any_applied = true;
+                        let subject = cert.body.subject_root();
+                        let mine = subject == self.my_root_pk.as_slice();
+                        match &cert.body.change {
+                            SetChange::Admit { voting_power, .. } => {
+                                info!(
+                                    root = %hex::encode(&subject[..8.min(subject.len())]),
+                                    power = voting_power,
+                                    seats = new_set.len(),
+                                    total_power = new_set.total_voting_power(),
+                                    effective_from = height + 1,
+                                    replay,
+                                    "Validator ADMITTED"
+                                );
+                                if mine {
+                                    info!(
+                                        effective_from = height + 1,
+                                        "THIS NODE now holds a voting seat — signing from the next height"
+                                    );
+                                }
+                            }
+                            SetChange::Remove { .. } => {
+                                info!(
+                                    root = %hex::encode(&subject[..8.min(subject.len())]),
+                                    seats = new_set.len(),
+                                    total_power = new_set.total_voting_power(),
+                                    effective_from = height + 1,
+                                    replay,
+                                    "Validator REMOVED"
+                                );
+                                if mine {
+                                    info!("THIS NODE was unseated — it keeps verifying as an observer");
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => info!(height, "set change already applied — no-op"),
+                    Err(e) => error!(%e, height, "Rejected set change certificate"),
+                }
+                // Whatever happened, a committed copy retires our queued copy.
+                self.pending_set_changes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .retain(|q| q.body != cert.body);
+            }
+        }
+        if any_applied {
+            let set = self.validators.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let mut hist = self.set_history.lock().unwrap_or_else(|e| e.into_inner());
+            hist.push((height + 1, set));
+        }
+    }
+
     /// R2/WS-F: after restore, make the LIVE signer match the epoch the chain says we're
     /// on. Restore rebuilds the validator set (snapshot + replayed certs) but the signer
     /// was constructed at startup from the genesis-era file; if our on-chain entry moved
@@ -1149,6 +1252,7 @@ impl HkApp {
 
         let agg_valid = self.apply_batch_to_chain(height, &batch, true, false)?;
         self.apply_rotations(height, &batch, false);
+        self.apply_set_changes(height, &batch, false);
 
         // P3.0/WS-B: capture the persistent facts BEFORE the value moves into `decided`.
         let cert_dto = crate::codec::RawCommitCertificate::from(&certificate);
@@ -1418,6 +1522,7 @@ impl HkApp {
             let batch = Batch::decode(&value.txs);
             self.apply_batch_to_chain(h, &batch, false, sb.agg_valid)?;
             self.apply_rotations(h, &batch, true);
+            self.apply_set_changes(h, &batch, true);
             self.decided.insert(h, DecidedEntry { value, certificate });
             replayed += 1;
         }

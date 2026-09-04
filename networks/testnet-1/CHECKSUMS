@@ -10,3 +10,6 @@ fb330c291c656e71a7d3473f9cffabb7a449a98ea7f8ddbcc09bd7062e16fb15  HashKinetics-W
 # v0.13.2 release — node hardening (H-batch) + R12; state-compatible, recommended for every public-facing node (minimum stays v0.13.0)
 b94b89f08fa80e04d0d112036a1497be110f7db7c4e5d2b4f9cfa72a697003b7  hk-node-v0.13.2.gz
 b7601e846176cafb8de575305d82e3ee182172a6def0444cadf8359d002b0f37  hk-node-v0.13.2
+# v0.14.0 release — V1 validator-set changes on a running chain + K5 (refuse to start without a verifier on a pinned genesis); state-compatible; minimum stays v0.13.0 UNTIL the first set change commits, then v0.14.0
+1ba156f01a7991a327bc7bb6a84ee54ed6f5ca558da9b34e00d7c88bcd8ed165  hk-node-v0.14.0.gz
+30d6f773f89f79a198141dd5a8e9f43d2725aeb969fd42ec8c8941b8a6d9a012  hk-node-v0.14.0

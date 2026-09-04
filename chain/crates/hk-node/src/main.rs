@@ -13,7 +13,7 @@
 
 /// The release label this binary reports (`hk-node --version`, the usage banner).
 /// Bump with every node release; the crate version is workspace-wide and not it.
-pub const NODE_VERSION: &str = "v0.13.2";
+pub const NODE_VERSION: &str = "v0.14.0";
 
 mod account;
 mod app;
@@ -43,7 +43,7 @@ mod verifier;
 
 use std::path::PathBuf;
 
-use hk_consensus::{op_seed, HkPriv, RootSecret, RotationCert};
+use hk_consensus::{op_seed, Approval, HkPriv, RootSecret, RotationCert, SetChange, SetChangeBody, SetChangeCert};
 
 use crate::genesis::{GenesisValidator, HkGenesis};
 use crate::node::App;
@@ -160,6 +160,12 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
             let epoch = args.get(3).and_then(|s| s.parse().ok());
             let valid_from = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
             cmd_issue_rotation(&home, epoch, valid_from)
+        }
+        Some("set-change") => {
+            // V1: validator-set changes on a running chain — propose (build the body) →
+            // approve (each seat signs with its root, on its own machine) → assemble
+            // (collect approvals, verify, print the cert) → hk_submitSetChange on any peer.
+            cmd_set_change(&args[2..])
         }
         Some("agg-bench") => {
             // C1p2.a: the aggregation scaling curve — T_agg(N) = a + b·N (prover only).
@@ -278,7 +284,7 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
         }
         _ => {
             eprintln!("HashKinetics node {NODE_VERSION} (hash-based consensus + shielded pool + disclosure + durable store)");
-            eprintln!("usage: hk-node testnet <N> <HOME> | start <NODE_HOME> | wallet <CMD …> | keygen <HOME> [MONIKER] | issue-rotation <HOME> [EPOCH] [VALID_FROM] | genesis-build <VALIDATORS.json> <OUT.json> | config-gen <HOME> --listen … --peers … | storm <RPC> [RATE] [DURATION_S] | demo <RPC> | demo-economy <RPC> <PROVER> | demo-shielded <RPC> <PROVER> | demo-disclose <RPC> <PROVER> | demo-agg <RPC> <PROVER> | demo-mandates <RPC> <PROVER> | verify-disclosure <package.json>");
+            eprintln!("usage: hk-node testnet <N> <HOME> | start <NODE_HOME> | wallet <CMD …> | keygen <HOME> [MONIKER] | issue-rotation <HOME> [EPOCH] [VALID_FROM] | set-change propose|approve|assemble … | genesis-build <VALIDATORS.json> <OUT.json> | config-gen <HOME> --listen … --peers … | storm <RPC> [RATE] [DURATION_S] | demo <RPC> | demo-economy <RPC> <PROVER> | demo-shielded <RPC> <PROVER> | demo-disclose <RPC> <PROVER> | demo-agg <RPC> <PROVER> | demo-mandates <RPC> <PROVER> | verify-disclosure <package.json>");
             eprintln!("join a testnet: docs/VALIDATOR-ONBOARDING.md (keygen → send validator.json → receive genesis → config-gen → start)");
             eprintln!("accounts (U1): account-new DIR · account-info DIR · account-balance RPC ID|DIR · account-send DIR RPC TO MICRO [ASSET] · account-create DIR RPC AUTH_COMMIT MICRO [ASSET] · faucet-serve DIR RPC [--drip …]");
             eprintln!("wallet: init DIR ACCOUNT [RPC] · status DIR [RPC] · address DIR [RPC] · scan DIR [RPC] · transfer DIR TO USD [RPC] · shield DIR USD [RPC] [PROVER] · unshield DIR USD [RPC] [PROVER] · pay DIR HKADDR USD [MEMO] [RPC] [PROVER] · disclose DIR COMMITMENT OUT.json [RPC]");
@@ -543,6 +549,162 @@ fn cmd_issue_rotation(home: &PathBuf, epoch: Option<u64>, valid_from: u64) -> ey
     println!("    curl -s -X POST <PEER_RPC> -d @-");
     println!("\nthen restart THIS validator's node — it adopts the fresh epoch-{epoch} tree on boot.");
     Ok(())
+}
+
+/// V1 (v0.14): validator-set changes on a running chain. Three verbs, one certificate:
+///
+///   hk-node set-change propose <HOME> --admit <validator.json> [--power 1] --not-before H --not-after H2
+///   hk-node set-change propose <HOME> --remove <root_pk_hex>          --not-before H --not-after H2
+///       → prints `set-change.json` (the BODY; chain id read from <HOME>/genesis.json)
+///   hk-node set-change approve <HOME> <set-change.json>
+///       → on EACH approving seat's machine (needs its priv_validator_key.json): signs the body
+///         with the seat's stateless SLH-DSA root → prints `approval-<root8>.json`
+///   hk-node set-change assemble <set-change.json> <approval.json>… [-o cert.json]
+///       → verifies every approval, prints the certificate; submit it through ANY live peer:
+///         printf '{"method":"hk_submitSetChange","params":%s}' "$(cat cert.json)" | curl -s -X POST <RPC> -d @-
+///
+/// Authority = strictly more than ⅔ of the CURRENT seats' voting power, checked by every
+/// node at propose and at commit; the change takes effect one height after it commits.
+fn cmd_set_change(args: &[String]) -> eyre::Result<()> {
+    let usage = "usage: hk-node set-change propose <HOME> (--admit <validator.json> [--power N] | --remove <root_hex>) --not-before H --not-after H | approve <HOME> <set-change.json> | assemble <set-change.json> <approval.json>... [-o cert.json]";
+    match args.first().map(String::as_str) {
+        Some("propose") => {
+            let home = PathBuf::from(args.get(1).ok_or_else(|| eyre::eyre!("{usage}"))?);
+            let mut admit: Option<PathBuf> = None;
+            let mut remove: Option<String> = None;
+            let mut power: u64 = 1;
+            let mut not_before: Option<u64> = None;
+            let mut not_after: Option<u64> = None;
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--admit" => { admit = args.get(i + 1).map(PathBuf::from); i += 2 }
+                    "--remove" => { remove = args.get(i + 1).cloned(); i += 2 }
+                    "--power" => { power = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(1); i += 2 }
+                    "--not-before" => { not_before = args.get(i + 1).and_then(|v| v.parse().ok()); i += 2 }
+                    "--not-after" => { not_after = args.get(i + 1).and_then(|v| v.parse().ok()); i += 2 }
+                    other => eyre::bail!("unknown flag {other}\n{usage}"),
+                }
+            }
+            let (not_before, not_after) = match (not_before, not_after) {
+                (Some(a), Some(b)) if b >= a => (a, b),
+                _ => eyre::bail!("--not-before and --not-after (≥ not-before) are required — a certificate must expire\n{usage}"),
+            };
+            let chain_id = chain_id_of_home(&home)?;
+            let change = match (admit, remove) {
+                (Some(vj), None) => {
+                    let raw = std::fs::read_to_string(&vj)
+                        .map_err(|e| eyre::eyre!("{}: {e}", vj.display()))?;
+                    let gv: GenesisValidator = serde_json::from_str(&raw)?;
+                    if gv.root_pk.len() != 48 {
+                        eyre::bail!("{}: root_pk must be 48 bytes (SLH-DSA-192s)", vj.display());
+                    }
+                    SetChange::Admit { root_pk: gv.root_pk, public_key: gv.public_key, voting_power: power }
+                }
+                (None, Some(hexroot)) => {
+                    let root_pk = hex::decode(hexroot.trim()).map_err(|e| eyre::eyre!("--remove: bad hex: {e}"))?;
+                    if root_pk.len() != 48 {
+                        eyre::bail!("--remove: root_pk must be 48 bytes (96 hex chars)");
+                    }
+                    SetChange::Remove { root_pk }
+                }
+                _ => eyre::bail!("exactly one of --admit / --remove\n{usage}"),
+            };
+            let body = SetChangeBody { chain_id: chain_id.clone(), change, not_before, not_after };
+            body.check_shape().map_err(|e| eyre::eyre!(e))?;
+            let out = home.join("set-change.json");
+            std::fs::write(&out, serde_json::to_string_pretty(&body)?)?;
+            println!("✓ set-change body written: {}", out.display());
+            println!("  chain id  : {chain_id}");
+            match &body.change {
+                SetChange::Admit { root_pk, public_key, voting_power } => {
+                    println!("  ADMIT     : root {}… · address {} · power {voting_power}",
+                        hex::encode(&root_pk[..8]), hk_consensus::HkAddress::from_public_key(public_key));
+                }
+                SetChange::Remove { root_pk } => println!("  REMOVE    : root {}…", hex::encode(&root_pk[..8])),
+            }
+            println!("  window    : commit height {not_before} … {not_after} (effective one height after commit)");
+            println!("\nnext: on EACH approving seat's machine:  hk-node set-change approve <HOME> {}", out.display());
+            println!("      (approvals from strictly more than 2/3 of the current voting power are required)");
+            Ok(())
+        }
+        Some("approve") => {
+            let home = PathBuf::from(args.get(1).ok_or_else(|| eyre::eyre!("{usage}"))?);
+            let body_path = PathBuf::from(args.get(2).ok_or_else(|| eyre::eyre!("{usage}"))?);
+            let body: SetChangeBody = serde_json::from_str(&std::fs::read_to_string(&body_path)
+                .map_err(|e| eyre::eyre!("{}: {e}", body_path.display()))?)?;
+            body.check_shape().map_err(|e| eyre::eyre!(e))?;
+            // Refuse to sign for a different network than this home's genesis, if it has one.
+            if let Ok(cid) = chain_id_of_home(&home) {
+                if cid != body.chain_id {
+                    eyre::bail!("this home is on {cid}; the body is for {} — refusing to approve", body.chain_id);
+                }
+            }
+            let key_path = home.join("priv_validator_key.json");
+            let raw = std::fs::read_to_string(&key_path)
+                .map_err(|e| eyre::eyre!("{}: {e} (run on the SEAT's machine)", key_path.display()))?;
+            let seed: [u8; 32] = serde_json::from_str(&raw)?;
+            let root = RootSecret::from_seed(&seed);
+            println!("signing the set-change body with this seat's SLH-DSA root (stateless — never exhausts)...");
+            let approval = Approval::sign(&root, &body);
+            let tag = hex::encode(&approval.root_pk[..4]);
+            let out = home.join(format!("approval-{tag}.json"));
+            std::fs::write(&out, serde_json::to_string(&approval)?)?;
+            println!("✓ approval written: {}", out.display());
+            println!("  seat root : {}…", hex::encode(&approval.root_pk[..8]));
+            println!("\nsend it to the coordinator; assemble with:  hk-node set-change assemble {} <approvals…>", body_path.display());
+            Ok(())
+        }
+        Some("assemble") => {
+            let body_path = PathBuf::from(args.get(1).ok_or_else(|| eyre::eyre!("{usage}"))?);
+            let body: SetChangeBody = serde_json::from_str(&std::fs::read_to_string(&body_path)
+                .map_err(|e| eyre::eyre!("{}: {e}", body_path.display()))?)?;
+            let mut out_path = PathBuf::from("set-change-cert.json");
+            let mut approvals: Vec<Approval> = Vec::new();
+            let mut i = 2;
+            while i < args.len() {
+                if args[i] == "-o" {
+                    out_path = PathBuf::from(args.get(i + 1).ok_or_else(|| eyre::eyre!("-o needs a path"))?);
+                    i += 2;
+                    continue;
+                }
+                let a: Approval = serde_json::from_str(&std::fs::read_to_string(&args[i])
+                    .map_err(|e| eyre::eyre!("{}: {e}", args[i]))?)?;
+                if !a.verify(&body) {
+                    eyre::bail!("{}: approval signature does NOT verify over this body", args[i]);
+                }
+                if approvals.iter().any(|x| x.root_pk == a.root_pk) {
+                    println!("  (duplicate approval from root {}… skipped)", hex::encode(&a.root_pk[..8]));
+                } else {
+                    println!("  ✓ approval from root {}…", hex::encode(&a.root_pk[..8]));
+                    approvals.push(a);
+                }
+                i += 1;
+            }
+            if approvals.is_empty() {
+                eyre::bail!("no approvals given\n{usage}");
+            }
+            let cert = SetChangeCert { body, approvals };
+            std::fs::write(&out_path, serde_json::to_string(&serde_json::json!({ "cert": cert }))?)?;
+            println!("✓ certificate written: {} ({} approvals)", out_path.display(), cert.approvals.len());
+            println!("  the chain checks the supermajority against the CURRENT set at propose and at commit.");
+            println!("\nsubmit it through ANY live peer (it rides that peer's next proposal inside its window):");
+            println!("  printf '{{\"method\":\"hk_submitSetChange\",\"params\":%s}}' \"$(cat {})\" | curl -s -X POST <PEER_RPC> -d @-", out_path.display());
+            println!("  then:  curl -s -X POST <PEER_RPC> -d '{{\"method\":\"hk_getValidators\"}}'   # seats + pending_set_changes");
+            Ok(())
+        }
+        _ => eyre::bail!("{usage}"),
+    }
+}
+
+/// The chain id a node home is on: SHA-256 of its genesis.json, first 4 bytes — exactly
+/// what `hk_chainInfo.chain_id` reports.
+fn chain_id_of_home(home: &PathBuf) -> eyre::Result<String> {
+    use sha2::{Digest, Sha256};
+    let gpath = home.join("genesis.json");
+    let bytes = std::fs::read(&gpath).map_err(|e| eyre::eyre!("{}: {e}", gpath.display()))?;
+    let d = Sha256::digest(&bytes);
+    Ok(format!("hashkinetics-1-{}", hex::encode(&d[..4])))
 }
 
 /// Coordinator-side: assemble genesis from the collected validator.json blobs

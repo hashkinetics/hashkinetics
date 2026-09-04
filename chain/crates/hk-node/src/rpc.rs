@@ -21,7 +21,10 @@
 //!   hk_getBlock     {height}                   -> full block: txs (public summaries) +
 //!                                                 per-tx receipts + aggregate verdict + cert
 //!   hk_getBlocks    {before?, limit?<=50}      -> newest-first block list
-//!   hk_getValidators                           -> the live validator set + power
+//!   hk_getValidators                           -> the live validator set + power (+ queued set changes)
+//!   hk_submitSetChange {cert}                  -> {accepted, queued}  (V1: a seat admitted/removed
+//!                                                 by a supermajority of the current seats' roots;
+//!                                                 rides this node's next proposal)
 //!   hk_getMempool                              -> {count, txids[<=100]}
 //!
 //! PRIVACY NOTE: these endpoints expose only what consensus already made public —
@@ -87,7 +90,7 @@ pub async fn serve(addr: SocketAddr, h: SharedHandles) -> eyre::Result<()> {
 /// request still runs — so these are refused outright when an Origin is present.
 /// Read methods and `hk_submitTx` stay browser-callable (the explorer, the site,
 /// the wallet). Override for a deliberately browser-driven devnet: HK_RPC_ALLOW_BROWSER_OPS=1.
-const OPERATOR_METHODS: &[&str] = &["hk_submitRotation", "hk_gossipTxs", "hk_submitBundle"];
+const OPERATOR_METHODS: &[&str] = &["hk_submitRotation", "hk_submitSetChange", "hk_gossipTxs", "hk_submitBundle"];
 
 fn browser_ops_allowed() -> bool {
     std::env::var("HK_RPC_ALLOW_BROWSER_OPS").map(|v| v == "1").unwrap_or(false)
@@ -491,6 +494,7 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
         },
         "hk_getValidators" => {
             let vs = h.validators.lock().unwrap_or_else(|e| e.into_inner());
+            let queued = h.pending_set_changes.lock().unwrap_or_else(|e| e.into_inner());
             json!({"result": {
                 "count": vs.len(),
                 "total_power": vs.total_voting_power(),
@@ -500,8 +504,57 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
                     "epoch": v.epoch,
                     "root_pk": hex::encode(&v.root_pk),
                 })).collect::<Vec<_>>(),
+                "pending_set_changes": queued.iter().map(|c| {
+                    let change = match &c.body.change {
+                        hk_consensus::SetChange::Admit { root_pk, voting_power, .. } =>
+                            json!({"admit": hex::encode(root_pk), "voting_power": voting_power}),
+                        hk_consensus::SetChange::Remove { root_pk } =>
+                            json!({"remove": hex::encode(root_pk)}),
+                    };
+                    json!({
+                        "change": change,
+                        "not_before": c.body.not_before,
+                        "not_after": c.body.not_after,
+                        "approvals": c.approvals.len(),
+                    })
+                }).collect::<Vec<_>>(),
             }})
         }
+        // V1: queue a validator-set change certificate. Checked against the live set
+        // here (chain id, supermajority of CURRENT seats, window not yet closed) and
+        // re-checked at propose + commit by every node; the root signatures make it
+        // trustless to carry — anyone may relay a valid certificate.
+        "hk_submitSetChange" => match params.get("cert") {
+            Some(c) => match serde_json::from_value::<hk_consensus::SetChangeCert>(c.clone()) {
+                Ok(cert) => {
+                    let tip = h.chain.lock().unwrap_or_else(|e| e.into_inner()).height;
+                    let check = {
+                        let vs = h.validators.lock().unwrap_or_else(|e| e.into_inner());
+                        cert.verify_against(&vs, &h.chain_id)
+                    };
+                    match check {
+                        Ok(()) if cert.body.not_after < tip => json!({"result": {
+                            "accepted": false,
+                            "reason": format!("window closed: not_after {} < tip {tip}", cert.body.not_after)
+                        }}),
+                        Ok(()) => {
+                            let mut q = h.pending_set_changes.lock().unwrap_or_else(|e| e.into_inner());
+                            let dup = q.iter().any(|x| x.body == cert.body);
+                            if !dup {
+                                q.push(cert.clone());
+                            }
+                            json!({"result": {"accepted": true, "queued": !dup,
+                                "approvals": cert.approvals.len(),
+                                "window": [cert.body.not_before, cert.body.not_after],
+                                "note": "cert rides this node's next proposal inside its window"}})
+                        }
+                        Err(e) => json!({"result": {"accepted": false, "reason": e}}),
+                    }
+                }
+                Err(e) => json!({"error": format!("bad cert: {e}")}),
+            },
+            None => json!({"error": "params.cert required (output of `hk-node set-change assemble`)"}),
+        },
         "hk_getMempool" => {
             let mp = h.mempool.lock().unwrap_or_else(|e| e.into_inner());
             json!({"result": {
