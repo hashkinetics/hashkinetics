@@ -4,7 +4,7 @@
 
 [**hashkinetics.org**](https://www.hashkinetics.org) · [**Live explorer**](https://www.hashkinetics.org/explorer) · [**Public RPC**](https://rpc.hashkinetics.org) · [**X @hashkinetics**](https://x.com/hashkinetics) · [**Discord**](https://discord.gg/RsSfb9gn3) · validators@hashkinetics.org
 
-`testnet-1: LIVE (fees from block 1)` · `spend proof: 1.24 s (GPU)` · `274 tx/s storm-measured` · `256 proofs → ONE 1.24 MB STARK: measured` · `nothing is for sale`
+`testnet-1: LIVE since 2026-09-02` · `node v0.15.0 · wallet v0.13.1` · `seats change on the running chain (v0.14.0)` · `issued assets with issuer controls (v0.15.0)` · `spend proof: 1.24 s (GPU)` · `274 tx/s storm-measured` · `nothing is for sale`
 
 ---
 
@@ -22,7 +22,7 @@ HashKinetics moves the cap into consensus:
 
 ## Live right now
 
-A 4-validator public **testnet-1** runs since 2026-09-02 — real hash-signed BFT, pinned genesis, protocol fee bound into the genesis from block 1, shielded pool active (its predecessor staging-1 ran 107k blocks and is archived):
+A 4-validator public **testnet-1** runs since 2026-09-02 — real hash-signed BFT, pinned genesis, protocol fee bound into the genesis from block 1, shielded pool active, 59,000+ blocks by 2026-09-05, every seat on v0.15.0 (its predecessor staging-1 ran 107k blocks and is archived). Four releases have rolled onto it without a pause, one voter at a time: v0.13.2 (hardening), v0.14.0 (seat changes), v0.15.0 (issued assets).
 
 - **Explorer:** [hashkinetics.org/explorer](https://www.hashkinetics.org/explorer) — "the scanner that can't dox you": commitments, nullifiers, one running total. No amounts, no parties, by construction.
 - **RPC:** `https://rpc.hashkinetics.org` (JSON-RPC over POST; try `{"method":"hk_chainInfo","params":{}}`).
@@ -104,6 +104,25 @@ Your first spend signs with your own hash-based ratchet at index 0 — the same 
 
 Then **watch it land**: the explorer at [hashkinetics.org/explorer](https://www.hashkinetics.org/explorer) now answers *anything* — paste a block height, a transaction id, an account id, or a nullifier into one search box and get the full picture, with shareable deep links (`#tx=…`, `#account=…`, `#block=…`). The wallet links every payment straight to its proof on-chain. Shielded holdings stay invisible by design — the scanner that can't dox you. (v0.11.2) **Since v0.13.0 the wallet is fee-aware and shielded:** it shows the chain's fee, refuses locally what the chain would refuse, and can shield, unshield, pay a stealth address and export a one-time disclosure — proofs made on the public prover.
 
+## Issue an asset (since v0.15.0 — the floor a stablecoin issuer needs)
+
+Any funded account can become an issuer. The asset id is derived from *your* account and the symbol, so nobody can squat it; the policy you register with is the policy the chain enforces forever after — mint, freeze an account, pause the asset, allow shielding — and every movement of your asset passes one consensus gate. Supply lives in the state commitment; `hk_getAsset` reports it with the node's own conservation check.
+
+```bash
+# the id your account gets for a symbol (offline)
+./target/release/hk-node asset-id ~/my-account USDC.t
+
+# register (policy flags: m=mintable f=freezable p=pausable s=shieldable, or - for none), then mint, freeze, pause, burn
+./target/release/hk-node asset register ~/my-account https://rpc.hashkinetics.org USDC.t 6 mfps
+./target/release/hk-node asset mint     ~/my-account https://rpc.hashkinetics.org <ASSET-ID> <TO-ID> 5000000
+./target/release/hk-node asset freeze   ~/my-account https://rpc.hashkinetics.org <ASSET-ID> <ACCOUNT-ID>   # unfreeze to lift
+./target/release/hk-node asset pause    ~/my-account https://rpc.hashkinetics.org <ASSET-ID>                # unpause to lift
+./target/release/hk-node asset burn     <holder-dir> https://rpc.hashkinetics.org <ASSET-ID> 1000000 <DESTINATION-hex>
+./target/release/hk-node asset info     https://rpc.hashkinetics.org USDC.t@<YOUR-ACCOUNT-ID>            # supply, burned, paused, frozen, conserved
+```
+
+A frozen account's transfer comes back as `rejected: frozen by issuer`; a paused asset's as `rejected: asset paused` — receipts the explorer shows. What is *not* here yet: attested (reserve-backed) minting and burn receipts for an issuer's return path — designed in `docs/STABLECOIN-RAILS-AND-ORACLE-PLAN.md`, not built; every issued asset on testnet-1 is a test asset. Rule, gates and commitment layout: `docs/X1-ISSUED-ASSETS.md`. ⚠ The first asset transaction on testnet-1 makes v0.15.0 the minimum node version from that block.
+
 ## Run a full node on testnet-1 (now, no permission needed)
 
 `networks/testnet-1/` holds the pinned genesis and bootstrap peers — clone, build, point your node at them, and you're syncing and independently verifying the live chain, serving your own RPC and explorer. One screen of commands, no GPU, no stake: `networks/testnet-1/README.md` (run the current release, v0.15.0; v0.13.0 is the minimum to sync, and each appended transaction kind raises the minimum at the block where it first appears). The genesis digest is the network's fingerprint; your node's `app_hash` at any height must equal what `rpc.hashkinetics.org` reports — same input, same hash, no trust required.
@@ -112,7 +131,7 @@ Then **watch it land**: the explorer at [hashkinetics.org/explorer](https://www.
 
 The testnet recruits external validators now — one Linux box, **no GPU, no stake, no cost**. Your keys are generated on your machine and never leave it; your permanent identity is a stateless SLH-DSA root; exhaustion and downtime are liveness faults only, never fund-loss — proven the hard way: this network's val-0 ran its tree to zero, was revived by a root-signed cert carried through a peer (`issue-rotation` → `hk_submitRotation`), and rejoined with a fresh tree. The whole flow is in this repo.
 
-Read `docs/VALIDATOR-ONBOARDING.md`, then mail **validators@hashkinetics.org** with your `validator.json`. Honest framing: external operators start as **observers** (full verification, own RPC + explorer — same binary, minus the vote); since v0.14.0 a voting seat is **admitted on the running chain** by a certificate approved by more than ⅔ of the current seats' root keys — no new genesis (`docs/V1-VALIDATOR-SET-CHANGES.md`). An observer at the tip with our `app_hash` is the precondition; the first external seat is being admitted on 2026-09-04. How a genesis is run, with the record of this one: `docs/CEREMONY-TESTNET-1.md`.
+Read `docs/VALIDATOR-ONBOARDING.md`, then mail **validators@hashkinetics.org** with your `validator.json`. Honest framing: external operators start as **observers** (full verification, own RPC + explorer — same binary, minus the vote); since v0.14.0 a voting seat is **admitted on the running chain** by a certificate approved by more than ⅔ of the current seats' root keys — no new genesis (`docs/V1-VALIDATOR-SET-CHANGES.md`). An observer at the tip with our `app_hash`, running the current release, is the precondition; the first external operator is syncing toward exactly that, and his seat follows the moment he is there — no ceremony, no restart. How a genesis is run, with the record of this one: `docs/CEREMONY-TESTNET-1.md`.
 
 ## What this repo is
 
@@ -122,8 +141,14 @@ Read `docs/VALIDATOR-ONBOARDING.md`, then mail **validators@hashkinetics.org** w
 | `chain/crates/hk-crypto` | Hash-based signatures: LMS/HSS (RFC 8554) with reserve-then-sign persistence, SLH-DSA-SHAKE-192s roots (FIPS 205), PayWord, KAT-verified |
 | `zkvm-bakeoff/` | The shared spend circuit (`no_std`) + SP1/RISC0/OpenVM harnesses, the GPU prover service, and the aggregation guest |
 | `docs/CAPACITY-SHEET.md` | Every measured number with date, hardware, and the command that produced it |
-| `docs/VALIDATOR-ONBOARDING.md` | Join the network: keygen → ceremony → run → operating rules |
-| `docs/AUDIT-SCOPE.md` | Trust boundaries, crypto inventory, consensus invariants — the audit work-packages, prepared before the auditors |
+| `networks/testnet-1/` | The join kit: pinned genesis, bootstrap peers, `CHECKSUMS` for every release |
+| `docs/VALIDATOR-ONBOARDING.md` | Join the network: keygen → observer → seat (admitted on the running chain since v0.14.0) → operating rules |
+| `docs/V1-VALIDATOR-SET-CHANGES.md` · `docs/X1-ISSUED-ASSETS.md` | The v0.14 / v0.15 consensus rules: seat changes and issued assets — rule, wire, activation, runbooks |
+| `docs/RPC.md` · `docs/FEES.md` · `docs/WALLET-GUIDE.md` | Every RPC method with its fields; the protocol fee as a genesis fact; the Windows wallet guide |
+| `docs/AUDIT-SCOPE.md` | Trust boundaries, crypto inventory, consensus invariants (incl. V1 and X1) — the audit work-packages, prepared before the auditors |
+| `explorer/` | The single-file explorer behind hashkinetics.org/explorer — runs against any node RPC |
+| `chain/rehearsal.sh` · `chain/gate-v1.sh` · `chain/gate-x1.sh` | The devnet gates every release passes: ceremony + restore shapes, seat changes (25/25), issued assets (40/40) |
+| `CHANGELOG.md` | Every release with its gate receipts and roll receipts — dated, with the incidents that shaped it |
 
 Protocol papers (whitepaper + formal yellowpaper with the state transition, proof relations, and invariants I1–I10): [hashkinetics.org](https://www.hashkinetics.org) → Papers.
 
