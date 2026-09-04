@@ -13,7 +13,7 @@
 
 /// The release label this binary reports (`hk-node --version`, the usage banner).
 /// Bump with every node release; the crate version is workspace-wide and not it.
-pub const NODE_VERSION: &str = "v0.15.0";
+pub const NODE_VERSION: &str = "v0.15.1";
 
 mod account;
 mod app;
@@ -232,6 +232,25 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
             account::cmd_asset_id(&who, &sym)
         }
         Some("asset") => account::cmd_asset(&args[2..]),
+        // ---- K6 (v0.15.1): the join kit ships the verifying keys ----------------------
+        Some("vks-fetch") => {
+            // Coordinator/operator-side: pull the three vks from a prover (http or https),
+            // optionally check them against a genesis' pins, write `vks.json` — the file a
+            // node reads via HK_VKS_FILE / <HOME>/vks.json so it never needs the prover.
+            let usage = "usage: hk-node vks-fetch <PROVER_URL> [-o vks.json] [--genesis genesis.json]";
+            let url = args.get(2).cloned().ok_or_else(|| eyre::eyre!(usage))?;
+            let mut out = PathBuf::from("vks.json");
+            let mut gen: Option<PathBuf> = None;
+            let mut i = 3;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "-o" => { out = PathBuf::from(args.get(i + 1).ok_or_else(|| eyre::eyre!(usage))?); i += 2 }
+                    "--genesis" => { gen = Some(PathBuf::from(args.get(i + 1).ok_or_else(|| eyre::eyre!(usage))?)); i += 2 }
+                    _ => return Err(eyre::eyre!(usage)),
+                }
+            }
+            cmd_vks_fetch(&url, &out, gen.as_deref())
+        }
         Some("faucet-serve") => {
             let usage = "usage: hk-node faucet-serve <WALLET-DIR> <RPC> [--listen 127.0.0.1:9922] [--drip MICRO] [--asset HEX] [--cooldown-secs N] [--daily-cap N]";
             let dir = PathBuf::from(args.get(2).cloned().ok_or_else(|| eyre::eyre!(usage))?);
@@ -296,6 +315,7 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
             eprintln!("usage: hk-node testnet <N> <HOME> | start <NODE_HOME> | wallet <CMD …> | keygen <HOME> [MONIKER] | issue-rotation <HOME> [EPOCH] [VALID_FROM] | set-change propose|approve|assemble … | genesis-build <VALIDATORS.json> <OUT.json> | config-gen <HOME> --listen … --peers … | storm <RPC> [RATE] [DURATION_S] | demo <RPC> | demo-economy <RPC> <PROVER> | demo-shielded <RPC> <PROVER> | demo-disclose <RPC> <PROVER> | demo-agg <RPC> <PROVER> | demo-mandates <RPC> <PROVER> | verify-disclosure <package.json>");
             eprintln!("join a testnet: docs/VALIDATOR-ONBOARDING.md (keygen → send validator.json → receive genesis → config-gen → start)");
             eprintln!("accounts (U1): account-new DIR · account-info DIR · account-balance RPC ID|DIR · account-send DIR RPC TO MICRO [ASSET] · account-create DIR RPC AUTH_COMMIT MICRO [ASSET] · faucet-serve DIR RPC [--drip …]");
+            eprintln!("verifying keys (K6): vks-fetch PROVER_URL [-o vks.json] [--genesis genesis.json]  — a node reads HK_VKS_FILE or <HOME>/vks.json and needs no prover to verify");
             eprintln!("issued assets (X1): asset-id ISSUER|DIR SYMBOL · asset register DIR RPC SYMBOL DECIMALS FLAGS(m/f/p/s|-) · asset mint DIR RPC ASSET TO MICRO · asset burn DIR RPC ASSET MICRO [DEST-hex] · asset freeze|unfreeze DIR RPC ASSET ACCOUNT · asset pause|unpause DIR RPC ASSET · asset info RPC ASSET|SYMBOL@ISSUER · asset list RPC");
             eprintln!("wallet: init DIR ACCOUNT [RPC] · status DIR [RPC] · address DIR [RPC] · scan DIR [RPC] · transfer DIR TO USD [RPC] · shield DIR USD [RPC] [PROVER] · unshield DIR USD [RPC] [PROVER] · pay DIR HKADDR USD [MEMO] [RPC] [PROVER] · disclose DIR COMMITMENT OUT.json [RPC]");
             Ok(())
@@ -312,6 +332,44 @@ async fn run_node(home: PathBuf) -> eyre::Result<()> {
 /// P2.5: pin the proof-system vks into genesis when a prover is reachable at
 /// generation time. Nodes then REFUSE any other proof system — which also makes
 /// fetching vk BYTES from a hosted prover trustless for external validators.
+/// K6: `vks-fetch` — the three verifying keys as a file the join kit ships.
+fn cmd_vks_fetch(url: &str, out: &PathBuf, genesis: Option<&std::path::Path>) -> eyre::Result<()> {
+    let v = demo::rpc(url, "vks", serde_json::json!({}));
+    let r = v.get("result").ok_or_else(|| eyre::eyre!("prover at {url} returned no result: {v}"))?;
+    let mut set = serde_json::Map::new();
+    let mut pins = Vec::new();
+    for key in ["spend_vk", "mint_vk", "agg_vk"] {
+        let hexs = r.get(key).and_then(|x| x.as_str()).ok_or_else(|| eyre::eyre!("prover response missing {key}"))?;
+        let bytes = hex::decode(hexs).map_err(|e| eyre::eyre!("{key} hex: {e}"))?;
+        pins.push((key, hex::encode(hk_crypto::hash::shake256_32(hk_crypto::hash::DOM_VK_PIN, &[&bytes])), bytes.len()));
+        set.insert(key.to_string(), serde_json::Value::String(hexs.to_string()));
+    }
+    if let Some(g) = genesis {
+        let raw = std::fs::read_to_string(g).map_err(|e| eyre::eyre!("{}: {e}", g.display()))?;
+        let hg: HkGenesis = serde_json::from_str(&raw)?;
+        match hg.vk_pins {
+            Some(p) => {
+                let want = [("spend_vk", p.spend), ("mint_vk", p.mint), ("agg_vk", p.agg)];
+                for ((key, got, _), (_, w)) in pins.iter().zip(want.iter()) {
+                    if got != w {
+                        eyre::bail!("{key} PIN MISMATCH: genesis {w}, prover {got} — not writing; this prover serves a different proof system than the genesis pins");
+                    }
+                }
+                println!("✓ all three vks match the pins in {}", g.display());
+            }
+            None => println!("(genesis {} carries no vk pins — nothing to check against)", g.display()),
+        }
+    }
+    let text = serde_json::to_string_pretty(&serde_json::Value::Object(set))?;
+    std::fs::write(out, format!("{text}\n"))?;
+    println!("✓ verifying keys written: {} ({} bytes)", out.display(), text.len() + 1);
+    for (key, pin, len) in &pins {
+        println!("  {key:8} {len} bytes · pin {pin}");
+    }
+    println!("\na node reads this file via HK_VKS_FILE=<path> (or as <HOME>/vks.json) and needs no prover to verify");
+    Ok(())
+}
+
 fn fetch_vk_pins() -> Option<crate::genesis::VkPins> {
     match std::env::var("HK_PROVER_URL") {
         Ok(url) if !url.is_empty() => {

@@ -1,6 +1,6 @@
 # HashKinetics — Validator Onboarding (public testnet)
 
-**v0.15.0 · testnet-1.** Run **v0.15.0** (the current release). Minimum to *sync* **testnet-1** (`hashkinetics-1-4e4ea68d`) is v0.13.0 — the fee policy lives in its genesis, so older nodes cannot decode it — but the network activates appended transaction kinds by height: the first validator-set change (v0.14.0) and the first issued-asset transaction (v0.15.0) each make their release the minimum for every node from that block on (an older node halts there, loudly, by design). A node that wants a seat must be ≥ v0.15.0 before it is admitted. (staging-1 is retired and archived: `networks/staging-1/`.) How an external operator joins a HashKinetics network: generate a key,
+**v0.15.1 · testnet-1.** Run **v0.15.1** (the current release — it ships the verifying keys in the kit, so your node never depends on our prover). Minimum to *sync* **testnet-1** (`hashkinetics-1-4e4ea68d`) is v0.13.0 — the fee policy lives in its genesis, so older nodes cannot decode it — but the network activates appended transaction kinds by height: the first validator-set change (v0.14.0) and the first issued-asset transaction (v0.15.0) each make their release the minimum for every node from that block on (an older node halts there, loudly, by design). A node that wants a seat must be ≥ v0.15.0 before it is admitted. (staging-1 is retired and archived: `networks/staging-1/`.) How an external operator joins a HashKinetics network: generate a key,
 send one public JSON blob, receive genesis, start. Every consensus signature you will ever
 produce is hash-based (LMS/HSS over SHAKE-256 under a stateless SLH-DSA-192s root) — you are
 operating post-quantum BFT.
@@ -74,8 +74,9 @@ Skipping gossip is safe: your node still validates everything; only tx relay is 
 ## 5 · Start (and keep started)
 
 ```bash
-export HK_PROVER_URL=https://prover.hashkinetics.org   # vk fetch, pin-verified
+cp networks/testnet-1/vks.json ~/hk-validator/vks.json   # since v0.15.1: the verifying keys ship in the kit — no prover needed
 hk-node start ~/hk-validator
+# (pre-v0.15.1 alternative, still supported: HK_PROVER_URL=https://prover.hashkinetics.org — fetches the same pinned keys at startup)
 ```
 As a service, `/etc/systemd/system/hk-node.service`:
 ```ini
@@ -84,8 +85,9 @@ Description=HashKinetics validator
 After=network-online.target
 [Service]
 User=hk
-Environment=HK_PROVER_URL=<prover-url>
 Environment=RUST_LOG=info
+# the verifying keys live at /home/hk/hk-validator/vks.json (copied from the kit); set
+# Environment=HK_VKS_FILE=<path> to point elsewhere, or HK_PROVER_URL=<prover-url> to fetch them instead
 ExecStart=/home/hk/chain/target/release/hk-node start /home/hk/hk-validator
 Restart=always
 RestartSec=5

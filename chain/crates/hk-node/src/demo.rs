@@ -9,8 +9,6 @@
 //!
 //! Run against a live devnet:  hk-node demo http://127.0.0.1:26000
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -100,22 +98,35 @@ impl Wallet {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn rpc(base: &str, method: &str, params: Value) -> Value {
-    let hostport = base.trim_start_matches("http://").split('/').next().unwrap_or(base).to_string();
-    let body = json!({ "method": method, "params": params }).to_string();
-    let req = format!(
-        "POST / HTTP/1.1\r\nHost: {hostport}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    match TcpStream::connect(&hostport) {
-        Ok(mut s) => {
-            let _ = s.write_all(req.as_bytes());
-            let mut resp = String::new();
-            let _ = s.read_to_string(&mut resp);
-            let payload = resp.splitn(2, "\r\n\r\n").nth(1).unwrap_or("");
-            serde_json::from_str(payload).unwrap_or_else(|_| json!({"error":"unparseable response"}))
+    // K6 (v0.15.1): one https-capable client for every endpoint. The previous version
+    // opened a raw TcpStream and only stripped "http://", so `https://rpc.hashkinetics.org`
+    // (the public edge) and `https://prover.hashkinetics.org` were unreachable from the
+    // stock binary — every README command against the public RPC silently failed.
+    match post_json(base, &json!({ "method": method, "params": params }), 30) {
+        Ok(v) => v,
+        Err(e) => json!({ "error": e }),
+    }
+}
+
+/// Blocking JSON POST to `base` (scheme optional — a bare host:port means http://),
+/// `timeout_secs` end to end. Non-2xx answers still carry the server's JSON body
+/// (our RPC returns `{"error": …}` with a status), so the caller sees the reason.
+pub(crate) fn post_json(base: &str, body: &Value, timeout_secs: u64) -> Result<Value, String> {
+    let url = if base.starts_with("http://") || base.starts_with("https://") {
+        base.to_string()
+    } else {
+        format!("http://{base}")
+    };
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build();
+    match agent.post(&url).send_json(body.clone()) {
+        Ok(resp) => resp.into_json::<Value>().map_err(|e| format!("{url}: unparseable response: {e}")),
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            serde_json::from_str::<Value>(&text).map_err(|_| format!("{url}: HTTP {code}: {}", text.chars().take(200).collect::<String>()))
         }
-        Err(e) => json!({ "error": format!("connect {hostport}: {e}") }),
+        Err(e) => Err(format!("{url}: {e}")),
     }
 }
 

@@ -16,3 +16,7 @@ b7601e846176cafb8de575305d82e3ee182172a6def0444cadf8359d002b0f37  hk-node-v0.13.
 # v0.15.0 release — X1 issued assets (registry, issuer mint/burn/freeze/pause, supply in the state commitment); state-compatible; minimum stays v0.13.0 UNTIL the first asset transaction commits, then v0.15.0
 4187a31f63ee2941a84e508f4cdb85c16b2e713b259665f54d6095ba7a67b133  hk-node-v0.15.0.gz
 38fb156b057314d7176b02b946ff7542ca469742df71fe050c64c1c9b6aca5b4  hk-node-v0.15.0
+# v0.15.1 release — K6: verifying keys ship in this kit (vks.json), https client; client-only, no activation
+b7776b06547f238ac78ef8f15ab9af9cb9c9919094c9f441e506afdd4a9185b9  vks.json
+85efc5edb3284cd163524006bb8ca6198d3787b7dc22f9c4e0c2e3677118bf35  hk-node-v0.15.1.gz
+61a9a1420dda2d5353809bc6726fa1e923581efdbaeb73bfcc8b0bd05337fc9c  hk-node-v0.15.1

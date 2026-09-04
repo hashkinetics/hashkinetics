@@ -187,10 +187,30 @@ impl Node for App {
         // WS2: wire the real SP1 STARK verifier if a prover URL is configured. Without it
         // the chain keeps hk-state's RejectAll default — shielded txs are refused, never
         // trusted. (vks are fetched from hk-prove once; mainnet pins them in genesis.)
+        // K6 (v0.15.1): the verifying keys come from a FILE first — `HK_VKS_FILE`, else
+        // `<HOME>/vks.json` (the join kit ships it) — and only then from a prover URL.
+        // A node on a pinned genesis therefore needs no prover to verify; the file is
+        // checked against the pins exactly like a fetched set.
         #[cfg(feature = "sp1-verify")]
-        let pool_verifier: Option<crate::state::PoolVerifiers> =
-            match std::env::var("HK_PROVER_URL") {
-                Ok(url) if !url.is_empty() => {
+        let pool_verifier: Option<crate::state::PoolVerifiers> = {
+            let explicit = std::env::var("HK_VKS_FILE").ok().filter(|p| !p.is_empty()).map(std::path::PathBuf::from);
+            let default_file = self.home_dir.join("vks.json");
+            let vks_file = explicit.or_else(|| default_file.exists().then_some(default_file));
+            let prover_url = std::env::var("HK_PROVER_URL").ok().filter(|u| !u.is_empty());
+            match (vks_file, prover_url) {
+                (Some(path), _) => {
+                    match crate::verifier::from_vks_file(&path, genesis.vk_pins.as_ref()).await {
+                        Ok(v) => {
+                            info!(path = %path.display(), "SP1 pool verifier wired from the vks file (no prover needed to verify; in-node STARK verification live, incl. aggregates)");
+                            Some(v)
+                        }
+                        Err(e) => {
+                            error!(%e, path = %path.display(), "SP1 verifier init FAILED from the vks file — shielded txs will be rejected");
+                            None
+                        }
+                    }
+                }
+                (None, Some(url)) => {
                     match crate::verifier::from_prover_url(&url, genesis.vk_pins.as_ref()).await {
                         Ok(v) => {
                             info!(%url, "SP1 pool verifier wired (in-node STARK verification live, incl. aggregates)");
@@ -202,11 +222,12 @@ impl Node for App {
                         }
                     }
                 }
-                _ => {
-                    info!("HK_PROVER_URL not set — shielded txs will be rejected (RejectAll default)");
+                (None, None) => {
+                    info!("neither a vks file nor HK_PROVER_URL — shielded txs will be rejected (RejectAll default)");
                     None
                 }
-            };
+            }
+        };
         #[cfg(not(feature = "sp1-verify"))]
         let pool_verifier: Option<crate::state::PoolVerifiers> = None;
 
@@ -221,9 +242,11 @@ impl Node for App {
         if pool_verifier.is_none() && genesis.vk_pins.is_some() && !allow_unverified {
             eyre::bail!(
                 "this network pins its proof system (genesis.vk_pins) but no STARK verifier is wired: \
-                 set HK_PROVER_URL=https://prover.hashkinetics.org (the prover must be reachable at \
-                 startup) — starting without it wedges the node at the first shielded block \
-                 (app_hash divergence). HK_ALLOW_UNVERIFIED=1 overrides for experiments."
+                 put the kit's verifying keys next to the genesis (copy networks/<net>/vks.json to \
+                 <HOME>/vks.json, or set HK_VKS_FILE=<path>) — no prover needed — or set \
+                 HK_PROVER_URL=https://prover.hashkinetics.org (reachable at startup). Starting \
+                 without a verifier wedges the node at the first shielded block (app_hash \
+                 divergence). HK_ALLOW_UNVERIFIED=1 overrides for experiments."
             );
         }
 

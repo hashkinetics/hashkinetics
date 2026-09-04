@@ -31,6 +31,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
 
+# K6 (v0.15.1): the blocking HTTP client behind every CLI/RPC/prover call — speaks https
+# (rustls). Before this the node's own client was plain TCP, so the public https edge and
+# https://prover.hashkinetics.org were unreachable from the stock binary (found by the
+# first external operator, 2026-09-05).
+ureq = { version = "2.10", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 eyre = "0.6"
 toml = "0.8"

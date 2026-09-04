@@ -4,7 +4,7 @@
 
 [**hashkinetics.org**](https://www.hashkinetics.org) · [**Live explorer**](https://www.hashkinetics.org/explorer) · [**Public RPC**](https://rpc.hashkinetics.org) · [**X @hashkinetics**](https://x.com/hashkinetics) · [**Discord**](https://discord.gg/RsSfb9gn3) · validators@hashkinetics.org
 
-`testnet-1: LIVE since 2026-09-02` · `node v0.15.0 · wallet v0.13.1` · `seats change on the running chain (v0.14.0)` · `issued assets with issuer controls (v0.15.0)` · `spend proof: 1.24 s (GPU)` · `274 tx/s storm-measured` · `nothing is for sale`
+`testnet-1: LIVE since 2026-09-02` · `node v0.15.1 · wallet v0.13.1` · `seats change on the running chain (v0.14.0)` · `issued assets with issuer controls (v0.15.0)` · `spend proof: 1.24 s (GPU)` · `274 tx/s storm-measured` · `nothing is for sale`
 
 ---
 
@@ -125,7 +125,7 @@ A frozen account's transfer comes back as `rejected: frozen by issuer`; a paused
 
 ## Run a full node on testnet-1 (now, no permission needed)
 
-`networks/testnet-1/` holds the pinned genesis and bootstrap peers — clone, build, point your node at them, and you're syncing and independently verifying the live chain, serving your own RPC and explorer. One screen of commands, no GPU, no stake: `networks/testnet-1/README.md` (run the current release, v0.15.0; v0.13.0 is the minimum to sync, and each appended transaction kind raises the minimum at the block where it first appears). The genesis digest is the network's fingerprint; your node's `app_hash` at any height must equal what `rpc.hashkinetics.org` reports — same input, same hash, no trust required.
+`networks/testnet-1/` holds the pinned genesis, the bootstrap peers and — since v0.15.1 — the three STARK verifying keys (`vks.json`, pinned by the genesis, so your node verifies every proof locally and never depends on our prover). Clone, build, point your node at them, and you're syncing and independently verifying the live chain, serving your own RPC and explorer. One screen of commands, no GPU, no stake: `networks/testnet-1/README.md` (run the current release, v0.15.0; v0.13.0 is the minimum to sync, and each appended transaction kind raises the minimum at the block where it first appears). The genesis digest is the network's fingerprint; your node's `app_hash` at any height must equal what `rpc.hashkinetics.org` reports — same input, same hash, no trust required.
 
 ## Run a validator
 

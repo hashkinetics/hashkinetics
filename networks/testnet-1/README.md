@@ -1,6 +1,6 @@
 # HashKinetics testnet-1 — join as a full node
 
-> **Current release: v0.15.0** (run it). Minimum to sync: v0.13.0 — testnet-1 launched 2026-09-02 from a fresh
+> **Current release: v0.15.1** (run it — since v0.15.1 the kit carries the verifying keys, `vks.json`, and the node's client speaks https). Minimum to sync: v0.13.0 — testnet-1 launched 2026-09-02 from a fresh
 > genesis with the protocol fee (100 micro per envelope, burned) **bound in the genesis
 > from height 1** and the faucet treasury allocated at genesis — no activation heights,
 > no coordinated rolls for the fee. Appended transaction kinds activate by height instead:
@@ -36,25 +36,32 @@ cd hashkinetics/chain && cargo build --release
 # your node identity (never leaves your machine):
 ./target/release/hk-node keygen ~/hk-testnet-1 my-observer
 
-# the network artifacts (this directory):
+# the network artifacts (this directory): the pinned genesis AND the verifying keys
 cp ../networks/testnet-1/genesis.json ~/hk-testnet-1/genesis.json
+cp ../networks/testnet-1/vks.json     ~/hk-testnet-1/vks.json      # since v0.15.1: verify without our prover
 
 # config with the published bootstrap peers:
 ./target/release/hk-node config-gen ~/hk-testnet-1 \
   --listen /ip4/0.0.0.0/tcp/27000 \
   --peers $(paste -sd, ../networks/testnet-1/PEERS.txt)
 
-HK_PROVER_URL=https://prover.hashkinetics.org ./target/release/hk-node start ~/hk-testnet-1
+./target/release/hk-node start ~/hk-testnet-1
 ```
 
-**`HK_PROVER_URL` is required to sync.** It wires the in-node SP1 STARK verifier
-(verifying keys are fetched once and checked against the genesis `vk_pins`).
-Without it your node keeps the refuse-all posture and will REJECT the first
-canonical block that carries a shielded proof — an `app_hash divergence` wedge
-at that height (we did this to ourselves once; see CHANGELOG 0.10.9). Shipping
-the verifying keys inside this kit, removing the live dependency, is queued.
+**The verifier must be wired to sync**, and since v0.15.1 the kit carries what it needs:
+`vks.json` holds the three SP1 verifying keys (104 bytes each); the node reads
+`<HOME>/vks.json` (or `HK_VKS_FILE=<path>`), checks every key against the genesis
+`vk_pins`, and verifies every STARK locally — **no prover connection, ever**. A
+tampered or foreign `vks.json` is refused at startup (`PIN MISMATCH`). The old way,
+`HK_PROVER_URL=https://prover.hashkinetics.org` (fetch the same keys from our prover at
+startup), still works — and since v0.15.1 the node's own HTTP client speaks https, which
+it did not before: on v0.13–v0.15.0 that instruction was impossible on the stock binary
+(found by the first external operator, 2026-09-05; `docs/INCIDENTS.md` #10). Without a
+verifier a node on this genesis refuses to start (K5) rather than wedge at the first
+shielded block.
 
-Startup must print `SP1 pool verifier wired` and `verifying keys MATCH the genesis pins`, then sync heights.
+Startup must print `SP1 pool verifier wired from the vks file` and `verifying keys MATCH the genesis pins`, then sync heights.
+Regenerate the file yourself if you distrust ours: `hk-node vks-fetch https://prover.hashkinetics.org -o vks.json --genesis genesis.json` writes it only if the keys match the pins.
 Your RPC is at `:26000` — point `explorer/index.html` at it and you have your own
 window into the chain, served from your own verification.
 
