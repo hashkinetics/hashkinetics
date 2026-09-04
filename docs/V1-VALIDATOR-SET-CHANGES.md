@@ -1,6 +1,6 @@
 # V1 — validator-set changes on a running chain
 
-**Status: implemented 2026-09-04 (v0.14.0, unreleased); devnet gate `chain/gate-v1.sh`; testnet-1 activation after the gate.** This is the item that gated the soak clock: until it ships, every external cohort needs a new genesis, so no external voter can ever join testnet-1. After it, a seat is admitted or removed by a certificate that rides an ordinary block.
+**Status: implemented 2026-09-04 (v0.14.0); devnet gate `chain/gate-v1.sh` 25/25; rolled to every testnet-1 seat on 2026-09-04 (R7, one voter at a time, heights 55641 → 56023, chain never paused; `hk_getValidators.pending_set_changes` live on the public RPC). Activated: the first set change may now commit; minimum node version for testnet-1 becomes v0.14.0 at that moment.** This is the item that gated the soak clock: until it ships, every external cohort needs a new genesis, so no external voter can ever join testnet-1. After it, a seat is admitted or removed by a certificate that rides an ordinary block.
 
 ## 1 · The rule
 
