@@ -69,7 +69,7 @@ fn p0_demo_storyline() {
     let genesis = Genesis {
         time: 1_000,
         accounts: vec![org.genesis(), a.genesis(), b.genesis(), c.genesis(), merchant.genesis()],
-        alloc: vec![(org.id, usd, 50 * M)], fee: None
+        alloc: vec![(org.id, usd, 50 * M)], fee: None, assets: vec![]
     };
     let mut st = State::from_genesis(&genesis).unwrap();
 
@@ -180,7 +180,7 @@ fn channel_refund_after_expiry() {
     let genesis = Genesis {
         time: 100,
         accounts: vec![org.genesis(), merchant.genesis()],
-        alloc: vec![(org.id, usd, 10 * M)], fee: None
+        alloc: vec![(org.id, usd, 10 * M)], fee: None, assets: vec![]
     };
     let mut st = State::from_genesis(&genesis).unwrap();
 
@@ -227,7 +227,7 @@ fn attenuation_enforced_at_creation() {
     const M: Amount = 1_000_000;
     let usd = h(9);
     let mut org = Keychain::new(b"org3");
-    let genesis = Genesis { time: 100, accounts: vec![org.genesis()], alloc: vec![(org.id, usd, M)], fee: None };
+    let genesis = Genesis { time: 100, accounts: vec![org.genesis()], alloc: vec![(org.id, usd, M)], fee: None, assets: vec![] };
     let mut st = State::from_genesis(&genesis).unwrap();
     let (m0, bad) = (h(0xC0), h(0xC1));
     let txs = vec![
@@ -281,7 +281,7 @@ fn aggregated_coverage_accepts_proofless_txs() {
     let genesis = Genesis {
         time: 100,
         accounts: vec![org.genesis()],
-        alloc: vec![(org.id, usd, 10 * M)], fee: None
+        alloc: vec![(org.id, usd, 10 * M)], fee: None, assets: vec![]
     };
     let mut st = State::from_genesis(&genesis).unwrap(); // verifier = RejectAll
 
@@ -339,7 +339,7 @@ fn mandated_unshield_respects_the_envelope() {
     let genesis = Genesis {
         time: 100,
         accounts: vec![org.genesis(), agent.genesis(), merchant.genesis()],
-        alloc: vec![(org.id, usd, 50 * M)], fee: None
+        alloc: vec![(org.id, usd, 50 * M)], fee: None, assets: vec![]
     };
     let mut st = State::from_genesis(&genesis).unwrap();
     st.verifier = Arc::new(JsonEchoVerifier);
@@ -438,7 +438,7 @@ fn shielded_pool_storyline() {
     let genesis = Genesis {
         time: 100,
         accounts: vec![org.genesis(), merchant.genesis()],
-        alloc: vec![(org.id, usd, 10 * M)], fee: None
+        alloc: vec![(org.id, usd, 10 * M)], fee: None, assets: vec![]
     };
     let mut st = State::from_genesis(&genesis).unwrap();
 
@@ -589,7 +589,7 @@ fn snapshot_roundtrip_identical_commitment_and_keeps_running() {
     let genesis = Genesis {
         time: 1_000,
         accounts: vec![org.genesis(), a.genesis(), merchant.genesis()],
-        alloc: vec![(org.id, usd, 50 * M)], fee: None
+        alloc: vec![(org.id, usd, 50 * M)], fee: None, assets: vec![]
     };
     let mut st = State::from_genesis(&genesis).unwrap();
 
@@ -661,7 +661,7 @@ fn u1_runtime_account_creation_faucet_flow() {
     let genesis = Genesis {
         time: 1_000,
         accounts: vec![faucet.genesis()],
-        alloc: vec![(faucet.id, usd, 100 * M)], fee: None
+        alloc: vec![(faucet.id, usd, 100 * M)], fee: None, assets: vec![]
     };
     let mut st = State::from_genesis(&genesis).unwrap();
     let bal = |st: &State, id: H256| st.balances.get(&(id, usd)).copied().unwrap_or(0);
@@ -740,7 +740,7 @@ fn u4_flat_protocol_fee_burn_refund_and_activation() {
     let genesis = Genesis {
         time: 1_000,
         accounts: vec![org.genesis(), bob.genesis()],
-        alloc: vec![(org.id, usd, 10 * M), (bob.id, usd, 150)], fee: None
+        alloc: vec![(org.id, usd, 10 * M), (bob.id, usd, 150)], fee: None, assets: vec![]
     };
     let mut st = State::from_genesis(&genesis).unwrap();
     st.fee_micro = 100;
@@ -815,7 +815,8 @@ fn u4b_genesis_bound_fee_policy_applies_from_block_one() {
         time: 1_000,
         accounts: vec![org.genesis(), bob.genesis()],
         alloc: vec![(org.id, usd, 10 * M)],
-        fee: Some(GenesisFee { micro: 100, from_height: 1 }),
+        fee: Some(GenesisFee { micro: 100, from_height: 1, asset: None }),
+        assets: vec![],
     };
     let st0 = State::from_genesis(&genesis).unwrap();
     assert_eq!((st0.fee_micro, st0.fee_from), (100, 1), "genesis pins the policy");
@@ -841,4 +842,318 @@ fn u4b_genesis_bound_fee_policy_applies_from_block_one() {
     let legacy: Genesis = serde_json::from_str(r#"{"time":1,"accounts":[],"alloc":[]}"#).unwrap();
     assert!(legacy.fee.is_none(), "pre-v0.13 genesis files still parse");
     assert!(!serde_json::to_string(&legacy).unwrap().contains("fee"), "None is not serialized");
+}
+
+// ---------------------------------------------------------------------------------
+// X1 — issued assets (docs/X1-ISSUED-ASSETS.md)
+// ---------------------------------------------------------------------------------
+
+fn x1_policy(flags: &str) -> crate::assets::AssetPolicy {
+    crate::assets::AssetPolicy::from_flags(flags).unwrap()
+}
+
+/// Apply one tx as its own block; return the receipt string ("ok" or the error).
+fn x1_apply(st: &mut State, h: u64, tx: SignedTx) -> Result<Vec<crate::Event>, String> {
+    let r = st.apply_block(h, 1_000 + h, &[tx]).unwrap();
+    r.into_iter().next().unwrap().result
+}
+
+fn x1_held_equals_issued(st: &State, asset: &H256) {
+    let (held, issued) = st.asset_conservation(asset).expect("registered");
+    assert_eq!(held, issued, "I5' conservation: held {held} != issued {issued}");
+}
+
+#[test]
+fn x1_register_mint_freeze_pause_burn_storyline() {
+    use crate::assets::derive_asset_id;
+    const M: Amount = 1_000_000;
+    let usd = h(9);
+    let mut issuer = Keychain::new(b"x1-issuer");
+    let mut alice = Keychain::new(b"x1-alice");
+    let mut bob = Keychain::new(b"x1-bob");
+    let genesis = Genesis {
+        time: 1_000,
+        accounts: vec![issuer.genesis(), alice.genesis(), bob.genesis()],
+        alloc: vec![(issuer.id, usd, 10 * M), (alice.id, usd, 10 * M), (bob.id, usd, 10 * M)],
+        fee: Some(GenesisFee { micro: 100, from_height: 1, asset: None }),
+        assets: vec![],
+    };
+    let mut st = State::from_genesis(&genesis).unwrap();
+    let c0 = st.state_commitment();
+    let usdc = derive_asset_id(&issuer.id, "USDC.t");
+    let mut height = 0u64;
+    let mut next = || { height += 1; height };
+
+    // 1) Squat: an id that is not H(sender, symbol) → refused; a stranger cannot claim it either.
+    let squat = issuer.sign(Tx::AssetRegister { asset: h(0xC0), symbol: "USDC.t".into(), decimals: 6, policy: x1_policy("mfps") });
+    let r = x1_apply(&mut st, next(), squat);
+    assert!(r.unwrap_err().contains("asset id does not match"));
+    issuer.rollback();
+    let steal = alice.sign(Tx::AssetRegister { asset: usdc, symbol: "USDC.t".into(), decimals: 6, policy: x1_policy("mfps") });
+    assert!(x1_apply(&mut st, next(), steal).unwrap_err().contains("asset id does not match"));
+    alice.rollback();
+    assert_ne!(st.state_commitment(), c0, "height moved — but the registry is still empty");
+    assert!(st.assets.is_empty());
+
+    // 2) The real registration: freezable, pausable, mintable, pool-eligible.
+    let reg = issuer.sign(Tx::AssetRegister { asset: usdc, symbol: "USDC.t".into(), decimals: 6, policy: x1_policy("mfps") });
+    let ev = x1_apply(&mut st, next(), reg).unwrap();
+    assert!(matches!(ev[0], crate::Event::AssetRegistered { asset, .. } if asset == usdc));
+    let dup = issuer.sign(Tx::AssetRegister { asset: usdc, symbol: "USDC.t".into(), decimals: 6, policy: x1_policy("m") });
+    assert!(x1_apply(&mut st, next(), dup).unwrap_err().contains("already registered"));
+    issuer.rollback();
+    let bad_sym = issuer.sign(Tx::AssetRegister { asset: derive_asset_id(&issuer.id, "1bad"), symbol: "1bad".into(), decimals: 6, policy: x1_policy("m") });
+    assert!(x1_apply(&mut st, next(), bad_sym).unwrap_err().contains("bad asset symbol"));
+    issuer.rollback();
+
+    // 3) Mint: issuer only, mintable only, to a frozen account never.
+    let not_issuer = alice.sign(Tx::AssetMint { asset: usdc, to: alice.id, amount: 5 * M });
+    assert!(x1_apply(&mut st, next(), not_issuer).unwrap_err().contains("not the asset's issuer"));
+    alice.rollback();
+    let mint = issuer.sign(Tx::AssetMint { asset: usdc, to: alice.id, amount: 5 * M });
+    assert!(x1_apply(&mut st, next(), mint).is_ok());
+    assert_eq!(st.balance(&alice.id, &usdc), 5 * M);
+    assert_eq!(st.assets[&usdc].supply, 5 * M);
+    x1_held_equals_issued(&st, &usdc);
+
+    // 4) Transfer works; freeze bob → neither direction moves; unfreeze → moves again.
+    let pay = alice.sign(Tx::Transfer { to: bob.id, asset: usdc, amount: 2 * M });
+    assert!(x1_apply(&mut st, next(), pay).is_ok());
+    let freeze = issuer.sign(Tx::AssetFreeze { asset: usdc, account: bob.id, frozen: true });
+    assert!(x1_apply(&mut st, next(), freeze).is_ok());
+    let to_bob = alice.sign(Tx::Transfer { to: bob.id, asset: usdc, amount: M });
+    assert_eq!(x1_apply(&mut st, next(), to_bob).unwrap_err(), "frozen by issuer");
+    alice.rollback();
+    let from_bob = bob.sign(Tx::Transfer { to: alice.id, asset: usdc, amount: M });
+    assert_eq!(x1_apply(&mut st, next(), from_bob).unwrap_err(), "frozen by issuer");
+    bob.rollback();
+    // The native asset is unregistered: bob's USD still moves — the gate is per asset.
+    let usd_ok = bob.sign(Tx::Transfer { to: alice.id, asset: usd, amount: M });
+    assert!(x1_apply(&mut st, next(), usd_ok).is_ok());
+    let mint_frozen = issuer.sign(Tx::AssetMint { asset: usdc, to: bob.id, amount: M });
+    assert_eq!(x1_apply(&mut st, next(), mint_frozen).unwrap_err(), "frozen by issuer");
+    issuer.rollback();
+    let unfreeze = issuer.sign(Tx::AssetFreeze { asset: usdc, account: bob.id, frozen: false });
+    assert!(x1_apply(&mut st, next(), unfreeze).is_ok());
+    let from_bob = bob.sign(Tx::Transfer { to: alice.id, asset: usdc, amount: M });
+    assert!(x1_apply(&mut st, next(), from_bob).is_ok());
+    assert_eq!(st.balance(&bob.id, &usdc), M);
+    x1_held_equals_issued(&st, &usdc);
+
+    // 5) Pause: nothing moves, not even a mint; the issuer can still unpause.
+    let pause = issuer.sign(Tx::AssetPause { asset: usdc, paused: true });
+    assert!(x1_apply(&mut st, next(), pause).is_ok());
+    let paused_pay = alice.sign(Tx::Transfer { to: bob.id, asset: usdc, amount: M });
+    assert_eq!(x1_apply(&mut st, next(), paused_pay).unwrap_err(), "asset paused");
+    alice.rollback();
+    let paused_mint = issuer.sign(Tx::AssetMint { asset: usdc, to: alice.id, amount: M });
+    assert_eq!(x1_apply(&mut st, next(), paused_mint).unwrap_err(), "asset paused");
+    issuer.rollback();
+    let paused_burn = alice.sign(Tx::AssetBurn { asset: usdc, amount: M, destination: vec![] });
+    assert_eq!(x1_apply(&mut st, next(), paused_burn).unwrap_err(), "asset paused");
+    alice.rollback();
+    let unpause = issuer.sign(Tx::AssetPause { asset: usdc, paused: false });
+    assert!(x1_apply(&mut st, next(), unpause).is_ok());
+
+    // 6) Burn with a destination: holder-signed, supply accounting, bound on the payload.
+    let long = alice.sign(Tx::AssetBurn { asset: usdc, amount: M, destination: vec![7u8; 65] });
+    assert!(x1_apply(&mut st, next(), long).unwrap_err().contains("destination too long"));
+    alice.rollback();
+    let burn = alice.sign(Tx::AssetBurn { asset: usdc, amount: M, destination: b"eth:0xabc".to_vec() });
+    let ev = x1_apply(&mut st, next(), burn).unwrap();
+    assert!(matches!(&ev[0], crate::Event::AssetBurned { amount, destination, .. } if *amount == M && destination == b"eth:0xabc"));
+    assert_eq!(st.assets[&usdc].burned, M);
+    assert_eq!(st.balance(&alice.id, &usdc), 3 * M);
+    x1_held_equals_issued(&st, &usdc);
+    let too_much = bob.sign(Tx::AssetBurn { asset: usdc, amount: 2 * M, destination: vec![] });
+    assert!(x1_apply(&mut st, next(), too_much).unwrap_err().contains("insufficient balance"));
+    bob.rollback();
+
+    // 7) Policy is law: an asset registered without `m`/`f`/`p` refuses those verbs.
+    let fixed = derive_asset_id(&issuer.id, "FIXED");
+    let reg2 = issuer.sign(Tx::AssetRegister { asset: fixed, symbol: "FIXED".into(), decimals: 0, policy: x1_policy("-") });
+    assert!(x1_apply(&mut st, next(), reg2).is_ok());
+    for tx in [
+        Tx::AssetMint { asset: fixed, to: alice.id, amount: 1 },
+        Tx::AssetFreeze { asset: fixed, account: alice.id, frozen: true },
+        Tx::AssetPause { asset: fixed, paused: true },
+    ] {
+        let s = issuer.sign(tx);
+        assert!(x1_apply(&mut st, next(), s).unwrap_err().contains("policy forbids"));
+        issuer.rollback();
+    }
+    // Unknown asset: every verb refuses the same way.
+    let unknown = issuer.sign(Tx::AssetMint { asset: h(0xD1), to: alice.id, amount: 1 });
+    assert!(x1_apply(&mut st, next(), unknown).unwrap_err().contains("unknown asset"));
+    issuer.rollback();
+
+    // 8) The registry is in Σ: two states differing only in a frozen set differ in commitment.
+    let mut twin = State::from_snapshot(st.to_snapshot());
+    assert_eq!(twin.state_commitment(), st.state_commitment());
+    twin.assets.get_mut(&usdc).unwrap().frozen.insert(bob.id);
+    assert_ne!(twin.state_commitment(), st.state_commitment());
+}
+
+#[test]
+fn x1_wire_variants_are_appended_last() {
+    // bincode enum tags are u32 LE in declaration order. Every pre-X1 variant keeps its
+    // tag (AccountCreate = 9); the five X1 variants follow — old blocks decode unchanged.
+    let tag = |tx: &Tx| u32::from_le_bytes(bincode::serialize(tx).unwrap()[..4].try_into().unwrap());
+    let id = h(1);
+    assert_eq!(tag(&Tx::Transfer { to: id, asset: id, amount: 1 }), 0);
+    assert_eq!(tag(&Tx::AccountCreate { id, auth_commit: id, asset: id, amount: 0 }), 9);
+    assert_eq!(tag(&Tx::AssetRegister { asset: id, symbol: "A".into(), decimals: 0, policy: x1_policy("-") }), 10);
+    assert_eq!(tag(&Tx::AssetMint { asset: id, to: id, amount: 1 }), 11);
+    assert_eq!(tag(&Tx::AssetBurn { asset: id, amount: 1, destination: vec![] }), 12);
+    assert_eq!(tag(&Tx::AssetFreeze { asset: id, account: id, frozen: true }), 13);
+    assert_eq!(tag(&Tx::AssetPause { asset: id, paused: true }), 14);
+    // JSON form (the signing digest) carries the destination as hex, like every byte field.
+    let j = serde_json::to_string(&Tx::AssetBurn { asset: id, amount: 1, destination: vec![0xab, 0xcd] }).unwrap();
+    assert!(j.contains("\"destination\":\"abcd\""), "{j}");
+    let back: Tx = serde_json::from_str(&j).unwrap();
+    assert!(matches!(back, Tx::AssetBurn { destination, .. } if destination == vec![0xab, 0xcd]));
+}
+
+#[test]
+fn x1_genesis_assets_fee_asset_and_snapshot_v3() {
+    use crate::assets::AssetPolicy;
+    const M: Amount = 1_000_000;
+    let hkn = h(9); // the historical fee asset id, registered as the native asset
+    let mut treasury = Keychain::new(b"x1-treasury");
+    let mut user = Keychain::new(b"x1-user");
+    let native = crate::GenesisAsset { id: hkn, symbol: "HKN".into(), decimals: 6, issuer: treasury.id, policy: AssetPolicy::default() };
+    let genesis = Genesis {
+        time: 1_000,
+        accounts: vec![treasury.genesis(), user.genesis()],
+        alloc: vec![(treasury.id, hkn, 100 * M), (user.id, hkn, 10 * M)],
+        fee: Some(GenesisFee { micro: 100, from_height: 1, asset: None }),
+        assets: vec![native.clone()],
+    };
+    let mut st = State::from_genesis(&genesis).unwrap();
+    // Allocations of a genesis-registered asset ARE its supply — conservation from block 0.
+    assert_eq!(st.assets[&hkn].supply, 110 * M);
+    x1_held_equals_issued(&st, &hkn);
+    // A fee burn is accounted through fees_burned, and I5' still balances.
+    let pay = user.sign(Tx::Transfer { to: treasury.id, asset: hkn, amount: M });
+    assert!(x1_apply(&mut st, 1, pay).is_ok());
+    assert_eq!(st.fees_burned, 100);
+    x1_held_equals_issued(&st, &hkn);
+    // The native asset has no issuer powers: the "issuer" cannot mint or pause it.
+    let mint = treasury.sign(Tx::AssetMint { asset: hkn, to: user.id, amount: M });
+    assert!(x1_apply(&mut st, 2, mint).unwrap_err().contains("policy forbids"));
+    treasury.rollback();
+
+    // Snapshot v3 round-trips the registry and the commitment.
+    let bytes = bincode::serialize(&st.to_snapshot()).unwrap();
+    let snap: crate::StateSnapshot = bincode::deserialize(&bytes).unwrap();
+    let mut back = State::from_snapshot(snap);
+    back.fee_micro = st.fee_micro;
+    back.fee_from = st.fee_from;
+    assert_eq!(back.assets, st.assets);
+    assert_eq!(back.state_commitment(), st.state_commitment());
+
+    // A genesis whose fee asset is pausable or freezable is refused at load.
+    let mut bad = genesis.clone();
+    bad.assets[0].policy = AssetPolicy::from_flags("p").unwrap();
+    assert_eq!(State::from_genesis(&bad).err().unwrap(), crate::StateError::BadFeeAssetPolicy);
+    let mut bad2 = genesis.clone();
+    bad2.assets.push(native.clone());
+    assert_eq!(State::from_genesis(&bad2).err().unwrap(), crate::StateError::DuplicateAsset);
+
+    // `fee.asset` names another fee asset: the envelope fee is charged there.
+    let gas = h(0x6A);
+    let mut g2 = genesis.clone();
+    g2.fee = Some(GenesisFee { micro: 100, from_height: 1, asset: Some(gas) });
+    g2.alloc.push((user.id, gas, 1_000));
+    let mut st2 = State::from_genesis(&g2).unwrap();
+    assert_eq!(st2.fee_asset, gas);
+    let mut user2 = Keychain::new(b"x1-user");
+    let pay = user2.sign(Tx::Transfer { to: treasury.id, asset: hkn, amount: M });
+    assert!(x1_apply(&mut st2, 1, pay).is_ok());
+    assert_eq!(st2.balance(&user.id, &gas), 900);
+    assert_eq!(st2.balance(&user.id, &hkn), 9 * M, "the HKN balance paid no fee");
+}
+
+#[test]
+fn x1_gates_reach_mandates_channels_and_the_pool() {
+    use crate::assets::derive_asset_id;
+    const M: Amount = 1_000_000;
+    let usd = h(9);
+    let mut issuer = Keychain::new(b"x1g-issuer");
+    let mut org = Keychain::new(b"x1g-org");
+    let mut agent = Keychain::new(b"x1g-agent");
+    let mut merchant = Keychain::new(b"x1g-merchant");
+    let genesis = Genesis {
+        time: 1_000,
+        accounts: vec![issuer.genesis(), org.genesis(), agent.genesis(), merchant.genesis()],
+        alloc: vec![(org.id, usd, 10 * M)],
+        fee: None,
+        assets: vec![],
+    };
+    let mut st = State::from_genesis(&genesis).unwrap();
+    let usdc = derive_asset_id(&issuer.id, "USDC.t");
+    let novault = derive_asset_id(&issuer.id, "NOVAULT"); // not pool-eligible
+    let mut height = 0u64;
+    let mut next = || { height += 1; height };
+
+    for (asset, sym, flags) in [(usdc, "USDC.t", "mfps"), (novault, "NOVAULT", "mfp")] {
+        let reg = issuer.sign(Tx::AssetRegister { asset, symbol: sym.into(), decimals: 6, policy: x1_policy(flags) });
+        assert!(x1_apply(&mut st, next(), reg).is_ok());
+        let mint = issuer.sign(Tx::AssetMint { asset, to: org.id, amount: 10 * M });
+        assert!(x1_apply(&mut st, next(), mint).is_ok());
+    }
+
+    // A mandate tree denominated in USDC.t: the ROOT funder (org) is the payer of every spend.
+    let (m0, ma) = (h(0xB0), h(0xB1));
+    let mk = |id, parent, holder, asset| Tx::MandateCreate {
+        id, parent, holder, asset, rate_per_sec: 0, buffer_max: 5 * M, per_tx_max: 5 * M,
+        initial_buffer: 5 * M, expiry: 1_000_000, tier: 1,
+    };
+    assert!(x1_apply(&mut st, next(), org.sign(mk(m0, None, org.id, usdc))).is_ok());
+    assert!(x1_apply(&mut st, next(), org.sign(mk(ma, Some(m0), agent.id, usdc))).is_ok());
+    let spend = agent.sign(Tx::MandateSpend { leaf: ma, to: merchant.id, amount: M });
+    assert!(x1_apply(&mut st, next(), spend).is_ok());
+    // Freeze the ORG (the funder): the agent's spend is refused although the agent is not frozen.
+    assert!(x1_apply(&mut st, next(), issuer.sign(Tx::AssetFreeze { asset: usdc, account: org.id, frozen: true })).is_ok());
+    let spend = agent.sign(Tx::MandateSpend { leaf: ma, to: merchant.id, amount: M });
+    assert_eq!(x1_apply(&mut st, next(), spend).unwrap_err(), "frozen by issuer");
+    agent.rollback();
+    // A channel open draws escrow from the funder → same gate.
+    let tip = h(0x77);
+    let nonce = st.accounts[&agent.id].nonce;
+    let ch = State::derive_channel_id(&agent.id, &merchant.id, &tip, nonce);
+    let open = agent.sign(Tx::ChannelOpen { id: ch, mandate: ma, payee: merchant.id, asset: usdc, tip, unit_price: 1_000, max_steps: 10, expiry: 1_000_000 });
+    assert_eq!(x1_apply(&mut st, next(), open).unwrap_err(), "frozen by issuer");
+    agent.rollback();
+    assert!(x1_apply(&mut st, next(), issuer.sign(Tx::AssetFreeze { asset: usdc, account: org.id, frozen: false })).is_ok());
+    let nonce = st.accounts[&agent.id].nonce;
+    let ch = State::derive_channel_id(&agent.id, &merchant.id, &tip, nonce);
+    let open = agent.sign(Tx::ChannelOpen { id: ch, mandate: ma, payee: merchant.id, asset: usdc, tip, unit_price: 1_000, max_steps: 10, expiry: 1_000_000 });
+    assert!(x1_apply(&mut st, next(), open).is_ok());
+    // Escrow counts toward conservation while the channel is open.
+    x1_held_equals_issued(&st, &usdc);
+    // Pause the asset: the refund path is a movement too.
+    assert!(x1_apply(&mut st, next(), issuer.sign(Tx::AssetPause { asset: usdc, paused: true })).is_ok());
+    let t = 2_000_000u64; // past the channel's expiry; later blocks must not go back in time
+    let refund = agent.sign(Tx::ChannelRefund { id: ch });
+    height += 1;
+    let r = st.apply_block(height, t, &[refund]).unwrap();
+    assert_eq!(r[0].result.as_ref().unwrap_err(), "asset paused");
+    agent.rollback();
+    height += 1;
+    let unpause = issuer.sign(Tx::AssetPause { asset: usdc, paused: false });
+    let r = st.apply_block(height, t + 1, &[unpause]).unwrap();
+    assert!(r[0].result.is_ok(), "{:?}", r[0].result);
+    let refund = agent.sign(Tx::ChannelRefund { id: ch });
+    height += 1;
+    let r = st.apply_block(height, t + 2, &[refund]).unwrap();
+    assert!(r[0].result.is_ok(), "{:?}", r[0].result);
+    x1_held_equals_issued(&st, &usdc);
+
+    // The pool: a registered asset without `s` never enters it (checked before any proof).
+    let shield = org.sign(Tx::MintToPool { asset: novault, value: M, commitment: h(0x55), proof: vec![1], stealth_ct: vec![] });
+    height += 1;
+    let r = st.apply_block(height, t + 3, &[shield]).unwrap();
+    assert_eq!(r[0].result.as_ref().unwrap_err(), "asset is not pool-eligible");
+    org.rollback();
 }

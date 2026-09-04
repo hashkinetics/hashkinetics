@@ -66,6 +66,7 @@
   .b-rej{background:rgba(255,93,122,.12);color:var(--danger);border:1px solid rgba(255,93,122,.35)}
   .b-kind{background:rgba(78,240,208,.1);color:var(--cyan);border:1px solid rgba(78,240,208,.3)}
   .b-kind.shield,.b-kind.shielded_spend{background:rgba(139,123,255,.12);color:var(--violet);border-color:rgba(139,123,255,.35)}
+  .b-kind.asset_register,.b-kind.asset_mint,.b-kind.asset_burn,.b-kind.asset_freeze,.b-kind.asset_pause{background:rgba(255,200,87,.12);color:#ffc857;border-color:rgba(255,200,87,.35)}
 
   .privnote{font-size:12px;color:var(--muted);border-left:2px solid var(--violet);padding:6px 12px;margin:10px 0 4px;line-height:1.55}
   .privnote b{color:var(--violet)}
@@ -157,6 +158,12 @@
         <div class="kv" style="margin-top:8px"><div><span class="muted">External nodes (join kit)</span></div><div class="right"><span class="badge b-rot" id="s-observers">observers welcome — see /network#join</span></div></div>
         <div class="privnote" style="border-color:var(--cyan)"><b style="color:var(--cyan)">Every vote is hash-based</b> (LMS/HSS over SHAKE-256) under an SLH-DSA root — the consensus itself is post-quantum, not just the wallets. Epoch badges climb when a validator rotates its signing tree — automatic since v0.10.5; on testnet-1 all four seats rotated unattended on 2026-09-03 (heights 11,584–11,595). The external row counts nodes that joined via the public join kit and independently verify the chain from block 1. These validators run on Google Cloud; the prover lives elsewhere entirely. Want a seat? <a href="/network#join" style="color:var(--cyan)">Join as an observer now; seats follow.</a></div>
       </div>
+      <div class="card">
+        <h2><span class="spark">◈</span> Issued assets</h2>
+        <table id="assets"><thead><tr><th>Asset</th><th>Issuer</th><th class="right">Supply</th><th class="right">Burned</th><th class="right">State</th></tr></thead><tbody></tbody></table>
+        <div class="kv" style="margin-top:8px"><div><span class="muted">Registry (v0.15.0)</span></div><div class="right"><span class="badge b-rot" id="s-assets-note">loading…</span></div></div>
+        <div class="privnote" style="border-color:#ffc857"><b style="color:#ffc857">Issuer-controlled, chain-enforced.</b> An issuer registers an asset under an id only it can claim (H(issuer ‖ symbol)), then mints, burns, freezes an account or pauses the asset under a policy fixed at registration. Supply and burns sit inside the state commitment; <b>conserved ✓</b> is this node&#39;s own check that Σ balances + escrow + pool = supply − burned. Every mint here is issuer-signed — attested (reserve-backed) minting is designed, not built.</div>
+      </div>
     </div>
   </div>
 
@@ -230,6 +237,20 @@ async function pollPanels(){
     const m=await rpc('hk_getMempool');
     $('s-mempool').textContent=m.count;
   }catch(e){}
+  try{
+    const a=await rpc('hk_getAssets');
+    const tb=$('assets').querySelector('tbody');
+    if(!a.assets||a.assets.length===0){
+      tb.innerHTML='<tr><td colspan="5" class="muted">no issuer has registered an asset yet — the registry is live since v0.15.0; the first registration is the first asset transaction</td></tr>';
+      $('s-assets-note').textContent='empty · fee asset '+short(a.fee_asset,10);
+    }else{
+      tb.innerHTML=a.assets.map(x=>{
+        const st=(x.paused?'<span class="badge b-kind asset_pause">paused</span> ':'')+(x.frozen_count>0?'<span class="badge b-kind asset_freeze">'+x.frozen_count+' frozen</span> ':'')+(x.conserved?'<span class="badge b-agg" title="Σ balances + escrow + pool == supply − burned on this node">conserved ✓</span>':'<span class="badge b-kind asset_burn">NOT conserved</span>');
+        return `<tr><td><b>${x.symbol}</b> <span class="muted mono">${short(x.asset,10)}</span> <span class="muted">policy ${x.policy.flags}</span></td><td class="mono"><a href="#account=${x.issuer}" onclick="openAccount('${x.issuer}');return false">${short(x.issuer,12)}</a></td><td class="right">${usd(x.supply)}</td><td class="right">${usd(x.burned)}</td><td class="right">${st}</td></tr>`;
+      }).join('');
+      $('s-assets-note').textContent=a.count+' registered · fee asset '+short(a.fee_asset,10);
+    }
+  }catch(e){ try{ $('s-assets-note').textContent='node predates v0.15.0'; }catch(_){} }
 }
 function kv(k,v){return `<div class="k">${k}</div><div>${v}</div>`}
 

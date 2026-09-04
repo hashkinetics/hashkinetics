@@ -1,6 +1,6 @@
 # HashKinetics — Validator Onboarding (public testnet)
 
-**v0.13.0 · testnet-1.** Minimum node version to sync **testnet-1** (`hashkinetics-1-4e4ea68d`) is **v0.13.0** — the fee policy lives in its genesis, so older nodes cannot decode it; build from a tag ≥ v0.13.0. (staging-1 is retired and archived: `networks/staging-1/`.) How an external operator joins a HashKinetics network: generate a key,
+**v0.15.0 · testnet-1.** Run **v0.15.0** (the current release). Minimum to *sync* **testnet-1** (`hashkinetics-1-4e4ea68d`) is v0.13.0 — the fee policy lives in its genesis, so older nodes cannot decode it — but the network activates appended transaction kinds by height: the first validator-set change (v0.14.0) and the first issued-asset transaction (v0.15.0) each make their release the minimum for every node from that block on (an older node halts there, loudly, by design). A node that wants a seat must be ≥ v0.15.0 before it is admitted. (staging-1 is retired and archived: `networks/staging-1/`.) How an external operator joins a HashKinetics network: generate a key,
 send one public JSON blob, receive genesis, start. Every consensus signature you will ever
 produce is hash-based (LMS/HSS over SHAKE-256 under a stateless SLH-DSA-192s root) — you are
 operating post-quantum BFT.
@@ -163,6 +163,6 @@ Coordinator also runs: the seed node (stable public multiaddr), the hosted prove
 endpoint + proving for demo traffic), and the public explorer. **G3 soak clock**: starts
 when ≥4 external validators hold ≥⅓ of voting power; 30 days incident-free.
 
-## 8 · From observer to seat (v0.14.0)
+## 8 · From observer to seat (v0.14.0; run v0.15.0)
 
-A seat is admitted on the running chain by a `SetChangeCert` approved by more than ⅔ of the current seats' root keys; it takes effect one height after it commits and your node starts voting with no restart. Preconditions: your observer is at the tip with the canonical `app_hash`, ran with `HK_PROVER_URL` from the first block (a node on this genesis refuses to start without the verifier since v0.14.0), and you sent `validator.json` (public halves only) to validators@hashkinetics.org. Procedure and receipts: `docs/V1-VALIDATOR-SET-CHANGES.md`.
+A seat is admitted on the running chain by a `SetChangeCert` approved by more than ⅔ of the current seats' root keys; it takes effect one height after it commits and your node starts voting with no restart. Preconditions: your observer runs the current release (≥ v0.15.0 — the admission certificate rides a v2-framed block, and issued-asset transactions follow), is at the tip with the canonical `app_hash`, ran with `HK_PROVER_URL` from the first block (a node on this genesis refuses to start without the verifier since v0.14.0), and you sent `validator.json` (public halves only) to validators@hashkinetics.org. Procedure and receipts: `docs/V1-VALIDATOR-SET-CHANGES.md`.

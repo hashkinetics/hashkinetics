@@ -1438,14 +1438,15 @@ impl HkApp {
             // Config survives the image swap (a snapshot must not smuggle in policy):
             // the verifier AND the U4 fee parameters are re-injected from the running
             // configuration, exactly as `HkApp::new` set them.
-            let (verifier, fee_micro, fee_from) = {
+            let (verifier, fee_micro, fee_from, fee_asset) = {
                 let c = self.chain.lock().unwrap();
-                (c.verifier.clone(), c.fee_micro, c.fee_from)
+                (c.verifier.clone(), c.fee_micro, c.fee_from, c.fee_asset)
             };
             let mut st = hk_state::State::from_snapshot(snap.state);
             st.verifier = verifier;
             st.fee_micro = fee_micro;
             st.fee_from = fee_from;
+            st.fee_asset = fee_asset; // X1: genesis fact, config-like on restore
             let got = st.state_commitment().0;
             if got != snap.app_hash {
                 return Err(eyre!(
@@ -1695,6 +1696,11 @@ fn tx_kind(tx: &hk_state::tx::Tx) -> &'static str {
         Tx::MintToPool { .. } => "shield",
         Tx::ShieldedSpend { .. } => "shielded_spend",
         Tx::AccountCreate { .. } => "account_create",
+        Tx::AssetRegister { .. } => "asset_register",
+        Tx::AssetMint { .. } => "asset_mint",
+        Tx::AssetBurn { .. } => "asset_burn",
+        Tx::AssetFreeze { .. } => "asset_freeze",
+        Tx::AssetPause { .. } => "asset_pause",
     }
 }
 
@@ -1708,6 +1714,9 @@ fn tx_counterparty(tx: &hk_state::tx::Tx) -> Option<hk_primitives::AccountId> {
         Tx::ChannelOpen { payee, .. } => Some(*payee),
         Tx::AccountCreate { id, .. } => Some(*id),
         Tx::ShieldedSpend { credit, .. } => *credit,
+        // X1: a mint reaches `to`; a freeze names the account it acts on.
+        Tx::AssetMint { to, .. } => Some(*to),
+        Tx::AssetFreeze { account, .. } => Some(*account),
         _ => None,
     }
 }

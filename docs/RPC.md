@@ -34,14 +34,16 @@ curl -s -X POST https://rpc.hashkinetics.org \
 | `hk_getAccountTxs` | `id`, `limit?` (default 25, **max 100**) | `id`, `total`, `txs[{txid, height, kind}]` newest-first — every envelope the account sent or was credited by |
 | `hk_getReceipt` | `txid` | `found`, `detail` — the consensus receipt string (`ok: <n> event(s)` or `rejected: <rule>`), from a ring of the newest 4,096 receipts; older receipts come back through `hk_getTx.receipt` |
 
-`kind` is one of `transfer`, `account_create`, `mandate_create`, `mandate_spend`, `mandate_revoke`, `channel_open`, `channel_settle`, `channel_refund`, `shield`, `shielded_spend`. Transparent kinds expose sender, counterparty and amount in `fields` (this is the transparent skeleton by design); pool kinds expose only nullifier / commitments / the pool fee. `hk_getBlock`/`hk_getBlocks` answer `{"error":"persistence disabled on this node (HK_NO_PERSIST)"}` on a node started without a block log.
+`kind` is one of `transfer`, `account_create`, `mandate_create`, `mandate_spend`, `mandate_revoke`, `channel_open`, `channel_settle`, `channel_refund`, `shield`, `shielded_spend`, and since v0.15.0 (X1) `asset_register`, `asset_mint`, `asset_burn`, `asset_freeze`, `asset_pause` (fields: asset, symbol/decimals/policy, to/amount, destination hex, account/frozen, paused). Refusal receipts an issuer policy produces read `rejected: asset paused`, `rejected: frozen by issuer`, `rejected: asset is not pool-eligible`, `rejected: sender is not the asset's issuer`, `rejected: asset policy forbids this (…)`. Transparent kinds expose sender, counterparty and amount in `fields` (this is the transparent skeleton by design); pool kinds expose only nullifier / commitments / the pool fee. `hk_getBlock`/`hk_getBlocks` answer `{"error":"persistence disabled on this node (HK_NO_PERSIST)"}` on a node started without a block log.
 
 ## Accounts & money
 
 | Method | Params | Result |
 |---|---|---|
-| `hk_getAccount` | `id` | `found`, `nonce` (= the next ratchet index), `auth_commit` (the currently committed one-time key) |
+| `hk_getAccount` | `id` | `found`, `nonce` (= the next ratchet index), `auth_commit` (the currently committed one-time key), `balances[{asset, symbol?, amount, frozen}]` (X1, v0.15.0: every non-zero transparent balance, by asset) |
 | `hk_balance` | `id`, `asset` | `amount` (string, micro) |
+| `hk_getAsset` | `asset` **or** `issuer` + `symbol` | X1 (v0.15.0): `found`, `asset{asset, symbol, decimals, issuer, policy{flags, mintable, freezable, pausable, pool_eligible}, supply, burned, circulating, held, conserved, paused, frozen_count, registered_at}` — `conserved` is the node's own I5' check (`held == circulating`); `asset_id` echoes the derived id when not found |
+| `hk_getAssets` | — | X1: `count`, `fee_asset`, `assets[…]` (the whole registry, same shape) |
 | `hk_submitTx` | `tx` (a `SignedTx` JSON object — the CLI and the wallet build these) | `accepted: true, txid` or `accepted: false, reason` (mempool admission mirrors the state machine's checks: nonce window, balance **including the 100-micro envelope fee**, duplicate nullifier, …); an accepted tx is also pushed to the node's gossip peers |
 | `hk_mandateAvailable` | `leaf` (mandate id), `at?` (unix seconds; default chain time) | `available` (string, micro) — what the leaf may spend right now under every ancestor's drip and cap, or `null` + `reason` |
 | `hk_getChannel` | `id` | `payer`, `payee`, `asset`, `mandate`, `tip`, `unit_price`, `max_steps`, `highest_step_settled`, `escrow_remaining`, `expiry`, `refunded` — a PayWord channel's full state |

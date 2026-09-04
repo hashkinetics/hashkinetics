@@ -7,7 +7,8 @@
 //!   DTO) + this node's aggregate verdict, so replay reproduces the exact same
 //!   receipts WITHOUT needing a prover connection.
 //! - **Snapshot**: every [`SNAPSHOT_EVERY`] blocks, the full node image
-//!   (`snapshot.bin`): Σ (via `hk_state::StateSnapshot`), the pool-note index,
+//!   (`snapshot3.bin`; `snapshot2.bin`/`snapshot.bin` are read for in-place upgrades —
+//!   the file name is the format version): Σ (via `hk_state::StateSnapshot`), the pool-note index,
 //!   receipts, mempool, validator set + rotation epochs, and the app_hash the image
 //!   must recompute to. Restore REFUSES to run on a commitment mismatch — the same
 //!   posture as the vk pins.
@@ -105,6 +106,65 @@ struct LegacyStateSnapshot {
     pub pool: hk_state::pool::PoolState,
 }
 
+/// X1/v0.15: pre-registry `StateSnapshot` layout (v2: has `fees_burned`, no `assets`) —
+/// read-only mirror for `snapshot2.bin`. The registry restores EMPTY from a v2 file;
+/// on a network whose genesis registers assets the recomputed commitment then
+/// differs from the recorded one and restore refuses (resync from genesis) — never
+/// a silent divergence. New snapshots are written as `snapshot3.bin`.
+#[derive(Deserialize)]
+struct V2StateSnapshot {
+    pub height: u64,
+    pub time: hk_primitives::Timestamp,
+    pub accounts: std::collections::BTreeMap<hk_primitives::AccountId, hk_state::Account>,
+    pub balances:
+        std::collections::BTreeMap<(hk_primitives::AccountId, hk_primitives::AssetId), hk_primitives::Amount>,
+    pub mandates: hk_mandate::MandateTree,
+    pub root_funding: std::collections::BTreeMap<hk_primitives::MandateId, hk_primitives::AccountId>,
+    pub channels: std::collections::BTreeMap<hk_primitives::ChannelId, hk_state::Channel>,
+    pub pool: hk_state::pool::PoolState,
+    pub fees_burned: hk_primitives::Amount,
+}
+
+#[derive(Deserialize)]
+struct V2NodeSnapshot {
+    pub app_hash: [u8; 32],
+    pub height: u64,
+    pub state: V2StateSnapshot,
+    pub pool_notes: Vec<(H256, Vec<u8>)>,
+    pub receipts: Vec<([u8; 32], String)>,
+    pub mempool: Vec<SignedTx>,
+    pub validators: Vec<ValidatorDto>,
+    pub current_epoch: u64,
+    pub highest_issued_epoch: u64,
+}
+
+impl From<V2NodeSnapshot> for NodeSnapshot {
+    fn from(l: V2NodeSnapshot) -> Self {
+        NodeSnapshot {
+            app_hash: l.app_hash,
+            height: l.height,
+            state: StateSnapshot {
+                height: l.state.height,
+                time: l.state.time,
+                accounts: l.state.accounts,
+                balances: l.state.balances,
+                mandates: l.state.mandates,
+                root_funding: l.state.root_funding,
+                channels: l.state.channels,
+                pool: l.state.pool,
+                fees_burned: l.state.fees_burned,
+                assets: std::collections::BTreeMap::new(), // pre-registry history by definition
+            },
+            pool_notes: l.pool_notes,
+            receipts: l.receipts,
+            mempool: l.mempool,
+            validators: l.validators,
+            current_epoch: l.current_epoch,
+            highest_issued_epoch: l.highest_issued_epoch,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct LegacyNodeSnapshot {
     pub app_hash: [u8; 32],
@@ -133,6 +193,7 @@ impl From<LegacyNodeSnapshot> for NodeSnapshot {
                 channels: l.state.channels,
                 pool: l.state.pool,
                 fees_burned: 0, // pre-fee history by definition
+                assets: std::collections::BTreeMap::new(),
             },
             pool_notes: l.pool_notes,
             receipts: l.receipts,
@@ -147,6 +208,7 @@ impl From<LegacyNodeSnapshot> for NodeSnapshot {
 pub struct NodeStore {
     blocks_dir: PathBuf,
     snapshot_path: PathBuf,
+    v2_snapshot_path: PathBuf,
     legacy_snapshot_path: PathBuf,
     wal_path: PathBuf,
     /// R10 v2: lowest height of the gap-free block-file suffix reaching the tip
@@ -162,7 +224,8 @@ impl NodeStore {
             .wrap_err_with(|| format!("creating block dir {}", blocks_dir.display()))?;
         Ok(Self {
             blocks_dir,
-            snapshot_path: home.join("snapshot2.bin"),
+            snapshot_path: home.join("snapshot3.bin"),
+            v2_snapshot_path: home.join("snapshot2.bin"),
             legacy_snapshot_path: home.join("snapshot.bin"),
             wal_path: home.join("mempool.wal"),
             disk_min: std::sync::atomic::AtomicU64::new(0),
@@ -230,26 +293,25 @@ impl NodeStore {
         // to a FRESHER snapshot.bin written by the older one afterwards). Never let
         // the file format decide — load whatever is present and resume from the
         // HIGHEST height. (Lesson from the aborted v0.12.1 roll, 2026-09-02.)
-        let v2: Option<NodeSnapshot> = if self.snapshot_path.exists() {
+        let mut candidates: Vec<NodeSnapshot> = Vec::new();
+        if self.snapshot_path.exists() {
             let bytes = std::fs::read(&self.snapshot_path)?;
-            Some(bincode::deserialize(&bytes).wrap_err("corrupt snapshot2.bin")?)
-        } else {
-            None
-        };
-        let legacy: Option<NodeSnapshot> = if self.legacy_snapshot_path.exists() {
+            candidates.push(bincode::deserialize(&bytes).wrap_err("corrupt snapshot3.bin")?);
+        }
+        if self.v2_snapshot_path.exists() {
+            let bytes = std::fs::read(&self.v2_snapshot_path)?;
+            let snap: V2NodeSnapshot = bincode::deserialize(&bytes).wrap_err("corrupt snapshot2.bin")?;
+            candidates.push(snap.into());
+        }
+        if self.legacy_snapshot_path.exists() {
             let bytes = std::fs::read(&self.legacy_snapshot_path)?;
             let snap: LegacyNodeSnapshot =
                 bincode::deserialize(&bytes).wrap_err("corrupt snapshot.bin (legacy)")?;
-            Some(snap.into())
-        } else {
-            None
-        };
-        Ok(match (v2, legacy) {
-            (Some(a), Some(b)) => Some(if b.height > a.height { b } else { a }),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        })
+            candidates.push(snap.into());
+        }
+        // Highest height wins regardless of format (a rolled-back voter may have a
+        // fresher older-format file next to a stale newer one).
+        Ok(candidates.into_iter().max_by_key(|s| s.height))
     }
 
     // ---- mempool WAL ----

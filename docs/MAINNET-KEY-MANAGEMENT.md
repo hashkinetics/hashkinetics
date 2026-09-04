@@ -233,7 +233,7 @@ block). That is the property to preserve.
 - Per-epoch operational seeds via `op_seed(master, epoch)` (epoch 0 = genesis key).
 - Demo trigger `HK_ROTATE_EVERY=N` issues a self-rotation every N heights.
 
-**Hardening status — R-series SHIPPED AND PRODUCTION-PROVEN (v0.10.5 → v0.13.0):**
+**Hardening status — R-series SHIPPED AND PRODUCTION-PROVEN (v0.10.5 → v0.15.0):**
 Staging incident #1 (2026-08-28) field-proved the urgency: no rotation trigger armed,
 val-0's tree exhausted at height 10,848 and the chain halted 6 h rather than reuse a
 leaf. The design held; the R-series closed the ops gap (C-PROGRAM-PLAN.md §R):
@@ -265,6 +265,21 @@ leaf. The design held; the R-series closed the ops gap (C-PROGRAM-PLAN.md §R):
 - **Fresh trees per chain (testnet-1 ceremony, 2026-09-02)** — a stateful tree that signed
   on one chain is never restarted from a reset counter on another; every seat generated
   new keys into a new home and the old home is kept only as an archive.
+- **V1 ✅ (v0.14.0, rolled 2026-09-04)** — the validator SET changes on the running chain:
+  a seat is admitted or removed by SLH-DSA root approvals from strictly more than ⅔ of the
+  current seats, signed on each seat's own host (`hk-node set-change approve` reads that
+  host's `priv_validator_key.json`; the key never moves), bound to the chain id and a
+  commit-height window. No coordinator key exists. Mainnet: bonded self-admission +
+  governance replace the approval rule; the certificate shape stays.
+- **K5 ✅ (v0.14.0)** — a node on a genesis that pins its proof system refuses to start
+  without a wired verifier (found by the first external operator's wedge at height 479).
+- **Issuer keys (X1, v0.15.0)** — an issued asset's issuer is an ordinary account (L-ratchet
+  one-time keys, reserve-then-sign); its policy and issuer are immutable after registration
+  in v0.15, so an issuer that needs a key change registers under a fresh id until the
+  governance path ships. Mainnet issuers hold the account seed in an HSM/systemd credential
+  (K2 rules); the attested-mint path (X2) adds the issuer's own attestation key — the one
+  classical signature the chain will verify, always paired with a hash-based relayer
+  signature and a rate limit.
 - Open: R11 (verify-only proof-system client — the node's memory floor is the verifier
   client's init footprint, not history) · STARK-aggregated commit certificates (below).
 - Operator hygiene learned in recovery: `consensus_state.bin` is the signer's spent-leaf

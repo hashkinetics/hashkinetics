@@ -1,10 +1,10 @@
-# The protocol fee — normative reference (v0.13.0 · testnet-1)
+# The protocol fee — normative reference (v0.15.0 · testnet-1)
 
 **One flat fee per transaction envelope, bound into the genesis, burned.** On testnet-1: **100 micro** (0.000100 test units) from **height 1**. This page is what a wallet, an exchange integration, an agent framework or an auditor needs; the consensus rule itself is `YELLOWPAPER.md` §19.2–19.3 and `chain/crates/hk-state/src/lib.rs` (`apply_signed`).
 
 ## The rule in one paragraph
 
-Every signed envelope applied at height `h ≥ fee.from_height` is charged `fee.micro` of the fee asset (`0909…09`, the transparent test unit) **before** its payload runs. If the payload is refused, the fee is credited back and the state is exactly as before — a refused transaction never moves money, fee included. If the payload succeeds, the fee is **burned**: debited from the sender and credited nowhere; the cumulative burn is `fees_burned`, part of the state commitment. Nobody earns the fee on testnet-1. The account's one-time key ratchet advances only on success, so a refused envelope costs neither money nor a key index.
+Every signed envelope applied at height `h ≥ fee.from_height` is charged `fee.micro` of the fee asset (`0909…09`, the transparent test unit on testnet-1; since v0.15.0 a genesis may name another via `chain.fee.asset`) **before** its payload runs. If the payload is refused, the fee is credited back and the state is exactly as before — a refused transaction never moves money, fee included. If the payload succeeds, the fee is **burned**: debited from the sender and credited nowhere; the cumulative burn is `fees_burned`, part of the state commitment. Nobody earns the fee on testnet-1. The account's one-time key ratchet advances only on success, so a refused envelope costs neither money nor a key index.
 
 ## What this means in practice
 
@@ -37,4 +37,5 @@ Not a fee market (no priority, no bidding — the mempool is first-come within t
 
 - v0.12.0/0.12.1 (2026-09-02) — first cut, activation by local config at a fixed height; the accompanying R10 memory change broke restore on a live validator and the roll was aborted.
 - v0.12.2 (2026-09-02, one voter at a time) — fee + R9 shipped without R10; `fees_burned` enters `C(Σ)` only once nonzero so the rolling upgrade could not fork before activation.
+- v0.15.0 (2026-09-04) — `chain.fee.asset` (X1): the fee asset is a genesis field too (absent = the historical constant, so testnet-1's genesis bytes are unchanged). The fee leg is a protocol movement and is NOT subject to issuer controls: a genesis that registers its fee asset as pausable or freezable is refused at load, so no issuer key can pause the chain's fee path (`docs/X1-ISSUED-ASSETS.md`). Fee burns of a registered fee asset are accounted in `fees_burned` and subtracted in that asset's conservation identity.
 - v0.13.0 (2026-09-02 evening) — the policy became a genesis fact; testnet-1 burns from block 1. The first burned fee on the public chain was the first faucet drip (an `AccountCreate` paid by the treasury) within the first hour; `burned_micro = 900` (nine envelopes) at height 15,897 on 2026-09-03 morning.

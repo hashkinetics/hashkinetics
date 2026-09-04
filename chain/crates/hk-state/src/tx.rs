@@ -104,6 +104,26 @@ pub enum Tx {
     /// existing bincode variant tags are untouched): nodes must be ≥ v0.11.0 before the
     /// first AccountCreate commits, or they fail to decode the batch.
     AccountCreate { id: AccountId, auth_commit: H256, asset: AssetId, amount: Amount },
+    /// X1 (docs/X1-ISSUED-ASSETS.md): register an issued asset. The SENDER becomes the
+    /// issuer; `asset` must equal `H(DOM_ASSET_ID ‖ sender ‖ symbol)` (squat-proof, like
+    /// account ids). `policy` is fixed for the asset's life. ⚠ CONSENSUS-BREAKING
+    /// ADDITION — this and the four variants below are appended LAST; nodes must be
+    /// ≥ v0.15.0 before the first asset transaction commits.
+    AssetRegister { asset: AssetId, symbol: String, decimals: u8, policy: crate::assets::AssetPolicy },
+    /// X1: issuer-signed mint (`policy.mintable`). Refused while paused or when `to` is frozen.
+    AssetMint { asset: AssetId, to: AccountId, amount: Amount },
+    /// X1: holder-signed burn. `destination` (≤ 64 bytes, opaque) is the redemption target
+    /// an issuer's return path reads — formats are X3's; the chain only bounds it.
+    AssetBurn {
+        asset: AssetId,
+        amount: Amount,
+        #[serde(with = "serde_bytes_vec", default)]
+        destination: Vec<u8>,
+    },
+    /// X1: issuer-signed freeze/unfreeze of one account for this asset (`policy.freezable`).
+    AssetFreeze { asset: AssetId, account: AccountId, frozen: bool },
+    /// X1: issuer-signed pause/unpause of the whole asset (`policy.pausable`).
+    AssetPause { asset: AssetId, paused: bool },
 }
 
 /// Account-signed transaction envelope — the L-ratchet (hk-crypto::lamport docs):
@@ -125,7 +145,7 @@ pub struct SignedTx {
 /// formats (JSON — RPC, receipts, genesis) and RAW BYTES for binary formats (bincode —
 /// the consensus wire), so a 2.7 MB proof costs 2.7 MB on the wire instead of ~11 MB.
 /// The SIGNING digest and txid still hash the JSON form — signature domains unchanged.
-mod serde_bytes_vec {
+pub(crate) mod serde_bytes_vec {
     use serde::{Deserialize, Deserializer, Serializer};
     pub fn serialize<S: Serializer>(v: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
         if s.is_human_readable() {

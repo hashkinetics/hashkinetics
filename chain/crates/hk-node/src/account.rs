@@ -249,3 +249,108 @@ pub(crate) fn health_json(rpc: &str, faucet_id: &H256, drip: Amount) -> serde_js
         "fee": fee,
     })
 }
+
+// ---- X1: issued assets (docs/X1-ISSUED-ASSETS.md) ----------------------------------
+
+/// `asset-id <ISSUER-hex|DIR> <SYMBOL>` — offline: the id the runtime rule assigns.
+pub(crate) fn cmd_asset_id(who: &str, symbol: &str) -> eyre::Result<()> {
+    let issuer = match parse_h256(who) {
+        Ok(h) => h,
+        Err(_) => AccountFile::load(Path::new(who))?.id_h256()?,
+    };
+    if !hk_state::assets::valid_symbol(symbol) {
+        return Err(eyre::eyre!("bad symbol '{symbol}' (1-16 of [A-Za-z0-9._-], letter first)"));
+    }
+    let id = hk_state::assets::derive_asset_id(&issuer, symbol);
+    println!("{}", hex::encode(id.0));
+    Ok(())
+}
+
+/// `asset <verb> …` — the five issuer/holder verbs, signed with the DIR's account
+/// through the same reserve-then-sign path as `account-send`, plus two read-only views.
+pub(crate) fn cmd_asset(args: &[String]) -> eyre::Result<()> {
+    let usage = "usage: hk-node asset register <DIR> <RPC> <SYMBOL> <DECIMALS> <FLAGS m/f/p/s|-> \
+                 | mint <DIR> <RPC> <ASSET-hex> <TO-hex> <MICRO> \
+                 | burn <DIR> <RPC> <ASSET-hex> <MICRO> [DESTINATION-hex] \
+                 | freeze|unfreeze <DIR> <RPC> <ASSET-hex> <ACCOUNT-hex> \
+                 | pause|unpause <DIR> <RPC> <ASSET-hex> \
+                 | info <RPC> <ASSET-hex | SYMBOL@ISSUER-hex> \
+                 | list <RPC>";
+    let arg = |i: usize| args.get(i).cloned().ok_or_else(|| eyre::eyre!(usage));
+    match args.first().map(String::as_str) {
+        Some("register") => {
+            let dir = PathBuf::from(arg(1)?);
+            let rpc = arg(2)?;
+            let symbol = arg(3)?;
+            let decimals: u8 = arg(4)?.parse().map_err(|_| eyre::eyre!("bad decimals"))?;
+            let policy = hk_state::assets::AssetPolicy::from_flags(&arg(5)?).map_err(|e| eyre::eyre!(e))?;
+            if !hk_state::assets::valid_symbol(&symbol) {
+                return Err(eyre::eyre!("bad symbol '{symbol}' (1-16 of [A-Za-z0-9._-], letter first)"));
+            }
+            let issuer = AccountFile::load(&dir)?.id_h256()?;
+            let asset = hk_state::assets::derive_asset_id(&issuer, &symbol);
+            println!("→ registering {symbol} (decimals {decimals}, policy {}) as {}", policy.flags(), hex::encode(asset.0));
+            println!("  issuer {} — the id is bound to this account and this symbol", hex::encode(issuer.0));
+            sign_submit(&dir, &rpc, Tx::AssetRegister { asset, symbol, decimals, policy })
+        }
+        Some("mint") => {
+            let dir = PathBuf::from(arg(1)?);
+            let rpc = arg(2)?;
+            let asset = parse_h256(&arg(3)?)?;
+            let to = parse_h256(&arg(4)?)?;
+            let amount: Amount = arg(5)?.parse().map_err(|_| eyre::eyre!("bad amount"))?;
+            println!("→ minting {amount} of {} to {}", hex::encode(asset.0), hex::encode(to.0));
+            sign_submit(&dir, &rpc, Tx::AssetMint { asset, to, amount })
+        }
+        Some("burn") => {
+            let dir = PathBuf::from(arg(1)?);
+            let rpc = arg(2)?;
+            let asset = parse_h256(&arg(3)?)?;
+            let amount: Amount = arg(4)?.parse().map_err(|_| eyre::eyre!("bad amount"))?;
+            let destination = match args.get(5) {
+                Some(d) => hex::decode(d.trim()).map_err(|e| eyre::eyre!("bad destination hex: {e}"))?,
+                None => Vec::new(),
+            };
+            if destination.len() > hk_state::assets::MAX_BURN_DESTINATION {
+                return Err(eyre::eyre!("destination longer than {} bytes", hk_state::assets::MAX_BURN_DESTINATION));
+            }
+            println!("→ burning {amount} of {} (destination {} bytes)", hex::encode(asset.0), destination.len());
+            sign_submit(&dir, &rpc, Tx::AssetBurn { asset, amount, destination })
+        }
+        Some(v @ ("freeze" | "unfreeze")) => {
+            let dir = PathBuf::from(arg(1)?);
+            let rpc = arg(2)?;
+            let asset = parse_h256(&arg(3)?)?;
+            let account = parse_h256(&arg(4)?)?;
+            let frozen = v == "freeze";
+            println!("→ {v} {} for asset {}", hex::encode(account.0), hex::encode(asset.0));
+            sign_submit(&dir, &rpc, Tx::AssetFreeze { asset, account, frozen })
+        }
+        Some(v @ ("pause" | "unpause")) => {
+            let dir = PathBuf::from(arg(1)?);
+            let rpc = arg(2)?;
+            let asset = parse_h256(&arg(3)?)?;
+            let paused = v == "pause";
+            println!("→ {v} asset {}", hex::encode(asset.0));
+            sign_submit(&dir, &rpc, Tx::AssetPause { asset, paused })
+        }
+        Some("info") => {
+            let rpc = arg(1)?;
+            let what = arg(2)?;
+            let params = match what.split_once('@') {
+                Some((sym, issuer)) => json!({"issuer": issuer, "symbol": sym}),
+                None => json!({"asset": what}),
+            };
+            let v = demo::rpc(&rpc, "hk_getAsset", params);
+            println!("{}", serde_json::to_string_pretty(&v)?);
+            Ok(())
+        }
+        Some("list") => {
+            let rpc = arg(1)?;
+            let v = demo::rpc(&rpc, "hk_getAssets", json!({}));
+            println!("{}", serde_json::to_string_pretty(&v)?);
+            Ok(())
+        }
+        _ => Err(eyre::eyre!(usage)),
+    }
+}

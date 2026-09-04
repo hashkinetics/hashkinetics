@@ -59,6 +59,7 @@ impl HkGenesis {
             accounts: vec![],
             alloc: vec![],
             fee: None,
+            assets: vec![],
         })
     }
 

@@ -13,3 +13,6 @@ b7601e846176cafb8de575305d82e3ee182172a6def0444cadf8359d002b0f37  hk-node-v0.13.
 # v0.14.0 release — V1 validator-set changes on a running chain + K5 (refuse to start without a verifier on a pinned genesis); state-compatible; minimum stays v0.13.0 UNTIL the first set change commits, then v0.14.0
 1ba156f01a7991a327bc7bb6a84ee54ed6f5ca558da9b34e00d7c88bcd8ed165  hk-node-v0.14.0.gz
 30d6f773f89f79a198141dd5a8e9f43d2725aeb969fd42ec8c8941b8a6d9a012  hk-node-v0.14.0
+# v0.15.0 release — X1 issued assets (registry, issuer mint/burn/freeze/pause, supply in the state commitment); state-compatible; minimum stays v0.13.0 UNTIL the first asset transaction commits, then v0.15.0
+4187a31f63ee2941a84e508f4cdb85c16b2e713b259665f54d6095ba7a67b133  hk-node-v0.15.0.gz
+38fb156b057314d7176b02b946ff7542ca469742df71fe050c64c1c9b6aca5b4  hk-node-v0.15.0

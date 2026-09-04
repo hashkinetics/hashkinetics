@@ -5,7 +5,11 @@ testnet since 2026-08-27 (staging-1) and on testnet-1 since 2026-09-02 — unles
 Since this revision: the consensus wire is bincode (0.9.11), verifying keys are pinned in the
 genesis (P2.5), one aggregate STARK covers a block's spends (0.9.9), a flat 100-micro envelope
 fee applies to every transaction including pool ones (0.12.2; genesis-bound 0.13.0 —
-`FEES.md`), and the Windows wallet drives every operation here (0.13.0).** This is the single source of truth for the pool as implemented —
+`FEES.md`), the Windows wallet drives every operation here (0.13.0), and since 0.15.0 a
+REGISTERED asset enters the pool only if its issuer set `pool_eligible` at registration —
+a note is unreachable by an issuer freeze by design, so the issuer decides up front
+(`X1-ISSUED-ASSETS.md`; the pool still pins one asset, and a paused asset's unshield
+credit is refused like any other movement while fully shielded transfers continue).** This is the single source of truth for the pool as implemented —
 the reference for auditors (P3), integrating partners, wallet implementers, and the future
 public protocol spec. Code is authoritative where they disagree; file an issue in
 `CLAUDE.md` decisions if you find such a disagreement.

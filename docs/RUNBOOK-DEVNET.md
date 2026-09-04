@@ -1,7 +1,7 @@
 # HashKinetics Devnet Runbook
 
-**v0.13.0 (2026-09-02).** The operational manual for running, demoing, debugging, and
-recording the local devnet (the public network is testnet-1 — `networks/testnet-1/`; the fleet ceremony is `CEREMONY-TESTNET-1.md`; `chain/rehearsal.sh` runs the whole ceremony + restore-shape gate on one box) — every failure mode in the troubleshooting table was actually hit
+**v0.15.0 (2026-09-04).** The operational manual for running, demoing, debugging, and
+recording the local devnet (the public network is testnet-1 — `networks/testnet-1/`; the fleet ceremony is `CEREMONY-TESTNET-1.md`; `chain/rehearsal.sh` runs the whole ceremony + restore-shape gate on one box; `chain/gate-v1.sh` proves validator-set changes and `chain/gate-x1.sh` proves issued assets end to end on a fresh devnet — run them after touching consensus) — every failure mode in the troubleshooting table was actually hit
 and diagnosed on ASUS-SERVER. Read this before touching a terminal after time away.
 Since v0.11 the devnet also carries the usage-sprint surfaces: `account-new/-info/-balance/-send/-create`
 (self-custody CLI), `faucet-serve` (the public drip service), and the `HashKinetics-Wallet.exe`

@@ -1,6 +1,6 @@
 # HashKinetics — Audit Scope & Trust-Boundary Map
 
-**v0.13.0 (2026-09-02 late; CertiK engaged; testnet-1 live). Purpose: the audit engagement starts from this document.** Since the original v0.9.7 draft the audit surface has GROWN — the usage sprint added consensus-affecting code that belongs in scope: `Tx::AccountCreate` (derived squat-proof account ids, `id = H(DOM_ACCOUNT_ID ‖ auth_commit)`, debit-then-create atomicity), the public `faucet-serve` drip service (rate limits, reserve-then-sign under a shared signer), the self-custody account CLI's reserve-then-sign nonce discipline, and the node-local search indexes (explicitly NOT in the state commitment). Deployed since and therefore IN scope: the v0.12 flat protocol fee (charge-then-refund-on-refusal, burn accounting in the state commitment) and its v0.13 genesis binding (`chain.fee` in genesis, env override refused; `genesis-build --alloc` squat-proof allocations from a nonce-0 auth commitment; `--demo-accounts` with PUBLIC seeds); the R9 rotation re-arm; R10 v2 (bounded decided window, value-sync served from the block log with certificate re-check before a block leaves the node, gap-free-suffix advertising, chain-height restore, background index pass); and the wallet's shielded side (`shield.json` reserve-then-advance counters, prover-side proof generation over HTTPS — the prover is untrusted for soundness, the node verifies). It
+**v0.15.0 (2026-09-04; CertiK engaged; testnet-1 live since 2026-09-02). Purpose: the audit engagement starts from this document.** Added to scope since v0.13.0 and deployed on testnet-1: **V1 validator-set changes** (v0.14.0 — `hk-consensus::setchange`: a `SetChangeCert` admits or removes a seat when SLH-DSA root approvals from strictly more than ⅔ of the CURRENT seats' voting power sign a chain-id-bound, height-windowed body; idempotent; never empties the set; per-height set history so certificates on both sides of a boundary verify against the right keys; batch wire v2 magic only when a block carries one), **K5** (a node on a genesis that pins its proof system refuses to start without a wired verifier), and **X1 issued assets** (v0.15.0 — `hk-state::assets`: registry entries `H(DOM_ASSET_ID ‖ issuer ‖ symbol)`, issuer-fixed policy, `AssetRegister/Mint/Burn/Freeze/Pause`, ONE gate on every balance movement of a registered asset incl. mandate spends through the root funder, channel escrow legs, shielding and the unshield credit; per-asset supply/burned/paused/frozen in the state commitment ONLY once the registry is non-empty; snapshot v3; the conservation invariant I5′; the fee-asset policy check at genesis). Both are appended-last wire changes with the activation rule "every node ≥ the release before the first such transaction commits". Since the original v0.9.7 draft the audit surface has GROWN — the usage sprint added consensus-affecting code that belongs in scope: `Tx::AccountCreate` (derived squat-proof account ids, `id = H(DOM_ACCOUNT_ID ‖ auth_commit)`, debit-then-create atomicity), the public `faucet-serve` drip service (rate limits, reserve-then-sign under a shared signer), the self-custody account CLI's reserve-then-sign nonce discipline, and the node-local search indexes (explicitly NOT in the state commitment). Deployed since and therefore IN scope: the v0.12 flat protocol fee (charge-then-refund-on-refusal, burn accounting in the state commitment) and its v0.13 genesis binding (`chain.fee` in genesis, env override refused; `genesis-build --alloc` squat-proof allocations from a nonce-0 auth commitment; `--demo-accounts` with PUBLIC seeds); the R9 rotation re-arm; R10 v2 (bounded decided window, value-sync served from the block log with certificate re-check before a block leaves the node, gap-free-suffix advertising, chain-height restore, background index pass); and the wallet's shielded side (`shield.json` reserve-then-advance counters, prover-side proof generation over HTTPS — the prover is untrusted for soundness, the node verifies). It
 inventories every trust boundary, cryptographic primitive, consensus-critical invariant,
 and deliberate v0/v1 shortcut — so an auditor's first week is spent auditing, not
 archaeology. Maintained alongside the code; the honesty rule applies: nothing below is
@@ -11,10 +11,10 @@ audited until a named third party has signed a report saying so.
 | Crate / component | Role | Consensus-critical? |
 |---|---|---|
 | `hk-spend-circuit` | THE shared statement (spend v3 + mint) + chain-side hash primitives — compiled identically into chain, wallets, zkVM guests | **Yes — soundness root** |
-| `hk-state` | Deterministic state machine: accounts (L-ratchet), balances, MandateTree, channels, **shielded pool** | **Yes** |
+| `hk-state` | Deterministic state machine: accounts (L-ratchet), balances, MandateTree, channels, **shielded pool**, **issued-asset registry + gates (X1)** | **Yes** |
 | `hk-crypto` | SHAKE-256 domains · Lamport/L-ratchet · PayWord · LMS/HSS (`hashsig`) · SLH-DSA root (`slhdsa_adapter`) · ML-KEM adapter (`mlkem`) · SHAKE-AEAD (`noteenc`) | **Yes** |
 | `hk-mandate` | MandateTree accounting (drip, envelopes, revocation) | **Yes** |
-| `hk-consensus` | Malachite context, hash-based signing provider, RotationCert | **Yes** |
+| `hk-consensus` | Malachite context, hash-based signing provider, RotationCert, **SetChangeCert (V1)** | **Yes** |
 | `hk-node` | Node: batches, streaming, commit path, RPC, **in-node SP1 verifier**, indexes | Verifier + commit path yes; RPC/indexes no |
 | `hk-wallet` | Client-side: addresses, sealing, scanning, witness building | No (but key-handling correctness = user-funds-critical) |
 | `hk-prove` (`sp1/script/bin/serve.rs`) | GPU proving service | No (untrusted by design — §2) |
@@ -80,12 +80,25 @@ Invariant: no two uses share a domain; auditors should verify the registry is to
    able to compute it.
 7. **Rotation safety** — RotationCert: root signature + registered root + strictly
    increasing epoch; live signer swap in the same commit as the set update.
-8. **Secure defaults** — an unconfigured node (no verifier) REJECTS shielded traffic.
+8. **Secure defaults** — an unconfigured node (no verifier) REJECTS shielded traffic; on a
+   genesis that pins its proof system it refuses to START without one (K5, v0.14.0).
+9. **Set-change safety (V1)** — a seat changes only under strictly-more-than-⅔ of the
+   CURRENT seats' root signatures over a chain-id-bound, height-windowed body; a
+   certificate is re-verified at propose and at commit against the set as it stands;
+   application is idempotent and never empties the set; the per-height set history makes
+   sync across a boundary verify against the right keys (no coordinator key exists).
+10. **Issued-asset conservation and authority (X1)** — for every registered asset
+    `Σ balances + Σ open escrow + pool = supply − burned − fees_burned`; supply changes
+    only by issuer-signed mint and holder-signed burn; freeze/pause are issuer-only and
+    policy-gated; every movement of a registered asset passes the same gate; unregistered
+    assets are untouched; the registry enters the commitment only when non-empty (so a
+    rolling upgrade cannot fork); a runtime registration can never claim an id whose
+    (issuer, symbol) preimage it does not hold; the fee asset cannot be pausable/freezable.
 
 ## 5 · Known-unaudited / deliberate shortcuts (dated, tracked)
 
 binary bincode wire codec (v0.9.11; the JSON codec's double-hex tax was measured and retired) · vk fetch-at-startup on
-(genesis-pinned vk hashes enforced on testnet-1; an unpinned genesis only warns — devnet posture) · single-asset pool v1 · wallet state
+(genesis-pinned vk hashes enforced on testnet-1; an unpinned genesis only warns — devnet posture) · single-asset pool v1 (X1 adds per-asset `pool_eligible`, but the pool still pins ONE asset) · issued-asset policy and issuer immutable after registration (no on-chain rotation of an issuer key yet — X2/K2) · no attested mint yet (every mint is issuer-signed; X2) · wallet state
 persisted reserve-then-advance (`shield.json`; wallet.json for the CLI) · node search indexes rebuilt from replay/background pass (R10 v2), unbounded in RAM · demo randomness
 deterministic · plain W-OTS (not WOTS+ masks) in-circuit — acceptable for bench/devnet,
 revisit at audit · L-ratchet rejected-tx retry hygiene (documented in tests) · rotation

@@ -10,6 +10,7 @@
 //! every rejection is a typed error; a failed tx mutates NOTHING (including the
 //! account ratchet — replay of a failed tx is a mempool concern, documented).
 
+pub mod assets;
 pub mod pool;
 pub mod tx;
 
@@ -28,6 +29,7 @@ use hk_spend_circuit::{tx_binding_for, MintPublic, SpendPublic};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use crate::assets::{derive_asset_id, valid_symbol, AssetInfo, AssetPolicy, MAX_BURN_DESTINATION, MAX_DECIMALS};
 use crate::pool::{PoolState, ProofVerifier, RejectAllVerifier};
 use crate::tx::{signing_digest, SignedTx, Tx};
 
@@ -59,6 +61,22 @@ pub struct GenesisFee {
     pub micro: Amount,
     /// First height at which the fee is charged (1 = from the first block).
     pub from_height: u64,
+    /// X1: the asset the fee is charged in. Absent = the historical constant
+    /// [`FEE_ASSET`] (testnet-1). A registered fee asset must not be pausable or
+    /// freezable — checked at genesis load (`fee asset policy`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset: Option<AssetId>,
+}
+
+/// X1: an asset registered from block 0. `id` is free here — genesis is the trust
+/// root — so a network can register its native asset under its historical id.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GenesisAsset {
+    pub id: AssetId,
+    pub symbol: String,
+    pub decimals: u8,
+    pub issuer: AccountId,
+    pub policy: AssetPolicy,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -70,6 +88,10 @@ pub struct Genesis {
     /// (pre-v0.13 networks such as staging-1 activated fees by a coordinated roll).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fee: Option<GenesisFee>,
+    /// X1: assets registered at genesis (absent on testnet-1 — its bytes, hence its
+    /// chain id, are untouched).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assets: Vec<GenesisAsset>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -97,6 +119,18 @@ pub enum Event {
     /// APPENDED LAST: `Receipt.result` carries `Vec<Event>` through bincode snapshots —
     /// variant tags before this one must never shift.
     AccountCreated { id: AccountId, creator: AccountId, asset: AssetId, funded: Amount },
+    /// X1 (appended last, same discipline): the five issuer-asset events.
+    AssetRegistered { asset: AssetId, issuer: AccountId, symbol: String },
+    AssetMinted { asset: AssetId, to: AccountId, amount: Amount },
+    AssetBurned {
+        asset: AssetId,
+        from: AccountId,
+        amount: Amount,
+        #[serde(with = "tx::serde_bytes_vec", default)]
+        destination: Vec<u8>,
+    },
+    AssetFrozen { asset: AssetId, account: AccountId, frozen: bool },
+    AssetPaused { asset: AssetId, paused: bool },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -174,9 +208,37 @@ pub enum StateError {
     /// the sender couldn't even cover the envelope fee.
     #[error("insufficient balance for the protocol fee (have {have}, need {need})")]
     InsufficientFee { have: Amount, need: Amount },
+    // ---- X1 issued assets (docs/X1-ISSUED-ASSETS.md §2) — receipt strings the explorer shows ----
+    #[error("unknown asset (not registered)")]
+    UnknownAsset,
+    #[error("asset already registered")]
+    AssetExists,
+    #[error("asset id does not match H(issuer, symbol)")]
+    AssetIdMismatch,
+    #[error("bad asset symbol (1-16 of [A-Za-z0-9._-], letter first)")]
+    BadSymbol,
+    #[error("bad decimals (max 18)")]
+    BadDecimals,
+    #[error("sender is not the asset's issuer")]
+    NotIssuer,
+    #[error("asset policy forbids this (not mintable / freezable / pausable)")]
+    PolicyForbids,
+    #[error("asset paused")]
+    AssetPaused,
+    #[error("frozen by issuer")]
+    AccountFrozen,
+    #[error("asset is not pool-eligible")]
+    NotPoolEligible,
+    #[error("burn destination too long (max 64 bytes)")]
+    BurnDestinationTooLong,
+    #[error("fee asset policy: the fee asset must not be pausable or freezable")]
+    BadFeeAssetPolicy,
+    #[error("duplicate genesis asset")]
+    DuplicateAsset,
 }
 
 /// U4: the asset the flat protocol fee is charged in (the staging USD test asset).
+/// X1: the DEFAULT — a genesis may name another via `fee.asset` (`State::fee_asset`).
 pub const FEE_ASSET: AssetId = H256([9u8; 32]);
 
 pub struct State {
@@ -208,6 +270,11 @@ pub struct State {
     pub fee_from: u64,
     /// U4: running total of burned fees — REAL state (in Σ once nonzero), snapshotted.
     pub fees_burned: Amount,
+    /// X1: the asset the envelope fee is charged in — a GENESIS fact (`fee.asset`),
+    /// default [`FEE_ASSET`]. Config-like: re-injected from genesis on restore.
+    pub fee_asset: AssetId,
+    /// X1: the issued-asset registry — REAL state, in Σ once non-empty, snapshotted (v3).
+    pub assets: BTreeMap<AssetId, AssetInfo>,
 }
 
 /// The persistent image of [`State`] (P3.0/WS-B): every field that feeds the state
@@ -227,6 +294,10 @@ pub struct StateSnapshot {
     pub pool: PoolState,
     /// U4 (snapshot format v2 — see `NodeStore`): total protocol fees burned.
     pub fees_burned: Amount,
+    /// X1 (snapshot format v3 — `snapshot3.bin`): the asset registry. bincode is
+    /// positional, so this MUST stay the last field; the node keeps a v2 mirror to
+    /// read older files (an absent registry restores empty).
+    pub assets: BTreeMap<AssetId, AssetInfo>,
 }
 
 impl Default for State {
@@ -245,6 +316,8 @@ impl Default for State {
             fee_micro: 0,
             fee_from: u64::MAX,
             fees_burned: 0,
+            fee_asset: FEE_ASSET,
+            assets: BTreeMap::new(),
         }
     }
 }
@@ -279,14 +352,50 @@ impl State {
                 return Err(StateError::DuplicateAccount);
             }
         }
+        // X1: genesis-registered assets come first, so allocations below can count
+        // toward a registered asset's supply (conservation I5' holds from block 0).
+        for ga in &g.assets {
+            if !valid_symbol(&ga.symbol) {
+                return Err(StateError::BadSymbol);
+            }
+            if ga.decimals > MAX_DECIMALS {
+                return Err(StateError::BadDecimals);
+            }
+            let info = AssetInfo {
+                symbol: ga.symbol.clone(),
+                decimals: ga.decimals,
+                issuer: ga.issuer,
+                policy: ga.policy,
+                supply: 0,
+                burned: 0,
+                paused: false,
+                frozen: std::collections::BTreeSet::new(),
+                registered_at: 0,
+            };
+            if s.assets.insert(ga.id, info).is_some() {
+                return Err(StateError::DuplicateAsset);
+            }
+        }
         for (id, asset, amount) in &g.alloc {
             let e = s.balances.entry((*id, *asset)).or_insert(0);
             *e = e.saturating_add(*amount);
+            if let Some(info) = s.assets.get_mut(asset) {
+                info.supply = info.supply.saturating_add(*amount);
+            }
         }
         // U4.b: a genesis-bound fee policy is applied here, before any config can.
         if let Some(f) = &g.fee {
             s.fee_micro = f.micro;
             s.fee_from = f.from_height;
+            if let Some(a) = f.asset {
+                s.fee_asset = a;
+            }
+        }
+        // X1: an issuer key must never be able to pause the chain's fee path.
+        if let Some(info) = s.assets.get(&s.fee_asset) {
+            if info.policy.pausable || info.policy.freezable {
+                return Err(StateError::BadFeeAssetPolicy);
+            }
         }
         s.pool.seal_anchor(); // genesis anchor: the empty-tree root
         Ok(s)
@@ -397,13 +506,16 @@ impl State {
         // post-fee balance), refunded in full if dispatch refuses (a refused tx
         // never moves money — the existing atomicity contract holds). Burned on
         // success: debited, never credited anywhere.
+        // X1: the fee asset is a genesis fact (`fee_asset`); the fee leg is a protocol
+        // movement, not an issuer-controlled one — no asset gate here (docs §2).
         let fee = if self.height >= self.fee_from { self.fee_micro } else { 0 };
+        let fee_asset = self.fee_asset;
         if fee > 0 {
-            let have = self.balance(&stx.sender, &FEE_ASSET);
+            let have = self.balance(&stx.sender, &fee_asset);
             if have < fee {
                 return Err(StateError::InsufficientFee { have, need: fee });
             }
-            self.debit(&stx.sender, &FEE_ASSET, fee).expect("balance checked above");
+            self.debit(&stx.sender, &fee_asset, fee).expect("balance checked above");
         }
 
         let events = match self.dispatch(&stx.sender, &stx.payload) {
@@ -412,7 +524,7 @@ impl State {
                 if fee > 0 {
                     // Every dispatch arm checks before it mutates, so a refusal left
                     // the state untouched — refunding the fee restores it exactly.
-                    self.credit(&stx.sender, &FEE_ASSET, fee);
+                    self.credit(&stx.sender, &fee_asset, fee);
                 }
                 return Err(e);
             }
@@ -454,7 +566,176 @@ impl State {
                 sender, anchor, nullifier, out_commitment, out2_commitment, *fee, credit,
                 mandate, proof,
             ),
+            Tx::AssetRegister { asset, symbol, decimals, policy } => {
+                self.do_asset_register(sender, asset, symbol, *decimals, policy)
+            }
+            Tx::AssetMint { asset, to, amount } => self.do_asset_mint(sender, asset, to, *amount),
+            Tx::AssetBurn { asset, amount, destination } => {
+                self.do_asset_burn(sender, asset, *amount, destination)
+            }
+            Tx::AssetFreeze { asset, account, frozen } => {
+                self.do_asset_freeze(sender, asset, account, *frozen)
+            }
+            Tx::AssetPause { asset, paused } => self.do_asset_pause(sender, asset, *paused),
         }
+    }
+
+    // ---- X1: the asset gate (docs/X1-ISSUED-ASSETS.md §2) ----
+
+    /// The one check every movement of a REGISTERED asset passes: refused while the
+    /// asset is paused, refused when the account the money leaves or the account it
+    /// reaches is frozen. Unregistered assets have no issuer and pass untouched —
+    /// the pre-X1 behaviour, byte for byte.
+    fn asset_gate(
+        &self,
+        asset: &AssetId,
+        from: Option<&AccountId>,
+        to: Option<&AccountId>,
+    ) -> Result<(), StateError> {
+        if let Some(info) = self.assets.get(asset) {
+            if info.paused {
+                return Err(StateError::AssetPaused);
+            }
+            if from.is_some_and(|a| info.frozen.contains(a)) || to.is_some_and(|a| info.frozen.contains(a)) {
+                return Err(StateError::AccountFrozen);
+            }
+        }
+        Ok(())
+    }
+
+    /// The registered entry an ISSUER-ONLY verb acts on: known asset, sender is the
+    /// issuer, the policy allows the verb. (Pause/freeze are allowed while paused —
+    /// an issuer must be able to unpause.)
+    fn issuer_entry(
+        &mut self,
+        sender: &AccountId,
+        asset: &AssetId,
+        allowed: impl Fn(&AssetPolicy) -> bool,
+    ) -> Result<&mut AssetInfo, StateError> {
+        let info = self.assets.get_mut(asset).ok_or(StateError::UnknownAsset)?;
+        if info.issuer != *sender {
+            return Err(StateError::NotIssuer);
+        }
+        if !allowed(&info.policy) {
+            return Err(StateError::PolicyForbids);
+        }
+        Ok(info)
+    }
+
+    fn do_asset_register(
+        &mut self,
+        sender: &AccountId,
+        asset: &AssetId,
+        symbol: &str,
+        decimals: u8,
+        policy: &AssetPolicy,
+    ) -> Result<Vec<Event>, StateError> {
+        if !valid_symbol(symbol) {
+            return Err(StateError::BadSymbol);
+        }
+        if decimals > MAX_DECIMALS {
+            return Err(StateError::BadDecimals);
+        }
+        if *asset != derive_asset_id(sender, symbol) {
+            return Err(StateError::AssetIdMismatch);
+        }
+        if self.assets.contains_key(asset) {
+            return Err(StateError::AssetExists);
+        }
+        // A runtime registration can never claim the fee asset (its id has no
+        // (issuer, symbol) preimage), so BadFeeAssetPolicy is a genesis-only check.
+        // Pre-existing balances under this id are impossible for the same reason.
+        self.assets.insert(
+            *asset,
+            AssetInfo {
+                symbol: symbol.to_string(),
+                decimals,
+                issuer: *sender,
+                policy: *policy,
+                supply: 0,
+                burned: 0,
+                paused: false,
+                frozen: std::collections::BTreeSet::new(),
+                registered_at: self.height,
+            },
+        );
+        Ok(vec![Event::AssetRegistered { asset: *asset, issuer: *sender, symbol: symbol.to_string() }])
+    }
+
+    fn do_asset_mint(
+        &mut self,
+        sender: &AccountId,
+        asset: &AssetId,
+        to: &AccountId,
+        amount: Amount,
+    ) -> Result<Vec<Event>, StateError> {
+        if amount == 0 {
+            return Err(StateError::ZeroAmount);
+        }
+        {
+            let info = self.issuer_entry(sender, asset, |p| p.mintable)?;
+            info.supply.checked_add(amount).ok_or(StateError::Overflow)?;
+        }
+        self.asset_gate(asset, None, Some(to))?;
+        let info = self.assets.get_mut(asset).expect("checked above");
+        info.supply += amount;
+        self.credit(to, asset, amount);
+        Ok(vec![Event::AssetMinted { asset: *asset, to: *to, amount }])
+    }
+
+    fn do_asset_burn(
+        &mut self,
+        sender: &AccountId,
+        asset: &AssetId,
+        amount: Amount,
+        destination: &[u8],
+    ) -> Result<Vec<Event>, StateError> {
+        if amount == 0 {
+            return Err(StateError::ZeroAmount);
+        }
+        if destination.len() > MAX_BURN_DESTINATION {
+            return Err(StateError::BurnDestinationTooLong);
+        }
+        if !self.assets.contains_key(asset) {
+            return Err(StateError::UnknownAsset);
+        }
+        self.asset_gate(asset, Some(sender), None)?;
+        self.debit(sender, asset, amount)?;
+        let info = self.assets.get_mut(asset).expect("checked above");
+        info.burned = info.burned.saturating_add(amount);
+        Ok(vec![Event::AssetBurned {
+            asset: *asset,
+            from: *sender,
+            amount,
+            destination: destination.to_vec(),
+        }])
+    }
+
+    fn do_asset_freeze(
+        &mut self,
+        sender: &AccountId,
+        asset: &AssetId,
+        account: &AccountId,
+        frozen: bool,
+    ) -> Result<Vec<Event>, StateError> {
+        let info = self.issuer_entry(sender, asset, |p| p.freezable)?;
+        if frozen {
+            info.frozen.insert(*account);
+        } else {
+            info.frozen.remove(account);
+        }
+        Ok(vec![Event::AssetFrozen { asset: *asset, account: *account, frozen }])
+    }
+
+    fn do_asset_pause(
+        &mut self,
+        sender: &AccountId,
+        asset: &AssetId,
+        paused: bool,
+    ) -> Result<Vec<Event>, StateError> {
+        let info = self.issuer_entry(sender, asset, |p| p.pausable)?;
+        info.paused = paused;
+        Ok(vec![Event::AssetPaused { asset: *asset, paused }])
     }
 
     // ---- balances ----
@@ -477,6 +758,7 @@ impl State {
         if amount == 0 {
             return Err(StateError::ZeroAmount);
         }
+        self.asset_gate(asset, Some(from), Some(to))?; // X1
         self.debit(from, asset, amount)?;
         self.credit(to, asset, amount);
         Ok(vec![Event::Transferred { from: *from, to: *to, asset: *asset, amount }])
@@ -505,6 +787,7 @@ impl State {
             return Err(StateError::AccountExists);
         }
         if amount > 0 {
+            self.asset_gate(asset, Some(sender), Some(id))?; // X1: the funding leg moves money
             self.debit(sender, asset, amount)?;
         }
         self.accounts.insert(*id, Account { auth_commit: *auth_commit, nonce: 0 });
@@ -571,8 +854,10 @@ impl State {
         let root = self.mandates.root_of(leaf)?;
         let funder = *self.root_funding.get(&root).ok_or(StateError::UnknownMandate)?;
         // Ordering: mandate AUTHORIZATION verdict first (read-only check), then the
-        // settlement-layer balance check, then the mutating spend + fund movement.
+        // settlement-layer checks (X1 asset gate — the ROOT funder is the payer —
+        // then balance), then the mutating spend + fund movement.
         self.mandates.check(leaf, amount, self.time)?;
+        self.asset_gate(&asset, Some(&funder), Some(to))?;
         let have = self.balance(&funder, &asset);
         if have < amount {
             return Err(StateError::InsufficientBalance { have, need: amount });
@@ -629,6 +914,7 @@ impl State {
         let funder = *self.root_funding.get(&root).ok_or(StateError::UnknownMandate)?;
         // Same ordering as MandateSpend: authorization before settlement.
         self.mandates.check(&mandate, deposit, self.time)?;
+        self.asset_gate(&asset, Some(&funder), None)?; // X1: escrow leaves the funder
         let have = self.balance(&funder, &asset);
         if have < deposit {
             return Err(StateError::InsufficientBalance { have, need: deposit });
@@ -656,42 +942,51 @@ impl State {
     }
 
     fn do_channel_settle(&mut self, id: &ChannelId, word: &H256, step: u32) -> Result<Vec<Event>, StateError> {
-        let ch = self.channels.get_mut(id).ok_or(StateError::UnknownChannel)?;
-        if ch.refunded {
-            return Err(StateError::ChannelRefunded);
-        }
-        let prev = ch.state.highest_step_settled;
-        if step as u64 <= prev || step as u64 > ch.state.max_steps {
-            return Err(StateError::BadStep);
-        }
-        if !payword::verify_settlement(ch.state.tip.0, word.0, step) {
-            return Err(StateError::BadSettlement);
-        }
-        let newly = step as u64 - prev;
-        let paid = ch.state.unit_price.checked_mul(newly as Amount).ok_or(StateError::Overflow)?;
+        // Read-only checks first (X1: the gate needs `&self` while the channel is
+        // borrowed immutably), then the mutation under a fresh borrow.
+        let (paid, payee, asset) = {
+            let ch = self.channels.get(id).ok_or(StateError::UnknownChannel)?;
+            if ch.refunded {
+                return Err(StateError::ChannelRefunded);
+            }
+            let prev = ch.state.highest_step_settled;
+            if step as u64 <= prev || step as u64 > ch.state.max_steps {
+                return Err(StateError::BadStep);
+            }
+            if !payword::verify_settlement(ch.state.tip.0, word.0, step) {
+                return Err(StateError::BadSettlement);
+            }
+            let newly = step as u64 - prev;
+            let paid = ch.state.unit_price.checked_mul(newly as Amount).ok_or(StateError::Overflow)?;
+            (paid, ch.state.payee, ch.state.asset)
+        };
+        self.asset_gate(&asset, None, Some(&payee))?; // X1: escrow reaches the payee
         // Escrow always covers: deposit = unit_price × max_steps and step ≤ max_steps.
+        let ch = self.channels.get_mut(id).expect("checked above");
         ch.state.highest_step_settled = step as u64;
         ch.escrow_remaining -= paid;
-        let (payee, asset) = (ch.state.payee, ch.state.asset);
         self.credit(&payee, &asset, paid);
         Ok(vec![Event::ChannelSettled { id: *id, upto_step: step, paid }])
     }
 
     fn do_channel_refund(&mut self, sender: &AccountId, id: &ChannelId) -> Result<Vec<Event>, StateError> {
-        let ch = self.channels.get_mut(id).ok_or(StateError::UnknownChannel)?;
-        if ch.refunded {
-            return Err(StateError::ChannelRefunded);
-        }
-        if ch.state.payer != *sender {
-            return Err(StateError::NotHolder);
-        }
-        if self.time < ch.state.expiry {
-            return Err(StateError::NotExpired);
-        }
-        let amount = ch.escrow_remaining;
+        let (amount, payer, asset) = {
+            let ch = self.channels.get(id).ok_or(StateError::UnknownChannel)?;
+            if ch.refunded {
+                return Err(StateError::ChannelRefunded);
+            }
+            if ch.state.payer != *sender {
+                return Err(StateError::NotHolder);
+            }
+            if self.time < ch.state.expiry {
+                return Err(StateError::NotExpired);
+            }
+            (ch.escrow_remaining, ch.state.payer, ch.state.asset)
+        };
+        self.asset_gate(&asset, None, Some(&payer))?; // X1: escrow returns to the payer
+        let ch = self.channels.get_mut(id).expect("checked above");
         ch.escrow_remaining = 0;
         ch.refunded = true;
-        let (payer, asset) = (ch.state.payer, ch.state.asset);
         self.credit(&payer, &asset, amount);
         Ok(vec![Event::ChannelRefunded { id: *id, amount }])
     }
@@ -716,6 +1011,15 @@ impl State {
                 return Err(StateError::PoolAssetMismatch);
             }
         }
+        // X1/X5: a registered asset enters the pool only if its issuer allowed it
+        // (a note is unreachable by freeze — that is the point), and never while
+        // paused or from a frozen account.
+        if let Some(info) = self.assets.get(asset) {
+            if !info.policy.pool_eligible {
+                return Err(StateError::NotPoolEligible);
+            }
+        }
+        self.asset_gate(asset, Some(sender), None)?;
         if self.pool.tree.is_full() {
             return Err(StateError::PoolFull);
         }
@@ -773,6 +1077,11 @@ impl State {
             (true, None) => return Err(StateError::PoolAssetMismatch),
             (_, a) => a,
         };
+        // X1: the unshield credit is a transparent movement of the pool's asset —
+        // gated like any other (a fully shielded transfer, fee = 0, is not).
+        if fee > 0 {
+            self.asset_gate(&asset.expect("checked above"), None, credit.as_ref())?;
+        }
         if !self.pool.is_recent_anchor(&anchor.0) {
             return Err(StateError::PoolUnknownAnchor);
         }
@@ -834,6 +1143,7 @@ impl State {
             channels: self.channels.clone(),
             pool: self.pool.clone(),
             fees_burned: self.fees_burned,
+            assets: self.assets.clone(),
         }
     }
 
@@ -856,6 +1166,8 @@ impl State {
             fee_micro: 0,
             fee_from: u64::MAX,
             fees_burned: s.fees_burned,
+            fee_asset: FEE_ASSET, // config-like: the node re-injects genesis.fee.asset
+            assets: s.assets,
         }
     }
 
@@ -920,6 +1232,51 @@ impl State {
             buf.push(0xFE); // fee-section tag (cannot collide: the buffer is length-structured)
             buf.extend_from_slice(&self.fees_burned.to_le_bytes());
         }
+        // X1: the asset registry enters the commitment ONLY once non-empty — same
+        // trick: v0.14 and v0.15 nodes agree on every block until the first
+        // registration commits, so the upgrade roll cannot fork (docs §3).
+        if !self.assets.is_empty() {
+            buf.push(0xA5); // asset-section tag
+            buf.extend_from_slice(&(self.assets.len() as u64).to_le_bytes());
+            for (id, info) in &self.assets {
+                buf.extend_from_slice(&id.0);
+                info.commit_into(&mut buf);
+            }
+        }
         H256(shake256_32(DOM_STATE_COMMIT, &[&buf]))
+    }
+
+    // ---- X1 views ----
+
+    /// Registered-asset conservation (invariant I5', docs §2): the amount the state
+    /// machine can still account for. `None` for an unregistered asset.
+    /// `Σ balances + Σ open escrow + pool (if pinned) == supply − burned − fees_burned (fee asset)`
+    pub fn asset_conservation(&self, asset: &AssetId) -> Option<(Amount, Amount)> {
+        let info = self.assets.get(asset)?;
+        let mut held: Amount = 0;
+        for ((_, a), amt) in &self.balances {
+            if a == asset {
+                held = held.saturating_add(*amt);
+            }
+        }
+        for ch in self.channels.values() {
+            if ch.state.asset == *asset {
+                held = held.saturating_add(ch.escrow_remaining);
+            }
+        }
+        if self.pool.asset == Some(*asset) {
+            held = held.saturating_add(self.pool.total_shielded);
+        }
+        let mut issued = info.supply.saturating_sub(info.burned);
+        if *asset == self.fee_asset {
+            issued = issued.saturating_sub(self.fees_burned);
+        }
+        Some((held, issued))
+    }
+
+    /// The registry entry for an asset, by (issuer, symbol) — the runtime id rule.
+    pub fn asset_by_symbol(&self, issuer: &AccountId, symbol: &str) -> Option<(AssetId, &AssetInfo)> {
+        let id = derive_asset_id(issuer, symbol);
+        self.assets.get(&id).map(|i| (id, i))
     }
 }

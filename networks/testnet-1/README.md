@@ -1,9 +1,11 @@
 # HashKinetics testnet-1 — join as a full node
 
-> **Minimum node version: v0.13.0.** testnet-1 launched 2026-09-02 from a fresh
+> **Current release: v0.15.0** (run it). Minimum to sync: v0.13.0 — testnet-1 launched 2026-09-02 from a fresh
 > genesis with the protocol fee (100 micro per envelope, burned) **bound in the genesis
 > from height 1** and the faucet treasury allocated at genesis — no activation heights,
-> no coordinated rolls. Build from a tag ≥ v0.13.0. (Its predecessor, `staging-1`, ran
+> no coordinated rolls for the fee. Appended transaction kinds activate by height instead:
+> the first validator-set change makes v0.14.0 the minimum, the first issued-asset
+> transaction makes v0.15.0 the minimum — an older node halts at that block by design. (Its predecessor, `staging-1`, ran
 > 2026-08-27 → 2026-09-02, stopped at height 107,182 and is archived — see `../staging-1/`.)
 
 The public testnet (the chain behind [hashkinetics.org/explorer](https://www.hashkinetics.org/explorer)
@@ -12,7 +14,10 @@ can run a **full node** that syncs it, verifies every block, and serves its own 
 and explorer. External operators start as **observers**; since v0.14.0 a voting seat
 is admitted on the RUNNING chain by a certificate approved by more than ⅔ of the
 current seats' root keys — no new genesis (`docs/V1-VALIDATOR-SET-CHANGES.md`)
-(`docs/VALIDATOR-ONBOARDING.md`). Just want to use it? `https://www.hashkinetics.org/faucet`
+(`docs/VALIDATOR-ONBOARDING.md`). Since v0.15.0 the chain carries **issued assets**:
+an issuer registers an asset, mints, burns, freezes and pauses under a policy fixed at
+registration, with supply in the state commitment (`docs/X1-ISSUED-ASSETS.md`;
+`hk-node asset …`, `hk_getAssets`). Just want to use it? `https://www.hashkinetics.org/faucet`
 and the Windows wallet (`docs/WALLET-GUIDE.md`); every transaction pays 100 micro.
 
 **Identity, not topology, defines the network.** The `genesis.json` here — chain id,

@@ -8,7 +8,11 @@
 //!                                                 signer: {epoch, remaining, capacity}}  (R4)
 //!   hk_submitRotation {cert}                   -> {accepted, epoch, queued}  (R2: peer-carried
 //!                                                 revival — cert from `hk-node issue-rotation`)
-//!   hk_getAccount   {id}                      -> {found, nonce, auth_commit}
+//!   hk_getAccount   {id}                      -> {found, nonce, auth_commit, balances[]}
+//!   hk_getAsset     {asset | issuer+symbol}   -> {found, asset: {symbol, issuer, policy,
+//!                                                 supply, burned, circulating, held, conserved,
+//!                                                 paused, frozen_count}}            (X1)
+//!   hk_getAssets                              -> {count, fee_asset, assets[]}      (X1)
 //!   hk_balance      {id, asset}               -> {amount}            (u128 as string)
 //!   hk_mandateAvailable {leaf, at?}           -> {available}         (string | null)
 //!   hk_submitTx     {tx}                       -> {accepted, txid}
@@ -252,16 +256,55 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
             Some(id) => {
                 let chain = h.chain.lock().unwrap_or_else(|e| e.into_inner());
                 match chain.accounts.get(&id) {
-                    Some(acc) => json!({"result": {
-                        "found": true,
-                        "nonce": acc.nonce,
-                        "auth_commit": hex::encode(acc.auth_commit.0),
-                    }}),
+                    Some(acc) => {
+                        // X1: every transparent balance this account holds, by asset
+                        // (a wallet must show two balances once issued assets exist).
+                        let balances: Vec<Value> = chain
+                            .balances
+                            .range((id, H256([0u8; 32]))..=(id, H256([0xffu8; 32])))
+                            .filter(|(_, amt)| **amt > 0)
+                            .map(|((_, asset), amt)| json!({
+                                "asset": hex::encode(asset.0),
+                                "symbol": chain.assets.get(asset).map(|i| i.symbol.clone()),
+                                "amount": amt.to_string(),
+                                "frozen": chain.assets.get(asset).map(|i| i.frozen.contains(&id)).unwrap_or(false),
+                            }))
+                            .collect();
+                        json!({"result": {
+                            "found": true,
+                            "nonce": acc.nonce,
+                            "auth_commit": hex::encode(acc.auth_commit.0),
+                            "balances": balances,
+                        }})
+                    }
                     None => json!({"result": {"found": false}}),
                 }
             }
             None => json!({"error": "id must be 64-char hex"}),
         },
+        // X1: the issued-asset registry. `asset` (hex) OR `issuer` + `symbol` (the id rule).
+        "hk_getAsset" => {
+            let chain = h.chain.lock().unwrap_or_else(|e| e.into_inner());
+            let id = match param_h256(params, "asset") {
+                Some(a) => Some(a),
+                None => match (param_h256(params, "issuer"), params.get("symbol").and_then(|v| v.as_str())) {
+                    (Some(issuer), Some(sym)) => Some(hk_state::assets::derive_asset_id(&issuer, sym)),
+                    _ => None,
+                },
+            };
+            match id {
+                Some(id) => match chain.assets.get(&id) {
+                    Some(info) => json!({"result": {"found": true, "asset": asset_json(&id, info, &chain)}}),
+                    None => json!({"result": {"found": false, "asset_id": hex::encode(id.0)}}),
+                },
+                None => json!({"error": "asset (64-char hex) or issuer (64-char hex) + symbol required"}),
+            }
+        }
+        "hk_getAssets" => {
+            let chain = h.chain.lock().unwrap_or_else(|e| e.into_inner());
+            let list: Vec<Value> = chain.assets.iter().map(|(id, info)| asset_json(id, info, &chain)).collect();
+            json!({"result": {"count": list.len(), "fee_asset": hex::encode(chain.fee_asset.0), "assets": list}})
+        }
         "hk_balance" => match (param_h256(params, "id"), param_h256(params, "asset")) {
             (Some(id), Some(asset)) => {
                 let chain = h.chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -713,6 +756,24 @@ fn tx_summary(stx: &SignedTx) -> Value {
         Tx::AccountCreate { id, asset, amount, .. } => ("account_create", json!({
             "id": hex::encode(id.0), "asset": hex::encode(asset.0), "amount": amount.to_string(),
         })),
+        // X1: issued assets — the five issuer verbs, all public by construction.
+        Tx::AssetRegister { asset, symbol, decimals, policy } => ("asset_register", json!({
+            "asset": hex::encode(asset.0), "symbol": symbol, "decimals": decimals,
+            "policy": policy.flags(),
+        })),
+        Tx::AssetMint { asset, to, amount } => ("asset_mint", json!({
+            "asset": hex::encode(asset.0), "to": hex::encode(to.0), "amount": amount.to_string(),
+        })),
+        Tx::AssetBurn { asset, amount, destination } => ("asset_burn", json!({
+            "asset": hex::encode(asset.0), "amount": amount.to_string(),
+            "destination": hex::encode(destination),
+        })),
+        Tx::AssetFreeze { asset, account, frozen } => ("asset_freeze", json!({
+            "asset": hex::encode(asset.0), "account": hex::encode(account.0), "frozen": frozen,
+        })),
+        Tx::AssetPause { asset, paused } => ("asset_pause", json!({
+            "asset": hex::encode(asset.0), "paused": paused,
+        })),
     };
     json!({
         "txid": hex::encode(txid(stx)),
@@ -720,6 +781,33 @@ fn tx_summary(stx: &SignedTx) -> Value {
         "nonce": stx.nonce,
         "kind": kind,
         "fields": fields,
+    })
+}
+
+/// X1: one registry entry as the explorer/wallet sees it, with the conservation
+/// receipt (`held` must equal `issued` on every honest node — invariant I5').
+fn asset_json(id: &H256, info: &hk_state::assets::AssetInfo, chain: &hk_state::State) -> Value {
+    let (held, issued) = chain.asset_conservation(id).unwrap_or((0, 0));
+    json!({
+        "asset": hex::encode(id.0),
+        "symbol": info.symbol,
+        "decimals": info.decimals,
+        "issuer": hex::encode(info.issuer.0),
+        "policy": {
+            "flags": info.policy.flags(),
+            "mintable": info.policy.mintable,
+            "freezable": info.policy.freezable,
+            "pausable": info.policy.pausable,
+            "pool_eligible": info.policy.pool_eligible,
+        },
+        "supply": info.supply.to_string(),
+        "burned": info.burned.to_string(),
+        "circulating": issued.to_string(),
+        "held": held.to_string(),
+        "conserved": held == issued,
+        "paused": info.paused,
+        "frozen_count": info.frozen.len(),
+        "registered_at": info.registered_at,
     })
 }
 

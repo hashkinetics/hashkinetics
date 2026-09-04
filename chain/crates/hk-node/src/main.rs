@@ -13,7 +13,7 @@
 
 /// The release label this binary reports (`hk-node --version`, the usage banner).
 /// Bump with every node release; the crate version is workspace-wide and not it.
-pub const NODE_VERSION: &str = "v0.14.0";
+pub const NODE_VERSION: &str = "v0.15.0";
 
 mod account;
 mod app;
@@ -141,7 +141,7 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
             // P3.0c coordinator-side: validators.json (array) → genesis.json.
             // U4.b: fee policy + allocations are genesis facts (see cmd_genesis_build).
             let vals = args.get(2).cloned().ok_or_else(|| {
-                eyre::eyre!("usage: hk-node genesis-build <VALIDATORS.json> <OUT-genesis.json> [--fee-micro N] [--fee-from H] [--alloc AUTH0:MICRO ...] [--demo-accounts [ORG-USD]]  (env: HK_PROVER_URL to pin, HK_CHAIN_START_TIME)")
+                eyre::eyre!("usage: hk-node genesis-build <VALIDATORS.json> <OUT-genesis.json> [--fee-micro N] [--fee-from H] [--fee-asset HEX] [--alloc AUTH0:MICRO ...] [--asset SYMBOL:DECIMALS:ISSUER-AUTH0:FLAGS[:ID-hex] ...] [--demo-accounts [ORG-USD]]  (env: HK_PROVER_URL to pin, HK_CHAIN_START_TIME)")
             })?;
             let out = args.get(3).cloned().unwrap_or_else(|| "genesis.json".into());
             cmd_genesis_build(&vals, &out, &args[4.min(args.len())..])
@@ -223,6 +223,15 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
             let rpc = args.get(4).cloned().unwrap_or_else(|| "http://127.0.0.1:26000".into());
             account::cmd_adopt_demo(&dir, &name, &rpc)
         }
+        // ---- X1: issued assets (docs/X1-ISSUED-ASSETS.md) ----------------------------
+        Some("asset-id") => {
+            // Offline: the id an issuer account gets for a symbol.
+            let usage = "usage: hk-node asset-id <ISSUER-hex|DIR> <SYMBOL>";
+            let who = args.get(2).cloned().ok_or_else(|| eyre::eyre!(usage))?;
+            let sym = args.get(3).cloned().ok_or_else(|| eyre::eyre!(usage))?;
+            account::cmd_asset_id(&who, &sym)
+        }
+        Some("asset") => account::cmd_asset(&args[2..]),
         Some("faucet-serve") => {
             let usage = "usage: hk-node faucet-serve <WALLET-DIR> <RPC> [--listen 127.0.0.1:9922] [--drip MICRO] [--asset HEX] [--cooldown-secs N] [--daily-cap N]";
             let dir = PathBuf::from(args.get(2).cloned().ok_or_else(|| eyre::eyre!(usage))?);
@@ -287,6 +296,7 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
             eprintln!("usage: hk-node testnet <N> <HOME> | start <NODE_HOME> | wallet <CMD …> | keygen <HOME> [MONIKER] | issue-rotation <HOME> [EPOCH] [VALID_FROM] | set-change propose|approve|assemble … | genesis-build <VALIDATORS.json> <OUT.json> | config-gen <HOME> --listen … --peers … | storm <RPC> [RATE] [DURATION_S] | demo <RPC> | demo-economy <RPC> <PROVER> | demo-shielded <RPC> <PROVER> | demo-disclose <RPC> <PROVER> | demo-agg <RPC> <PROVER> | demo-mandates <RPC> <PROVER> | verify-disclosure <package.json>");
             eprintln!("join a testnet: docs/VALIDATOR-ONBOARDING.md (keygen → send validator.json → receive genesis → config-gen → start)");
             eprintln!("accounts (U1): account-new DIR · account-info DIR · account-balance RPC ID|DIR · account-send DIR RPC TO MICRO [ASSET] · account-create DIR RPC AUTH_COMMIT MICRO [ASSET] · faucet-serve DIR RPC [--drip …]");
+            eprintln!("issued assets (X1): asset-id ISSUER|DIR SYMBOL · asset register DIR RPC SYMBOL DECIMALS FLAGS(m/f/p/s|-) · asset mint DIR RPC ASSET TO MICRO · asset burn DIR RPC ASSET MICRO [DEST-hex] · asset freeze|unfreeze DIR RPC ASSET ACCOUNT · asset pause|unpause DIR RPC ASSET · asset info RPC ASSET|SYMBOL@ISSUER · asset list RPC");
             eprintln!("wallet: init DIR ACCOUNT [RPC] · status DIR [RPC] · address DIR [RPC] · scan DIR [RPC] · transfer DIR TO USD [RPC] · shield DIR USD [RPC] [PROVER] · unshield DIR USD [RPC] [PROVER] · pay DIR HKADDR USD [MEMO] [RPC] [PROVER] · disclose DIR COMMITMENT OUT.json [RPC]");
             Ok(())
         }
@@ -736,7 +746,11 @@ fn cmd_genesis_build(validators_path: &str, out_path: &str, rest: &[String]) -> 
         .unwrap_or(CHAIN_START_TIME);
 
     let (mut fee_micro, mut fee_from) = (100u128, 1u64);
+    let mut fee_asset: Option<hk_primitives::H256> = None;
     let mut allocs: Vec<(hk_primitives::H256, hk_primitives::Amount)> = Vec::new();
+    // X1: (symbol, decimals, issuer auth0, policy, explicit id) — the issuer is a
+    // genesis account named by its nonce-0 auth commitment, like --alloc.
+    let mut assets: Vec<(String, u8, hk_primitives::H256, hk_state::assets::AssetPolicy, Option<hk_primitives::H256>)> = Vec::new();
     let mut demo_org_usd: Option<u128> = None;
     let mut i = 0;
     while i < rest.len() {
@@ -747,6 +761,30 @@ fn cmd_genesis_build(validators_path: &str, out_path: &str, rest: &[String]) -> 
             }
             "--fee-from" => {
                 fee_from = rest.get(i + 1).and_then(|s| s.parse().ok()).ok_or_else(|| eyre::eyre!("--fee-from H"))?;
+                i += 2;
+            }
+            "--fee-asset" => {
+                let hexs = rest.get(i + 1).ok_or_else(|| eyre::eyre!("--fee-asset HEX"))?;
+                fee_asset = Some(account::parse_h256(hexs)?);
+                i += 2;
+            }
+            "--asset" => {
+                let spec = rest.get(i + 1).ok_or_else(|| eyre::eyre!("--asset SYMBOL:DECIMALS:ISSUER-AUTH0:FLAGS[:ID-hex]"))?;
+                let parts: Vec<&str> = spec.split(':').collect();
+                if parts.len() < 4 || parts.len() > 5 {
+                    eyre::bail!("--asset wants SYMBOL:DECIMALS:ISSUER-AUTH0:FLAGS[:ID-hex], got '{spec}'");
+                }
+                if !hk_state::assets::valid_symbol(parts[0]) {
+                    eyre::bail!("--asset: bad symbol '{}' (1-16 of [A-Za-z0-9._-], letter first)", parts[0]);
+                }
+                let decimals: u8 = parts[1].parse().map_err(|_| eyre::eyre!("--asset: bad decimals '{}'", parts[1]))?;
+                let issuer_auth = account::parse_h256(parts[2])?;
+                let policy = hk_state::assets::AssetPolicy::from_flags(parts[3]).map_err(|e| eyre::eyre!("--asset: {e}"))?;
+                let id = match parts.get(4) {
+                    Some(h) => Some(account::parse_h256(h)?),
+                    None => None,
+                };
+                assets.push((parts[0].to_string(), decimals, issuer_auth, policy, id));
                 i += 2;
             }
             "--alloc" => {
@@ -771,7 +809,7 @@ fn cmd_genesis_build(validators_path: &str, out_path: &str, rest: &[String]) -> 
         eyre::bail!("--fee-from must be ≥ 1 (heights start at 1)");
     }
 
-    let mut chain = hk_state::Genesis { time: start_time, accounts: vec![], alloc: vec![], fee: None };
+    let mut chain = hk_state::Genesis { time: start_time, accounts: vec![], alloc: vec![], fee: None, assets: vec![] };
     if let Some(org_usd) = demo_org_usd {
         chain.accounts = demo::genesis_accounts();
         chain.alloc = vec![(demo::account_id("org"), demo::usd(), org_usd * 1_000_000)];
@@ -784,7 +822,23 @@ fn cmd_genesis_build(validators_path: &str, out_path: &str, rest: &[String]) -> 
         chain.accounts.push(hk_state::GenesisAccount { id, auth_commit: *auth0 });
         chain.alloc.push((id, demo::usd(), *amount));
     }
-    chain.fee = Some(hk_state::GenesisFee { micro: fee_micro, from_height: fee_from });
+    chain.fee = Some(hk_state::GenesisFee { micro: fee_micro, from_height: fee_from, asset: fee_asset });
+    for (symbol, decimals, issuer_auth, policy, explicit_id) in &assets {
+        let issuer = account::derived_id(issuer_auth);
+        if !chain.accounts.iter().any(|a| a.id == issuer) {
+            // An issuer that holds no allocation still needs an account to sign from.
+            chain.accounts.push(hk_state::GenesisAccount { id: issuer, auth_commit: *issuer_auth });
+        }
+        // No explicit id → the runtime rule, so `hk-node asset-id` agrees with genesis.
+        let id = explicit_id.unwrap_or_else(|| hk_state::assets::derive_asset_id(&issuer, symbol));
+        if chain.assets.iter().any(|a| a.id == id) {
+            eyre::bail!("duplicate genesis asset {}", hex::encode(id.0));
+        }
+        chain.assets.push(hk_state::GenesisAsset { id, symbol: symbol.clone(), decimals: *decimals, issuer, policy: *policy });
+    }
+    // The state machine's own genesis validation (symbols, duplicates, fee-asset policy)
+    // runs here so a bad file never leaves the coordinator's machine.
+    hk_state::State::from_genesis(&chain).map_err(|e| eyre::eyre!("genesis refused by the state machine: {e}"))?;
 
     let vk_pins = fetch_vk_pins();
     if vk_pins.is_none() {
@@ -802,7 +856,11 @@ fn cmd_genesis_build(validators_path: &str, out_path: &str, rest: &[String]) -> 
         genesis.validators.len(),
         if genesis.vk_pins.is_some() { "YES" } else { "NO (devnet only!)" }
     );
-    println!("  fee policy       : {fee_micro} micro per envelope from height {fee_from} (genesis-bound)");
+    println!("  fee policy       : {fee_micro} micro per envelope from height {fee_from} (genesis-bound){}",
+        match fee_asset { Some(a) => format!(" in asset {}", hex::encode(a.0)), None => String::new() });
+    for a in &genesis.chain.as_ref().expect("set above").assets {
+        println!("  asset            : {} {} · decimals {} · issuer {} · policy {}", hex::encode(a.id.0), a.symbol, a.decimals, hex::encode(a.issuer.0), a.policy.flags());
+    }
     let c = genesis.chain.as_ref().expect("set above");
     for (id, _asset, amount) in &c.alloc {
         println!("  allocation       : {} ← {amount} micro", hex::encode(id.0));
