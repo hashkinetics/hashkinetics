@@ -17,6 +17,9 @@
 //!   wallet must NEVER reuse an `ots_index` (persist it reserve-then-sign — leaf reuse
 //!   hands the leaf key to anyone who sees both signatures, incl. a delegated prover).
 
+/// K1/K2 (v0.16.0): keys at rest — the sealed-file envelope shared by the node CLI, the faucet and the GUI wallet.
+pub mod sealed;
+
 use hk_crypto::hash::shake256_32;
 use hk_crypto::mlkem::{self, NoteKem};
 use hk_crypto::noteenc;

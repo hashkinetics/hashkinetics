@@ -23,3 +23,7 @@ b7776b06547f238ac78ef8f15ab9af9cb9c9919094c9f441e506afdd4a9185b9  vks.json
 # v0.15.2 release — N1: live peer table (hk_getPeers, node_version, version tag); client-only, no activation
 91876bebce06feeeffd330871c48d6cd55a57ee8d101ac406ed76e1b32c18230  hk-node-v0.15.2.gz
 df66ca57ae0db8fc22d6e8d358dbc55a56ae8e09fb91857e87273c29840f2d61  hk-node-v0.15.2
+# v0.16.0 release — S+K: block-log segments + retention, persisted index, snapshot knobs; HKE1 sealed key files; faucet hot/cold (client-only, no activation) · wallet v0.14.0
+6e1843b3ec8407e310eef78ee993755dbdeaa218f00703331fe4237734d26436  hk-node-v0.16.0.gz
+e4af8aeffc997ef2a98001ec6c2be028c7a618fc8952476c1045b79177b741ca  hk-node-v0.16.0
+c588811c38d860354c8509682de5fb7271968ee55ce5b30ab05d8e89387c9a4b  HashKinetics-Wallet.exe (v0.14.0)

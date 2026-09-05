@@ -70,6 +70,39 @@ fn snapshot_every() -> u64 {
             .unwrap_or(SNAPSHOT_EVERY)
     })
 }
+
+/// C2.8 (v0.16.0): block-log retention in heights (`HK_RETAIN_BLOCKS`, default 0 =
+/// keep everything). Voters and the public gateway keep everything — a pruned node
+/// serves value-sync only from its first kept height.
+pub(crate) fn retain_blocks() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("HK_RETAIN_BLOCKS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0))
+}
+
+/// S2 (v0.16.0): how often the search index is written to disk (`HK_INDEX_PERSIST_EVERY`,
+/// default 4 × the snapshot cadence). Restart resumes indexing above the persisted
+/// height instead of re-reading every block file.
+fn index_persist_every() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("HK_INDEX_PERSIST_EVERY")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(snapshot_every() * 4)
+    })
+}
+
+/// S2: the `&'static str` kind names live in `tx_kind`; a persisted index carries
+/// them as strings and maps them back here (an unknown name stays "unknown").
+fn kind_static(s: &str) -> &'static str {
+    const KINDS: [&str; 15] = [
+        "transfer", "mandate_create", "mandate_spend", "mandate_revoke", "channel_open",
+        "channel_settle", "channel_refund", "shield", "shielded_spend", "account_create",
+        "asset_register", "asset_mint", "asset_burn", "asset_freeze", "asset_pause",
+    ];
+    KINDS.iter().copied().find(|k| *k == s).unwrap_or("unknown")
+}
 use crate::streaming::PartStreamsMap;
 use hk_consensus::HkValidator;
 
@@ -256,6 +289,10 @@ pub struct HkApp {
     /// (0 = no disk history yet). Restore measures it; a failed block write moves it
     /// past the hole. `earliest_height()` advertises min(RAM window, this) to peers.
     history_min: u64,
+    /// S2 (v0.16.0): progress of the background history-index pass — the highest
+    /// height it has indexed contiguously from its start; `u64::MAX` once it is done
+    /// (then the live path keeps the index current and `tip` is the covered height).
+    index_floor: Arc<std::sync::atomic::AtomicU64>,
     /// R9: when we last issued a rotation cert (either path). Not persisted — a
     /// restart deliberately clears it, so a wedged guard re-arms on the next trigger.
     last_issue_time: Option<std::time::Instant>,
@@ -399,6 +436,7 @@ impl HkApp {
             undecided: BTreeMap::new(),
             decided: BTreeMap::new(),
             history_min: 0,
+            index_floor: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
             last_issue_time: None,
             master_seed,
             root,
@@ -1377,6 +1415,7 @@ impl HkApp {
             if height % snapshot_every() == 0 {
                 let t_snap = std::time::Instant::now();
                 let snap = self.make_snapshot();
+                store.rotate_snapshot_if_configured(); // S3: HK_KEEP_PREV_SNAPSHOT=1
                 match store.save_snapshot(&snap) {
                     Ok(()) => {
                         let mp = self.mempool.lock().unwrap();
@@ -1384,14 +1423,64 @@ impl HkApp {
                             error!(%e, "failed to reset mempool WAL");
                         }
                         info!(height, "Node snapshot persisted (restart resumes here)");
+                        // C2.8: everything at-or-below this snapshot may be packed into
+                        // segments — one segment per snapshot, off the commit path.
+                        store.compact_one_background(height);
+                        // C2.8 retention: whole old segments only; the servable floor moves up.
+                        match store.prune_below(height, retain_blocks()) {
+                            Ok(Some(min)) => {
+                                if min > self.history_min {
+                                    self.history_min = min;
+                                    store.set_disk_min(min);
+                                    info!(height, servable_from = min, "block log: retention pruned old segments");
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => warn!(%e, "block log: retention prune failed"),
+                        }
                     }
                     Err(e) => error!(%e, height, "failed to persist snapshot"),
                 }
                 self.timers.snap_ms += t_snap.elapsed().as_millis() as u64;
             }
+            // S2: the search index goes to disk on its own cadence.
+            if height % index_persist_every() == 0 {
+                self.persist_index(&store, height);
+            }
         }
 
         Ok(())
+    }
+
+    // ---- S2 (v0.16.0): search index persistence ----
+
+    /// Write the search index to disk. Coverage is the tip once the history pass is
+    /// done, else the pass's contiguous floor (heights above it are indexed live but
+    /// a resumed pass must not skip the gap).
+    fn persist_index(&self, store: &Arc<NodeStore>, tip: u64) {
+        let floor = self.index_floor.load(std::sync::atomic::Ordering::Relaxed);
+        let through = if floor == u64::MAX { tip } else { floor };
+        if through == 0 {
+            return;
+        }
+        let ix = {
+            let ti = self.tx_index.lock().unwrap_or_else(|e| e.into_inner());
+            let ai = self.acct_index.lock().unwrap_or_else(|e| e.into_inner());
+            crate::store::PersistedIndex {
+                through_height: through,
+                tx: ti.iter().filter(|(_, (h, _))| *h <= through).map(|(id, (h, i))| (*id, *h, *i)).collect(),
+                acct: ai
+                    .iter()
+                    .map(|(a, list)| {
+                        (*a, list.iter().filter(|(_, h, _)| *h <= through).map(|(id, h, k)| (*id, *h, (*k).to_string())).collect())
+                    })
+                    .collect(),
+            }
+        };
+        match store.save_index(&ix) {
+            Ok(()) => info!(through, txs = ix.tx.len(), "search index persisted (S2)"),
+            Err(e) => warn!(%e, "search index persist failed (rebuilt from the block log next restart)"),
+        }
     }
 
     // ---- P3.0/WS-B: snapshot + restore ----
@@ -1559,11 +1648,40 @@ impl HkApp {
         // txid, so the two never double-count. `HK_INDEX_HISTORY=0` skips it (a voter
         // that serves no explorer). RSS stays O(window), not O(height).
         let index_history = std::env::var("HK_INDEX_HISTORY").map(|v| v != "0").unwrap_or(true);
-        if index_history && files_below > 0 {
+        // S2 (v0.16.0): resume from the persisted index — the pass only reads heights
+        // above what the last write covered (a corrupt/absent file = start from 1).
+        let indexed_through = match store.load_index() {
+            Some(ix) => {
+                let through = ix.through_height.min(snap_height);
+                {
+                    let mut ti = self.tx_index.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut ai = self.acct_index.lock().unwrap_or_else(|e| e.into_inner());
+                    for (id, h, i) in ix.tx {
+                        if h <= through {
+                            ti.insert(id, (h, i));
+                        }
+                    }
+                    for (acct, list) in ix.acct {
+                        let e = ai.entry(acct).or_default();
+                        for (id, h, kind) in list {
+                            if h <= through {
+                                e.push((id, h, kind_static(&kind)));
+                            }
+                        }
+                    }
+                }
+                info!(through, "search index restored from disk (S2) — resuming above it");
+                through
+            }
+            None => 0,
+        };
+        let todo: Vec<u64> = heights.iter().copied().filter(|h| *h > indexed_through && *h <= snap_height).collect();
+        if index_history && !todo.is_empty() {
             let store = store.clone();
             let ti = self.tx_index.clone();
             let ai = self.acct_index.clone();
-            let todo: Vec<u64> = heights.iter().copied().filter(|h| *h <= snap_height).collect();
+            let floor = self.index_floor.clone();
+            floor.store(indexed_through, std::sync::atomic::Ordering::Relaxed);
             let _detached = std::thread::Builder::new()
                 .name("hk-index-history".into())
                 .spawn(move || {
@@ -1580,11 +1698,13 @@ impl HkApp {
                             Ok(None) => {}
                             Err(e) => warn!(%e, height = h, "index pass: unreadable block file (skipped)"),
                         }
+                        floor.store(h, std::sync::atomic::Ordering::Relaxed);
                         done += 1;
                         if done % 20_000 == 0 {
                             info!(done, txs_seen, "index pass: progress");
                         }
                     }
+                    floor.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
                     info!(
                         blocks = done,
                         txs = txs_seen,
@@ -1593,6 +1713,39 @@ impl HkApp {
                     );
                 })
                 .map_err(|e| eyre!("spawning index pass: {e}"))?;
+        } else {
+            // Nothing to index (or HK_INDEX_HISTORY=0: history stays unindexed and the
+            // persisted coverage must not claim otherwise).
+            let floor = if index_history { u64::MAX } else { indexed_through };
+            self.index_floor.store(floor, std::sync::atomic::Ordering::Relaxed);
+        }
+        let _ = files_below;
+
+        // C2.8 (v0.16.0): migrate the per-height block log into segments in the
+        // background, oldest first — every complete span at-or-below the snapshot.
+        // `HK_COMPACT_HISTORY=0` leaves the old layout alone (both are readable).
+        if std::env::var("HK_COMPACT_HISTORY").map(|v| v != "0").unwrap_or(true) {
+            let store = store.clone();
+            let _detached = std::thread::Builder::new()
+                .name("hk-compact".into())
+                .spawn(move || match store.compactable_segments(snap_height) {
+                    Ok(ids) if !ids.is_empty() => {
+                        let t0 = std::time::Instant::now();
+                        let (mut segs, mut files) = (0u64, 0usize);
+                        for id in ids {
+                            match store.compact_segment(id) {
+                                Ok(n) => {
+                                    segs += 1;
+                                    files += n;
+                                }
+                                Err(e) => warn!(%e, segment = id, "block log: compaction failed (files kept)"),
+                            }
+                        }
+                        info!(segments = segs, files_retired = files, secs = t0.elapsed().as_secs(), "block log: migration to segments complete");
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!(%e, "block log: could not list segments"),
+                });
         }
 
         // Mempool WAL: admissions since the last snapshot, re-run through the SAME

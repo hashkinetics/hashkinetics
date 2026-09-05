@@ -47,19 +47,21 @@ impl AccountFile {
         dir.join("account.json")
     }
 
+    /// K1 (v0.16.0): the file may be sealed (`HKE1`); `keys::read_secret` opens it with
+    /// `HK_WALLET_PASSPHRASE` / `_FILE` / systemd credential / prompt. Plain files never ask.
     pub(crate) fn load(dir: &Path) -> eyre::Result<Self> {
         let p = Self::path(dir);
-        let s = fs::read_to_string(&p)
-            .map_err(|e| eyre::eyre!("no account at {} ({e}) — run account-new first", p.display()))?;
+        if !p.exists() {
+            return Err(eyre::eyre!("no account at {} — run account-new first", p.display()));
+        }
+        let s = crate::keys::read_secret(&p, crate::keys::Secret::Wallet)?;
         Ok(serde_json::from_str(&s)?)
     }
 
+    /// Atomic (tmp → fsync → rename); a sealed file is written back sealed.
     pub(crate) fn save(&self, dir: &Path) -> eyre::Result<()> {
         fs::create_dir_all(dir)?;
-        let tmp = dir.join("account.json.tmp");
-        fs::write(&tmp, serde_json::to_string_pretty(self)?)?;
-        fs::rename(&tmp, Self::path(dir))?;
-        Ok(())
+        crate::keys::write_secret(&Self::path(dir), &serde_json::to_string_pretty(self)?, crate::keys::Secret::Wallet)
     }
 
     pub(crate) fn seed_bytes(&self) -> eyre::Result<Vec<u8>> {

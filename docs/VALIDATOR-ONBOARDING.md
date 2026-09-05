@@ -88,6 +88,9 @@ User=hk
 Environment=RUST_LOG=info
 # the verifying keys live at /home/hk/hk-validator/vks.json (copied from the kit); set
 # Environment=HK_VKS_FILE=<path> to point elsewhere, or HK_PROVER_URL=<prover-url> to fetch them instead
+# v0.16.0 — only if you sealed the key (§5a): the passphrase file is read by root and
+# handed to the process as $CREDENTIALS_DIRECTORY/hk-key-passphrase; it is never in the environment
+#LoadCredential=hk-key-passphrase:/etc/hk/key-passphrase
 ExecStart=/home/hk/chain/target/release/hk-node start /home/hk/hk-validator
 Restart=always
 RestartSec=5
@@ -99,6 +102,70 @@ WantedBy=multi-user.target
 resumes from its block log + snapshot to a byte-identical state commitment. There is no
 "resync from genesis" and no state to lose. Reserve-then-sign signer persistence means a
 crash can never reuse a one-time signature leaf.
+
+### 5a · Keys at rest (v0.16.0, optional but recommended)
+
+`priv_validator_key.json` is the SLH-DSA root seed — everything (votes, rotations,
+set-change approvals) derives from it. Since v0.16.0 it can live on disk **sealed**:
+Argon2id (default **512 MiB, 4 passes, 4 lanes** — about a second) derives a key from a
+passphrase, XChaCha20-Poly1305 encrypts the JSON, and the file becomes an `HKE1` envelope
+that says what it is (and which parameters it used) without revealing anything.
+
+```bash
+hk-node key-seal ~/hk-validator          # prompts twice; or export HK_KEY_PASSPHRASE for scripts
+sudo install -m 0600 -o root -g root /dev/stdin /etc/hk/key-passphrase <<< '<the passphrase>'
+# then uncomment LoadCredential= in the unit above, `systemctl daemon-reload`, restart
+hk-node key-unseal ~/hk-validator        # back to plaintext (migration / HSM import)
+```
+
+**Brute force, plainly.** Someone who copies the file can guess passphrases offline forever;
+what stops them is the cost of one guess times the number of guesses your passphrase forces.
+At 512 MiB per guess a GPU fits a few dozen guesses at a time and each is memory-bound, so a
+card manages tens of guesses per second, not billions — and the passphrase is checked, not
+trusted: `key-seal` refuses fewer than 12 characters (unless it is a 4+-word phrase), common
+words with decoration, keyboard walks and repeats. `hk-node passphrase-new` prints seven
+random words (63 bits): at this KDF cost that is millions of GPU-years. `HK_SEAL_M_KIB` /
+`HK_SEAL_T` raise or lower the profile for a new seal (floor 64 MiB / t=3; a small host can
+use 128–256 MiB); a file always opens with the parameters it was sealed with. The KDF runs
+once per process — the node derives at start and never again.
+
+**Second factor (optional, recommended for seats):** `hk-node keyfile-new /etc/hk/seat.key`
+writes 32 random bytes; export `HK_KEY_KEYFILE=/etc/hk/seat.key` when you run `key-seal`
+and in the unit. The envelope records the key file's fingerprint (`kf`); without the file,
+the passphrase opens nothing — brute force becomes impossible rather than slow. Keep the
+key file on a different device than any backup of the sealed key.
+
+Where the node looks for the passphrase, first hit wins: `HK_KEY_PASSPHRASE` →
+`HK_KEY_PASSPHRASE_FILE=<path>` (first line) → systemd `LoadCredential=hk-key-passphrase:…`
+→ an interactive prompt when started on a terminal. Without any of them a sealed key makes
+`start` fail loudly ("this file is sealed — set HK_KEY_PASSPHRASE…") rather than run half-armed.
+`issue-rotation` and `set-change approve` read the sealed file the same way. A key generated
+with `HK_KEY_PASSPHRASE` exported is sealed from its first byte on disk.
+
+What this buys and what it does not, plainly: a stolen backup, a copied home directory or a
+disk image are useless without the passphrase. A **running** node still holds the seed in
+memory, and `consensus_state.bin` — the live LMS tree state, rewritten on every vote — is
+not sealed in v0.16.0 (it is the current operational tree only; a root-signed rotation
+retires it, and it never reveals the root seed). The HSM path is described in
+`docs/MAINNET-KEY-MANAGEMENT.md`; the sealed file is the software floor until then.
+
+### 5b · Disk: block-log segments, retention, persisted index (v0.16.0)
+
+Nothing to configure by default. What changed under you: committed blocks older than the
+hot tail are compacted into 1,024-block segment files (`blocks/seg000000000.hkb` …) at
+snapshot time, the tx/account search index persists (`index3.bin`) so a restart no longer
+replays history to rebuild it, and the previous snapshot can be kept as a fallback. Knobs,
+all environment variables on `start`:
+
+| variable | default | meaning |
+|---|---|---|
+| `HK_RETAIN_BLOCKS=N` | unset (keep everything) | delete whole segments older than `tip − N` blocks (never the hot tail, never a partial segment); an archive node leaves this unset |
+| `HK_KEEP_PREV_SNAPSHOT=1` | off | keep `snapshot.prev` next to the live snapshot |
+| `HK_INDEX_PERSIST_EVERY=N` | every snapshot | also persist the search index every N blocks |
+| `HK_COMPACT_HISTORY=0` | 1 (on) | skip the one-time background compaction of pre-v0.16 per-height files |
+
+A pruned node answers `hk_getBlock` for heights it dropped with "not found" and says so
+in `hk_chainInfo` (`retain_blocks`); explorers and auditors should point at an archive node.
 
 ## 6 · Verify you're live
 

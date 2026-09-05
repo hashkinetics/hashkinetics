@@ -171,6 +171,35 @@ spend circuit) are the same ones gate 2 is already benchmarking.
   (certifying epoch keys) while epoch keys certify operational keys *hourly* — the
   root then touches key material a handful of times a year.
 
+### Where the software stands today (v0.16.0) and the seam an HSM plugs into
+
+- **Keys at rest — shipped.** `priv_validator_key.json` (root seed), `account.json`,
+  `wallet.json` and the GUI's `shield.json` can be sealed on disk: the `HKE1` envelope
+  (`hk-wallet/src/sealed.rs`) — Argon2id 512 MiB/t=4/p=4 by default (parameters ride in
+  the envelope; `HK_SEAL_M_KIB`/`HK_SEAL_T`, floor 64 MiB/t=3) → XChaCha20-Poly1305, AAD
+  `hk/v1/sealed`, one salt per key, a fresh nonce per write; the derived key is cached so
+  the KDF runs once per unlock. Passphrase strength is enforced (`check_strength`), a
+  7-word generator exists (`passphrase-new`), and an optional key file (`keyfile-new`,
+  `*_KEYFILE`) is a second factor the backup never carries. Passphrase sources: env, file,
+  systemd `LoadCredential=`, prompt. Commands: `hk-node key-seal|key-unseal HOME`,
+  `account-seal|account-unseal DIR`; the GUI has "Protect with a passphrase". A plain file
+  keeps working — sealing is per file, per operator, reversible.
+- **Not sealed yet:** `consensus_state.bin`, the advancing LMS/HSS private state
+  (`used ‖ state`) rewritten on every signature. It is the *current operational tree*
+  only — it cannot yield the root, and a root-signed rotation retires it — but a copy
+  taken between two votes can sign as that operational key until rotation. Sealing it
+  needs the derived key held in memory and one AEAD per write (cheap); it is scheduled
+  with the signer refactor below rather than bolted on.
+- **The seam.** Every signer the node uses goes through `hk_consensus::HkPriv` →
+  `HashSigner::sign(&mut self, msg) -> Option<Vec<u8>>` with persistence inside the
+  call (reserve-then-sign). An HSM-backed signer implements the same surface: the module
+  holds the LMS private state and its monotone counter, the node passes the message
+  digest and receives the signature; `remaining()` and `used()` come from the module.
+  The root (`RootSecret`, SLH-DSA-192s, stateless) needs only `sign(bytes)` — the
+  easiest half to move into an HSM first, since it signs a handful of certs a year.
+  Nothing in consensus, the wire format or the certificates changes when the seed
+  stops being a file.
+
 ---
 
 ## Validator lifecycle (staking)

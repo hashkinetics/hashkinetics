@@ -1,4 +1,4 @@
-# HashKinetics JSON-RPC — the complete reference (node v0.15.2)
+# HashKinetics JSON-RPC — the complete reference (node v0.16.0)
 
 **Every method the node answers, with parameters, result shapes, limits and the errors you can get.** The public endpoint is `https://rpc.hashkinetics.org` (testnet-1, `hashkinetics-1-4e4ea68d`); a local node answers on `http://127.0.0.1:26000`. This is the same API the website, the explorer, the faucet and the Windows wallet use — there is no second, private one. Source of truth: `chain/crates/hk-node/src/rpc.rs` (one `dispatch` match; if this page and the code disagree, the code wins and this page has a bug).
 
@@ -18,12 +18,12 @@ curl -s -X POST https://rpc.hashkinetics.org \
 
 | Method | Params | Result |
 |---|---|---|
-| `hk_chainInfo` | — | `chain_id`, `genesis_digest`, `node_version` (v0.15.2: the binary answering, e.g. `v0.15.2`), `peers` (v0.15.2: live p2p peer count), `height`, `app_hash`, `signer{epoch, remaining, capacity}` (this node's own operational-key budget; observers report their own unused tree), `fee{micro, from_height, burned_micro}`, `history{disk_from, ram_window, indexed_txs}` |
+| `hk_chainInfo` | — | `chain_id`, `genesis_digest`, `node_version` (v0.15.2: the binary answering, e.g. `v0.15.2`), `peers` (v0.15.2: live p2p peer count), `height`, `app_hash`, `signer{epoch, remaining, capacity}` (this node's own operational-key budget; observers report their own unused tree), `fee{micro, from_height, burned_micro}`, `history{disk_from, ram_window, indexed_txs, retain_blocks}` (v0.16.0: `retain_blocks` = null on an archive node, N when the node prunes segments older than tip−N) |
 | `hk_getValidators` | — | `count`, `total_power`, `validators[{address, voting_power, epoch, root_pk}]` — the set as of the tip; `epoch` climbs on every self-rotation |
 | `hk_getMempool` | — | `count`, `txids[≤100]` — this node's pending admissions |
 | `hk_getPeers` | — | **v0.15.2 (N1).** This node's live p2p peer table, straight from its swarm: `self{peer_id, version, genesis_digest}`, `count`, `inbound`, `outbound`, `public_addr` (peers on a public address), `identified` (identify received on the consensus protocol), `islands_refused` (peers on a different genesis disconnected by the genesis gate since boot), `peers[{peer_id, direction: inbound\|outbound, addr, private_addr, version, genesis: match\|untagged\|pending\|mismatch, identified, connected_secs, connections}]`. `addr` is the connection's real remote address masked by the node to its /24 (v4) or /48 (v6) — never what the peer claims to listen on; `private_addr` marks loopback / RFC 1918 / CGNAT / ULA peers (the founding fleet peers over its private network); `version` is `null` for a ≤ v0.15.1 peer (it advertises its genesis but not its version). An entry exists only while a connection is open. The gateway's table is the network's public roll call because every kit node bootstraps through it; a node that peers only with other operators is not visible there |
 
-`fee.burned_micro` is the cumulative burn since genesis (in `C(Σ)` once nonzero); `history.disk_from` is the lowest height this node can serve from its block log (the gap-free suffix — R10 v2), `ram_window` the number of recent decided heights held in memory, `indexed_txs` the size of the node-local search index (0 while the background index pass is still running after a restart).
+`fee.burned_micro` is the cumulative burn since genesis (in `C(Σ)` once nonzero); `history.disk_from` is the lowest height this node can serve from its block log (the gap-free suffix — R10 v2), `ram_window` the number of recent decided heights held in memory, `indexed_txs` the size of the node-local search index (since v0.16.0 it is restored from `index3.bin` on restart, so it is rarely 0), `retain_blocks` (v0.16.0) the node's `HK_RETAIN_BLOCKS` setting or null — a pruned node answers `hk_getBlock` below `disk_from` with `not found`; point explorers and auditors at an archive node such as the public endpoint.
 
 ## Blocks & history
 

@@ -21,6 +21,12 @@
 //! - Cooldowns persist (`faucet-cooldowns.json` next to the wallet) and the map is
 //!   bounded: a restart no longer hands everyone a fresh drip, and a scan of a
 //!   million addresses no longer grows memory without limit (H9, v0.13.2).
+//! - K3 (v0.16.0) hot/cold: the faucet account is a HOT wallet holding a small float;
+//!   the treasury stays in a COLD account that tops it up by hand (docs/FAUCET-RUNBOOK.md).
+//!   `/health` reports `low` (balance under `HK_FAUCET_LOW_MICRO`, default 50 drips) and
+//!   `drips_left`; below `HK_FAUCET_RESERVE_MICRO` (default 2 drips) it refuses with 503
+//!   instead of burning a ratchet index on a doomed transfer. Its `account.json` can be
+//!   sealed (`hk-node account-seal DIR`; passphrase via `LoadCredential=hk-wallet-passphrase`).
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -44,6 +50,10 @@ pub(crate) struct FaucetCfg {
     pub asset: H256,
     pub cooldown: Duration,
     pub daily_cap: u32,
+    /// K3: `/health.low = balance < low_micro` — the refill signal for the cold wallet.
+    pub low_micro: Amount,
+    /// K3: below this the faucet answers 503 rather than sign a transfer that will fail.
+    pub reserve_micro: Amount,
 }
 
 struct FaucetState {
@@ -69,8 +79,14 @@ pub(crate) fn serve(cfg: FaucetCfg) -> eyre::Result<()> {
     let bal = demo::balance(&cfg.node_rpc, &id);
     println!("🚰 faucet up: account {} · balance {bal} micro · drip {} micro", file.id, cfg.drip);
     println!("   listening on {} (put nginx in front; X-Forwarded-For honored)", cfg.listen);
-    if bal < cfg.drip * 10 {
-        println!("   ⚠ balance covers <10 drips — refill soon");
+    println!(
+        "   K3 hot/cold: low watermark {} micro ({} drips) · reserve floor {} micro — top up from the cold account",
+        cfg.low_micro,
+        cfg.low_micro / cfg.drip.max(1),
+        cfg.reserve_micro
+    );
+    if bal < cfg.low_micro {
+        println!("   ⚠ LOW: balance {bal} micro is under the watermark — refill from the cold wallet");
     }
 
     let listener = TcpListener::bind(&cfg.listen)?;
@@ -143,7 +159,19 @@ fn handle(st: std::sync::Arc<FaucetState>, mut stream: TcpStream) -> eyre::Resul
         return Ok(());
     }
     if method == "GET" && path.starts_with("/health") {
-        let h = health_json(&st.cfg.node_rpc, &st.faucet_id, st.cfg.drip);
+        let mut h = health_json(&st.cfg.node_rpc, &st.faucet_id, st.cfg.drip);
+        // K3: the refill signal. `low` is what the site/alerts watch; `drips_left` is the
+        // human number; `reserve_micro` is where drips stop.
+        let bal: Amount = h
+            .get("faucet_balance_micro")
+            .and_then(|b| b.as_u64().map(|x| x as Amount).or_else(|| b.as_f64().map(|f| f as Amount)))
+            .unwrap_or(0);
+        if let Some(o) = h.as_object_mut() {
+            o.insert("low".into(), json!(bal < st.cfg.low_micro));
+            o.insert("low_watermark_micro".into(), json!(st.cfg.low_micro));
+            o.insert("reserve_micro".into(), json!(st.cfg.reserve_micro));
+            o.insert("drips_left".into(), json!(bal.saturating_sub(st.cfg.reserve_micro) / st.cfg.drip.max(1)));
+        }
         respond(&mut stream, "200 OK", &h);
         return Ok(());
     }
@@ -247,6 +275,20 @@ fn handle(st: std::sync::Arc<FaucetState>, mut stream: TcpStream) -> eyre::Resul
         respond(&mut stream, "400 Bad Request", &json!({"error":"body must be {\"auth_commit\":\"<64 hex>\"} or {\"account\":\"<64 hex>\"}"}));
         return Ok(());
     };
+
+    // ---- K3: reserve floor — refuse instead of burning a ratchet index --------------
+    {
+        let bal = demo::balance(&st.cfg.node_rpc, &st.faucet_id);
+        if bal < st.cfg.reserve_micro.saturating_add(st.cfg.drip) {
+            undo_stamp(&st, &ip);
+            eprintln!("⚠ faucet dry: balance {bal} micro < reserve {} + drip {} — refill from the cold wallet", st.cfg.reserve_micro, st.cfg.drip);
+            respond(&mut stream, "503 Service Unavailable", &json!({"error":"faucet is being refilled — try again later", "faucet_balance_micro": bal}));
+            return Ok(());
+        }
+        if bal < st.cfg.low_micro {
+            eprintln!("⚠ faucet low: balance {bal} micro < watermark {} — refill from the cold wallet", st.cfg.low_micro);
+        }
+    }
 
     // ---- sign (reserve-then-sign) + submit + receipt ----------------------
     let txid = {

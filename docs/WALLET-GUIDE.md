@@ -1,4 +1,4 @@
-# HashKinetics Wallet — user guide (Windows · v0.13.1 · testnet-1)
+# HashKinetics Wallet — user guide (Windows · v0.14.0 · testnet-1)
 
 **What to click first, how to hide money, how to show it again, how to pay someone privately, and how to prove one payment to one person.** The same guide exists as a slide deck (`HashKinetics-Wallet-Guide.pptx` / `.pdf`, screenshots in `wallet-guide-shots/`); this is the text version for the repository and the website (`/wallet`). Everything here was done on the live network on 2026-09-02 — the transaction ids are real and searchable in the explorer.
 
@@ -61,6 +61,16 @@ Open **Backup & advanced**. Your keys live in `%USERPROFILE%\.hashkinetics\`:
 - `account.json` — the transparent seed and your ratchet counter. `copy seed` puts the 64-hex seed on the clipboard; store it offline.
 - `shield.json` — created the first time you shield. It holds the **shielded master** and two counters that must never run backwards (the one-time spend key index and the note tag). **Back it up too, and never restore an older copy over a newer one** — a reused one-time key would leak spend authority. Restoring the shielded side from the account seed alone is deliberately not offered.
 
+### 5a · Protect with a passphrase (wallet v0.14.0)
+
+Under **Backup & advanced → Protect with a passphrase**, type a passphrase twice — 12+ characters, or a passphrase of 4+ words; **generate** gives you seven random words (write them down) — and click **Protect this wallet**. From then on both files are stored **encrypted** (Argon2id 512 MiB → XChaCha20-Poly1305; the file starts with `"hke": 1` instead of your seed), and the wallet opens to an **Unlock** screen. Unlocking takes about a second (that is the brute-force cost, paid once); everything after is instant. The passphrase is kept in memory for the session only.
+
+- A copied `account.json` / `shield.json` is useless without the passphrase. A running, unlocked wallet still holds the keys in memory — lock your screen, not just the wallet.
+- **There is no recovery.** Forget the passphrase and the files are gone; the 64-hex **seed backup** from §5 is what brings the transparent account back (the shielded side follows the rule above — keep a copy of `shield.json` from *before* you protected it, or unprotect, back up, re-protect).
+- **How hard is it to guess?** A copied file lets an attacker try passphrases offline; each try costs 512 MiB of memory and about a second of work, so even a GPU manages tens of guesses per second. Weak passphrases are refused (short, common words with digits, keyboard walks); seven generated words are 63 bits — beyond any offline attack at that cost. A key file (`HK_WALLET_KEYFILE=<path>` set when you protect and when you unlock; make one with `hk-node keyfile-new`) adds a second factor the backup never carries.
+- The CLI reads the same envelope: `hk-node account-*` and `wallet` commands on a protected directory take the passphrase from `HK_WALLET_PASSPHRASE`, `HK_WALLET_PASSPHRASE_FILE` or a prompt, and `hk-node account-seal DIR` / `account-unseal DIR` do the same conversion from a terminal.
+- **Remove passphrase (write plain files)** puts plain JSON back on disk; **Change** re-seals under a new one (the old one must be loaded — the wallet is unlocked).
+
 ## 6 · What "shielded" means here
 
 Money in the **pool** is a set of hash-committed notes; who owns which note, and how much it is, is invisible to the chain and to the explorer. Spending a note produces a STARK proof (made for you by the public prover, verified by every validator) and a **nullifier** that prevents the note being spent twice — without revealing which note it was. The explorer shows the pool's total and the nullifier count, nothing else. There is no master view key anywhere in the design; disclosure is one payment, one time, to one party (step 11).
@@ -116,6 +126,8 @@ Every note has a **disclose** button. It writes `disclosure-<id>.json` next to y
 | spinner for a long time on a shielded op | the prover is proving (up to 15 min under load) | wait; the receipt lands in ACTIVITY |
 | `shield.json` error about capacity | 64 one-time spend keys used on this master | move `shield.json` aside (keep it!) and shield again with a fresh master — old notes stay spendable from the old file |
 | a payment shows `rejected: …` | the chain refused it — the log says why | nothing was spent; fix the cause and retry |
+| opens to **This wallet is protected** | the files are sealed (v0.14.0) | type the passphrase; there is no reset — use the seed backup if it is lost |
+| `Could not unlock: wrong passphrase` | typo, or a file was tampered with | retry; the wallet never half-opens a sealed file |
 
 Files: `%USERPROFILE%\.hashkinetics\account.json` · `shield.json` · `disclosure-*.json`. The prover URL field defaults to `https://prover.hashkinetics.org`; point it at your own `hk-prove` if you run one.
 

@@ -227,6 +227,9 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
                     "disk_from": h.store.as_ref().map(|s| s.disk_min()).filter(|m| *m > 0),
                     "ram_window": crate::state::decided_window(),
                     "indexed_txs": h.tx_index.lock().unwrap_or_else(|e| e.into_inner()).len(),
+                    // C2.8 (v0.16.0): null = archive node (keeps every block); N = this node
+                    // prunes whole segments older than tip−N, and `disk_from` moves up.
+                    "retain_blocks": Some(crate::state::retain_blocks()).filter(|r| *r > 0),
                 },
             }})
         }

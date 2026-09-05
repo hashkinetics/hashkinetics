@@ -13,7 +13,7 @@
 
 /// The release label this binary reports (`hk-node --version`, the usage banner).
 /// Bump with every node release; the crate version is workspace-wide and not it.
-pub const NODE_VERSION: &str = "v0.15.2";
+pub const NODE_VERSION: &str = "v0.16.0";
 
 mod account;
 mod app;
@@ -30,6 +30,7 @@ mod demo_mandates;
 mod demo_shielded;
 mod genesis;
 mod gossip;
+mod keys;
 mod mempool;
 mod node;
 mod rpc;
@@ -232,6 +233,64 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
             account::cmd_asset_id(&who, &sym)
         }
         Some("asset") => account::cmd_asset(&args[2..]),
+        // ---- K1/K2 (v0.16.0): keys at rest ------------------------------------------------
+        Some("key-seal") | Some("key-unseal") => {
+            // The validator seed. Sealed files are read by `start`, `issue-rotation` and
+            // `set-change approve` with HK_KEY_PASSPHRASE / _FILE / LoadCredential / prompt.
+            let cmd = args[1].as_str();
+            let home = PathBuf::from(args.get(2).cloned().ok_or_else(|| eyre::eyre!("usage: hk-node {cmd} <HOME>"))?);
+            let key_path = home.join("priv_validator_key.json");
+            if cmd == "key-seal" {
+                let mut pass = None;
+                keys::seal_path(&key_path, keys::Secret::ValidatorKey, &mut pass)?;
+                println!("the node now needs the passphrase to start — see docs/VALIDATOR-ONBOARDING.md (keys at rest):");
+                println!("  systemd : LoadCredential=hk-key-passphrase:/etc/hk/key-passphrase   (root-only file)");
+                println!("  shell   : HK_KEY_PASSPHRASE_FILE=/etc/hk/key-passphrase hk-node start {}", home.display());
+                if std::env::var("HK_KEY_KEYFILE").map(|v| !v.trim().is_empty()).unwrap_or(false) {
+                    println!("  key file: the unit also needs Environment=HK_KEY_KEYFILE=<path> (or LoadCredential=hk-key-keyfile:<path> + HK_KEY_KEYFILE=%d/hk-key-keyfile)");
+                }
+                println!("  note    : consensus_state.bin (the live LMS tree state) stays plain in v0.16.0 — see the doc");
+            } else {
+                keys::unseal_path(&key_path, keys::Secret::ValidatorKey)?;
+            }
+            Ok(())
+        }
+        Some("keyfile-new") => {
+            // A key-file second factor: 32 random bytes the backup never carries. Point
+            // HK_KEY_KEYFILE / HK_WALLET_KEYFILE at it before `key-seal` / `account-seal`.
+            let path = PathBuf::from(args.get(2).cloned().ok_or_else(|| eyre::eyre!("usage: hk-node keyfile-new <PATH>"))?);
+            keys::keyfile_new(&path)
+        }
+        Some("passphrase-new") => {
+            // 7 words from a 512-word list = 63 bits (clear your scrollback after copying it).
+            let n: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(7);
+            println!("{}", hk_wallet::sealed::generate_passphrase(n));
+            Ok(())
+        }
+        Some("account-seal") | Some("account-unseal") => {
+            // account.json (transparent keychain) + wallet.json (shielded master) in DIR,
+            // one passphrase for both — the GUI wallet reads the same envelope.
+            let cmd = args[1].as_str();
+            let dir = PathBuf::from(args.get(2).cloned().ok_or_else(|| eyre::eyre!("usage: hk-node {cmd} <DIR>"))?);
+            let files = ["account.json", "wallet.json", "shield.json"];
+            let present: Vec<PathBuf> = files.iter().map(|f| dir.join(f)).filter(|p| p.exists()).collect();
+            if present.is_empty() {
+                eyre::bail!("nothing to {cmd} in {} (no account.json / wallet.json / shield.json)", dir.display());
+            }
+            let mut pass = None;
+            for p in &present {
+                if cmd == "account-seal" {
+                    keys::seal_path(p, keys::Secret::Wallet, &mut pass)?;
+                } else {
+                    keys::unseal_path(p, keys::Secret::Wallet)?;
+                }
+            }
+            if cmd == "account-seal" {
+                println!("every account-*/wallet/faucet-serve command on this DIR now needs the passphrase:");
+                println!("  HK_WALLET_PASSPHRASE_FILE=<path> (or HK_WALLET_PASSPHRASE, LoadCredential=hk-wallet-passphrase:…, or the prompt)");
+            }
+            Ok(())
+        }
         // ---- K6 (v0.15.1): the join kit ships the verifying keys ----------------------
         Some("vks-fetch") => {
             // Coordinator/operator-side: pull the three vks from a prover (http or https),
@@ -252,7 +311,7 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
             cmd_vks_fetch(&url, &out, gen.as_deref())
         }
         Some("faucet-serve") => {
-            let usage = "usage: hk-node faucet-serve <WALLET-DIR> <RPC> [--listen 127.0.0.1:9922] [--drip MICRO] [--asset HEX] [--cooldown-secs N] [--daily-cap N]";
+            let usage = "usage: hk-node faucet-serve <WALLET-DIR> <RPC> [--listen 127.0.0.1:9922] [--drip MICRO] [--asset HEX] [--cooldown-secs N] [--daily-cap N] [--low-micro N] [--reserve-micro N]   (env: HK_FAUCET_LOW_MICRO, HK_FAUCET_RESERVE_MICRO)";
             let dir = PathBuf::from(args.get(2).cloned().ok_or_else(|| eyre::eyre!(usage))?);
             let rpc = args.get(3).cloned().ok_or_else(|| eyre::eyre!(usage))?;
             let mut listen = "127.0.0.1:9922".to_string();
@@ -260,6 +319,10 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
             let mut asset: Option<String> = None;
             let mut cooldown: u64 = 86_400;
             let mut daily_cap: u32 = 200;
+            // K3: low watermark + reserve floor (flags win over env; defaults are drip-relative).
+            let env_u128 = |k: &str| std::env::var(k).ok().and_then(|s| s.trim().parse::<u128>().ok());
+            let mut low_micro: Option<u128> = env_u128("HK_FAUCET_LOW_MICRO");
+            let mut reserve_micro: Option<u128> = env_u128("HK_FAUCET_RESERVE_MICRO");
             let rest: Vec<String> = args[4..].to_vec();
             let mut i = 0;
             while i < rest.len() {
@@ -269,6 +332,8 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
                     "--asset" => { asset = rest.get(i + 1).cloned(); i += 2 }
                     "--cooldown-secs" => { cooldown = rest.get(i + 1).and_then(|s| s.parse().ok()).ok_or_else(|| eyre::eyre!(usage))?; i += 2 }
                     "--daily-cap" => { daily_cap = rest.get(i + 1).and_then(|s| s.parse().ok()).ok_or_else(|| eyre::eyre!(usage))?; i += 2 }
+                    "--low-micro" => { low_micro = Some(rest.get(i + 1).and_then(|s| s.parse().ok()).ok_or_else(|| eyre::eyre!(usage))?); i += 2 }
+                    "--reserve-micro" => { reserve_micro = Some(rest.get(i + 1).and_then(|s| s.parse().ok()).ok_or_else(|| eyre::eyre!(usage))?); i += 2 }
                     _ => return Err(eyre::eyre!(usage)),
                 }
             }
@@ -284,6 +349,8 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
                 asset,
                 cooldown: std::time::Duration::from_secs(cooldown),
                 daily_cap,
+                low_micro: low_micro.unwrap_or(drip.saturating_mul(50)),
+                reserve_micro: reserve_micro.unwrap_or(drip.saturating_mul(2)),
             })
         }
         Some("verify-disclosure") => {
@@ -316,6 +383,7 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
             eprintln!("join a testnet: docs/VALIDATOR-ONBOARDING.md (keygen → send validator.json → receive genesis → config-gen → start)");
             eprintln!("accounts (U1): account-new DIR · account-info DIR · account-balance RPC ID|DIR · account-send DIR RPC TO MICRO [ASSET] · account-create DIR RPC AUTH_COMMIT MICRO [ASSET] · faucet-serve DIR RPC [--drip …]");
             eprintln!("verifying keys (K6): vks-fetch PROVER_URL [-o vks.json] [--genesis genesis.json]  — a node reads HK_VKS_FILE or <HOME>/vks.json and needs no prover to verify");
+            eprintln!("keys at rest (K1/K2): key-seal|key-unseal HOME (priv_validator_key.json; HK_KEY_PASSPHRASE[_FILE] / LoadCredential=hk-key-passphrase) · account-seal|account-unseal DIR (account.json + wallet.json; HK_WALLET_PASSPHRASE[_FILE] / LoadCredential=hk-wallet-passphrase) · keyfile-new PATH (second factor via HK_KEY_KEYFILE / HK_WALLET_KEYFILE) · passphrase-new [WORDS]");
             eprintln!("issued assets (X1): asset-id ISSUER|DIR SYMBOL · asset register DIR RPC SYMBOL DECIMALS FLAGS(m/f/p/s|-) · asset mint DIR RPC ASSET TO MICRO · asset burn DIR RPC ASSET MICRO [DEST-hex] · asset freeze|unfreeze DIR RPC ASSET ACCOUNT · asset pause|unpause DIR RPC ASSET · asset info RPC ASSET|SYMBOL@ISSUER · asset list RPC");
             eprintln!("wallet: init DIR ACCOUNT [RPC] · status DIR [RPC] · address DIR [RPC] · scan DIR [RPC] · transfer DIR TO USD [RPC] · shield DIR USD [RPC] [PROVER] · unshield DIR USD [RPC] [PROVER] · pay DIR HKADDR USD [MEMO] [RPC] [PROVER] · disclose DIR COMMITMENT OUT.json [RPC]");
             Ok(())
@@ -561,7 +629,10 @@ fn cmd_keygen(home: &PathBuf, moniker: &str) -> eyre::Result<()> {
     }
     println!("generating hash-based validator key (LMS/HSS keygen — a moment)...");
     let seed: [u8; 32] = os_seed(); // H12: OS CSPRNG, no userspace generator state
-    std::fs::write(&key_path, serde_json::to_string_pretty(&seed)?)?;
+    // K2 (v0.16.0): written plain unless HK_KEY_PASSPHRASE is exported, in which case the
+    // seed is sealed from its first byte on disk. `hk-node key-seal HOME` does it later.
+    keys::write_secret(&key_path, &serde_json::to_string_pretty(&seed)?, keys::Secret::ValidatorKey)?;
+    let sealed_now = keys::is_sealed_file(&key_path);
     let gv = GenesisValidator {
         root_pk: RootSecret::from_seed(&seed).public_bytes().to_vec(),
         public_key: HkPriv::from_seed(seed).public(),
@@ -570,7 +641,14 @@ fn cmd_keygen(home: &PathBuf, moniker: &str) -> eyre::Result<()> {
     let vj = home.join("validator.json");
     std::fs::write(&vj, serde_json::to_string_pretty(&gv)?)?;
     println!("✓ key material written:");
-    println!("    {}  (SECRET — never leaves this machine; back it up)", key_path.display());
+    println!(
+        "    {}  (SECRET — never leaves this machine; back it up{})",
+        key_path.display(),
+        if sealed_now { "; SEALED with HK_KEY_PASSPHRASE" } else { "" }
+    );
+    if !sealed_now {
+        println!("    ↳ encrypt it at rest:  hk-node key-seal {}   (docs/VALIDATOR-ONBOARDING.md → keys at rest)", home.display());
+    }
     println!("    {}  (PUBLIC — send THIS to the genesis coordinator)", vj.display());
     println!("  moniker           : {moniker}");
     println!("  root identity     : SLH-DSA-192s {}…", hex::encode(&gv.root_pk[..8.min(gv.root_pk.len())]));
@@ -592,8 +670,8 @@ fn cmd_keygen(home: &PathBuf, moniker: &str) -> eyre::Result<()> {
 /// (never-signed ⇒ starts at leaf 0) and it rejoins consensus.
 fn cmd_issue_rotation(home: &PathBuf, epoch: Option<u64>, valid_from: u64) -> eyre::Result<()> {
     let key_path = home.join("priv_validator_key.json");
-    let raw = std::fs::read_to_string(&key_path)
-        .map_err(|e| eyre::eyre!("{}: {e} (run on the VALIDATOR's machine)", key_path.display()))?;
+    let raw = keys::read_secret(&key_path, keys::Secret::ValidatorKey)
+        .map_err(|e| eyre::eyre!("{e} (run on the VALIDATOR's machine)"))?;
     let seed: [u8; 32] = serde_json::from_str(&raw)?;
     let root = RootSecret::from_seed(&seed);
     let epoch = epoch.unwrap_or(1);
@@ -709,8 +787,8 @@ fn cmd_set_change(args: &[String]) -> eyre::Result<()> {
                 }
             }
             let key_path = home.join("priv_validator_key.json");
-            let raw = std::fs::read_to_string(&key_path)
-                .map_err(|e| eyre::eyre!("{}: {e} (run on the SEAT's machine)", key_path.display()))?;
+            let raw = keys::read_secret(&key_path, keys::Secret::ValidatorKey)
+                .map_err(|e| eyre::eyre!("{e} (run on the SEAT's machine)"))?;
             let seed: [u8; 32] = serde_json::from_str(&raw)?;
             let root = RootSecret::from_seed(&seed);
             println!("signing the set-change body with this seat's SLH-DSA root (stateless — never exhausts)...");

@@ -14,6 +14,12 @@ hk-state = { path = "../hk-state" }
 # Disclosure packages are serialized (JSON files handed to auditors) — P2.2.
 serde = { workspace = true }
 hex = { workspace = true }
+# K1/K2 (v0.16.0): the HKE1 sealed-file envelope (keys at rest) — Argon2id + XChaCha20-Poly1305.
+serde_json = { workspace = true }
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+rpassword = "7"
+rand = "0.8"
+zeroize = "1"
 
 [dev-dependencies]
-serde_json = { workspace = true }

@@ -64,15 +64,16 @@ pub fn shield_path() -> PathBuf {
     wallet_dir().join("shield.json")
 }
 
+/// K1 (v0.14.0): `shield.json` may be sealed under the session passphrase (`crate::vault`).
 pub fn load_shield() -> Option<ShieldFile> {
-    let s = std::fs::read_to_string(shield_path()).ok()?;
+    let s = crate::vault::read(&shield_path()).ok()??;
     serde_json::from_str(&s).ok()
 }
 
-fn save_shield(f: &ShieldFile) -> Result<(), String> {
+pub fn save_shield(f: &ShieldFile) -> Result<(), String> {
     std::fs::create_dir_all(wallet_dir()).map_err(|e| e.to_string())?;
     let tmp = wallet_dir().join("shield.json.tmp");
-    let bytes = serde_json::to_string_pretty(f).map_err(|e| e.to_string())?;
+    let bytes = crate::vault::encode(&shield_path(), &serde_json::to_string_pretty(f).map_err(|e| e.to_string())?)?;
     // v0.13.1: fsync before rename — the OTS index and note tag are never-reuse counters.
     crate::write_atomic(&shield_path(), &tmp, bytes.as_bytes())
 }
@@ -86,6 +87,10 @@ pub fn ots_budget() -> Option<(u32, u32)> {
 pub fn load_or_create_shield() -> Result<ShieldFile, String> {
     if let Some(f) = load_shield() {
         return Ok(f);
+    }
+    if shield_path().exists() {
+        // K1: sealed-and-locked, or unreadable — never create a fresh master over it.
+        return Err("shield.json exists but cannot be opened (locked or corrupt) — unlock the wallet first".into());
     }
     let mut m = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut m);

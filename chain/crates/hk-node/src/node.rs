@@ -103,8 +103,11 @@ impl Node for App {
         HkPriv::from_seed(file)
     }
 
+    /// K2 (v0.16.0): `priv_validator_key.json` may be sealed (`hk-node key-seal HOME`);
+    /// the passphrase comes from `HK_KEY_PASSPHRASE`, `HK_KEY_PASSPHRASE_FILE`, a systemd
+    /// `LoadCredential=hk-key-passphrase:…`, or a prompt when started on a terminal.
     fn load_private_key_file(&self) -> eyre::Result<Self::PrivateKeyFile> {
-        let raw = std::fs::read_to_string(self.key_path())?;
+        let raw = crate::keys::read_secret(&self.key_path(), crate::keys::Secret::ValidatorKey)?;
         serde_json::from_str(&raw).map_err(Into::into)
     }
 

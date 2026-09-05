@@ -66,17 +66,19 @@ fn wpath(dir: &Path) -> PathBuf {
     dir.join("wallet.json")
 }
 
+/// K1 (v0.16.0): `wallet.json` may be sealed — same passphrase source as `account.json`
+/// (`HK_WALLET_PASSPHRASE` …); `hk-node account-seal DIR` seals both in one go.
 fn load(dir: &Path) -> Result<WalletFile> {
-    let raw = std::fs::read_to_string(wpath(dir))
-        .map_err(|e| eyre!("no wallet at {} ({e}) — run `wallet init` first", dir.display()))?;
+    let p = wpath(dir);
+    if !p.exists() {
+        return Err(eyre!("no wallet at {} — run `wallet init` first", dir.display()));
+    }
+    let raw = crate::keys::read_secret(&p, crate::keys::Secret::Wallet)?;
     Ok(serde_json::from_str(&raw)?)
 }
 
 fn save(dir: &Path, w: &WalletFile) -> Result<()> {
-    let tmp = wpath(dir).with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(w)?)?;
-    std::fs::rename(&tmp, wpath(dir))?;
-    Ok(())
+    crate::keys::write_secret(&wpath(dir), &serde_json::to_string_pretty(w)?, crate::keys::Secret::Wallet)
 }
 
 fn keys(w: &WalletFile) -> Result<WalletKeys> {

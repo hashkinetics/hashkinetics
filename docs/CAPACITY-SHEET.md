@@ -46,6 +46,19 @@ Landed by the soak itself: real interval distribution from the public testnet ex
 
 **Landed 2026-08-27 (C2.1/C2.2):** indexed mempool (txid + sender-slot + pending-nullifier sets), admission mirrors apply's preconditions, O(mempool)-with-O(1)-tests prune. Storm evidence: rejected counts are pure FutureNonce backpressure (window 64), **included == admitted** (zero junk reached blocks), residual 0 after ≤3.1 s drains (was 60 s+ pre-C2 with stalls), block interval 2.04 → 1.62 s under identical load. Cap 8192 (`HK_MEMPOOL_CAP`), window 64 (`HK_NONCE_WINDOW`).
 
+## f · Seat scaling — how block cadence and per-block cost move with the number of voting seats (added 2026-09-05, `chain/bench-seats.sh`)
+
+Seats are not capped by the protocol: a seat is admitted by certificate (V1) and every seat adds one hash-based commit signature per block (LMS/HSS, ~KB-scale) plus one more voter the proposer must hear from. This table is the measured cost; rows come from `./bench-seats.sh N DURATION` — N validators on ONE box, unverified devnet (no STARK verifier, so consensus is the only thing timed). One-box numbers are a lower bound on WAN cadence and an upper bound on per-block bytes; the WAN number rides the soak.
+
+| Date | Seats | Window | Blocks/s | Mean interval | Commit sigs/block | Empty block bytes (≈ certificate) | RSS/node | Blocks needing round > 0 (last 20) | Notes |
+|---|---|---|---|---|---|---|---|---|---|
+| _(pending)_ | 4 | 120 s | | | | | | | baseline = the fleet's shape |
+| _(pending)_ | 8 | 120 s | | | | | | | |
+| _(pending)_ | 16 | 120 s | | | | | | | |
+| _(pending)_ | 32 | 120 s | | | | | | | one box may starve here — note the CPU count |
+
+Quote rule: "N seats measured at X blocks/s on one machine" — never "the chain supports N seats" from this table alone.
+
 ## Quote discipline
 
 Until the M1 row is green: public materials quote **"274 tx/s sustained (storm harness, 1,024-tx blocks, 4-validator devnet — measured)"** and may still say "183 TPS at today's measured config" (Tier-1 arithmetic from the 256/1.4s measured pair) and "183,000/s effective via channels" — both already provenance-labeled. The first storm report upgrades nothing publicly by itself; **the 30-min public-testnet run is what turns M1 into a quotable fact.**

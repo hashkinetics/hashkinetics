@@ -18,6 +18,10 @@
 //!   doomed envelope. "max" = balance − fee.
 //! - U3v2 (`shielded.rs`): shield / unshield / stealth pay / scan / disclose over the
 //!   public prover — the same lib code the CLI wallet and the P2 demos proved.
+//! - K1 (v0.14.0, node v0.16.0): "Protect with a passphrase" seals account.json and
+//!   shield.json on disk (`HKE1`: Argon2id → XChaCha20-Poly1305, the same envelope the
+//!   CLI's `account-seal` writes, so CLI and GUI still share a wallet). A sealed wallet
+//!   opens to an Unlock screen; the passphrase lives in memory for the session only.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -37,7 +41,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// Shown in the footer; bump with every release (the crate version is workspace-wide).
-pub const WALLET_VERSION: &str = "v0.13.1";
+pub const WALLET_VERSION: &str = "v0.14.0";
 const RPC_DEFAULT: &str = "https://rpc.hashkinetics.org";
 const FAUCET_DEFAULT: &str = "https://faucet.hashkinetics.org";
 const EXPLORER: &str = "https://www.hashkinetics.org/explorer/";
@@ -80,8 +84,178 @@ fn account_path() -> PathBuf {
     wallet_dir().join("account.json")
 }
 
+// ---------------------------------------------------------------------------
+// K1 — keys at rest (v0.14.0). One in-memory passphrase for both secret files.
+// ---------------------------------------------------------------------------
+
+pub mod vault {
+    //! The GUI's view of `hk_wallet::sealed`: while a passphrase is set, every secret file
+    //! is written sealed; while it is unset, files are written plain. A sealed file with no
+    //! passphrase in memory is "locked" — the loaders return `None` and the UI shows the
+    //! Unlock screen instead of offering to create a wallet over it.
+    //!
+    //! Brute-force posture (see the module docs in `hk_wallet::sealed`): the Argon2id work
+    //! (512 MiB, ≈1 s) runs ONCE at unlock/protect and the derived key is cached per salt;
+    //! every save afterwards is an AEAD call, so a heavy KDF costs the user nothing per send.
+    //! `HK_WALLET_KEYFILE=<path>` adds a key-file second factor (a file the backup does not
+    //! carry) to any wallet protected while it is set.
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    use hk_wallet::sealed::{self, Kdf, SealKey, Sealed};
+
+    #[derive(Default)]
+    struct State {
+        passphrase: Option<String>,
+        /// Derived keys by salt; `primary` is the salt new files are sealed under.
+        keys: HashMap<String, SealKey>,
+        primary: Option<String>,
+    }
+
+    static STATE: Mutex<Option<State>> = Mutex::new(None);
+
+    fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
+        let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        f(g.get_or_insert_with(State::default))
+    }
+
+    pub fn passphrase() -> Option<String> {
+        with(|s| s.passphrase.clone())
+    }
+
+    pub fn is_protected() -> bool {
+        passphrase().is_some()
+    }
+
+    fn keyfile() -> Result<Option<Vec<u8>>, String> {
+        sealed::keyfile_from_env("HK_WALLET").map_err(|e| e.to_string())
+    }
+
+    /// Forget everything (lock / remove passphrase).
+    pub fn clear() {
+        with(|s| *s = State::default());
+    }
+
+    /// Put a passphrase back without deriving anything yet (rollback path); keys are
+    /// derived per envelope as files are touched.
+    pub fn restore_passphrase(p: &str) {
+        with(|s| {
+            *s = State::default();
+            s.passphrase = Some(p.to_string());
+        });
+    }
+
+    /// Set a NEW passphrase: derives a fresh key (fresh salt) that becomes the primary.
+    pub fn set_new_passphrase(p: &str) -> Result<(), String> {
+        sealed::check_strength(p)?;
+        let key = SealKey::new(p, keyfile()?.as_deref(), Kdf::default_profile()).map_err(|e| e.to_string())?;
+        with(|s| {
+            *s = State::default();
+            s.passphrase = Some(p.to_string());
+            s.primary = Some(key.salt_hex());
+            s.keys.insert(key.salt_hex(), key);
+        });
+        Ok(())
+    }
+
+    /// Does this file exist as an `HKE1` envelope?
+    pub fn is_sealed_file(path: &Path) -> bool {
+        std::fs::read_to_string(path).map(|s| sealed::is_sealed(&s)).unwrap_or(false)
+    }
+
+    /// A sealed file we cannot open right now (no passphrase in memory).
+    pub fn is_locked(path: &Path) -> bool {
+        is_sealed_file(path) && passphrase().is_none()
+    }
+
+    fn key_for(env: &Sealed) -> Result<(), String> {
+        // Ensure a cached key exists for this envelope's salt (derive if needed).
+        let have = with(|s| s.keys.get(&env.salt).map(|k| k.fits(env)).unwrap_or(false));
+        if have {
+            return Ok(());
+        }
+        let p = passphrase().ok_or("locked")?;
+        let key = SealKey::for_envelope(env, &p, keyfile()?.as_deref()).map_err(|e| e.to_string())?;
+        with(|s| {
+            if s.primary.is_none() {
+                s.primary = Some(key.salt_hex());
+            }
+            s.keys.insert(key.salt_hex(), key);
+        });
+        Ok(())
+    }
+
+    /// Read a secret file: `Ok(Some)` plain or opened; `Ok(None)` = sealed and locked;
+    /// `Err` = wrong passphrase / missing key file / malformed / I/O.
+    pub fn read(path: &Path) -> Result<Option<String>, String> {
+        let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        if !sealed::is_sealed(&raw) {
+            return Ok(Some(raw));
+        }
+        if passphrase().is_none() {
+            return Ok(None);
+        }
+        let env = sealed::parse(&raw).map_err(|e| e.to_string())?;
+        key_for(&env)?;
+        let bytes = with(|s| s.keys[&env.salt].open(&env)).map_err(|e| e.to_string())?;
+        String::from_utf8(bytes).map(Some).map_err(|e| e.to_string())
+    }
+
+    /// Try a passphrase against `path`; on success it becomes the session passphrase and
+    /// the derived key is cached (the one expensive step of the session).
+    pub fn unlock(path: &Path, candidate: &str) -> Result<(), String> {
+        let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        if !sealed::is_sealed(&raw) {
+            clear();
+            return Ok(());
+        }
+        let env = sealed::parse(&raw).map_err(|e| e.to_string())?;
+        let key = SealKey::for_envelope(&env, candidate, keyfile()?.as_deref()).map_err(|e| e.to_string())?;
+        key.open(&env).map_err(|e| e.to_string())?;
+        with(|s| {
+            *s = State::default();
+            s.passphrase = Some(candidate.to_string());
+            s.primary = Some(key.salt_hex());
+            s.keys.insert(key.salt_hex(), key);
+        });
+        Ok(())
+    }
+
+    /// The bytes to put on disk for `plaintext` at `path`: sealed while a passphrase is
+    /// set (under the key of the envelope being replaced, else the primary key); plain otherwise.
+    pub fn encode(path: &Path, plaintext: &str) -> Result<String, String> {
+        if passphrase().is_none() {
+            return Ok(plaintext.to_string());
+        }
+        let existing = std::fs::read_to_string(path).ok().filter(|s| sealed::is_sealed(s));
+        let salt = match existing {
+            Some(raw) => {
+                let env = sealed::parse(&raw).map_err(|e| e.to_string())?;
+                key_for(&env)?;
+                env.salt
+            }
+            None => match with(|s| s.primary.clone()) {
+                Some(salt) => salt,
+                None => {
+                    // A new file with no primary key yet (e.g. right after a rollback): one derivation.
+                    let p = passphrase().ok_or("locked")?;
+                    let key = SealKey::new(&p, keyfile()?.as_deref(), Kdf::default_profile()).map_err(|e| e.to_string())?;
+                    let salt = key.salt_hex();
+                    with(|s| {
+                        s.primary = Some(salt.clone());
+                        s.keys.insert(salt.clone(), key);
+                    });
+                    salt
+                }
+            },
+        };
+        with(|s| s.keys[&salt].seal_to_json(plaintext)).map_err(|e| e.to_string())
+    }
+}
+
 fn load_account() -> Option<AccountFile> {
-    let s = std::fs::read_to_string(account_path()).ok()?;
+    let s = vault::read(&account_path()).ok()??;
     serde_json::from_str(&s).ok()
 }
 
@@ -101,8 +275,32 @@ pub fn write_atomic(path: &std::path::Path, tmp: &std::path::Path, bytes: &[u8])
 fn save_account(f: &AccountFile) -> Result<(), String> {
     std::fs::create_dir_all(wallet_dir()).map_err(|e| e.to_string())?;
     let tmp = wallet_dir().join("account.json.tmp");
-    let bytes = serde_json::to_string_pretty(f).map_err(|e| e.to_string())?;
+    let bytes = vault::encode(&account_path(), &serde_json::to_string_pretty(f).map_err(|e| e.to_string())?)?;
     write_atomic(&account_path(), &tmp, bytes.as_bytes())
+}
+
+/// K1: the two secret files as currently readable (under the CURRENT vault passphrase).
+/// Read BEFORE switching the passphrase, written AFTER — that is what makes a change of
+/// passphrase (or removing it) safe: nothing is written that was not first read back.
+type SecretFiles = (Option<AccountFile>, Option<shielded::ShieldFile>);
+
+fn read_secret_files() -> Result<SecretFiles, String> {
+    let a = if account_path().exists() { Some(load_account().ok_or("could not read account.json")?) } else { None };
+    let s = if shielded::shield_path().exists() { Some(shielded::load_shield().ok_or("could not read shield.json")?) } else { None };
+    Ok((a, s))
+}
+
+fn write_secret_files(files: &SecretFiles) -> Result<usize, String> {
+    let mut n = 0;
+    if let Some(a) = &files.0 {
+        save_account(a)?;
+        n += 1;
+    }
+    if let Some(s) = &files.1 {
+        shielded::save_shield(s)?;
+        n += 1;
+    }
+    Ok(n)
 }
 
 fn commit_at(seed: &[u8], nonce: u64) -> H256 {
@@ -488,6 +686,13 @@ struct App {
     evt_rx: Receiver<Evt>,
     evt_tx: Sender<Evt>,
     booted: bool,
+    // K1 — keys at rest
+    locked: bool,
+    unlock_input: String,
+    pass_new: String,
+    pass_repeat: String,
+    /// A generated passphrase shown in clear until the user protects or clears it.
+    generated: Option<String>,
 }
 
 impl App {
@@ -501,8 +706,9 @@ impl App {
         cc.egui_ctx.set_visuals(visuals);
         let (evt_tx, evt_rx) = channel();
         install_panic_hook(evt_tx.clone(), cc.egui_ctx.clone());
+        let locked = vault::is_locked(&account_path());
         Self {
-            account: load_account(),
+            account: if locked { None } else { load_account() },
             balance: None,
             on_chain: None,
             chain_id: None,
@@ -523,6 +729,100 @@ impl App {
             evt_rx,
             evt_tx,
             booted: false,
+            locked,
+            unlock_input: String::new(),
+            pass_new: String::new(),
+            pass_repeat: String::new(),
+            generated: None,
+        }
+    }
+
+    // ---- K1: unlock / protect / unprotect --------------------------------------------
+
+    fn unlock(&mut self) {
+        let candidate = std::mem::take(&mut self.unlock_input);
+        match vault::unlock(&account_path(), candidate.trim()) {
+            Ok(()) => {
+                self.locked = false;
+                self.account = load_account();
+                self.push_log("Wallet unlocked — the passphrase stays in memory for this session only.".into(), CYAN);
+                if let Some(id) = self.id_h256() {
+                    spawn_refresh(self.evt_tx.clone(), id);
+                }
+            }
+            Err(e) => self.push_log(format!("Could not unlock: {e}"), RED),
+        }
+    }
+
+    fn protect(&mut self) {
+        let a = self.pass_new.trim().to_string();
+        let b = self.pass_repeat.trim().to_string();
+        if a != b {
+            self.push_log("The two passphrases differ.".into(), RED);
+            return;
+        }
+        if let Err(why) = hk_wallet::sealed::check_strength(&a) {
+            self.push_log(format!("Passphrase refused: {why}. Try Generate — 7 random words are easy to type and beyond any offline attack."), RED);
+            return;
+        }
+        let files = match read_secret_files() {
+            Ok(f) => f,
+            Err(e) => {
+                self.push_log(format!("Could not read the wallet files — nothing changed: {e}"), RED);
+                return;
+            }
+        };
+        let previous = vault::passphrase();
+        // Argon2id 512 MiB × 4 passes: about a second, once. Every save afterwards is instant.
+        if let Err(e) = vault::set_new_passphrase(&a) {
+            self.push_log(format!("Could not derive the sealing key — nothing changed: {e}"), RED);
+            return;
+        }
+        match write_secret_files(&files) {
+            Ok(n) => {
+                self.pass_new.clear();
+                self.pass_repeat.clear();
+                self.generated = None;
+                let kf = if std::env::var("HK_WALLET_KEYFILE").map(|v| !v.trim().is_empty()).unwrap_or(false) { " + your key file" } else { "" };
+                self.push_log(format!("Protected: {n} file(s) sealed on disk (Argon2id 512 MiB → XChaCha20-Poly1305{kf}). Back up the passphrase — it cannot be recovered."), CYAN);
+            }
+            Err(e) => {
+                match &previous {
+                    Some(p) => vault::restore_passphrase(p),
+                    None => vault::clear(),
+                }
+                let _ = write_secret_files(&files);
+                self.push_log(format!("Could not seal the wallet files — restored the previous state: {e}"), RED);
+            }
+        }
+    }
+
+    fn generate_passphrase(&mut self) {
+        let p = hk_wallet::sealed::generate_passphrase(7);
+        self.pass_new = p.clone();
+        self.pass_repeat = p.clone();
+        self.generated = Some(p);
+    }
+
+    fn unprotect(&mut self) {
+        let files = match read_secret_files() {
+            Ok(f) => f,
+            Err(e) => {
+                self.push_log(format!("Could not read the wallet files — still protected: {e}"), RED);
+                return;
+            }
+        };
+        let previous = vault::passphrase();
+        vault::clear();
+        match write_secret_files(&files) {
+            Ok(n) => self.push_log(format!("Passphrase removed: {n} file(s) are plain JSON on disk again."), GOLD),
+            Err(e) => {
+                if let Some(p) = &previous {
+                    vault::restore_passphrase(p);
+                }
+                let _ = write_secret_files(&files);
+                self.push_log(format!("Could not rewrite the wallet files — still protected: {e}"), RED);
+            }
         }
     }
 
@@ -636,6 +936,27 @@ impl eframe::App for App {
             ui.separator();
             ui.add_space(8.0);
 
+            if self.locked {
+                // K1: a sealed wallet lives here — never offer to create one over it.
+                ui.label(egui::RichText::new("This wallet is protected.").size(16.0));
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Enter the passphrase to unlock account.json / shield.json for this session.").color(DIM));
+                ui.add_space(8.0);
+                let r = ui.add(egui::TextEdit::singleline(&mut self.unlock_input).password(true).desired_width(300.0).hint_text("passphrase"));
+                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                ui.add_space(6.0);
+                if ui.add(egui::Button::new(egui::RichText::new("  Unlock  ").size(15.0).color(egui::Color32::BLACK)).fill(CYAN)).clicked() || enter {
+                    self.unlock();
+                }
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new(format!("Files: {}", wallet_dir().display())).size(10.0).color(DIM));
+                ui.add_space(8.0);
+                ui.separator();
+                ui.label(egui::RichText::new("ACTIVITY").size(10.0).color(DIM));
+                for (line, color, _) in &self.log_lines {
+                    ui.label(egui::RichText::new(line).size(11.0).color(*color));
+                }
+            } else {
             match self.account.clone() {
                 None => {
                     ui.label(egui::RichText::new("Get on the chain in one click.").size(16.0));
@@ -918,6 +1239,61 @@ impl eframe::App for App {
                         ui.label(egui::RichText::new(format!("Wallet file: {}", account_path().display())).size(10.0).color(DIM));
                     });
 
+                    // K1 (v0.14.0): keys at rest.
+                    ui.add_space(6.0);
+                    let protected = vault::is_protected();
+                    let title = if protected { "Passphrase: ON (files sealed on disk)" } else { "Protect with a passphrase" };
+                    egui::CollapsingHeader::new(title).show(ui, |ui| {
+                        if protected {
+                            ui.label(egui::RichText::new("account.json and shield.json are encrypted on disk (Argon2id 512 MiB → XChaCha20-Poly1305). A copied file is useless without the passphrase; a running, unlocked wallet still holds the keys in memory.").color(DIM).size(11.0));
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("Change:").color(DIM).size(11.0));
+                                ui.add(egui::TextEdit::singleline(&mut self.pass_new).password(true).desired_width(130.0).hint_text("new passphrase"));
+                                ui.add(egui::TextEdit::singleline(&mut self.pass_repeat).password(true).desired_width(130.0).hint_text("repeat"));
+                                if ui.small_button("generate").clicked() {
+                                    self.generate_passphrase();
+                                }
+                                if ui.small_button("apply").clicked() {
+                                    self.protect();
+                                }
+                            });
+                            if let Some(g) = self.generated.clone() {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(egui::RichText::new(&g).monospace().size(12.0).color(GOLD));
+                                    if ui.small_button("copy").clicked() {
+                                        ui.output_mut(|o| o.copied_text = g.clone());
+                                    }
+                                });
+                            }
+                            if ui.small_button("remove passphrase (write plain files)").clicked() {
+                                self.unprotect();
+                            }
+                        } else {
+                            ui.label(egui::RichText::new("Seal account.json and shield.json so a stolen backup or disk image is useless without the passphrase (Argon2id 512 MiB — about a second to unlock, then instant; a copied file allows only tens of guesses per second even on a GPU). The CLI reads the same format (hk-node account-seal). There is NO recovery if you forget it — keep the seed backup too.").color(DIM).size(11.0));
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.add(egui::TextEdit::singleline(&mut self.pass_new).password(true).desired_width(140.0).hint_text("12+ chars or 4+ words"));
+                                ui.add(egui::TextEdit::singleline(&mut self.pass_repeat).password(true).desired_width(140.0).hint_text("repeat"));
+                                if ui.small_button("generate").on_hover_text("7 random words from a 512-word list = 63 bits").clicked() {
+                                    self.generate_passphrase();
+                                }
+                            });
+                            if let Some(g) = self.generated.clone() {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(egui::RichText::new(&g).monospace().size(12.0).color(GOLD));
+                                    if ui.small_button("copy").clicked() {
+                                        ui.output_mut(|o| o.copied_text = g.clone());
+                                    }
+                                });
+                                ui.label(egui::RichText::new("Write it down before you click Protect. It is shown once.").color(DIM).size(10.0));
+                            }
+                            if ui.button(" Protect this wallet ").clicked() {
+                                self.protect();
+                            }
+                        }
+                    });
+
                     ui.add_space(8.0);
                     ui.separator();
                     ui.add_space(4.0);
@@ -936,6 +1312,7 @@ impl eframe::App for App {
                     });
                 }
             }
+            } // !locked
 
             // Footer (flows after the content now that the page scrolls)
             ui.add_space(14.0);

@@ -7,7 +7,7 @@
 #   ./gate-n1.sh                       # needs hk-prove on 127.0.0.1:9911 (vk pins)
 #
 # What it proves (each line is a PASS/FAIL):
-#   1. 4-validator devnet: node0 sees exactly 3 peers, every one identified, version v0.15.2,
+#   1. 4-validator devnet: node0 sees exactly 3 peers, every one identified, version = the binary's,
 #      genesis "match", private (loopback) masked address; hk_chainInfo carries node_version + peers.
 #   2. a 5th node joins from genesis → node0 lists it as INBOUND within seconds; node4 lists the
 #      four validators as OUTBOUND; connected_secs climbs.
@@ -20,6 +20,8 @@ cd "$(dirname "$0")"
 H="${HK_DEVNET_HOME:-$HOME/hk-devnet}"
 BIN="$(readlink -f "${CARGO_TARGET_DIR:-target}/release/hk-node")"
 PROVER="${HK_PROVER_URL:-http://127.0.0.1:9911}"
+# the version tag every peer must advertise = the binary's own (`hk-node version` prints "hk-node vX.Y.Z")
+VER="$("$BIN" version 2>/dev/null | awk '{print $2}')"; [[ -z "$VER" ]] && VER=$(grep -o 'NODE_VERSION: &str = "[^"]*"' crates/hk-node/src/main.rs | cut -d'"' -f2)
 PASS=0; FAIL=0
 ok()   { echo "  PASS  $*"; PASS=$((PASS+1)); }
 bad()  { echo "  FAIL  $*"; FAIL=$((FAIL+1)); }
@@ -42,13 +44,13 @@ wait_py 26000 "r['identified']" 3 15
 V=$(py 26000 "r['count'],r['identified'],r['inbound']+r['outbound'],r['public_addr'],r['islands_refused']")
 [[ "$V" == "3 3 3 0 0" ]] && ok "node0: 3 peers, 3 identified, 0 public addresses, 0 islands: $V" || bad "node0 table: $V"
 V=$(py 26000 "sorted({(p['version'],p['genesis'],p['private_addr']) for p in r['peers']})")
-[[ "$V" == "[('v0.15.2', 'match', True)]" ]] && ok "every peer: version v0.15.2 · genesis match · private addr" || bad "peer tags: $V"
+[[ "$V" == "[('$VER', 'match', True)]" ]] && ok "every peer: version $VER · genesis match · private addr" || bad "peer tags: $V"
 V=$(py 26000 "sorted({p['addr'].rsplit('/',1)[0] for p in r['peers']})")
 [[ "$V" == "['/ip4/127.0.0.0/tcp']" ]] && ok "addresses masked to the /24: $V" || bad "masking: $V"
 S=$(py 26000 "r['self']['peer_id'][:8]+' '+r['self']['version']+' '+r['self']['genesis_digest'][:8]")
-[[ "$S" == 12D3KooW*" v0.15.2 "* ]] && ok "self: $S" || bad "self block: $S"
+[[ "$S" == 12D3KooW*" $VER "* ]] && ok "self: $S" || bad "self block: $S"
 C=$(rpc 26000 hk_chainInfo | python3 -c 'import sys,json;r=json.load(sys.stdin)["result"];print(r["node_version"],r["peers"])' 2>/dev/null)
-[[ "$C" == "v0.15.2 3" ]] && ok "hk_chainInfo.node_version + peers: $C" || bad "chainInfo: $C"
+[[ "$C" == "$VER 3" ]] && ok "hk_chainInfo.node_version + peers: $C" || bad "chainInfo: $C"
 
 echo "== 2 · a 5th node joins: inbound on node0, outbound on node4"
 rm -rf "$H/node4"; "$BIN" keygen "$H/node4" ext-4 >/dev/null; cp "$H/node0/genesis.json" "$H/node4/genesis.json"
@@ -59,7 +61,7 @@ wait_py 26000 "r['identified']" 4 30 && ok "node0 sees 4 identified peers within
 wait_py 26004 "len(r['self']['peer_id'])>0" True 30 || bad "node4 RPC never answered hk_getPeers"
 N4=$(py 26004 "r['self']['peer_id']")
 V=$(py 26000 "next(((p['direction'],p['version'],p['genesis']) for p in r['peers'] if p['peer_id']=='$N4'),None)")
-[[ "$V" == "('inbound', 'v0.15.2', 'match')" ]] && ok "node0 lists node4 as inbound · v0.15.2 · match" || bad "node4 on node0: $V"
+[[ "$V" == "('inbound', '$VER', 'match')" ]] && ok "node0 lists node4 as inbound · $VER · match" || bad "node4 on node0: $V"
 wait_py 26004 "r['identified']" 4 30
 V=$(py 26004 "sorted({p['direction'] for p in r['peers']}),r['count']")
 [[ "$V" == "['outbound'] 4" ]] && ok "node4 lists the four validators, all outbound" || bad "node4 table: $V"
