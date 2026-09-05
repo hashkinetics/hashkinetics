@@ -974,7 +974,7 @@ mod n1_tests {
     #[test]
     fn masks_public_and_private_hosts() {
         assert_eq!(mask_multiaddr("/ip4/203.0.113.77/tcp/27000"), ("/ip4/203.0.113.0/tcp/27000".into(), false));
-        assert_eq!(mask_multiaddr("/ip4/10.128.0.9/tcp/27000"), ("/ip4/10.128.0.0/tcp/27000".into(), true));
+        assert_eq!(mask_multiaddr("/ip4/10.42.7.9/tcp/27000"), ("/ip4/10.42.7.0/tcp/27000".into(), true));
         assert_eq!(mask_multiaddr("/ip4/127.0.0.1/tcp/27001"), ("/ip4/127.0.0.0/tcp/27001".into(), true));
         assert_eq!(mask_multiaddr("/ip4/100.64.3.4/tcp/1"), ("/ip4/100.64.3.0/tcp/1".into(), true));
         assert_eq!(mask_multiaddr("/ip4/100.128.3.4/tcp/1"), ("/ip4/100.128.3.0/tcp/1".into(), false));
