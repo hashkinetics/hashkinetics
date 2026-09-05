@@ -114,6 +114,9 @@ pub struct SharedHandles {
     /// account → its transactions (as sender OR counterparty), commit order.
     pub acct_index:
         Arc<Mutex<std::collections::HashMap<hk_primitives::AccountId, Vec<([u8; 32], u64, &'static str)>>>>,
+    /// N1 (v0.15.2): this node's libp2p peer id (base58) — named in `hk_getPeers.self`.
+    /// node.rs fills it after the keypair is derived; empty in tests.
+    pub self_peer_id: String,
 }
 
 /// Bounded map of txid -> human receipt string ("ok: ..." / "rejected: ...").
@@ -452,6 +455,7 @@ impl HkApp {
             signer_gauge: self.signer_gauge.clone(),
             tx_index: self.tx_index.clone(),
             acct_index: self.acct_index.clone(),
+            self_peer_id: String::new(),
         }
     }
 

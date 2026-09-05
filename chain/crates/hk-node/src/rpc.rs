@@ -26,6 +26,11 @@
 //!                                                 per-tx receipts + aggregate verdict + cert
 //!   hk_getBlocks    {before?, limit?<=50}      -> newest-first block list
 //!   hk_getValidators                           -> the live validator set + power (+ queued set changes)
+//!   hk_getPeers                                -> this node's live p2p peer table (N1, v0.15.2):
+//!                                                 {self, count, inbound, outbound, public_addr,
+//!                                                  identified, islands_refused, peers[{peer_id,
+//!                                                  direction, addr (masked /24 · /48), private_addr,
+//!                                                  version, genesis, connected_secs}]}
 //!   hk_submitSetChange {cert}                  -> {accepted, queued}  (V1: a seat admitted/removed
 //!                                                 by a supermajority of the current seats' roots;
 //!                                                 rides this node's next proposal)
@@ -198,6 +203,10 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
                 // Genesis-gate: the network's identity fingerprint (== `sha256sum
                 // genesis.json`). A joiner confirms this matches before trusting a node.
                 "genesis_digest": hex::encode(h.genesis_digest),
+                // N1 (v0.15.2): an operator can prove which binary answers, and how many
+                // peers it holds (the full table is `hk_getPeers`).
+                "node_version": crate::NODE_VERSION,
+                "peers": malachitebft_network::hk_peers().len(),
                 "height": chain.height,
                 "app_hash": hex::encode(chain.state_commitment().0),
                 // R4: THIS node's consensus-signer leaf budget (the fuse, visible).
@@ -563,6 +572,59 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
                 }).collect::<Vec<_>>(),
             }})
         }
+        // N1 (v0.15.2): this node's live p2p peer table, straight from the swarm — who is
+        // connected, which way, from where (masked), on which genesis and node version.
+        // Measured, not configured: an entry exists only while a connection is open. The
+        // gateway's table is the network's public roll call (every kit node bootstraps
+        // through it); a node that peers only with other operators is not visible here.
+        "hk_getPeers" => {
+            let peers = malachitebft_network::hk_peers();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let (mut inbound, mut outbound, mut public_addr, mut identified) = (0usize, 0usize, 0usize, 0usize);
+            let mut list = Vec::with_capacity(peers.len());
+            for p in &peers {
+                let (addr, private) = mask_multiaddr(&p.remote_addr);
+                if p.direction == "inbound" { inbound += 1 } else { outbound += 1 }
+                if !private { public_addr += 1 }
+                if p.identified { identified += 1 }
+                let genesis = match (p.identified, p.genesis) {
+                    (false, _) => "pending",
+                    (true, Some(g)) if g == h.genesis_digest => "match",
+                    (true, Some(_)) => "mismatch",
+                    (true, None) => "untagged",
+                };
+                list.push(json!({
+                    "peer_id": p.peer_id,
+                    "direction": p.direction,
+                    "addr": addr,
+                    "private_addr": private,
+                    // null = a ≤ v0.15.1 node (genesis tag only) or identify not yet received
+                    "version": p.node_version,
+                    "genesis": genesis,
+                    "identified": p.identified,
+                    "connected_secs": now.saturating_sub(p.connected_at),
+                    "connections": p.connections,
+                }));
+            }
+            json!({"result": {
+                "self": {
+                    "peer_id": h.self_peer_id,
+                    "version": crate::NODE_VERSION,
+                    "genesis_digest": hex::encode(h.genesis_digest),
+                },
+                "count": peers.len(),
+                "inbound": inbound,
+                "outbound": outbound,
+                "public_addr": public_addr,
+                "identified": identified,
+                "islands_refused": malachitebft_network::hk_islands_refused(),
+                "peers": list,
+                "note": "live from this node's swarm; addresses masked to /24 (v4) · /48 (v6) — a peer's real source address, not what it claims to listen on; private_addr = loopback/RFC 1918/CGNAT/ULA (the founding fleet peers over its private network)",
+            }})
+        }
         // V1: queue a validator-set change certificate. Checked against the live set
         // here (chain id, supermajority of CURRENT seats, window not yet closed) and
         // re-checked at propose + commit by every node; the root signatures make it
@@ -647,6 +709,20 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
                                 "verified": sb.agg_valid,
                             },
                             "rotations": batch.as_ref().map(|b| b.rotations.len()).unwrap_or(0),
+                            // v0.15.2: validator-set change certificates carried by this block
+                            // (V1) — the explorer surface could not show the block that seated
+                            // testnet-1's first external validator (72219) until this existed.
+                            "set_changes": batch.as_ref().map(|b| b.set_changes.iter().map(|c| {
+                                let (kind, root_pk, power) = match &c.body.change {
+                                    hk_consensus::SetChange::Admit { root_pk, voting_power, .. } =>
+                                        ("admit", hex::encode(root_pk), Some(*voting_power)),
+                                    hk_consensus::SetChange::Remove { root_pk } =>
+                                        ("remove", hex::encode(root_pk), None),
+                                };
+                                json!({"change": kind, "root_pk": root_pk, "voting_power": power,
+                                       "approvals": c.approvals.len(),
+                                       "not_before": c.body.not_before, "not_after": c.body.not_after})
+                            }).collect::<Vec<_>>()).unwrap_or_default(),
                             "certificate": {
                                 "round": sb.certificate.round.as_i64(),
                                 "value_id": hex::encode(sb.certificate.value_id.as_bytes()),
@@ -695,6 +771,7 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
                         "tx_count": batch.as_ref().map(|b| b.txs.len()).unwrap_or(0),
                         "aggregate": batch.as_ref().map(|b| !b.agg_proof.is_empty()).unwrap_or(false),
                         "rotations": batch.as_ref().map(|b| b.rotations.len()).unwrap_or(0),
+                        "set_changes": batch.as_ref().map(|b| b.set_changes.len()).unwrap_or(0),
                         "value_id": hex::encode(&sb.certificate.value_id.as_bytes()[..8]),
                     }));
                 }
@@ -833,4 +910,110 @@ async fn respond(sock: &mut tokio::net::TcpStream, status: u16, body: &Value) ->
     sock.write_all(&payload).await?;
     sock.flush().await?;
     Ok(())
+}
+
+/// N1 (v0.15.2): mask a multiaddr's host for public display — IPv4 to its /24, IPv6 to
+/// its /48 (a v4-mapped v6 address is masked like v4), DNS names kept as they are.
+/// Returns `(masked, is_private)`; private = loopback, unspecified, RFC 1918, CGNAT
+/// (100.64/10), link-local, or a v6 ULA — i.e. a peer on the same private network.
+pub(crate) fn mask_multiaddr(addr: &str) -> (String, bool) {
+    let parts: Vec<&str> = addr.split('/').collect();
+    let mut out: Vec<String> = Vec::with_capacity(parts.len());
+    let mut private = false;
+    let mut i = 0;
+    while i < parts.len() {
+        let p = parts[i];
+        if (p == "ip4" || p == "ip6") && i + 1 < parts.len() {
+            let (masked, prv) = mask_host(p, parts[i + 1]);
+            private |= prv;
+            out.push(p.to_string());
+            out.push(masked);
+            i += 2;
+        } else {
+            out.push(p.to_string());
+            i += 1;
+        }
+    }
+    (out.join("/"), private)
+}
+
+fn mask_v4(ip: std::net::Ipv4Addr) -> (String, bool) {
+    let o = ip.octets();
+    let private = ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_private()
+        || ip.is_link_local()
+        || (o[0] == 100 && (o[1] & 0xc0) == 64);
+    (format!("{}.{}.{}.0", o[0], o[1], o[2]), private)
+}
+
+fn mask_host(proto: &str, host: &str) -> (String, bool) {
+    if proto == "ip4" {
+        if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+            return mask_v4(ip);
+        }
+    } else if let Ok(ip) = host.parse::<std::net::Ipv6Addr>() {
+        if let Some(v4) = ip.to_ipv4_mapped() {
+            let (m, prv) = mask_v4(v4);
+            return (format!("::ffff:{m}"), prv);
+        }
+        let s = ip.segments();
+        let private = ip.is_loopback()
+            || ip.is_unspecified()
+            || (s[0] & 0xfe00) == 0xfc00
+            || (s[0] & 0xffc0) == 0xfe80;
+        return (format!("{:x}:{:x}:{:x}::", s[0], s[1], s[2]), private);
+    }
+    (host.to_string(), false)
+}
+
+#[cfg(test)]
+mod n1_tests {
+    use super::mask_multiaddr;
+
+    #[test]
+    fn masks_public_and_private_hosts() {
+        assert_eq!(mask_multiaddr("/ip4/203.0.113.77/tcp/27000"), ("/ip4/203.0.113.0/tcp/27000".into(), false));
+        assert_eq!(mask_multiaddr("/ip4/10.128.0.9/tcp/27000"), ("/ip4/10.128.0.0/tcp/27000".into(), true));
+        assert_eq!(mask_multiaddr("/ip4/127.0.0.1/tcp/27001"), ("/ip4/127.0.0.0/tcp/27001".into(), true));
+        assert_eq!(mask_multiaddr("/ip4/100.64.3.4/tcp/1"), ("/ip4/100.64.3.0/tcp/1".into(), true));
+        assert_eq!(mask_multiaddr("/ip4/100.128.3.4/tcp/1"), ("/ip4/100.128.3.0/tcp/1".into(), false));
+        assert_eq!(
+            mask_multiaddr("/ip6/2a02:c207:2355:1558::1/tcp/27000"),
+            ("/ip6/2a02:c207:2355::/tcp/27000".into(), false)
+        );
+        assert_eq!(mask_multiaddr("/ip6/fd00:1::5/tcp/27000"), ("/ip6/fd00:1:0::/tcp/27000".into(), true));
+        assert_eq!(mask_multiaddr("/ip6/::1/tcp/27000"), ("/ip6/0:0:0::/tcp/27000".into(), true));
+        assert_eq!(
+            mask_multiaddr("/ip6/::ffff:203.0.113.9/tcp/27000"),
+            ("/ip6/::ffff:203.0.113.0/tcp/27000".into(), false)
+        );
+        assert_eq!(
+            mask_multiaddr("/dns4/seed.hashkinetics.org/tcp/27000"),
+            ("/dns4/seed.hashkinetics.org/tcp/27000".into(), false)
+        );
+        // garbage stays garbage, never panics
+        assert_eq!(mask_multiaddr("/ip4/not-an-ip/tcp/1"), ("/ip4/not-an-ip/tcp/1".into(), false));
+        assert_eq!(mask_multiaddr(""), ("".into(), false));
+    }
+
+    #[test]
+    fn peer_agent_tags_parse_both_generations() {
+        use malachitebft_network::{hk_peer_genesis_digest, hk_peer_node_version};
+        let digest = "4e4ea68d48cba1ad4cc7155c19e7768f1fa2cbc99ba0f2b47c58948ec9e971c7";
+        let old = format!("hashkinetics/1/genesis/{digest}");
+        let new = format!("hashkinetics/1/genesis/{digest}/hk-node/v0.15.2");
+        let want = hex::decode(digest).unwrap();
+        assert_eq!(hk_peer_genesis_digest(&old).unwrap().to_vec(), want);
+        assert_eq!(hk_peer_genesis_digest(&new).unwrap().to_vec(), want);
+        assert_eq!(hk_peer_node_version(&old), None);
+        assert_eq!(hk_peer_node_version(&new).as_deref(), Some("v0.15.2"));
+        // not a tag / wrong length / junk after the digest / non-ASCII boundaries: never gate, never panic
+        assert_eq!(hk_peer_genesis_digest("hashkinetics/1"), None);
+        assert_eq!(hk_peer_genesis_digest(&format!("hashkinetics/1/genesis/{}", &digest[..63])), None);
+        assert_eq!(hk_peer_genesis_digest(&format!("hashkinetics/1/genesis/{digest}x")), None);
+        assert_eq!(hk_peer_genesis_digest("hashkinetics/1/genesis/ééééééééééééééééééééééééééééééééé"), None);
+        assert_eq!(hk_peer_node_version(&format!("hashkinetics/1/genesis/{digest}/hk-node/")), None);
+        assert_eq!(hk_peer_node_version(&format!("hashkinetics/1/genesis/{digest}/hk-node/v0.15.2 <script>")), None);
+    }
 }

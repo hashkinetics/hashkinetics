@@ -162,8 +162,14 @@ impl Node for App {
             d
         };
         malachitebft_network::hk_set_genesis_digest(genesis_digest);
+        // N1 (v0.15.2): advertise our version to peers too (identify agent tag), and
+        // remember our own libp2p id so `hk_getPeers` can name it.
+        malachitebft_network::hk_set_node_version(crate::NODE_VERSION);
+        let self_peer_id = self.get_keypair(op_handle.clone()).public().to_peer_id().to_string();
         info!(
             genesis_digest = %hex::encode(genesis_digest),
+            peer_id = %self_peer_id,
+            version = crate::NODE_VERSION,
             "genesis fingerprint pinned — network identity (island peers refused)"
         );
 
@@ -285,6 +291,7 @@ impl Node for App {
         // 0.7: spawn the RPC server sharing the chain/mempool/receipts handles.
         if config.hk_rpc.enabled {
             let mut handles = state.handles();
+            handles.self_peer_id = self_peer_id.clone();
             // C2.3: single-hop tx gossip — locally admitted txs push to peer RPCs.
             if !config.hk_rpc.gossip_peers.is_empty() {
                 handles.gossip =

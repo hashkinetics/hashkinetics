@@ -20,3 +20,6 @@ b7601e846176cafb8de575305d82e3ee182172a6def0444cadf8359d002b0f37  hk-node-v0.13.
 b7776b06547f238ac78ef8f15ab9af9cb9c9919094c9f441e506afdd4a9185b9  vks.json
 85efc5edb3284cd163524006bb8ca6198d3787b7dc22f9c4e0c2e3677118bf35  hk-node-v0.15.1.gz
 61a9a1420dda2d5353809bc6726fa1e923581efdbaeb73bfcc8b0bd05337fc9c  hk-node-v0.15.1
+# v0.15.2 release — N1: live peer table (hk_getPeers, node_version, version tag); client-only, no activation
+91876bebce06feeeffd330871c48d6cd55a57ee8d101ac406ed76e1b32c18230  hk-node-v0.15.2.gz
+df66ca57ae0db8fc22d6e8d358dbc55a56ae8e09fb91857e87273c29840f2d61  hk-node-v0.15.2

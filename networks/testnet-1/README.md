@@ -1,6 +1,6 @@
 # HashKinetics testnet-1 — join as a full node
 
-> **Current release: v0.15.1** (run it — since v0.15.1 the kit carries the verifying keys, `vks.json`, and the node's client speaks https). Minimum to sync: v0.13.0 — testnet-1 launched 2026-09-02 from a fresh
+> **Current release: v0.15.2** (run it — since v0.15.1 the kit carries the verifying keys, `vks.json`, and the node's client speaks https; since v0.15.2 your node advertises its version to its peers and shows up on [hashkinetics.org/network#live](https://www.hashkinetics.org/network#live) the moment it connects to the gateway). Minimum to sync: v0.13.0 — testnet-1 launched 2026-09-02 from a fresh
 > genesis with the protocol fee (100 micro per envelope, burned) **bound in the genesis
 > from height 1** and the faucet treasury allocated at genesis — no activation heights,
 > no coordinated rolls for the fee. Appended transaction kinds activate by height instead:

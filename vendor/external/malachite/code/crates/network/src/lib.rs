@@ -75,27 +75,155 @@ fn hk_hex32(bytes: &[u8; 32]) -> String {
     s
 }
 
+// ---------------------------------------------------------------------------
+// HK peer table + version tag (HashKinetics fork, N1 / hk-node v0.15.2)
+//
+// The swarm loop already learns everything an operator wants to see about the
+// network — who is connected, in which direction, from where, on which genesis
+// and (since v0.15.2) on which node version. This block keeps a copy of that in
+// a process-wide table hk-node's RPC reads (`hk_getPeers`), the same pattern as
+// the genesis digest above: hk-node sets `HK_NODE_VERSION` once before `spawn`,
+// the tag rides identify's `agent_version` as `…/genesis/<64 hex>/hk-node/<ver>`.
+//
+// Compatibility: ≤ v0.15.1 parsers require the hex part to be EXACTLY 64 chars,
+// so they read the new tag as "no HK tag" and GRACE the peer (fail open — the
+// gate is defense in depth, never consensus). ≥ v0.15.2 parses both forms, so
+// once the fleet has rolled every seat gates every peer again. Nothing here
+// touches consensus, the wire format, or the state commitment.
+// ---------------------------------------------------------------------------
+
+/// This node's version string (e.g. `v0.15.2`), set once by hk-node before `spawn`.
+pub static HK_NODE_VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// hk-node calls this once at boot with its `NODE_VERSION`.
+pub fn hk_set_node_version(version: &str) {
+    let _ = HK_NODE_VERSION.set(version.to_string());
+}
+
 /// The libp2p identify `agent_version` we advertise — carries our genesis digest
-/// so peers can gate us. Untagged (`"hashkinetics/1"`) until the digest is set.
+/// so peers can gate us, and (v0.15.2) our node version so peers can see it.
+/// Untagged (`"hashkinetics/1"`) until the digest is set.
 pub(crate) fn hk_agent_version() -> String {
-    match hk_our_genesis_digest() {
-        Some(d) => format!("hashkinetics/1/genesis/{}", hk_hex32(&d)),
-        None => "hashkinetics/1".to_string(),
+    match (hk_our_genesis_digest(), HK_NODE_VERSION.get()) {
+        (Some(d), Some(v)) => format!("hashkinetics/1/genesis/{}/hk-node/{}", hk_hex32(&d), v),
+        (Some(d), None) => format!("hashkinetics/1/genesis/{}", hk_hex32(&d)),
+        (None, _) => "hashkinetics/1".to_string(),
     }
 }
 
 /// Extract a peer's advertised genesis digest from its identify `agent_version`.
 /// `None` = the peer advertised no HK genesis tag (legacy/foreign) → do NOT gate.
-pub(crate) fn hk_peer_genesis_digest(agent_version: &str) -> Option<[u8; 32]> {
-    let hexpart = agent_version.strip_prefix("hashkinetics/1/genesis/")?;
-    if hexpart.len() != 64 {
-        return None;
+/// Accepts both `…/genesis/<64 hex>` (≤ v0.15.1) and `…/genesis/<64 hex>/hk-node/<ver>`.
+pub fn hk_peer_genesis_digest(agent_version: &str) -> Option<[u8; 32]> {
+    let rest = agent_version.strip_prefix("hashkinetics/1/genesis/")?;
+    let hexpart = rest.get(..64)?;
+    match rest.get(64..) {
+        Some("") => {}
+        Some(tail) if tail.starts_with('/') => {}
+        _ => return None,
     }
     let mut out = [0u8; 32];
     for i in 0..32 {
         out[i] = u8::from_str_radix(hexpart.get(i * 2..i * 2 + 2)?, 16).ok()?;
     }
     Some(out)
+}
+
+/// Extract a peer's advertised node version (`v0.15.2`) from its `agent_version`.
+/// `None` = a ≤ v0.15.1 node (genesis tag only), or no HK tag at all.
+pub fn hk_peer_node_version(agent_version: &str) -> Option<String> {
+    let rest = agent_version.strip_prefix("hashkinetics/1/genesis/")?;
+    let tail = rest.get(64..)?;
+    let v = tail.strip_prefix("/hk-node/")?;
+    if v.is_empty() || v.len() > 32 || !v.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
+        return None;
+    }
+    Some(v.to_string())
+}
+
+/// One connected peer as this node's swarm sees it.
+#[derive(Clone, Debug)]
+pub struct HkPeer {
+    /// libp2p peer id (base58).
+    pub peer_id: String,
+    /// `"inbound"` (they dialed us) or `"outbound"` (we dialed them).
+    pub direction: &'static str,
+    /// The connection's remote multiaddr: the address we dialed, or an inbound
+    /// peer's send-back address (its real source address, not what it claims to listen on).
+    pub remote_addr: String,
+    /// identify received on the consensus protocol (until then the entry is a bare TCP peer).
+    pub identified: bool,
+    /// The peer's advertised genesis digest (`None` = untagged ≤ pre-gate build, or not yet identified).
+    pub genesis: Option<[u8; 32]>,
+    /// The peer's advertised node version (`None` = ≤ v0.15.1 or not yet identified).
+    pub node_version: Option<String>,
+    /// Unix seconds of the first live connection to this peer.
+    pub connected_at: u64,
+    /// Live connections to this peer (libp2p may hold more than one).
+    pub connections: usize,
+}
+
+static HK_PEERS: std::sync::OnceLock<std::sync::Mutex<HashMap<libp2p::PeerId, HkPeer>>> =
+    std::sync::OnceLock::new();
+
+/// Consensus-protocol peers refused by the genesis gate since boot (island chains).
+pub static HK_ISLANDS_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn hk_peer_table() -> &'static std::sync::Mutex<HashMap<libp2p::PeerId, HkPeer>> {
+    HK_PEERS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn hk_unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Snapshot of the live peer table, oldest connection first. Read by `hk_getPeers`.
+pub fn hk_peers() -> Vec<HkPeer> {
+    let table = hk_peer_table().lock().unwrap_or_else(|e| e.into_inner());
+    let mut peers: Vec<HkPeer> = table.values().cloned().collect();
+    peers.sort_by(|a, b| a.connected_at.cmp(&b.connected_at).then_with(|| a.peer_id.cmp(&b.peer_id)));
+    peers
+}
+
+/// Island chains refused since boot (see `HK_ISLANDS_REFUSED`).
+pub fn hk_islands_refused() -> u64 {
+    HK_ISLANDS_REFUSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn hk_peer_connected(peer_id: &libp2p::PeerId, direction: &'static str, remote_addr: String, connections: usize) {
+    let mut table = hk_peer_table().lock().unwrap_or_else(|e| e.into_inner());
+    let entry = table.entry(*peer_id).or_insert_with(|| HkPeer {
+        peer_id: peer_id.to_string(),
+        direction,
+        remote_addr: remote_addr.clone(),
+        identified: false,
+        genesis: None,
+        node_version: None,
+        connected_at: hk_unix_now(),
+        connections: 0,
+    });
+    entry.connections = connections.max(1);
+}
+
+fn hk_peer_identified(peer_id: &libp2p::PeerId, agent_version: &str) {
+    let mut table = hk_peer_table().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = table.get_mut(peer_id) {
+        entry.identified = true;
+        entry.genesis = hk_peer_genesis_digest(agent_version);
+        entry.node_version = hk_peer_node_version(agent_version);
+    }
+}
+
+fn hk_peer_closed(peer_id: &libp2p::PeerId, remaining: usize) {
+    let mut table = hk_peer_table().lock().unwrap_or_else(|e| e.into_inner());
+    if remaining == 0 {
+        table.remove(peer_id);
+    } else if let Some(entry) = table.get_mut(peer_id) {
+        entry.connections = remaining;
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -516,9 +644,19 @@ async fn handle_swarm_event(
             peer_id,
             connection_id,
             endpoint,
+            num_established,
             ..
         } => {
             trace!("Connected to {peer_id} with connection id {connection_id}",);
+
+            // HK peer table: who, which way, from where (before discovery consumes the endpoint).
+            let (direction, remote_addr) = match &endpoint {
+                libp2p::core::ConnectedPoint::Dialer { address, .. } => ("outbound", address.to_string()),
+                libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => {
+                    ("inbound", send_back_addr.to_string())
+                }
+            };
+            hk_peer_connected(&peer_id, direction, remote_addr, num_established.get() as usize);
 
             state
                 .discovery
@@ -557,6 +695,9 @@ async fn handle_swarm_event(
             state
                 .discovery
                 .handle_closed_connection(swarm, peer_id, connection_id);
+
+            // HK peer table: drop the entry when the last connection goes.
+            hk_peer_closed(&peer_id, num_established as usize);
 
             if num_established == 0 {
                 if let Err(e) = tx_event
@@ -604,10 +745,15 @@ async fn handle_swarm_event(
                                  (agent={}) — refusing island chain, disconnecting",
                                 info.agent_version
                             );
+                            HK_ISLANDS_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            hk_peer_closed(&peer_id, 0);
                             let _ = swarm.disconnect_peer_id(peer_id);
                             return ControlFlow::Continue(());
                         }
                     }
+
+                    // HK peer table: genesis tag + node version, now that identify arrived.
+                    hk_peer_identified(&peer_id, &info.agent_version);
 
                     let is_already_connected = state.discovery.handle_new_peer(
                         swarm,

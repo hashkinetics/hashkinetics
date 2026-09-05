@@ -156,7 +156,7 @@
         <h2><span class="spark">⬢</span> Validators</h2>
         <table id="vals"><thead><tr><th>Address</th><th class="right">Power</th><th class="right">Epoch</th></tr></thead><tbody></tbody></table>
         <div class="kv" style="margin-top:8px"><div><span class="muted">External nodes (join kit)</span></div><div class="right"><span class="badge b-rot" id="s-observers">observers welcome — see /network#join</span></div></div>
-        <div class="privnote" style="border-color:var(--cyan)"><b style="color:var(--cyan)">Every vote is hash-based</b> (LMS/HSS over SHAKE-256) under an SLH-DSA root — the consensus itself is post-quantum, not just the wallets. Epoch badges climb when a validator rotates its signing tree — automatic since v0.10.5; on testnet-1 all four seats rotated unattended on 2026-09-03 (heights 11,584–11,595). The external row counts nodes that joined via the public join kit and independently verify the chain from block 1. These validators run on Google Cloud; the prover lives elsewhere entirely. Want a seat? <a href="/network#join" style="color:var(--cyan)">Join as an observer now; seats follow.</a></div>
+        <div class="privnote" style="border-color:var(--cyan)"><b style="color:var(--cyan)">Every vote is hash-based</b> (LMS/HSS over SHAKE-256) under an SLH-DSA root — the consensus itself is post-quantum, not just the wallets. Epoch badges climb when a validator rotates its signing tree — automatic since v0.10.5; on testnet-1 all four seats rotated unattended on 2026-09-03 (heights 11,584–11,595). <b>EXTERNAL</b> marks a seat admitted on the running chain by a certificate from more than ⅔ of the current seats — the first one landed in block 72219 on 2026-09-05. The external-nodes row is the gateway's own live peer table (hk_getPeers, v0.15.2): every kit node bootstraps through it. These validators run on Google Cloud; the prover lives elsewhere entirely. Want a seat? <a href="/network#join" style="color:var(--cyan)">Join as an observer now; seats follow.</a></div>
       </div>
       <div class="card">
         <h2><span class="spark">◈</span> Issued assets</h2>
@@ -227,11 +227,25 @@ async function pollPanels(){
   }catch(e){}
   try{
     const v=await rpc('hk_getValidators');
+    // The four seats keyed at the testnet-1 ceremony (2026-09-02); any other seat was admitted
+    // on the running chain by a V1 certificate — an external validator. Live, not curated.
+    const FOUNDING=new Set(['42C00CD6A28B67C72014A22838983FB4CA92EB62','E77F5F4719C2A9E8942920DC6F3E1664BC11C9C9','F7D75524118179C201256A1220936FA5EEC74672','F874765D3C2F40B8B074975D9E8C0EB652D06211']);
+    const ext=v.validators.filter(x=>!FOUNDING.has(String(x.address).toUpperCase()));
     $('s-vals').textContent=v.count;
-    $('s-power').textContent='total power '+v.total_power;
+    $('s-power').textContent='total power '+v.total_power+' · '+ext.length+' external seat'+(ext.length===1?'':'s')+(v.pending_set_changes&&v.pending_set_changes.length?' · '+v.pending_set_changes.length+' change queued':'');
     const tb=$('vals').querySelector('tbody');
     tb.innerHTML=v.validators.map(x=>
-      `<tr><td class="mono">${short(x.address,16)}</td><td class="right">${x.voting_power}</td><td class="right">${x.epoch===0?'<span class="muted">genesis</span>':'<span class="badge b-rot">e'+x.epoch+'</span>'}</td></tr>`).join('');
+      `<tr><td class="mono">${short(x.address,16)} ${FOUNDING.has(String(x.address).toUpperCase())?'<span class="muted">founding</span>':'<span class="badge b-agg" title="admitted on the running chain by a certificate from more than 2/3 of the seats">EXTERNAL</span>'}</td><td class="right">${x.voting_power}</td><td class="right">${x.epoch===0?'<span class="muted">genesis</span>':'<span class="badge b-rot">e'+x.epoch+'</span>'}</td></tr>`).join('');
+    // v0.15.2: the gateway's live peer table — every kit node bootstraps through it
+    try{
+      const pr=await rpc('hk_getPeers');
+      const pub=pr.peers.filter(q=>q.identified&&!q.private_addr);
+      const vers={}; pr.peers.filter(q=>q.identified).forEach(q=>{const k=q.version||'≤ v0.15.1'; vers[k]=(vers[k]||0)+1;});
+      $('s-observers').textContent=pub.length+' node'+(pub.length===1?'':'s')+' on a public address · '+pr.peers.filter(q=>q.identified&&q.private_addr).length+' fleet · '+Object.entries(vers).map(([k,n])=>k+' ×'+n).join(', ')+(pr.islands_refused?' · '+pr.islands_refused+' island'+(pr.islands_refused===1?'':'s')+' refused':'');
+      $('s-observers').title='hk_getPeers on the gateway, live; addresses masked by the node';
+    }catch(_){
+      $('s-observers').textContent=ext.length+' external seat'+(ext.length===1?'':'s')+' voting · node count arrives with v0.15.2 (hk_getPeers)';
+    }
   }catch(e){}
   try{
     const m=await rpc('hk_getMempool');
