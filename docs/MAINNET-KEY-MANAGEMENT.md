@@ -309,8 +309,8 @@ leaf. The design held; the R-series closed the ops gap (C-PROGRAM-PLAN.md §R):
   (K2 rules); the attested-mint path (X2) adds the issuer's own attestation key — the one
   classical signature the chain will verify, always paired with a hash-based relayer
   signature and a rate limit.
-- Open: R11 (verify-only proof-system client — the node's memory floor is the verifier
-  client's init footprint, not history) · STARK-aggregated commit certificates (below).
+- R11 CLOSED in v0.17.0 (the node verifies with a verify-only client; the memory floor is
+  now the node itself, not a proving engine) · Open: STARK-aggregated commit certificates (below).
 - Operator hygiene learned in recovery: `consensus_state.bin` is the signer's spent-leaf
   state — never copy it between nodes; chain-data restores take `blocks/` + `snapshot.bin`
   only, and transplant tars must pack `snapshot.bin` FIRST (ordering skew wedges the engine).

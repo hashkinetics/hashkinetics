@@ -79,6 +79,58 @@ pub(crate) fn retain_blocks() -> u64 {
     *V.get_or_init(|| std::env::var("HK_RETAIN_BLOCKS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0))
 }
 
+// ---------------------------------------------------------------------------------------
+// R11 (v0.17.0): what this process costs, published by `hk_chainInfo.process` so the
+// "RAM minimum" line in the onboarding doc is a number any operator can check, not a claim.
+// ---------------------------------------------------------------------------------------
+
+static PROCESS_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+static VERIFIER_INIT_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Called once when `start` begins; `uptime_secs` counts from here.
+pub(crate) fn mark_process_start() {
+    let _ = PROCESS_START.set(std::time::Instant::now());
+}
+
+/// Seconds since `mark_process_start` (None before it — the CLI subcommands never call it).
+pub(crate) fn uptime_secs() -> Option<u64> {
+    PROCESS_START.get().map(|t| t.elapsed().as_secs())
+}
+
+/// How long the verify-only STARK client took to come up, in ms (None until wired).
+pub(crate) fn verifier_init_ms() -> Option<u64> {
+    VERIFIER_INIT_MS.get().copied()
+}
+
+/// Set once by the verifier module when the client is up; a later call cannot overwrite.
+#[cfg_attr(not(feature = "sp1-verify"), allow(dead_code))]
+pub(crate) fn set_verifier_init_ms(ms: u64) {
+    let _ = VERIFIER_INIT_MS.set(ms);
+}
+
+/// This process's resident set in bytes — Linux only (`/proc/self/statm`, field 2 in pages);
+/// None where the kernel does not say. Cheap enough to read on every `hk_chainInfo`.
+pub(crate) fn rss_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+        // SAFETY: sysconf is a plain libc query with no preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as i64;
+        rss_from_statm(&statm, page)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// `/proc/self/statm` is "size resident shared text lib data dt" in pages.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn rss_from_statm(statm: &str, page_size: i64) -> Option<u64> {
+    let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    (page_size > 0).then(|| pages.saturating_mul(page_size as u64))
+}
+
 /// S2 (v0.16.0): how often the search index is written to disk (`HK_INDEX_PERSIST_EVERY`,
 /// default 4 × the snapshot cadence). Restart resumes indexing above the persisted
 /// height instead of re-reading every block file.
@@ -1996,5 +2048,32 @@ mod rotation_trigger_tests {
         let t = ts[0];
         assert_eq!(rotation_due(t - 1, t, 0, None, false, 1, 0, false), (true, true));
         assert_eq!(rotation_due(t, t, 0, None, false, 1, 0, false), (false, false));
+    }
+}
+
+#[cfg(test)]
+mod r11_process_tests {
+    use super::{rss_from_statm, set_verifier_init_ms, verifier_init_ms};
+
+    #[test]
+    fn r11_rss_is_read_from_statm_pages() {
+        // "size resident shared text lib data dt" — resident is field 2, in pages.
+        assert_eq!(rss_from_statm("123456 4096 300 10 0 2000 0\n", 4096), Some(4096 * 4096));
+        assert_eq!(rss_from_statm("1 1", 16384), Some(16384));
+        // a kernel line we cannot parse, or a bogus page size, is "unknown" — never a number
+        assert_eq!(rss_from_statm("garbage", 4096), None);
+        assert_eq!(rss_from_statm("1 x 3", 4096), None);
+        assert_eq!(rss_from_statm("1 2 3", 0), None);
+        assert_eq!(rss_from_statm("1 2 3", -1), None);
+    }
+
+    #[test]
+    fn r11_verifier_init_is_recorded_once() {
+        // None before the verifier is wired (a CLI subcommand never sets it)…
+        let before = verifier_init_ms();
+        set_verifier_init_ms(7);
+        // …then the first value sticks; a second wiring attempt cannot overwrite it.
+        set_verifier_init_ms(9_999);
+        assert_eq!(verifier_init_ms(), Some(before.unwrap_or(7)));
     }
 }

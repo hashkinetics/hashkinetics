@@ -1,14 +1,17 @@
 # HashKinetics — Validator Onboarding (public testnet)
 
-**v0.16.1 · testnet-1.** Run **v0.16.1** (the current release — the kit ships the verifying keys, so your node never depends on our prover; since v0.15.2 your node advertises its version to its peers and appears on the public roll call, `hk_getPeers` / [hashkinetics.org/network#live](https://www.hashkinetics.org/network#live), the moment it connects). Minimum to *sync* **testnet-1** (`hashkinetics-1-4e4ea68d`) is v0.13.0 — the fee policy lives in its genesis, so older nodes cannot decode it — but the network activates appended transaction kinds by height: the first validator-set change (v0.14.0) and the first issued-asset transaction (v0.15.0) each make their release the minimum for every node from that block on (an older node halts there, loudly, by design). A node that wants a seat must be ≥ v0.15.0 before it is admitted. (staging-1 is retired and archived: `networks/staging-1/`.) How an external operator joins a HashKinetics network: generate a key,
+**v0.17.0 · testnet-1.** Run **v0.17.0** (the current release — since v0.17.0 the node verifies STARKs with a verify-only client — no proving engine at start-up, so a restart costs seconds, not minutes; the resident-set figures are published with the v0.17.0 roll receipt in `CHANGELOG.md` and any node reports its own in `hk_chainInfo.process`; the kit ships the verifying keys, so your node never depends on our prover; since v0.15.2 your node advertises its version to its peers and appears on the public roll call, `hk_getPeers` / [hashkinetics.org/network#live](https://www.hashkinetics.org/network#live), the moment it connects). Minimum to *sync* **testnet-1** (`hashkinetics-1-4e4ea68d`) is v0.13.0 — the fee policy lives in its genesis, so older nodes cannot decode it — but the network activates appended transaction kinds by height: the first validator-set change (v0.14.0) and the first issued-asset transaction (v0.15.0) each make their release the minimum for every node from that block on (an older node halts there, loudly, by design). A node that wants a seat must be ≥ v0.15.0 before it is admitted. (staging-1 is retired and archived: `networks/staging-1/`.) How an external operator joins a HashKinetics network: generate a key,
 send one public JSON blob, receive genesis, start. Every consensus signature you will ever
 produce is hash-based (LMS/HSS over SHAKE-256 under a stateless SLH-DSA-192s root) — you are
 operating post-quantum BFT.
 
 ## 0 · What you need
 
-- Linux (bare or WSL2), 4+ cores, **8 GB RAM minimum** (the node's steady RSS is ~6.7 GB —
-  the proof-system verifier's fixed footprint — until R11 lands; 16 GB is comfortable),
+- Linux (bare or WSL2), 4+ cores, **8 GB RAM minimum** (until v0.16.1 the node's steady RSS
+  was ~6.7 GB — the proof-system's *proving* engine built just to verify; v0.17.0 verifies with
+  a verify-only client and the fleet number is being re-measured on this release — check any
+  node yourself: `hk_chainInfo.process.rss_bytes`. This line drops to the measured figure once
+  all four founding seats report it; 16 GB stays comfortable),
   20 GB+ disk (the node is durable: per-height block log + snapshots — plan for growth).
 - **No GPU.** Validators VERIFY STARKs in-node on CPU; GPUs are for people *making*
   payments, not validating them.

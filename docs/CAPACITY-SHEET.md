@@ -59,6 +59,18 @@ Seats are not capped by the protocol: a seat is admitted by certificate (V1) and
 
 Quote rule: "N seats measured at X blocks/s on one machine" — never "the chain supports N seats" from this table alone.
 
+## g · Node resident set and restart time (added 2026-09-06 with R11 / v0.17.0)
+
+Until v0.16.1 every node built SP1's full CPU prover to verify STARKs: ~6.7 GB resident per seat on the fleet's e2-standard-2 hosts and 3–6 minutes from `systemctl start` to an answering RPC (INCIDENTS #6). v0.17.0 verifies with the SDK's verify-only client. The rows below are READ from `hk_chainInfo.process` (`rss_bytes`, `verifier_init_ms`) and from the roll driver's clock — never estimated.
+
+| Date | Host | Release | Client | RSS steady | Verifier init | Start → RPC | Source |
+|---|---|---|---|---|---|---|---|
+| 2026-09-02 | fleet (4×) | v0.13.0 | full CpuProver | ~6.7 GB | ~5 min | 3–6 min | journal + `ps` (INCIDENTS #6) |
+| 2026-09-06 | WSL devnet node (4 on one box) | v0.17.0 | LightProver | 52 MiB at start · 259–309 MiB after mint + spends + aggregate | 379 ms (219 ms on restart) | 1 s (2 s on a persisted restart) | `chain/gate-r11.sh` 2026-09-06 |
+| _(pending — filled by the v0.17.0 roll)_ | hk-val-1 / val-0 / val-2 / gateway | v0.17.0 | LightProver | _(measured at the roll)_ | _(measured at the roll)_ | _(measured at the roll)_ | `ops/roll-v0.17.0.sh memory` |
+
+Quote rule: the onboarding RAM line = the largest fleet steady-state RSS, rounded up to the next GB, plus 2 GB of headroom for catch-up bursts (restore-time RSS on val-0 peaked at 6.7 of 7.9 GB during the 2026-09-05 sealed-key restart — measure that too).
+
 ## Quote discipline
 
 Until the M1 row is green: public materials quote **"274 tx/s sustained (storm harness, 1,024-tx blocks, 4-validator devnet — measured)"** and may still say "183 TPS at today's measured config" (Tier-1 arithmetic from the 256/1.4s measured pair) and "183,000/s effective via channels" — both already provenance-labeled. The first storm report upgrades nothing publicly by itself; **the 30-min public-testnet run is what turns M1 into a quotable fact.**

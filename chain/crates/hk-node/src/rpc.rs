@@ -5,7 +5,9 @@
 //!
 //! Methods:
 //!   hk_chainInfo                              -> {chain_id, height, app_hash,
-//!                                                 signer: {epoch, remaining, capacity}}  (R4)
+//!                                                 signer: {epoch, remaining, capacity},  (R4)
+//!                                                 process: {rss_bytes, uptime_secs,
+//!                                                           verifier_init_ms}}  (R11, v0.17.0)
 //!   hk_submitRotation {cert}                   -> {accepted, epoch, queued}  (R2: peer-carried
 //!                                                 revival — cert from `hk-node issue-rotation`)
 //!   hk_getAccount   {id}                      -> {found, nonce, auth_commit, balances[]}
@@ -236,6 +238,15 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
                     // C2.8 (v0.16.0): null = archive node (keeps every block); N = this node
                     // prunes whole segments older than tip−N, and `disk_from` moves up.
                     "retain_blocks": Some(crate::state::retain_blocks()).filter(|r| *r > 0),
+                },
+                // R11 (v0.17.0): what THIS process costs — resident set (Linux; null
+                // elsewhere), seconds since start, and how long the verify-only STARK
+                // client took to come up (null = no verifier wired). The onboarding doc's
+                // RAM line is checkable on any node with one call.
+                "process": {
+                    "rss_bytes": crate::state::rss_bytes(),
+                    "uptime_secs": crate::state::uptime_secs(),
+                    "verifier_init_ms": crate::state::verifier_init_ms(),
                 },
             }})
         }

@@ -32,3 +32,6 @@ c588811c38d860354c8509682de5fb7271968ee55ce5b30ab05d8e89387c9a4b  HashKinetics-W
 f6bfaf7181d0d944f3714655d132b7e18d058842c011837224426ba9ff5919d5  hk-node-v0.16.1
 17566a9e5cc258814f06924c65334631f62205358823414f4abaf587e5f8308e  HashKinetics-Wallet.exe (v0.14.1)
 8c9abbb081d10318f0fce74787d568346d5ed11596c14d45e687dfe214a51f99  HashKinetics-Wallet-linux-x86_64-v0.14.1.zip (built by GitHub Actions run #2 on the v0.16.1 tag; artifact digest as reported by GitHub — verify the downloaded zip with sha256sum / Get-FileHash)
+# v0.17.0 release — R11: verify-only SP1 client (seconds to start, small resident set; hk_chainInfo.process); client-only, no activation · wallet unchanged (v0.14.1, on the v0.16.1 release)
+5f04af612e4a061532c40ec3ba196bbcd3d2f721643252b2065720e5280c7d5a  hk-node-v0.17.0.gz
+8d57ad976c28994b1a7b16d1ab9c71ac4255156640cfb7e8b03e889430bfb938  hk-node-v0.17.0

@@ -14,6 +14,17 @@
 //! needs no prover to verify (K6, v0.15.1).
 //!
 //! All raw-STARK: `client.verify` on core/compressed SP1 proofs — no pairing wraps (F1).
+//!
+//! R11 (v0.17.0): the client is VERIFY-ONLY. Until v0.16.1 the node built the SDK's full
+//! `CpuProver` — the whole proving engine (recursion programs for every shard shape, the
+//! shrink and wrap provers) stood up just so `verify` could be called: ~5 minutes of init on
+//! a 2-vCPU host and a multi-GB resident set that never produced a proof (INCIDENTS #6,
+//! the "8 GB minimum" line). The SDK's `LightProver` builds only the verifier machines and
+//! carries the pinned recursion-vk root; `prove` on it is an error by design. Verification
+//! is the SAME code path (`SP1Verifier` via `SP1NodeCore`) with the same embedded vk root,
+//! so what the fleet accepted before it accepts now, and nothing more — a client-only
+//! change, no consensus impact. Init time is measured and published
+//! (`hk_chainInfo.process.verifier_init_ms`) so the claim is checkable on every node.
 
 use std::sync::Arc;
 
@@ -104,7 +115,7 @@ pub async fn from_vks_file(
 }
 
 /// VERIFY THE VKS AGAINST THE GENESIS PINS (P2.5 — a mismatched proof system refuses to
-/// start), then construct a CPU client whose only job is `verify`.
+/// start), then construct a verify-only client (R11).
 async fn from_vk_set(
     set: &VkSet,
     pins: Option<&crate::genesis::VkPins>,
@@ -144,7 +155,18 @@ async fn from_vk_set(
     let mint_vk_hash = mint_vk.hash_u32();
     info!(%source, "spend+mint+agg verifying keys loaded");
 
-    let client = Arc::new(ProverClient::builder().cpu().build().await);
+    // R11 (v0.17.0): `.light()` — verifier machines + the pinned recursion-vk root, no
+    // proving engine. `.cpu()` was ~5 min / multi-GB on the fleet for the same `verify`.
+    let t0 = std::time::Instant::now();
+    let client = Arc::new(ProverClient::builder().light().build().await);
+    let init_ms = t0.elapsed().as_millis() as u64;
+    crate::state::set_verifier_init_ms(init_ms);
+    info!(
+        init_ms,
+        sp1_circuit = client.version(),
+        rss_mib = crate::state::rss_bytes().map(|b| b >> 20),
+        "verify-only SP1 client ready (R11: no proving engine in the node)"
+    );
 
     let c = client.clone();
     let spend: VerifyFn = Box::new(move |proof_bytes, expected_public| {

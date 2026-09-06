@@ -13,7 +13,7 @@
 
 /// The release label this binary reports (`hk-node --version`, the usage banner).
 /// Bump with every node release; the crate version is workspace-wide and not it.
-pub const NODE_VERSION: &str = "v0.16.1";
+pub const NODE_VERSION: &str = "v0.17.0";
 
 mod account;
 mod app;
@@ -446,6 +446,8 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
 
 async fn run_node(home: PathBuf) -> eyre::Result<()> {
     use malachitebft_app_channel::app::node::Node;
+    // R11: `hk_chainInfo.process.uptime_secs` counts from here.
+    crate::state::mark_process_start();
     let app = App::new(home, None);
     app.run().await
 }
