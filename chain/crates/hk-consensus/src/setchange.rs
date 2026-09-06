@@ -43,6 +43,10 @@ pub enum SetChange {
     Admit { root_pk: Vec<u8>, public_key: HkPub, voting_power: u64 },
     /// Unseat the validator with this root identity.
     Remove { root_pk: Vec<u8> },
+    /// G1 (v0.18.0): change a seated validator's voting power in place (root identity,
+    /// operational key and epoch untouched). The handover tool: the founding seats lower
+    /// their own weight, or raise an external's, by certificate — never by binary.
+    SetPower { root_pk: Vec<u8>, voting_power: u64 },
 }
 
 /// The signed body — everything an approver commits to.
@@ -96,6 +100,11 @@ impl SetChangeBody {
                 buf.push(0x02);
                 put_bytes(&mut buf, root_pk);
             }
+            SetChange::SetPower { root_pk, voting_power } => {
+                buf.push(0x03);
+                put_bytes(&mut buf, root_pk);
+                buf.extend_from_slice(&voting_power.to_le_bytes());
+            }
         }
         buf.extend_from_slice(&self.not_before.to_le_bytes());
         buf.extend_from_slice(&self.not_after.to_le_bytes());
@@ -107,6 +116,7 @@ impl SetChangeBody {
         match &self.change {
             SetChange::Admit { root_pk, .. } => root_pk,
             SetChange::Remove { root_pk } => root_pk,
+            SetChange::SetPower { root_pk, .. } => root_pk,
         }
     }
 
@@ -133,6 +143,14 @@ impl SetChangeBody {
             SetChange::Remove { root_pk } => {
                 if root_pk.len() != ROOT_PK_LEN {
                     return Err(format!("set change: root_pk must be {ROOT_PK_LEN} bytes"));
+                }
+            }
+            SetChange::SetPower { root_pk, voting_power } => {
+                if root_pk.len() != ROOT_PK_LEN {
+                    return Err(format!("set change: root_pk must be {ROOT_PK_LEN} bytes"));
+                }
+                if *voting_power == 0 {
+                    return Err("set change: voting_power must be ≥ 1 (remove the seat instead)".into());
                 }
             }
         }
@@ -244,7 +262,55 @@ pub fn apply_set_change(
             }
             Ok(Some(HkValidatorSet::new(vals)))
         }
+        SetChange::SetPower { root_pk, voting_power } => {
+            let seat = set
+                .iter()
+                .find(|v| &v.root_pk == root_pk)
+                .ok_or_else(|| "set change: set-power for a root that is not seated".to_string())?;
+            if seat.voting_power == *voting_power {
+                return Ok(None);
+            }
+            let vals: Vec<HkValidator> = set
+                .iter()
+                .map(|v| {
+                    let mut v = v.clone();
+                    if &v.root_pk == root_pk {
+                        v.voting_power = *voting_power;
+                    }
+                    v
+                })
+                .collect();
+            Ok(Some(HkValidatorSet::new(vals)))
+        }
     }
+}
+
+/// G1 (v0.18.0) — the bootstrap-governance re-weight. At the activation height every node
+/// sets the voting power of the GENESIS seats (identified by their permanent roots) to
+/// `power`, in place: operational keys, epochs and addresses untouched, no certificate,
+/// no signatures — the rule is in the binary every node runs, so it is exactly as
+/// authoritative as the genesis itself and applies identically on live commits and on
+/// replay. `None` = nothing to change (no genesis root seated, or all already at `power`).
+pub fn reweight_roots(set: &HkValidatorSet, roots: &[Vec<u8>], power: u64) -> Option<HkValidatorSet> {
+    let mut changed = false;
+    let vals: Vec<HkValidator> = set
+        .iter()
+        .map(|v| {
+            let mut v = v.clone();
+            if roots.iter().any(|r| r == &v.root_pk) && v.voting_power != power {
+                v.voting_power = power;
+                changed = true;
+            }
+            v
+        })
+        .collect();
+    changed.then(|| HkValidatorSet::new(vals))
+}
+
+/// The smallest approving/voting power that is strictly more than ⅔ of `total`
+/// (3·q > 2·total): the quorum line the chain and every set change use.
+pub fn quorum_power(total: u64) -> u64 {
+    (total.saturating_mul(2) / 3).saturating_add(1)
 }
 
 // SLH-DSA operations allocate large fixed arrays — run tests on a generous stack.
@@ -401,6 +467,79 @@ mod tests {
             };
             let c = Approval::sign(&r1, &clash);
             assert!(apply_set_change(&set, &cert(&clash, &[&c]), 5, CHAIN).is_err());
+        });
+    }
+
+    #[test]
+    fn g1_reweight_roots_touches_only_the_named_seats_and_is_idempotent() {
+        let (_, f1) = seat(1, 1);
+        let (_, f2) = seat(2, 1);
+        let (_, ext) = seat(3, 1);
+        let set = HkValidatorSet::new(vec![f1.clone(), f2.clone(), ext.clone()]);
+        let roots = vec![f1.root_pk.clone(), f2.root_pk.clone()];
+        let re = reweight_roots(&set, &roots, 4).expect("changed");
+        assert_eq!(re.total_voting_power(), 9);
+        for v in re.iter() {
+            let want = if roots.contains(&v.root_pk) { 4 } else { 1 };
+            assert_eq!(v.voting_power, want);
+            // identity untouched: address, key, epoch
+            let before = set.iter().find(|b| b.root_pk == v.root_pk).unwrap();
+            assert_eq!((v.address, &v.public_key, v.epoch), (before.address, &before.public_key, before.epoch));
+        }
+        // Founders alone now pass a change: 3·8 = 24 > 2·9 = 18. Before: 3·2 = 6 > 6 is false.
+        assert!(8 * 3 > re.total_voting_power() * 2);
+        assert!(!(2 * 3 > set.total_voting_power() * 2));
+        // Applying again changes nothing; an unknown root changes nothing.
+        assert!(reweight_roots(&re, &roots, 4).is_none());
+        assert!(reweight_roots(&set, &[vec![9u8; 48]], 4).is_none());
+        // The quorum line: strictly more than ⅔.
+        assert_eq!(quorum_power(6), 5);
+        assert_eq!(quorum_power(18), 13);
+        assert_eq!(quorum_power(4), 3);
+        assert_eq!(quorum_power(1), 1);
+    }
+
+    #[test]
+    fn set_power_certificate_changes_one_seat_in_place() {
+        on_big_stack(|| {
+            let (r1, v1) = seat(1, 4);
+            let (r2, v2) = seat(2, 4);
+            let (_r3, v3) = seat(3, 1);
+            let set = HkValidatorSet::new(vec![v1.clone(), v2.clone(), v3.clone()]);
+            // Two founders at 4 each: 3·8 = 24 > 2·9 = 18 — they pass a re-weight alone.
+            let body = SetChangeBody {
+                chain_id: CHAIN.into(),
+                change: SetChange::SetPower { root_pk: v3.root_pk.clone(), voting_power: 3 },
+                not_before: 0,
+                not_after: 10,
+            };
+            let a1 = Approval::sign(&r1, &body);
+            let a2 = Approval::sign(&r2, &body);
+            let new_set = apply_set_change(&set, &cert(&body, &[&a1, &a2]), 5, CHAIN).unwrap().expect("changed");
+            assert_eq!(new_set.total_voting_power(), 11);
+            let s3 = new_set.iter().find(|v| v.root_pk == v3.root_pk).unwrap();
+            assert_eq!((s3.voting_power, s3.address, s3.epoch), (3, v3.address, v3.epoch));
+            // Replay inside the window: no-op. Unknown root: error. Zero power: shape error.
+            assert!(apply_set_change(&new_set, &cert(&body, &[&a1, &a2]), 6, CHAIN).unwrap().is_none());
+            let ghost = SetChangeBody {
+                chain_id: CHAIN.into(),
+                change: SetChange::SetPower { root_pk: vec![7u8; 48], voting_power: 2 },
+                not_before: 0,
+                not_after: 10,
+            };
+            let g1 = Approval::sign(&r1, &ghost);
+            let g2 = Approval::sign(&r2, &ghost);
+            assert!(apply_set_change(&set, &cert(&ghost, &[&g1, &g2]), 5, CHAIN).is_err());
+            let zero = SetChangeBody {
+                chain_id: CHAIN.into(),
+                change: SetChange::SetPower { root_pk: v3.root_pk.clone(), voting_power: 0 },
+                not_before: 0,
+                not_after: 10,
+            };
+            assert!(zero.check_shape().is_err());
+            // The signing bytes distinguish SetPower from Admit/Remove on the same root.
+            let rm = SetChangeBody { change: SetChange::Remove { root_pk: v3.root_pk.clone() }, ..body.clone() };
+            assert_ne!(body.signing_bytes(), rm.signing_bytes());
         });
     }
 }

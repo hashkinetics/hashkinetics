@@ -68,3 +68,81 @@ impl HkGenesis {
         self.chain.as_ref().and_then(|c| c.fee.clone())
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// G1 (v0.18.0) — bootstrap governance: the activation table.
+// ---------------------------------------------------------------------------------------
+
+/// One network's bootstrap re-weight: at commit height `height` every node sets the voting
+/// power of the GENESIS seats (the roots in this genesis file) to `founding_power`, in place,
+/// effective `height + 1`. Externals keep their admitted power (1). With four founding seats
+/// at 4 the founders hold strictly more than ⅔ against up to SEVEN external seats
+/// (3·16 > 2·(16+7)), so no set of young seats can stall the chain or block a set change,
+/// and the founders alone can seat, unseat and — at the published handover — re-weight
+/// (`SetChange::SetPower`). The handover is a certificate, not a binary: this table only
+/// ever raises the founders once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bootstrap {
+    pub height: u64,
+    pub founding_power: u64,
+}
+
+/// testnet-1's activation. Chosen 2026-09-06 at tip ≈101,900 (~16 blocks/min): about four
+/// days of notice for external operators to be on v0.18.0 — a node still on v0.17 wedges at
+/// this height (its validator set, and so its state, diverge), exactly like every earlier
+/// activation. If the fleet cannot roll in time, a patch release moves the number BEFORE it
+/// is reached; it never moves after.
+pub const G1_TESTNET1_HEIGHT: u64 = 200_000;
+pub const G1_FOUNDING_POWER: u64 = 4;
+
+/// The re-weight this node applies for `chain_id`, if any. testnet-1 is hard-wired; any
+/// OTHER chain (devnets, rehearsals) reads `HK_G1_HEIGHT` / `HK_G1_POWER` from the
+/// environment so gates can exercise the activation — never the public network: an
+/// operator cannot talk a testnet-1 node onto a different rule.
+pub fn bootstrap_for(chain_id: &str) -> Option<Bootstrap> {
+    bootstrap_from(chain_id, std::env::var("HK_G1_HEIGHT").ok().as_deref(), std::env::var("HK_G1_POWER").ok().as_deref())
+}
+
+/// The pure table behind [`bootstrap_for`]: the chain id decides, the environment only
+/// ever speaks for chains that are not testnet-1 (tested without touching the process env).
+pub fn bootstrap_from(chain_id: &str, env_height: Option<&str>, env_power: Option<&str>) -> Option<Bootstrap> {
+    if chain_id == "hashkinetics-1-4e4ea68d" {
+        return Some(Bootstrap { height: G1_TESTNET1_HEIGHT, founding_power: G1_FOUNDING_POWER });
+    }
+    let height = env_height?.trim().parse::<u64>().ok().filter(|h| *h > 0)?;
+    let founding_power =
+        env_power.and_then(|s| s.trim().parse::<u64>().ok()).filter(|p| *p > 0).unwrap_or(G1_FOUNDING_POWER);
+    Some(Bootstrap { height, founding_power })
+}
+
+#[cfg(test)]
+mod g1_tests {
+    use super::*;
+
+    #[test]
+    fn g1_activation_is_hardwired_for_testnet1_and_env_only_elsewhere() {
+        assert_eq!(
+            bootstrap_from("hashkinetics-1-4e4ea68d", None, None),
+            Some(Bootstrap { height: 200_000, founding_power: 4 })
+        );
+        // The env can never move testnet-1's activation.
+        assert_eq!(bootstrap_from("hashkinetics-1-4e4ea68d", Some("5"), Some("9")).unwrap().height, 200_000);
+        assert_eq!(bootstrap_from("hashkinetics-1-4e4ea68d", Some("5"), Some("9")).unwrap().founding_power, 4);
+        // Any other chain: the env, height required, power defaulting to 4; junk and zero refused.
+        assert_eq!(bootstrap_from("hashkinetics-devnet-1", Some("5"), Some("9")), Some(Bootstrap { height: 5, founding_power: 9 }));
+        assert_eq!(bootstrap_from("hashkinetics-devnet-1", Some(" 40 "), None).unwrap().founding_power, 4);
+        assert_eq!(bootstrap_from("hashkinetics-devnet-1", Some("40"), Some("0")).unwrap().founding_power, 4);
+        assert_eq!(bootstrap_from("hashkinetics-devnet-1", Some("0"), Some("9")), None);
+        assert_eq!(bootstrap_from("hashkinetics-devnet-1", Some("soon"), None), None);
+        assert_eq!(bootstrap_from("hashkinetics-devnet-1", None, Some("9")), None);
+        // Without the variables the real reader answers None for a devnet and the table for testnet-1.
+        if std::env::var_os("HK_G1_HEIGHT").is_none() {
+            assert_eq!(bootstrap_for("hashkinetics-devnet-1"), None);
+        }
+        assert_eq!(bootstrap_for("hashkinetics-1-4e4ea68d").unwrap().height, 200_000);
+        // The arithmetic the number was chosen for: four founders at 4 beat up to seven externals.
+        let founders = 4 * G1_FOUNDING_POWER;
+        assert!(3 * founders > 2 * (founders + 7));
+        assert!(3 * founders <= 2 * (founders + 8));
+    }
+}

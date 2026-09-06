@@ -1,0 +1,43 @@
+[package]
+name = "hk-wallet-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# WA1 (2026-09-06) — the wallet's whole journey as a LIBRARY with a UniFFI surface, so the
+# Android app (Kotlin) and any later shell call the same Rust the desktop wallet runs:
+# account file (reserve-then-sign), faucet, transparent send, shield / unshield / stealth pay /
+# scan / disclose over the public prover, sealed files (HKE1) with a mobile KDF profile and an
+# app-supplied key file (Android Keystore). No UI, no threads of its own: every call blocks and
+# the caller runs it off the main thread. Files are byte-compatible with the desktop wallet
+# and the CLI (`account.json`, `shield.json`, `disclosure-*.json`).
+
+[lib]
+name = "hk_wallet_core"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["cli"]
+
+[features]
+default = []
+cli = ["uniffi/cli"]
+
+[dependencies]
+hk-primitives = { path = "../hk-primitives" }
+hk-crypto = { path = "../hk-crypto", features = ["mlkem"] }
+hk-state = { path = "../hk-state" }
+hk-wallet = { path = "../hk-wallet" }
+hk-spend-circuit = { path = "../../../zkvm-bakeoff/circuit" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+rand = "0.8"
+# rustls + ring + bundled webpki roots: no system certificate store needed (Android).
+ureq = { version = "2.10", features = ["json"] }
+uniffi = { version = "0.29" }
+
+[dev-dependencies]

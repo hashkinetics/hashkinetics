@@ -13,7 +13,7 @@
 
 /// The release label this binary reports (`hk-node --version`, the usage banner).
 /// Bump with every node release; the crate version is workspace-wide and not it.
-pub const NODE_VERSION: &str = "v0.17.0";
+pub const NODE_VERSION: &str = "v0.18.0";
 
 mod account;
 mod app;
@@ -767,12 +767,13 @@ fn cmd_issue_rotation(home: &PathBuf, epoch: Option<u64>, valid_from: u64) -> ey
 /// Authority = strictly more than ⅔ of the CURRENT seats' voting power, checked by every
 /// node at propose and at commit; the change takes effect one height after it commits.
 fn cmd_set_change(args: &[String]) -> eyre::Result<()> {
-    let usage = "usage: hk-node set-change propose <HOME> (--admit <validator.json> [--power N] | --remove <root_hex>) --not-before H --not-after H | approve <HOME> <set-change.json> | assemble <set-change.json> <approval.json>... [-o cert.json]";
+    let usage = "usage: hk-node set-change propose <HOME> (--admit <validator.json> [--power N] | --remove <root_hex> | --set-power <root_hex> --power N) --not-before H --not-after H | approve <HOME> <set-change.json> | assemble <set-change.json> <approval.json>... [-o cert.json]";
     match args.first().map(String::as_str) {
         Some("propose") => {
             let home = PathBuf::from(args.get(1).ok_or_else(|| eyre::eyre!("{usage}"))?);
             let mut admit: Option<PathBuf> = None;
             let mut remove: Option<String> = None;
+            let mut set_power: Option<String> = None;
             let mut power: u64 = 1;
             let mut not_before: Option<u64> = None;
             let mut not_after: Option<u64> = None;
@@ -781,6 +782,7 @@ fn cmd_set_change(args: &[String]) -> eyre::Result<()> {
                 match args[i].as_str() {
                     "--admit" => { admit = args.get(i + 1).map(PathBuf::from); i += 2 }
                     "--remove" => { remove = args.get(i + 1).cloned(); i += 2 }
+                    "--set-power" => { set_power = args.get(i + 1).cloned(); i += 2 }
                     "--power" => { power = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(1); i += 2 }
                     "--not-before" => { not_before = args.get(i + 1).and_then(|v| v.parse().ok()); i += 2 }
                     "--not-after" => { not_after = args.get(i + 1).and_then(|v| v.parse().ok()); i += 2 }
@@ -792,8 +794,8 @@ fn cmd_set_change(args: &[String]) -> eyre::Result<()> {
                 _ => eyre::bail!("--not-before and --not-after (≥ not-before) are required — a certificate must expire\n{usage}"),
             };
             let chain_id = chain_id_of_home(&home)?;
-            let change = match (admit, remove) {
-                (Some(vj), None) => {
+            let change = match (admit, remove, set_power) {
+                (Some(vj), None, None) => {
                     let raw = std::fs::read_to_string(&vj)
                         .map_err(|e| eyre::eyre!("{}: {e}", vj.display()))?;
                     let gv: GenesisValidator = serde_json::from_str(&raw)?;
@@ -802,14 +804,22 @@ fn cmd_set_change(args: &[String]) -> eyre::Result<()> {
                     }
                     SetChange::Admit { root_pk: gv.root_pk, public_key: gv.public_key, voting_power: power }
                 }
-                (None, Some(hexroot)) => {
+                (None, Some(hexroot), None) => {
                     let root_pk = hex::decode(hexroot.trim()).map_err(|e| eyre::eyre!("--remove: bad hex: {e}"))?;
                     if root_pk.len() != 48 {
                         eyre::bail!("--remove: root_pk must be 48 bytes (96 hex chars)");
                     }
                     SetChange::Remove { root_pk }
                 }
-                _ => eyre::bail!("exactly one of --admit / --remove\n{usage}"),
+                (None, None, Some(hexroot)) => {
+                    // G1 (v0.18.0): the handover tool — a seat's weight changed by certificate.
+                    let root_pk = hex::decode(hexroot.trim()).map_err(|e| eyre::eyre!("--set-power: bad hex: {e}"))?;
+                    if root_pk.len() != 48 {
+                        eyre::bail!("--set-power: root_pk must be 48 bytes (96 hex chars)");
+                    }
+                    SetChange::SetPower { root_pk, voting_power: power }
+                }
+                _ => eyre::bail!("exactly one of --admit / --remove / --set-power\n{usage}"),
             };
             let body = SetChangeBody { chain_id: chain_id.clone(), change, not_before, not_after };
             body.check_shape().map_err(|e| eyre::eyre!(e))?;
@@ -823,6 +833,7 @@ fn cmd_set_change(args: &[String]) -> eyre::Result<()> {
                         hex::encode(&root_pk[..8]), hk_consensus::HkAddress::from_public_key(public_key));
                 }
                 SetChange::Remove { root_pk } => println!("  REMOVE    : root {}…", hex::encode(&root_pk[..8])),
+                SetChange::SetPower { root_pk, voting_power } => println!("  SET-POWER : root {}… → power {voting_power}", hex::encode(&root_pk[..8])),
             }
             println!("  window    : commit height {not_before} … {not_after} (effective one height after commit)");
             println!("\nnext: on EACH approving seat's machine:  hk-node set-change approve <HOME> {}", out.display());

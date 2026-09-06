@@ -180,6 +180,9 @@ pub struct SharedHandles {
     pub store: Option<Arc<NodeStore>>,
     /// P3.0b explorer surface: live validator set (rotations write through this lock).
     pub validators: Arc<Mutex<HkValidatorSet>>,
+    /// G1 (v0.18.0): the genesis seats' permanent roots — `hk_getValidators` marks them and
+    /// reports the bootstrap re-weight (`genesis::bootstrap_for`) + the quorum arithmetic.
+    pub genesis_roots: Vec<Vec<u8>>,
     /// Deterministic chain clock epoch (block time = chain_start_time + height).
     pub chain_start_time: u64,
     /// C2.3: tx-gossip enqueue handle (`None` = gossip off; node.rs wires it when
@@ -356,6 +359,9 @@ pub struct HkApp {
     root: RootSecret,
     /// Our root public key (matches our entry in the validator set).
     my_root_pk: Vec<u8>,
+    /// G1 (v0.18.0): the permanent roots of the GENESIS seats — the ones the bootstrap
+    /// re-weight names at its activation height (`genesis::bootstrap_for`).
+    genesis_roots: Vec<Vec<u8>>,
     /// Epoch of our currently-live operational key (0 = genesis key).
     current_epoch: u64,
     /// Highest epoch we've already issued a cert for (avoids re-issuing).
@@ -409,6 +415,7 @@ impl HkApp {
         verifiers: Option<PoolVerifiers>,
     ) -> Result<Self> {
         let validators = genesis.validator_set()?;
+        let genesis_roots: Vec<Vec<u8>> = genesis.validators.iter().map(|v| v.root_pk.clone()).collect();
         // HK-R6: seed the shared set history — the genesis set verifies from height 1.
         // (restore_from_store reseeds at the snapshot; rotations append as they commit.)
         {
@@ -493,6 +500,7 @@ impl HkApp {
             master_seed,
             root,
             my_root_pk,
+            genesis_roots,
             current_epoch: 0,
             highest_issued_epoch: 0,
             op_handle,
@@ -538,6 +546,7 @@ impl HkApp {
             genesis_digest: self.genesis_digest,
             store: self.store.clone(),
             validators: self.validators.clone(),
+            genesis_roots: self.genesis_roots.clone(),
             chain_start_time: self.chain_start_time,
             gossip: None,
             foreign_rotations: self.foreign_rotations.clone(),
@@ -1262,6 +1271,21 @@ impl HkApp {
                                     info!("THIS NODE was unseated — it keeps verifying as an observer");
                                 }
                             }
+                            SetChange::SetPower { voting_power, .. } => {
+                                info!(
+                                    root = %hex::encode(&subject[..8.min(subject.len())]),
+                                    power = voting_power,
+                                    seats = new_set.len(),
+                                    total_power = new_set.total_voting_power(),
+                                    quorum = hk_consensus::quorum_power(new_set.total_voting_power()),
+                                    effective_from = height + 1,
+                                    replay,
+                                    "Validator RE-WEIGHTED (G1 set-power)"
+                                );
+                                if mine {
+                                    info!(power = voting_power, "THIS NODE's voting power changed");
+                                }
+                            }
                         }
                     }
                     Ok(None) => info!(height, "set change already applied — no-op"),
@@ -1272,6 +1296,37 @@ impl HkApp {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .retain(|q| q.body != cert.body);
+            }
+        }
+        // G1 (v0.18.0): the bootstrap re-weight — a rule of the binary, applied by every node
+        // at the SAME height on live commits and on replay, after any certificates in that
+        // block: the genesis seats' power becomes `founding_power`, effective height + 1.
+        if let Some(b) = crate::genesis::bootstrap_for(&self.chain_id) {
+            if height == b.height {
+                let current = self.validators.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                match hk_consensus::reweight_roots(&current, &self.genesis_roots, b.founding_power) {
+                    Some(new_set) => {
+                        let founding: u64 = new_set
+                            .iter()
+                            .filter(|v| self.genesis_roots.contains(&v.root_pk))
+                            .map(|v| v.voting_power)
+                            .sum();
+                        *self.validators.lock().unwrap_or_else(|e| e.into_inner()) = new_set.clone();
+                        any_applied = true;
+                        info!(
+                            height,
+                            founding_power = b.founding_power,
+                            founding_total = founding,
+                            total_power = new_set.total_voting_power(),
+                            seats = new_set.len(),
+                            quorum = hk_consensus::quorum_power(new_set.total_voting_power()),
+                            effective_from = height + 1,
+                            replay,
+                            "G1 BOOTSTRAP GOVERNANCE ACTIVATED — genesis seats re-weighted"
+                        );
+                    }
+                    None => info!(height, "G1 activation height reached — nothing to re-weight"),
+                }
             }
         }
         if any_applied {

@@ -31,7 +31,7 @@ pub use context::*;
 pub use hashsig_scheme::{op_seed, HkHashScheme, HkPriv, HkPub, HkSig};
 pub use provider::HkSigningProvider;
 pub use rotation::RotationCert;
-pub use setchange::{apply_set_change, Approval, SetChange, SetChangeBody, SetChangeCert};
+pub use setchange::{apply_set_change, quorum_power, reweight_roots, Approval, SetChange, SetChangeBody, SetChangeCert};
 
 /// The stateless SLH-DSA-192s validator root (re-exported for the node's genesis + rotation
 /// issuance). Certifies operational trees; never exhausts (docs/MAINNET-KEY-MANAGEMENT.md).

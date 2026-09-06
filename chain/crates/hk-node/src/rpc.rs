@@ -607,14 +607,33 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
         "hk_getValidators" => {
             let vs = h.validators.lock().unwrap_or_else(|e| e.into_inner());
             let queued = h.pending_set_changes.lock().unwrap_or_else(|e| e.into_inner());
+            let height = h.chain.lock().unwrap_or_else(|e| e.into_inner()).height;
+            let total = vs.total_voting_power();
+            // G1 (v0.18.0): the arithmetic every operator should be able to read off the
+            // node — who is a genesis seat, what the founders and the externals weigh, where
+            // the quorum line is, and how much power may be absent before commits stop.
+            let founding: u64 = vs.iter().filter(|v| h.genesis_roots.contains(&v.root_pk)).map(|v| v.voting_power).sum();
+            let quorum = hk_consensus::quorum_power(total);
+            let bootstrap = crate::genesis::bootstrap_for(&h.chain_id).map(|b| json!({
+                "height": b.height,
+                "founding_power": b.founding_power,
+                "active": height >= b.height,
+            }));
             json!({"result": {
                 "count": vs.len(),
-                "total_power": vs.total_voting_power(),
+                "total_power": total,
+                "founding_power": founding,
+                "external_power": total.saturating_sub(founding),
+                "quorum_power": quorum,
+                "max_absent_power": total.saturating_sub(quorum),
+                "founders_alone_decide": founding >= quorum,
+                "bootstrap": bootstrap,
                 "validators": vs.iter().map(|v| json!({
                     "address": v.address.to_string(),
                     "voting_power": v.voting_power,
                     "epoch": v.epoch,
                     "root_pk": hex::encode(&v.root_pk),
+                    "genesis": h.genesis_roots.contains(&v.root_pk),
                 })).collect::<Vec<_>>(),
                 "pending_set_changes": queued.iter().map(|c| {
                     let change = match &c.body.change {
@@ -622,6 +641,8 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
                             json!({"admit": hex::encode(root_pk), "voting_power": voting_power}),
                         hk_consensus::SetChange::Remove { root_pk } =>
                             json!({"remove": hex::encode(root_pk)}),
+                        hk_consensus::SetChange::SetPower { root_pk, voting_power } =>
+                            json!({"set_power": hex::encode(root_pk), "voting_power": voting_power}),
                     };
                     json!({
                         "change": change,
@@ -778,6 +799,8 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
                                         ("admit", hex::encode(root_pk), Some(*voting_power)),
                                     hk_consensus::SetChange::Remove { root_pk } =>
                                         ("remove", hex::encode(root_pk), None),
+                                    hk_consensus::SetChange::SetPower { root_pk, voting_power } =>
+                                        ("set_power", hex::encode(root_pk), Some(*voting_power)),
                                 };
                                 json!({"change": kind, "root_pk": root_pk, "voting_power": power,
                                        "approvals": c.approvals.len(),

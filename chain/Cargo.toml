@@ -12,7 +12,12 @@ members = [
     "crates/hk-wallet-gui",
 ]
 # v0.13.2 (H11): the 0.7-era DTO stub nothing depends on; deleted at the next housekeeping commit.
-exclude = ["crates/hk-rpc"]
+# WA1 (2026-09-06): the Android wallet core (`hk-wallet-core`, UniFFI) is written but has not had its
+# build cycle yet — it joins `members` the day it compiles and its gate is green, so that the v0.18.0
+# release build (and `cargo test` in the public clone) never waits on it. For its build cycle move it
+# back into `members` (it inherits workspace fields, so it cannot build from outside the workspace) and
+# take it out of `exclude` — in the WA1 commit, not before.
+exclude = ["crates/hk-rpc", "crates/hk-wallet-core"]
 
 [workspace.package]
 version = "0.0.1"
