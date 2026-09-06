@@ -67,9 +67,9 @@ Until v0.16.1 every node built SP1's full CPU prover to verify STARKs: ~6.7 GB r
 |---|---|---|---|---|---|---|---|
 | 2026-09-02 | fleet (4×) | v0.13.0 | full CpuProver | ~6.7 GB | ~5 min | 3–6 min | journal + `ps` (INCIDENTS #6) |
 | 2026-09-06 | WSL devnet node (4 on one box) | v0.17.0 | LightProver | 52 MiB at start · 259–309 MiB after mint + spends + aggregate | 379 ms (219 ms on restart) | 1 s (2 s on a persisted restart) | `chain/gate-r11.sh` 2026-09-06 |
-| _(pending — filled by the v0.17.0 roll)_ | hk-val-1 / val-0 / val-2 / gateway | v0.17.0 | LightProver | _(measured at the roll)_ | _(measured at the roll)_ | _(measured at the roll)_ | `ops/roll-v0.17.0.sh memory` |
+| 2026-09-06 | hk-val-1 / val-0 / val-2 / gateway (e2-standard-2, sealed keys) | v0.17.0 | LightProver | 59 / 56 / 54 / 58 MiB at 6–14 min uptime (was 6,727 / 6,215 / 6,457 / 6,088 MiB on v0.16.1 — systemd MemoryCurrent) | 795 / 1,168 / 1,011 / 1,401 ms | 6 / 15 / 13 / 16 s | `ops/roll-v0.17.0.sh memory` + journal `RPC listening` |
 
-Quote rule: the onboarding RAM line = the largest fleet steady-state RSS, rounded up to the next GB, plus 2 GB of headroom for catch-up bursts (restore-time RSS on val-0 peaked at 6.7 of 7.9 GB during the 2026-09-05 sealed-key restart — measure that too).
+Quote rule: the onboarding RAM line = the largest fleet steady-state RSS, rounded up to the next GB, plus headroom for catch-up verification and proof-heavy blocks (devnet nodes reached ~300 MiB verifying mints, spends and a compressed aggregate). Applied 2026-09-06: **4 GB minimum, 8 GB comfortable** (from "8 GB minimum, 16 GB comfortable"). The v0.16.1-era restore peak (val-0 at 6.7 of 7.9 GB during the 2026-09-05 sealed-key restart) was the proving engine, not the restore.
 
 ## Quote discipline
 
