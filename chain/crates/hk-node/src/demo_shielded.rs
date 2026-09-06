@@ -264,26 +264,34 @@ fn pool_line(base: &str) -> String {
 }
 
 /// Fetch the scanner feed: (leaves in order, (index, commitment, stealth_ct) entries).
+/// H3 (v0.16.1): the feed is paged (`from`/`limit`, `next` = the following page); this
+/// CLI reads it whole, page by page — the GUI wallet keeps a cursor instead.
 #[allow(clippy::type_complexity)]
 pub(crate) fn pool_notes(base: &str) -> eyre::Result<(Vec<Hash>, Vec<(u64, Hash, Vec<u8>)>)> {
-    let v = rpc(base, "hk_getPoolNotes", json!({}));
-    let arr = v
-        .get("result")
-        .and_then(|r| r.get("notes"))
-        .and_then(|n| n.as_array())
-        .ok_or_else(|| eyre::eyre!("hk_getPoolNotes failed: {v}"))?;
-    let mut leaves = Vec::with_capacity(arr.len());
-    let mut entries = Vec::with_capacity(arr.len());
-    for e in arr {
-        let idx = e.get("index").and_then(|i| i.as_u64()).ok_or_else(|| eyre::eyre!("bad index"))?;
-        let cm_hex = e.get("commitment").and_then(|c| c.as_str()).ok_or_else(|| eyre::eyre!("bad cm"))?;
-        let ct_hex = e.get("stealth_ct").and_then(|c| c.as_str()).unwrap_or("");
-        let cm_b = hex::decode(cm_hex)?;
-        let cm: Hash = cm_b.as_slice().try_into().map_err(|_| eyre::eyre!("cm not 32B"))?;
-        leaves.push(cm);
-        entries.push((idx, cm, hex::decode(ct_hex)?));
+    let mut leaves = Vec::new();
+    let mut entries: Vec<(u64, Hash, Vec<u8>)> = Vec::new();
+    let mut from = 0u64;
+    loop {
+        let v = rpc(base, "hk_getPoolNotes", json!({ "from": from, "limit": 5_000 }));
+        let r = v.get("result").ok_or_else(|| eyre::eyre!("hk_getPoolNotes failed: {v}"))?;
+        let arr = r.get("notes").and_then(|n| n.as_array()).ok_or_else(|| eyre::eyre!("hk_getPoolNotes failed: {v}"))?;
+        for e in arr {
+            let idx = e.get("index").and_then(|i| i.as_u64()).ok_or_else(|| eyre::eyre!("bad index"))?;
+            if idx < entries.len() as u64 {
+                continue; // a pre-H3 node answers everything regardless of `from`
+            }
+            let cm_hex = e.get("commitment").and_then(|c| c.as_str()).ok_or_else(|| eyre::eyre!("bad cm"))?;
+            let ct_hex = e.get("stealth_ct").and_then(|c| c.as_str()).unwrap_or("");
+            let cm_b = hex::decode(cm_hex)?;
+            let cm: Hash = cm_b.as_slice().try_into().map_err(|_| eyre::eyre!("cm not 32B"))?;
+            leaves.push(cm);
+            entries.push((idx, cm, hex::decode(ct_hex)?));
+        }
+        match r.get("next").and_then(|n| n.as_u64()) {
+            Some(n) if n > from => from = n,
+            _ => return Ok((leaves, entries)),
+        }
     }
-    Ok((leaves, entries))
 }
 
 /// Pull (proof bytes, prove_ms) out of an hk-prove response, or surface its error.

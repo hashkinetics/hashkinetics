@@ -1,4 +1,4 @@
-# HashKinetics Wallet — user guide (Windows · v0.14.0 · testnet-1)
+# HashKinetics Wallet — user guide (Windows · v0.14.1 · testnet-1)
 
 **What to click first, how to hide money, how to show it again, how to pay someone privately, and how to prove one payment to one person.** The same guide exists as a slide deck (`HashKinetics-Wallet-Guide.pptx` / `.pdf`, screenshots in `wallet-guide-shots/`); this is the text version for the repository and the website (`/wallet`). Everything here was done on the live network on 2026-09-02 — the transaction ids are real and searchable in the explorer.
 
@@ -87,7 +87,7 @@ Open the **SHIELDED** panel. Type an amount next to **Shield → pool** and clic
 
 *Screenshots: `shielded_panel.jpg`, `notes_first.jpg`*
 
-**↻ Scan pool** downloads the pool's note index and trial-decrypts every note with your key — only yours open. Each note shows `LIVE` or `SPENT`, its value, the memo (if a payer attached one) and `#index cm…`. **copy my stealth address** copies your `hkaddr:…` — give it to anyone who should pay you *privately*. Nobody can link a stealth address to your account id.
+**↻ Scan pool** reads the pool's note index and trial-decrypts every note with your key — only yours open. Since v0.14.1 the scan is *incremental*: the wallet remembers how far it has read and which notes are yours (inside `shield.json`, sealed with it when the wallet is protected), so a scan costs only what the pool appended since — the ACTIVITY line says how many new entries it read. A wallet moved to another network, or restored from an older `shield.json`, simply scans once from the start. Each note shows `LIVE` or `SPENT`, its value, the memo (if a payer attached one) and `#index cm…`. **copy my stealth address** copies your `hkaddr:…` — give it to anyone who should pay you *privately*. Nobody can link a stealth address to your account id.
 
 ## 9 · Unshield (show): pool → me
 
@@ -126,6 +126,8 @@ Every note has a **disclose** button. It writes `disclosure-<id>.json` next to y
 | spinner for a long time on a shielded op | the prover is proving (up to 15 min under load) | wait; the receipt lands in ACTIVITY |
 | `shield.json` error about capacity | 64 one-time spend keys used on this master | move `shield.json` aside (keep it!) and shield again with a fresh master — old notes stay spendable from the old file |
 | a payment shows `rejected: …` | the chain refused it — the log says why | nothing was spent; fix the cause and retry |
+| `the path does not fold to the stated root` | the node answered a bad Merkle path (v0.14.1 asks the node for one path per spend and re-checks it) | nothing was spent; ↻ Scan and retry, or point `HK_WALLET_RPC` at another node |
+| a note you know you received is missing after a scan | the scan cache is behind or from another network | ACTIVITY shows the pool size read; if it looks wrong, remove the `scan` block from `shield.json` (or the whole cache — never the seed) and scan again from the start |
 | opens to **This wallet is protected** | the files are sealed (v0.14.0) | type the passphrase; there is no reset — use the seed backup if it is lost |
 | `Could not unlock: wrong passphrase` | typo, or a file was tampered with | retry; the wallet never half-opens a sealed file |
 

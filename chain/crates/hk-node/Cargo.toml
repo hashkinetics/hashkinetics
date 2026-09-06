@@ -56,6 +56,12 @@ malachitebft-sync = { package = "informalsystems-malachitebft-sync", path = "../
 malachitebft-network = { package = "informalsystems-malachitebft-network", path = "../../../vendor/external/malachite/code/crates/network" }
 malachitebft-signing-ed25519 = { package = "informalsystems-malachitebft-signing-ed25519", path = "../../../vendor/external/malachite/code/crates/signing-ed25519", features = ["serde"] }
 
+# v0.16.1: `hk-node … | head -1` panicked on EPIPE (stdout closed by the reader, seen during
+# the K3 migration on the gateway) — main() restores SIG_DFL for SIGPIPE on unix. Already in
+# the lock file transitively (0.2.x), so this adds no new crate.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 default = ["sp1-verify"]
 sp1-verify = ["dep:sp1-sdk"]

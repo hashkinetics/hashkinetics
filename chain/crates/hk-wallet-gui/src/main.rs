@@ -22,6 +22,8 @@
 //!   shield.json on disk (`HKE1`: Argon2id → XChaCha20-Poly1305, the same envelope the
 //!   CLI's `account-seal` writes, so CLI and GUI still share a wallet). A sealed wallet
 //!   opens to an Unlock screen; the passphrase lives in memory for the session only.
+//! - H3 (v0.14.1, node v0.16.1): the pool scan is incremental and paged, and spends fetch
+//!   one Merkle path from the node — the wallet stays fast however large the pool grows.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -41,7 +43,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// Shown in the footer; bump with every release (the crate version is workspace-wide).
-pub const WALLET_VERSION: &str = "v0.14.0";
+pub const WALLET_VERSION: &str = "v0.14.1";
 const RPC_DEFAULT: &str = "https://rpc.hashkinetics.org";
 const FAUCET_DEFAULT: &str = "https://faucet.hashkinetics.org";
 const EXPLORER: &str = "https://www.hashkinetics.org/explorer/";
@@ -357,8 +359,14 @@ fn fmt_amount(micro: Amount) -> String {
 // ---------------------------------------------------------------------------
 
 fn rpc_call(method: &str, params: Value) -> Result<Value, String> {
+    rpc_call_within(method, params, 8)
+}
+
+/// H3 (v0.14.1): a page of the pool feed can be megabytes — the scanner's calls get a
+/// longer budget than the balance/nonce reads.
+fn rpc_call_within(method: &str, params: Value, secs: u64) -> Result<Value, String> {
     ureq::post(rpc_url())
-        .timeout(Duration::from_secs(8))
+        .timeout(Duration::from_secs(secs))
         .send_json(json!({ "method": method, "params": params }))
         .map_err(|e| format!("rpc: {e}"))?
         .into_json::<Value>()

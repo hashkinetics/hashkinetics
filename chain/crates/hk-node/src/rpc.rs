@@ -19,7 +19,13 @@
 //!   hk_getReceipt   {txid}                     -> {found, detail}
 //!   hk_getPoolInfo                             -> {version, asset?, root, latest_anchor,
 //!                                                  next_index, nullifiers, total_shielded}
-//!   hk_getPoolLeaves                           -> {leaves: [hex; ...]}  (wallet path rebuilds)
+//!   hk_getPoolLeaves {from?, limit?<=10000}    -> {leaves: [hex; ...], from, count, total, next}  (H3: paged)
+//!   hk_getPoolNotes  {from?, limit?<=10000}    -> {notes: [{index, commitment, stealth_ct}], from,
+//!                                                 count, total, next}   (H3, v0.16.1: paged — `next`
+//!                                                 is the wallet's scan cursor; null = end)
+//!   hk_getPoolPath   {index}                   -> {index, commitment, siblings[TREE_DEPTH], root, total}
+//!                                                 (H3: one authentication path; spenders no longer
+//!                                                 download every commitment)
 //!
 //! P3.0b explorer surface (store-backed — reads the durable block log, no app locks):
 //!   hk_getBlock     {height}                   -> full block: txs (public summaries) +
@@ -441,22 +447,62 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
                 "total_shielded": p.total_shielded.to_string(),
             }})
         }
+        // ---- H3 (v0.16.1): the pool feed is PAGED. `from` (leaf index, default 0) and
+        // `limit` (default and cap POOL_PAGE_MAX) — the answer carries `total` and `next`
+        // (null when the page reached the end). A wallet keeps `next` as its scan cursor and
+        // asks only for what it has not seen; a spender asks `hk_getPoolPath` for one
+        // authentication path instead of downloading every commitment.
         "hk_getPoolLeaves" => {
             let notes = h.pool_notes.lock().unwrap_or_else(|e| e.into_inner());
+            let (from, to, next) = pool_page(params, notes.len());
             json!({"result": {
-                "leaves": notes.iter().map(|(l, _)| hex::encode(l.0)).collect::<Vec<_>>(),
+                "leaves": notes[from..to].iter().map(|(l, _)| hex::encode(l.0)).collect::<Vec<_>>(),
+                "from": from,
+                "count": to - from,
+                "total": notes.len(),
+                "next": next,
             }})
         }
         "hk_getPoolNotes" => {
             // For scanners: (leaf index, commitment, stealth payload).
             let notes = h.pool_notes.lock().unwrap_or_else(|e| e.into_inner());
+            let (from, to, next) = pool_page(params, notes.len());
             json!({"result": {
-                "notes": notes.iter().enumerate().map(|(i, (l, ct))| json!({
-                    "index": i,
+                "notes": notes[from..to].iter().enumerate().map(|(i, (l, ct))| json!({
+                    "index": from + i,
                     "commitment": hex::encode(l.0),
                     "stealth_ct": hex::encode(ct),
                 })).collect::<Vec<_>>(),
+                "from": from,
+                "count": to - from,
+                "total": notes.len(),
+                "next": next,
             }})
+        }
+        "hk_getPoolPath" => {
+            // One leaf's authentication path (siblings bottom→top) + the root it folds to,
+            // computed from the node's full leaf list. The proof binds the root; the chain
+            // accepts it only while that root is a recent anchor — a wrong path can only
+            // cost the spender a rejected tx, never a coin.
+            match params.get("index").and_then(|v| v.as_u64()) {
+                Some(index) => {
+                    let notes = h.pool_notes.lock().unwrap_or_else(|e| e.into_inner());
+                    if (index as usize) >= notes.len() {
+                        json!({"error": format!("index {index} out of range (pool has {} commitments)", notes.len())})
+                    } else {
+                        let leaves: Vec<[u8; 32]> = notes.iter().map(|(l, _)| l.0).collect();
+                        let (siblings, root) = hk_state::pool::full_tree_path(&leaves, index);
+                        json!({"result": {
+                            "index": index,
+                            "commitment": hex::encode(leaves[index as usize]),
+                            "siblings": siblings.iter().map(hex::encode).collect::<Vec<_>>(),
+                            "root": hex::encode(root),
+                            "total": leaves.len(),
+                        }})
+                    }
+                }
+                None => json!({"error": "index (leaf index, integer) required"}),
+            }
         }
         "hk_getReceipt" => match param_h256(params, "txid") {
             Some(id) => {
@@ -898,6 +944,26 @@ fn param_h256(params: &Value, key: &str) -> Option<H256> {
     Some(H256(arr))
 }
 
+/// H3 (v0.16.1): the largest page the pool feed answers in one call. A page of notes is
+/// ~2.4 KB each (ML-KEM ciphertext + sealed note as hex), so this is ≈ 24 MB worst case —
+/// bounded on the node whatever the pool grows to; wallets page with `next`.
+pub(crate) const POOL_PAGE_MAX: usize = 10_000;
+
+/// `(from, to, next)` for a paged read of `total` items: `from` clamped to `total`,
+/// `limit` defaulted and capped at `POOL_PAGE_MAX`, `next` = the index after this page or
+/// `None` when the page reached the end.
+fn pool_page(params: &Value, total: usize) -> (usize, usize, Option<usize>) {
+    let from = params.get("from").and_then(|v| v.as_u64()).unwrap_or(0).min(total as u64) as usize;
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|l| (l as usize).clamp(1, POOL_PAGE_MAX))
+        .unwrap_or(POOL_PAGE_MAX);
+    let to = from.saturating_add(limit).min(total);
+    let next = (to < total).then_some(to);
+    (from, to, next)
+}
+
 fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
@@ -1018,5 +1084,29 @@ mod n1_tests {
         assert_eq!(hk_peer_genesis_digest("hashkinetics/1/genesis/ééééééééééééééééééééééééééééééééé"), None);
         assert_eq!(hk_peer_node_version(&format!("hashkinetics/1/genesis/{digest}/hk-node/")), None);
         assert_eq!(hk_peer_node_version(&format!("hashkinetics/1/genesis/{digest}/hk-node/v0.15.2 <script>")), None);
+    }
+}
+
+#[cfg(test)]
+mod h3_tests {
+    use super::{pool_page, POOL_PAGE_MAX};
+    use serde_json::json;
+
+    #[test]
+    fn h3_pool_pages_are_bounded_and_chain_to_the_end() {
+        // empty pool: nothing, no next
+        assert_eq!(pool_page(&json!({}), 0), (0, 0, None));
+        // default page covers a small pool in one go
+        assert_eq!(pool_page(&json!({}), 7), (0, 7, None));
+        // explicit pages chain: 0..3 → next 3, 3..6 → next 6, 6..7 → end
+        assert_eq!(pool_page(&json!({"limit": 3}), 7), (0, 3, Some(3)));
+        assert_eq!(pool_page(&json!({"from": 3, "limit": 3}), 7), (3, 6, Some(6)));
+        assert_eq!(pool_page(&json!({"from": 6, "limit": 3}), 7), (6, 7, None));
+        // past the end: empty page, no next (a wallet whose cursor == total asks exactly this)
+        assert_eq!(pool_page(&json!({"from": 7}), 7), (7, 7, None));
+        assert_eq!(pool_page(&json!({"from": 99}), 7), (7, 7, None));
+        // limit is capped, never zero
+        assert_eq!(pool_page(&json!({"limit": 0}), 7), (0, 1, Some(1)));
+        assert_eq!(pool_page(&json!({"limit": 1_000_000}), 3 * POOL_PAGE_MAX), (0, POOL_PAGE_MAX, Some(POOL_PAGE_MAX)));
     }
 }

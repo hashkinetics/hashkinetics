@@ -13,7 +13,7 @@
 
 /// The release label this binary reports (`hk-node --version`, the usage banner).
 /// Bump with every node release; the crate version is workspace-wide and not it.
-pub const NODE_VERSION: &str = "v0.16.0";
+pub const NODE_VERSION: &str = "v0.16.1";
 
 mod account;
 mod app;
@@ -55,6 +55,14 @@ const RPC_BASE_PORT: usize = 26000;
 const CHAIN_START_TIME: u64 = 1_000;
 
 fn main() -> eyre::Result<()> {
+    // v0.16.1: a reader closing stdout early (`hk-node account-info DIR | head -1`) is a
+    // quiet exit, not a "failed printing to stdout: Broken pipe" panic. Rust ignores SIGPIPE
+    // at startup; put the default disposition back before any thread exists.
+    #[cfg(unix)]
+    // SAFETY: called first thing in main, single-threaded, no signal handler installed yet.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -377,6 +385,44 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
                 }
             }
         }
+        Some("pool-path") => {
+            // H3 (v0.16.1): fetch ONE authentication path from a node and prove, locally,
+            // that it folds to the root the node states AND to the pool's current root —
+            // what the GUI wallet does before every spend, as a one-line diagnostic.
+            let usage = "usage: hk-node pool-path <RPC> <LEAF-INDEX>";
+            let rpc = args.get(2).cloned().ok_or_else(|| eyre::eyre!(usage))?;
+            let index: u64 = args.get(3).and_then(|s| s.parse().ok()).ok_or_else(|| eyre::eyre!(usage))?;
+            let v = demo::rpc(&rpc, "hk_getPoolPath", serde_json::json!({ "index": index }));
+            let r = v.get("result").ok_or_else(|| eyre::eyre!("hk_getPoolPath: {v}"))?;
+            let h32 = |s: Option<&serde_json::Value>| -> eyre::Result<[u8; 32]> {
+                let b = hex::decode(s.and_then(|x| x.as_str()).unwrap_or(""))?;
+                b.as_slice().try_into().map_err(|_| eyre::eyre!("not 32 bytes"))
+            };
+            let cm = h32(r.get("commitment"))?;
+            let root = h32(r.get("root"))?;
+            let siblings = r
+                .get("siblings")
+                .and_then(|s| s.as_array())
+                .ok_or_else(|| eyre::eyre!("no siblings"))?
+                .iter()
+                .map(|s| h32(Some(s)))
+                .collect::<eyre::Result<Vec<_>>>()?;
+            let folded = hk_wallet::fold_path(&cm, &siblings, index);
+            let pool_root = demo::rpc(&rpc, "hk_getPoolInfo", serde_json::json!({}))
+                .get("result")
+                .and_then(|i| i.get("root"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("?")
+                .to_string();
+            println!("leaf {index}: commitment {}  siblings {}  total {}", hex::encode(cm), siblings.len(), r.get("total").and_then(|t| t.as_u64()).unwrap_or(0));
+            println!("  stated root : {}", hex::encode(root));
+            println!("  folds to    : {}  {}", hex::encode(folded), if folded == root { "✓" } else { "✗ MISMATCH" });
+            println!("  pool root   : {pool_root}  {}", if pool_root == hex::encode(root) { "✓ current" } else { "(differs — the pool moved on; still a valid anchor while recent)" });
+            if folded != root {
+                eyre::bail!("the node's path does not fold to its stated root");
+            }
+            Ok(())
+        }
         _ => {
             eprintln!("HashKinetics node {NODE_VERSION} (hash-based consensus + shielded pool + disclosure + durable store)");
             eprintln!("usage: hk-node testnet <N> <HOME> | start <NODE_HOME> | wallet <CMD …> | keygen <HOME> [MONIKER] | issue-rotation <HOME> [EPOCH] [VALID_FROM] | set-change propose|approve|assemble … | genesis-build <VALIDATORS.json> <OUT.json> | config-gen <HOME> --listen … --peers … | storm <RPC> [RATE] [DURATION_S] | demo <RPC> | demo-economy <RPC> <PROVER> | demo-shielded <RPC> <PROVER> | demo-disclose <RPC> <PROVER> | demo-agg <RPC> <PROVER> | demo-mandates <RPC> <PROVER> | verify-disclosure <package.json>");
@@ -386,6 +432,13 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
             eprintln!("keys at rest (K1/K2): key-seal|key-unseal HOME (priv_validator_key.json; HK_KEY_PASSPHRASE[_FILE] / LoadCredential=hk-key-passphrase) · account-seal|account-unseal DIR (account.json + wallet.json; HK_WALLET_PASSPHRASE[_FILE] / LoadCredential=hk-wallet-passphrase) · keyfile-new PATH (second factor via HK_KEY_KEYFILE / HK_WALLET_KEYFILE) · passphrase-new [WORDS]");
             eprintln!("issued assets (X1): asset-id ISSUER|DIR SYMBOL · asset register DIR RPC SYMBOL DECIMALS FLAGS(m/f/p/s|-) · asset mint DIR RPC ASSET TO MICRO · asset burn DIR RPC ASSET MICRO [DEST-hex] · asset freeze|unfreeze DIR RPC ASSET ACCOUNT · asset pause|unpause DIR RPC ASSET · asset info RPC ASSET|SYMBOL@ISSUER · asset list RPC");
             eprintln!("wallet: init DIR ACCOUNT [RPC] · status DIR [RPC] · address DIR [RPC] · scan DIR [RPC] · transfer DIR TO USD [RPC] · shield DIR USD [RPC] [PROVER] · unshield DIR USD [RPC] [PROVER] · pay DIR HKADDR USD [MEMO] [RPC] [PROVER] · disclose DIR COMMITMENT OUT.json [RPC]");
+            eprintln!("pool (H3): pool-path RPC LEAF-INDEX  — fetch one authentication path and re-fold it locally");
+            // v0.16.1: an unknown command is a FAILURE (exit 2), not a successful usage print —
+            // `hk-node account-unseal DIR && shred -u passfile` on an older binary shredded the
+            // passphrase file because the usage text exited 0 (K3 migration, 2026-09-05).
+            if args.len() > 1 {
+                std::process::exit(2);
+            }
             Ok(())
         }
     }

@@ -3280,6 +3280,7 @@ dependencies = [
  "informalsystems-malachitebft-peer",
  "informalsystems-malachitebft-signing-ed25519",
  "informalsystems-malachitebft-sync",
+ "libc",
  "rand 0.8.7",
  "serde",
  "serde_json",

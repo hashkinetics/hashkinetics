@@ -231,7 +231,8 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> eyre::Result<()> {
 }
 
 /// `key-seal` / `account-seal`: convert one plain secret file into a sealed one. The new
-/// passphrase comes from `<PREFIX>_PASSPHRASE` (scripts) or a double prompt and must pass
+/// passphrase comes from `<PREFIX>_PASSPHRASE`, `<PREFIX>_PASSPHRASE_FILE` (v0.16.1, first
+/// line) or a double prompt and must pass
 /// `sealed::check_strength`; `<PREFIX>_KEYFILE` adds the second factor. `new_pass` carries
 /// the passphrase across several files in one command so they share one key (one salt).
 /// The plaintext is replaced only after a full seal → open round trip matches byte for byte.
@@ -244,14 +245,27 @@ pub(crate) fn seal_path(path: &Path, which: Secret, new_pass: &mut Option<String
     let _: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| eyre::eyre!("{}: not JSON ({e}) — refusing to seal", path.display()))?;
     if new_pass.is_none() {
-        let from_env = std::env::var(format!("{}_PASSPHRASE", which.prefix())).ok().filter(|p| !p.is_empty());
+        // v0.16.1: a NEW seal also takes `<PREFIX>_PASSPHRASE_FILE` (first line), so a
+        // generated passphrase can go file → seal → credential without ever being in an
+        // environment variable or a `$(cat …)` on a command line.
+        let prefix = which.prefix();
+        let from_env = std::env::var(format!("{prefix}_PASSPHRASE"))
+            .ok()
+            .filter(|p| !p.is_empty())
+            .map(|p| (format!("{prefix}_PASSPHRASE"), p))
+            .or_else(|| {
+                let path = std::env::var(format!("{prefix}_PASSPHRASE_FILE")).ok()?;
+                let s = std::fs::read_to_string(&path).ok()?;
+                let line = s.lines().next()?.trim().to_string();
+                (!line.is_empty()).then(|| (format!("{prefix}_PASSPHRASE_FILE"), line))
+            });
         let pass = match from_env {
-            Some(p) => {
-                sealed::check_strength(&p).map_err(|why| eyre::eyre!("{}_PASSPHRASE refused: {why} (HK_SEAL_ALLOW_WEAK=1 overrides on devnets only)", which.prefix()))?;
+            Some((source, p)) => {
+                sealed::check_strength(&p).map_err(|why| eyre::eyre!("{source} refused: {why} (HK_SEAL_ALLOW_WEAK=1 overrides on devnets only)"))?;
                 p
             }
             None => sealed::prompt_new_passphrase(&path.display().to_string()).ok_or_else(|| {
-                eyre::eyre!("no passphrase — set {}_PASSPHRASE or run on a terminal", which.prefix())
+                eyre::eyre!("no passphrase — set {prefix}_PASSPHRASE, {prefix}_PASSPHRASE_FILE=<path>, or run on a terminal")
             })?,
         };
         *new_pass = Some(pass);
@@ -434,6 +448,44 @@ mod tests {
         assert_eq!(read_secret(&p, Secret::ValidatorKey).unwrap(), "[7,7,7]");
         std::env::remove_var("HK_KEY_KEYFILE");
         std::env::remove_var("HK_KEY_PASSPHRASE");
+        forget(Secret::ValidatorKey);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // v0.16.1: a new seal reads `<PREFIX>_PASSPHRASE_FILE` too (first line, trimmed) — the
+    // fleet pattern `passphrase-new > file` → seal → `install` the same file as the credential.
+    #[test]
+    fn k2_new_seal_takes_the_passphrase_from_a_file() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        fast_kdf();
+        std::env::remove_var("HK_KEY_KEYFILE");
+        std::env::remove_var("HK_KEY_PASSPHRASE");
+        std::env::remove_var("HK_SEAL_ALLOW_WEAK");
+        forget(Secret::ValidatorKey);
+        let d = tmpdir("passfile");
+        let p = d.join("priv_validator_key.json");
+        std::fs::write(&p, "[9,9,9]").unwrap();
+        let f = d.join("key-passphrase");
+        // a weak first line is refused, file untouched
+        std::fs::write(&f, "hunter2\n").unwrap();
+        std::env::set_var("HK_KEY_PASSPHRASE_FILE", &f);
+        let mut none = None;
+        let e = seal_path(&p, Secret::ValidatorKey, &mut none).unwrap_err().to_string();
+        assert!(e.contains("HK_KEY_PASSPHRASE_FILE refused"), "{e}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "[9,9,9]");
+        // a generated passphrase with a trailing newline seals, and the same file opens it
+        std::fs::write(&f, format!("{}\n", sealed::generate_passphrase(7))).unwrap();
+        let mut none = None;
+        seal_path(&p, Secret::ValidatorKey, &mut none).unwrap();
+        assert!(is_sealed_file(&p));
+        forget(Secret::ValidatorKey);
+        assert_eq!(read_secret(&p, Secret::ValidatorKey).unwrap(), "[9,9,9]");
+        // `HK_KEY_PASSPHRASE` still wins over the file when both are set
+        forget(Secret::ValidatorKey);
+        std::env::set_var("HK_KEY_PASSPHRASE", "wrong wrong wrong wrong");
+        assert!(read_secret(&p, Secret::ValidatorKey).is_err());
+        std::env::remove_var("HK_KEY_PASSPHRASE");
+        std::env::remove_var("HK_KEY_PASSPHRASE_FILE");
         forget(Secret::ValidatorKey);
         let _ = std::fs::remove_dir_all(&d);
     }

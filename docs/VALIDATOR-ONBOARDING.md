@@ -112,11 +112,20 @@ passphrase, XChaCha20-Poly1305 encrypts the JSON, and the file becomes an `HKE1`
 that says what it is (and which parameters it used) without revealing anything.
 
 ```bash
-hk-node key-seal ~/hk-validator          # prompts twice; or export HK_KEY_PASSPHRASE for scripts
-sudo install -m 0600 -o root -g root /dev/stdin /etc/hk/key-passphrase <<< '<the passphrase>'
-# then uncomment LoadCredential= in the unit above, `systemctl daemon-reload`, restart
-hk-node key-unseal ~/hk-validator        # back to plaintext (migration / HSM import)
+# the way testnet-1's own seats are sealed: the passphrase is generated straight into a
+# file and never typed, never on a command line, never in shell history
+umask 077; hk-node passphrase-new > ~/.key.pass
+HK_KEY_PASSPHRASE="$(cat ~/.key.pass)" hk-node key-seal ~/hk-validator     # ~1 s; refuses weak passphrases
+sudo install -d -m 0700 /etc/hk
+sudo install -m 0600 -o root -g root ~/.key.pass /etc/hk/key-passphrase && shred -u ~/.key.pass
+sudo mkdir -p /etc/systemd/system/hk-node.service.d
+printf '%s\n' '[Service]' 'LoadCredential=hk-key-passphrase:/etc/hk/key-passphrase' | sudo tee /etc/systemd/system/hk-node.service.d/keys.conf
+sudo systemctl daemon-reload && sudo systemctl restart hk-node             # then watch signer.remaining fall in hk_chainInfo
+# (interactive alternative: `hk-node key-seal ~/hk-validator` prompts twice, no echo)
+hk-node key-unseal ~/hk-validator        # back to plaintext (migration / HSM import); reads the passphrase the same four ways
 ```
+Keep a copy of `/etc/hk/key-passphrase` somewhere that is not this host (password manager, sealed
+backup): the node cannot start without it, and a lost passphrase is a lost seat.
 
 **Brute force, plainly.** Someone who copies the file can guess passphrases offline forever;
 what stops them is the cost of one guess times the number of guesses your passphrase forces.

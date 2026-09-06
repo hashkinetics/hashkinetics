@@ -11,8 +11,11 @@
 //! - **Pay**: a fully shielded payment to an `hkaddr:` — the chain sees one nullifier and
 //!   two commitments. (The envelope signer is still visible, exactly as before; the U4
 //!   fee comes from our transparent balance, so keep a few micro there.)
-//! - **Scan**: trial-decapsulation over every pool ciphertext, all epochs, spent status
-//!   from `hk_nullifierSpent`.
+//! - **Scan**: trial-decapsulation over the pool's ciphertexts, all epochs, spent status
+//!   from `hk_nullifierSpent`. H3 (v0.14.1): INCREMENTAL — the feed is paged
+//!   (`hk_getPoolNotes {from, limit}`), the wallet keeps its cursor and every note it
+//!   found in `shield.json`, and a spend asks the node for ONE authentication path
+//!   (`hk_getPoolPath`, re-folded locally) instead of downloading every commitment.
 //! - **Disclose**: a one-time package that opens ONE received payment for an auditor —
 //!   no spend authority, no other notes, no future visibility.
 //!
@@ -30,7 +33,7 @@ use hk_primitives::{Amount, H256};
 use hk_spend_circuit::{nullifier, Hash, Note};
 use hk_state::tx::Tx;
 use hk_wallet::{
-    build_disclosure, build_mint, build_output, build_spend, epoch_of, note_key_as_recipient,
+    build_disclosure_with_path, build_mint, build_output, build_spend_with_path, epoch_of, note_key_as_recipient,
     scan_at, seal_note, Address, Discovered, WalletKeys,
 };
 use rand::RngCore;
@@ -38,7 +41,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::{
-    chain_balance, chain_info, fmt_amount, log, log_err, rpc_call, send_payload, wallet_dir, Evt, USD,
+    chain_balance, chain_info, fmt_amount, log, log_err, rpc_call, rpc_call_within, send_payload, wallet_dir, Evt, USD,
 };
 
 pub const PROVER_DEFAULT: &str = "https://prover.hashkinetics.org";
@@ -58,6 +61,65 @@ pub struct ShieldFile {
     pub next_ots_index: u32,
     /// Next self-note tag (rho/rcm derivation — reuse would link notes). Persisted BEFORE use.
     pub next_note_tag: u64,
+    /// H3 (v0.14.1): what this wallet has already scanned and found — the pool is
+    /// append-only, so a rescan reads only what the chain appended since. Absent in older
+    /// files (serde default = scan everything once, then remember).
+    #[serde(default)]
+    pub scan: ScanCache,
+}
+
+/// H3 (v0.14.1): the scan cursor + every note found so far. Lives inside `shield.json`
+/// (sealed with it when the wallet is protected — the note secrets are spend-relevant).
+/// Keyed to the chain id: a wallet pointed at another network starts over.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct ScanCache {
+    pub chain_id: String,
+    /// Pool entries `[0, scanned_through)` have been trial-decrypted under every epoch.
+    pub scanned_through: u64,
+    pub notes: Vec<StoredNote>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct StoredNote {
+    pub leaf_index: u64,
+    pub commitment: String,
+    pub value: u64,
+    pub rho: String,
+    pub rcm: String,
+    /// hex
+    pub memo: String,
+    /// Nullifiers are forever: once seen spent, never asked about again.
+    pub spent: bool,
+}
+
+impl StoredNote {
+    fn from_discovered(d: &Discovered) -> Self {
+        Self {
+            leaf_index: d.leaf_index,
+            commitment: hex::encode(d.commitment),
+            value: d.note.value,
+            rho: hex::encode(d.note.rho),
+            rcm: hex::encode(d.note.rcm),
+            memo: hex::encode(&d.memo),
+            spent: false,
+        }
+    }
+
+    fn to_discovered(&self, owner: Hash) -> Result<Discovered, String> {
+        let h32 = |s: &str, what: &str| -> Result<Hash, String> {
+            hex::decode(s)
+                .map_err(|e| format!("shield.json {what}: {e}"))?
+                .as_slice()
+                .try_into()
+                .map_err(|_| format!("shield.json {what}: not 32 bytes"))
+        };
+        Ok(Discovered {
+            note: Note { value: self.value, owner, rho: h32(&self.rho, "rho")?, rcm: h32(&self.rcm, "rcm")? },
+            commitment: h32(&self.commitment, "commitment")?,
+            leaf_index: self.leaf_index,
+            memo: hex::decode(&self.memo).unwrap_or_default(),
+        })
+    }
 }
 
 pub fn shield_path() -> PathBuf {
@@ -94,7 +156,13 @@ pub fn load_or_create_shield() -> Result<ShieldFile, String> {
     }
     let mut m = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut m);
-    let f = ShieldFile { version: 1, master_hex: hex::encode(m), next_ots_index: 0, next_note_tag: 1 };
+    let f = ShieldFile {
+        version: 1,
+        master_hex: hex::encode(m),
+        next_ots_index: 0,
+        next_note_tag: 1,
+        scan: ScanCache::default(),
+    };
     save_shield(&f)?;
     Ok(f)
 }
@@ -171,27 +239,101 @@ pub fn my_address(f: &ShieldFile) -> Result<String, String> {
 // Pool feed + scanning
 // ---------------------------------------------------------------------------
 
-/// (leaves in insertion order, (index, commitment, stealth_ct) entries) — `hk_getPoolNotes`.
-#[allow(clippy::type_complexity)]
-fn pool_notes() -> Result<(Vec<Hash>, Vec<(u64, Hash, Vec<u8>)>), String> {
-    let v = rpc_call("hk_getPoolNotes", json!({}))?;
-    let arr = v
-        .get("result")
-        .and_then(|r| r.get("notes"))
-        .and_then(|n| n.as_array())
-        .ok_or_else(|| format!("hk_getPoolNotes: {v}"))?;
-    let mut leaves = Vec::with_capacity(arr.len());
+/// H3 (v0.14.1): one page of the pool feed. `limit` keeps a page around 5 MB of hex so it
+/// fits the call budget on a slow link; a pre-H3 node ignores the paging and answers
+/// everything (no `next`, no `total`) — handled by the callers filtering on `index`.
+const POOL_PAGE: u64 = 2_000;
+const POOL_CALL_SECS: u64 = 90;
+
+type Entry = (u64, Hash, Vec<u8>);
+
+fn parse_hash(hex_str: &str, what: &str) -> Result<Hash, String> {
+    let b = hex::decode(hex_str).map_err(|e| format!("{what}: {e}"))?;
+    b.as_slice().try_into().map_err(|_| format!("{what}: not 32 bytes"))
+}
+
+/// `(entries, next, total)` for the page starting at `from`.
+fn pool_page(from: u64) -> Result<(Vec<Entry>, Option<u64>, Option<u64>), String> {
+    let v = rpc_call_within("hk_getPoolNotes", json!({ "from": from, "limit": POOL_PAGE }), POOL_CALL_SECS)?;
+    let r = v.get("result").ok_or_else(|| format!("hk_getPoolNotes: {v}"))?;
+    let arr = r.get("notes").and_then(|n| n.as_array()).ok_or_else(|| format!("hk_getPoolNotes: {v}"))?;
     let mut entries = Vec::with_capacity(arr.len());
     for e in arr {
         let idx = e.get("index").and_then(|i| i.as_u64()).ok_or("bad note index")?;
-        let cm_hex = e.get("commitment").and_then(|c| c.as_str()).ok_or("bad commitment")?;
+        let cm = parse_hash(e.get("commitment").and_then(|c| c.as_str()).ok_or("bad commitment")?, "commitment")?;
         let ct_hex = e.get("stealth_ct").and_then(|c| c.as_str()).unwrap_or("");
-        let cm_b = hex::decode(cm_hex).map_err(|e| e.to_string())?;
-        let cm: Hash = cm_b.as_slice().try_into().map_err(|_| "commitment not 32 bytes")?;
-        leaves.push(cm);
         entries.push((idx, cm, hex::decode(ct_hex).map_err(|e| e.to_string())?));
     }
-    Ok((leaves, entries))
+    Ok((entries, r.get("next").and_then(|n| n.as_u64()), r.get("total").and_then(|t| t.as_u64())))
+}
+
+/// Every pool entry with index ≥ `from`, plus the pool's size. Pages until `next` is null.
+fn pool_notes_from(from: u64) -> Result<(Vec<Entry>, u64), String> {
+    let mut all: Vec<Entry> = Vec::new();
+    let mut cursor = from;
+    loop {
+        let (page, next, total) = pool_page(cursor)?;
+        all.extend(page.into_iter().filter(|(i, _, _)| *i >= from));
+        match next {
+            Some(n) if n > cursor => cursor = n,
+            _ => {
+                let total = total.unwrap_or_else(|| all.iter().map(|(i, _, _)| i + 1).max().unwrap_or(from).max(from));
+                return Ok((all, total));
+            }
+        }
+    }
+}
+
+/// One entry by leaf index (its stealth payload is needed for a disclosure).
+fn pool_entry(index: u64) -> Result<Entry, String> {
+    let (page, _, _) = pool_page(index)?;
+    page.into_iter().find(|(i, _, _)| *i == index).ok_or_else(|| format!("leaf {index} is not in the pool"))
+}
+
+/// Every commitment in insertion order (the pre-H3 way to build a path) — paged.
+fn pool_leaves_all() -> Result<Vec<Hash>, String> {
+    let mut leaves: Vec<Hash> = Vec::new();
+    let mut cursor = 0u64;
+    loop {
+        let v = rpc_call_within("hk_getPoolLeaves", json!({ "from": cursor, "limit": POOL_PAGE }), POOL_CALL_SECS)?;
+        let r = v.get("result").ok_or_else(|| format!("hk_getPoolLeaves: {v}"))?;
+        let arr = r.get("leaves").and_then(|l| l.as_array()).ok_or_else(|| format!("hk_getPoolLeaves: {v}"))?;
+        let from = r.get("from").and_then(|f| f.as_u64()).unwrap_or(0);
+        for (i, l) in arr.iter().enumerate() {
+            if from + i as u64 >= leaves.len() as u64 {
+                leaves.push(parse_hash(l.as_str().ok_or("bad leaf")?, "leaf")?);
+            }
+        }
+        match r.get("next").and_then(|n| n.as_u64()) {
+            Some(n) if n > cursor => cursor = n,
+            _ => return Ok(leaves),
+        }
+    }
+}
+
+/// H3: the authentication path for one leaf — `hk_getPoolPath` on a v0.16.1+ node
+/// (siblings + the root they fold to; re-folded before use), the full leaf list on an
+/// older one. `(siblings, root)`.
+fn pool_path(index: u64) -> Result<(Vec<Hash>, Hash), String> {
+    if let Ok(v) = rpc_call("hk_getPoolPath", json!({ "index": index })) {
+        if let Some(r) = v.get("result") {
+            let sib = r.get("siblings").and_then(|s| s.as_array()).ok_or("hk_getPoolPath: no siblings")?;
+            let siblings = sib.iter().map(|s| parse_hash(s.as_str().unwrap_or(""), "sibling")).collect::<Result<Vec<_>, _>>()?;
+            let root = parse_hash(r.get("root").and_then(|s| s.as_str()).ok_or("hk_getPoolPath: no root")?, "root")?;
+            return Ok((siblings, root));
+        }
+        if let Some(e) = v.get("error").and_then(|e| e.as_str()) {
+            if e.contains("out of range") {
+                return Err(format!("hk_getPoolPath: {e}"));
+            }
+        }
+    }
+    // pre-H3 node: rebuild from every commitment
+    let leaves = pool_leaves_all()?;
+    if index as usize >= leaves.len() {
+        return Err(format!("leaf {index} is not in the pool ({} commitments)", leaves.len()));
+    }
+    Ok(hk_state::pool::full_tree_path(&leaves, index))
 }
 
 fn nullifier_spent(nf: &Hash) -> bool {
@@ -212,20 +354,57 @@ pub struct NoteView {
 }
 
 /// Every note ever paid to this wallet (all epochs), with spent status.
-fn my_notes(k: &WalletKeys) -> Result<(Vec<Hash>, Vec<(Discovered, bool)>), String> {
-    let (leaves, entries) = pool_notes()?;
-    let cur = epoch_of(chain_height()?);
-    let nk = k.nk();
-    let mut out: Vec<(Discovered, bool)> = Vec::new();
-    for e in 0..=cur {
-        for d in scan_at(k, e, &entries) {
-            if !out.iter().any(|(x, _)| x.commitment == d.commitment) {
-                let spent = nullifier_spent(&nullifier(&nk, &d.note.rho));
-                out.push((d, spent));
+///
+/// H3 (v0.14.1): incremental. Only pool entries past `scan.scanned_through` are fetched
+/// and trial-decrypted (every epoch up to the current one — an entry can only have been
+/// sealed to an epoch that existed when it was appended); found notes persist in
+/// `shield.json`, and a note seen spent is never asked about again. A different chain id,
+/// or a pool shorter than the cursor (another node's history), starts the scan over.
+fn my_notes(k: &WalletKeys, f: &mut ShieldFile) -> Result<Vec<(Discovered, bool)>, String> {
+    let chain_id = chain_info().map(|(c, _)| c).unwrap_or_default();
+    let mut changed = false;
+    if f.scan.chain_id != chain_id {
+        f.scan = ScanCache { chain_id, ..Default::default() };
+        changed = true;
+    }
+    let (mut entries, mut total) = pool_notes_from(f.scan.scanned_through)?;
+    if total < f.scan.scanned_through {
+        f.scan = ScanCache { chain_id: f.scan.chain_id.clone(), ..Default::default() };
+        changed = true;
+        let again = pool_notes_from(0)?;
+        entries = again.0;
+        total = again.1;
+    }
+    if !entries.is_empty() {
+        let cur = epoch_of(chain_height()?);
+        for e in 0..=cur {
+            for d in scan_at(k, e, &entries) {
+                if !f.scan.notes.iter().any(|n| n.leaf_index == d.leaf_index) {
+                    f.scan.notes.push(StoredNote::from_discovered(&d));
+                    changed = true;
+                }
             }
         }
     }
-    Ok((leaves, out))
+    if total > f.scan.scanned_through {
+        f.scan.scanned_through = total;
+        changed = true;
+    }
+    let nk = k.nk();
+    let owner = k.owner_tag();
+    let mut out: Vec<(Discovered, bool)> = Vec::with_capacity(f.scan.notes.len());
+    for n in f.scan.notes.iter_mut() {
+        let d = n.to_discovered(owner)?;
+        if !n.spent && nullifier_spent(&nullifier(&nk, &d.note.rho)) {
+            n.spent = true;
+            changed = true;
+        }
+        out.push((d, n.spent));
+    }
+    if changed {
+        save_shield(f)?;
+    }
+    Ok(out)
 }
 
 fn views(notes: &[(Discovered, bool)]) -> Vec<NoteView> {
@@ -302,13 +481,13 @@ fn fee_now() -> Amount {
 // Worker flows (each ends with Busy(false); each refreshes the note list on success)
 // ---------------------------------------------------------------------------
 
-fn finish(tx: &Sender<Evt>, id: &H256, sf: Option<&ShieldFile>) {
+fn finish(tx: &Sender<Evt>, id: &H256, sf: Option<&mut ShieldFile>) {
     if let Ok(b) = chain_balance(id) {
         let _ = tx.send(Evt::Balance(b));
     }
     if let Some(f) = sf {
         if let Ok(k) = keys(f) {
-            if let Ok((_, notes)) = my_notes(&k) {
+            if let Ok(notes) = my_notes(&k, f) {
                 let _ = tx.send(Evt::Notes(views(&notes)));
             }
         }
@@ -320,17 +499,27 @@ pub fn spawn_scan(tx: Sender<Evt>, id: H256) {
     std::thread::spawn(move || {
         let _ = tx.send(Evt::Busy(true));
         match load_or_create_shield() {
-            Ok(f) => {
+            Ok(mut f) => {
                 match my_address(&f) {
                     Ok(a) => {
                         let _ = tx.send(Evt::StealthAddr(a));
                     }
                     Err(e) => log_err(&tx, e),
                 }
-                match keys(&f).and_then(|k| my_notes(&k)) {
-                    Ok((_, notes)) => {
+                let before = f.scan.scanned_through;
+                match keys(&f).and_then(|k| my_notes(&k, &mut f)) {
+                    Ok(notes) => {
                         let unspent = notes.iter().filter(|(_, s)| !s).count();
-                        log(&tx, format!("Scanned the pool: {} note(s) are yours, {unspent} unspent.", notes.len()));
+                        let fresh = f.scan.scanned_through.saturating_sub(before);
+                        log(
+                            &tx,
+                            format!(
+                                "Scanned {fresh} new pool entr{} (pool size {}): {} note(s) are yours, {unspent} unspent.",
+                                if fresh == 1 { "y" } else { "ies" },
+                                f.scan.scanned_through,
+                                notes.len()
+                            ),
+                        );
                         let _ = tx.send(Evt::Notes(views(&notes)));
                     }
                     Err(e) => log_err(&tx, e),
@@ -390,7 +579,7 @@ pub fn spawn_shield(tx: Sender<Evt>, seed: Vec<u8>, id: H256, amount: Amount, pr
         if let Err(e) = res {
             log_err(&tx, e);
         }
-        finish(&tx, &id, Some(&f));
+        finish(&tx, &id, Some(&mut f));
     });
 }
 
@@ -415,15 +604,16 @@ pub fn spawn_unshield(tx: Sender<Evt>, seed: Vec<u8>, id: H256, amount: Amount, 
                     fmt_amount(fee)
                 ));
             }
-            let (leaves, notes) = my_notes(&k)?;
+            let notes = my_notes(&k, &mut f)?;
             let input = pick_note(&notes, amount)?;
             let change_v = input.note.value as Amount - amount;
+            let (siblings, root) = pool_path(input.leaf_index)?;
             let tag = reserve_tag(&mut f)?;
             let ots = reserve_ots(&mut f)?;
             let change = k.self_note(change_v as u64, tag);
             let epoch = epoch_of(chain_height()?);
             let (change_ct, _) = seal_note(&change, &k.address_at(epoch), &fresh32(), b"change").ok_or("seal failed")?;
-            let plan = build_spend(&leaves, input.leaf_index, input.note.clone(), &k, ots, change, dummy_note(), amount as u64, id.0)
+            let plan = build_spend_with_path(siblings, root, input.leaf_index, input.note.clone(), &k, ots, change, dummy_note(), amount as u64, id.0)
                 .map_err(|e| format!("build_spend: {e}"))?;
             log(&tx, format!("Proving the spend of {} on the prover… (a STARK; this can take a while)", fmt_amount(amount)));
             let (proof, ms) = prove(&prover, "prove_spend", serde_json::to_value(&plan.witness).map_err(|e| e.to_string())?)?;
@@ -452,7 +642,7 @@ pub fn spawn_unshield(tx: Sender<Evt>, seed: Vec<u8>, id: H256, amount: Amount, 
         if let Err(e) = res {
             log_err(&tx, e);
         }
-        finish(&tx, &id, Some(&f));
+        finish(&tx, &id, Some(&mut f));
     });
 }
 
@@ -478,17 +668,18 @@ pub fn spawn_pay(tx: Sender<Evt>, seed: Vec<u8>, id: H256, to: String, amount: A
                     fmt_amount(fee)
                 ));
             }
-            let (leaves, notes) = my_notes(&k)?;
+            let notes = my_notes(&k, &mut f)?;
             let input = pick_note(&notes, amount)?;
             let change_v = input.note.value as Amount - amount;
             let out = build_output(&to, amount as u64, &fresh32(), &fresh32(), memo.as_bytes())
                 .ok_or("could not build the output (bad recipient address?)")?;
+            let (siblings, root) = pool_path(input.leaf_index)?;
             let tag = reserve_tag(&mut f)?;
             let ots = reserve_ots(&mut f)?;
             let change = k.self_note(change_v as u64, tag);
             let epoch = epoch_of(chain_height()?);
             let (change_ct, _) = seal_note(&change, &k.address_at(epoch), &fresh32(), b"change").ok_or("seal failed")?;
-            let plan = build_spend(&leaves, input.leaf_index, input.note.clone(), &k, ots, out.note.clone(), change, 0, [0; 32])
+            let plan = build_spend_with_path(siblings, root, input.leaf_index, input.note.clone(), &k, ots, out.note.clone(), change, 0, [0; 32])
                 .map_err(|e| format!("build_spend: {e}"))?;
             log(&tx, format!("Proving a shielded payment of {} on the prover… (a STARK; this can take a while)", fmt_amount(amount)));
             let (proof, ms) = prove(&prover, "prove_spend", serde_json::to_value(&plan.witness).map_err(|e| e.to_string())?)?;
@@ -517,7 +708,7 @@ pub fn spawn_pay(tx: Sender<Evt>, seed: Vec<u8>, id: H256, to: String, amount: A
         if let Err(e) = res {
             log_err(&tx, e);
         }
-        finish(&tx, &id, Some(&f));
+        finish(&tx, &id, Some(&mut f));
     });
 }
 
@@ -526,12 +717,26 @@ pub fn spawn_disclose(tx: Sender<Evt>, id: H256, commitment_hex: String) {
     std::thread::spawn(move || {
         let _ = tx.send(Evt::Busy(true));
         let res: Result<(), String> = (|| {
-            let f = load_shield().ok_or("no shield.json — nothing shielded yet")?;
+            let mut f = load_shield().ok_or("no shield.json — nothing shielded yet")?;
             let k = keys(&f)?;
             let cm_b = hex::decode(&commitment_hex).map_err(|e| e.to_string())?;
             let cm: Hash = cm_b.as_slice().try_into().map_err(|_| "commitment must be 32 bytes")?;
-            let (leaves, entries) = pool_notes()?;
-            let (idx, _, ct) = entries.iter().find(|(_, c, _)| *c == cm).cloned().ok_or("commitment not found in the pool")?;
+            // H3: the leaf index comes from the scan cache (a note we found), the payload
+            // from one paged read; a commitment we never found is looked up in the feed.
+            let idx = match f.scan.notes.iter().find(|n| n.commitment == commitment_hex) {
+                Some(n) => n.leaf_index,
+                None => {
+                    let _ = my_notes(&k, &mut f);
+                    f.scan
+                        .notes
+                        .iter()
+                        .find(|n| n.commitment == commitment_hex)
+                        .map(|n| n.leaf_index)
+                        .or_else(|| pool_notes_from(0).ok()?.0.into_iter().find(|(_, c, _)| *c == cm).map(|(i, _, _)| i))
+                        .ok_or("commitment not found in the pool")?
+                }
+            };
+            let (_, _, ct) = pool_entry(idx)?;
             // ML-KEM decapsulation never fails (implicit rejection) — VALIDATE each epoch's
             // candidate key by opening the AEAD before packaging anything.
             let cur = epoch_of(chain_height()?);
@@ -543,7 +748,9 @@ pub fn spawn_disclose(tx: Sender<Evt>, id: H256, commitment_hex: String) {
                 })
                 .ok_or("this wallet cannot open that ciphertext (not the recipient)")?;
             let chain_id = chain_info().map(|(c, _)| c).unwrap_or_else(|_| "hashkinetics".into());
-            let pkg = build_disclosure(&chain_id, &leaves, idx, k.owner_tag(), ct, key).ok_or("package build failed")?;
+            let (siblings, anchor) = pool_path(idx)?;
+            let pkg = build_disclosure_with_path(&chain_id, cm, siblings, anchor, idx, k.owner_tag(), ct, key)
+                .ok_or("package build failed (the node's path does not fold to its root)")?;
             let out = wallet_dir().join(format!("disclosure-{}.json", &commitment_hex[..12]));
             std::fs::write(&out, serde_json::to_string_pretty(&pkg).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
             log(&tx, format!("Disclosure package written: {} — it opens exactly this payment and nothing else. Verify offline: hk-node verify-disclosure <file>", out.display()));

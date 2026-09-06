@@ -28,19 +28,23 @@ cold treasury (account-new, sealed, offline machine)  ──account-send──�
 ## 2 · Set-up (once)
 
 ```bash
-# on the faucet host, as the service user
+# on the faucet host, as the service user — this is how testnet-1's faucet was set up:
+# the hot passphrase is generated straight into a file, never typed, never on a command line
 hk-node account-new ~/hk-faucet-hot                    # prints the auth commitment (nonce-0)
-hk-node account-seal ~/hk-faucet-hot                   # passphrase twice; keep it in the password manager
+umask 077; hk-node passphrase-new > ~/.hot.pass
+HK_WALLET_PASSPHRASE="$(cat ~/.hot.pass)" hk-node account-seal ~/hk-faucet-hot
+sudo install -d -m 0700 /etc/hk
+sudo install -m 0600 -o root -g root ~/.hot.pass /etc/hk/faucet-passphrase && shred -u ~/.hot.pass
 
-# on the cold machine (the treasury directory, sealed the same way)
-hk-node account-seal ~/hk-treasury
+# on the cold machine (the treasury directory, sealed with a passphrase you choose at the prompt AND a key file)
+hk-node keyfile-new ~/.hk-treasury.key
+HK_WALLET_KEYFILE=~/.hk-treasury.key hk-node account-seal ~/hk-treasury
 # fund the hot account: create it with the float in one transaction
-HK_WALLET_PASSPHRASE_FILE=~/.hk-treasury-pass \
+HK_WALLET_KEYFILE=~/.hk-treasury.key \
 hk-node account-create ~/hk-treasury https://rpc.hashkinetics.org <HOT-AUTH-COMMIT-hex> 5000000000   # $5,000 test units
-
-# back on the faucet host: the unit
-sudo install -m 0600 -o root -g root /dev/stdin /etc/hk/faucet-passphrase <<< '<hot passphrase>'
 ```
+(The credential file is the only copy of the hot passphrase on the host; keep a second copy off-host —
+without it a reinstalled faucet cannot open its own float. The float is small on purpose.)
 `/etc/systemd/system/hk-faucet.service`:
 ```ini
 [Service]

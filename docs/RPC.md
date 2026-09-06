@@ -1,4 +1,4 @@
-# HashKinetics JSON-RPC — the complete reference (node v0.16.0)
+# HashKinetics JSON-RPC — the complete reference (node v0.16.1)
 
 **Every method the node answers, with parameters, result shapes, limits and the errors you can get.** The public endpoint is `https://rpc.hashkinetics.org` (testnet-1, `hashkinetics-1-4e4ea68d`); a local node answers on `http://127.0.0.1:26000`. This is the same API the website, the explorer, the faucet and the Windows wallet use — there is no second, private one. Source of truth: `chain/crates/hk-node/src/rpc.rs` (one `dispatch` match; if this page and the code disagree, the code wins and this page has a bug).
 
@@ -56,8 +56,9 @@ Every envelope pays the protocol fee (`docs/FEES.md`): a transfer of `amount` ne
 | Method | Params | Result |
 |---|---|---|
 | `hk_getPoolInfo` | — | `version`, `asset`, `root` (current commitment-tree root), `latest_anchor`, `next_index`, `nullifiers` (count), `total_shielded` (string, micro — the pool's conservation ledger) |
-| `hk_getPoolNotes` | — | `notes[{index, commitment, stealth_ct}]` — **the whole note index, no pagination** (wallets scan it by trial decapsulation; pagination is a plan item) |
-| `hk_getPoolLeaves` | — | `leaves[hex…]` — the whole commitment list (same caveat) |
+| `hk_getPoolNotes` | `from?` (leaf index, default 0), `limit?` (default and cap 10,000) | `notes[{index, commitment, stealth_ct}]`, `from`, `count`, `total`, `next` — **paged since v0.16.1 (H3)**: `next` is the index the following page starts at, `null` when this page reached the end. A wallet keeps `next` as its scan cursor and asks only for what it has not trial-decrypted yet (the pool is append-only); a page of 10,000 notes is ≈24 MB of hex, so clients on slow links page smaller (the desktop wallet uses 2,000) |
+| `hk_getPoolLeaves` | `from?`, `limit?` (same paging) | `leaves[hex…]`, `from`, `count`, `total`, `next` — the commitment list, for a client that insists on rebuilding paths itself |
+| `hk_getPoolPath` | `index` | `index`, `commitment`, `siblings[32]` (bottom → top), `root`, `total` — **v0.16.1 (H3)**: one authentication path, so a spender never downloads the pool. The wallet re-folds the siblings and refuses a path that does not reach `root`; the proof binds that root, which the chain accepts only while it is a recent anchor — a wrong path from a node can cost the spender a rejected transaction, never a coin. `index` out of range → `error` |
 | `hk_nullifierSpent` | `nullifier` | `spent` (bool) |
 | `hk_submitBundle` | `txs[]` (proof-less pool txs), `agg_proof` (hex, one aggregate STARK) | `accepted`, `txids[]` — the aggregator path (P2.3): one proof for every spend in the bundle |
 
@@ -98,4 +99,4 @@ curl -s -X POST https://rpc.hashkinetics.org -d '{"method":"hk_getPeers"}'
 
 ## Limits and refusals (v0.13.2)
 
-Per request: 10 s to arrive in full (`408 request timed out`), 8 MiB body (`413`), 256 concurrent connections per node (`503 rpc busy`). **Operator methods are not browser-callable:** `hk_submitRotation`, `hk_submitSetChange`, `hk_gossipTxs` and `hk_submitBundle` answer `403` when the request carries an `Origin` header (a web page cannot drive a node's operator surface even when it can reach it); every other method, including `hk_submitTx`, keeps CORS `*`. `hk_submitBundle` queues at most 64 bundles and refuses a duplicate aggregate; `hk_gossipTxs` takes at most 1,024 txs per call. Still ledgered (`docs/P3.2-IMPLEMENTATION-PLAN.md`): no auth, no per-client rate limit · `hk_getPoolNotes`/`hk_getPoolLeaves` return the whole pool (pagination = H3) · `hk_getAccountTxs` turns any account id into its full transparent payment graph (by design of the transparent skeleton; shield if you need privacy).
+Per request: 10 s to arrive in full (`408 request timed out`), 8 MiB body (`413`), 256 concurrent connections per node (`503 rpc busy`). **Operator methods are not browser-callable:** `hk_submitRotation`, `hk_submitSetChange`, `hk_gossipTxs` and `hk_submitBundle` answer `403` when the request carries an `Origin` header (a web page cannot drive a node's operator surface even when it can reach it); every other method, including `hk_submitTx`, keeps CORS `*`. `hk_submitBundle` queues at most 64 bundles and refuses a duplicate aggregate; `hk_gossipTxs` takes at most 1,024 txs per call. Still ledgered (`docs/P3.2-IMPLEMENTATION-PLAN.md`): no auth, no per-client rate limit · `hk_getPoolNotes`/`hk_getPoolLeaves` are paged (≤ 10,000 per call) and `hk_getPoolPath` answers one path since v0.16.1 (H3) · `hk_getAccountTxs` turns any account id into its full transparent payment graph (by design of the transparent skeleton; shield if you need privacy).

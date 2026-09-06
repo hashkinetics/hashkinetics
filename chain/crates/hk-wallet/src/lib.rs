@@ -282,6 +282,17 @@ pub fn note_key_as_recipient(
     Some(mlkem::note_key(&ss, commitment))
 }
 
+/// Fold a leaf up its authentication path (siblings bottom→top, bit `l` of `index`
+/// says which side the leaf's ancestor sits on at level `l`) to the root.
+pub fn fold_path(leaf: &Hash, siblings: &[Hash], index: u64) -> Hash {
+    let mut cur = *leaf;
+    for (l, sib) in siblings.iter().enumerate() {
+        let go_right = (index >> l) & 1 == 1;
+        cur = if go_right { hk_spend_circuit::merkle_node(sib, &cur) } else { hk_spend_circuit::merkle_node(&cur, sib) };
+    }
+    cur
+}
+
 /// Assemble a package from the pool's leaf list + the target entry + the note key.
 pub fn build_disclosure(
     chain_id: &str,
@@ -293,6 +304,25 @@ pub fn build_disclosure(
 ) -> Option<DisclosurePackage> {
     let commitment = *leaves.get(leaf_index as usize)?;
     let (siblings, anchor) = full_tree_path(leaves, leaf_index);
+    build_disclosure_with_path(chain_id, commitment, siblings, anchor, leaf_index, owner_tag, stealth_ct, note_key)
+}
+
+/// H3 (v0.16.1): the same package from one `hk_getPoolPath` answer. `None` when the
+/// path does not fold to `anchor` — the node handed over a wrong path.
+#[allow(clippy::too_many_arguments)]
+pub fn build_disclosure_with_path(
+    chain_id: &str,
+    commitment: Hash,
+    siblings: Vec<Hash>,
+    anchor: Hash,
+    leaf_index: u64,
+    owner_tag: Hash,
+    stealth_ct: Vec<u8>,
+    note_key: [u8; 32],
+) -> Option<DisclosurePackage> {
+    if siblings.len() != hk_spend_circuit::TREE_DEPTH || fold_path(&commitment, &siblings, leaf_index) != anchor {
+        return None;
+    }
     Some(DisclosurePackage {
         version: 1,
         chain_id: chain_id.to_string(),
@@ -329,16 +359,7 @@ pub fn verify_disclosure(p: &DisclosurePackage) -> Result<DisclosedPayment, Stri
     if p.siblings.len() != hk_spend_circuit::TREE_DEPTH {
         return Err("bad path length".into());
     }
-    let mut cur = p.commitment;
-    for (l, sib) in p.siblings.iter().enumerate() {
-        let go_right = (p.leaf_index >> l) & 1 == 1;
-        cur = if go_right {
-            hk_spend_circuit::merkle_node(sib, &cur)
-        } else {
-            hk_spend_circuit::merkle_node(&cur, sib)
-        };
-    }
-    if cur != p.anchor {
+    if fold_path(&p.commitment, &p.siblings, p.leaf_index) != p.anchor {
         return Err("inclusion path does not fold to the stated anchor".into());
     }
     Ok(DisclosedPayment {
@@ -460,7 +481,35 @@ pub fn build_spend(
     if leaves.get(leaf_index as usize) != Some(&cm) {
         return Err(format!("leaf {leaf_index} is not this note's commitment"));
     }
-    let (siblings, _root) = full_tree_path(leaves, leaf_index);
+    let (siblings, root) = full_tree_path(leaves, leaf_index);
+    build_spend_with_path(siblings, root, leaf_index, in_note, keys, ots_index, out_note, out2_note, fee, credit)
+}
+
+/// H3 (v0.16.1): the same plan from ONE authentication path (`hk_getPoolPath`) instead
+/// of every commitment in the pool. `root` is what the node says the path folds to; the
+/// fold is re-done here and must agree — and the proof binds that root, which the chain
+/// accepts only while it is a recent anchor. A wrong path can cost a rejected tx, never
+/// a coin.
+#[allow(clippy::too_many_arguments)]
+pub fn build_spend_with_path(
+    siblings: Vec<Hash>,
+    root: Hash,
+    leaf_index: u64,
+    in_note: Note,
+    keys: &WalletKeys,
+    ots_index: u32,
+    out_note: Note,
+    out2_note: Note,
+    fee: u64,
+    credit: [u8; 32],
+) -> Result<SpendPlan, String> {
+    let cm = commit_note(&in_note);
+    if siblings.len() != hk_spend_circuit::TREE_DEPTH {
+        return Err(format!("path has {} siblings, expected {}", siblings.len(), hk_spend_circuit::TREE_DEPTH));
+    }
+    if fold_path(&cm, &siblings, leaf_index) != root {
+        return Err(format!("leaf {leaf_index}: the path does not fold to the stated root"));
+    }
     let tx_binding = tx_binding_for(&credit, fee);
     let (sig, ots_path) = keys.authorize(ots_index, &tx_binding);
     let witness = SpendWitness {
@@ -558,6 +607,40 @@ mod tests {
         let dummy = Note { value: 0, owner: [0; 32], rho: [0; 32], rcm: [0; 32] };
         assert!(build_spend(&leaves, 0, other, &WalletKeys::new(b"other"), 0,
             w.self_note(100, 2), dummy, 0, [0; 32]).is_err());
+    }
+
+    // H3 (v0.16.1): a spend built from one authentication path (what `hk_getPoolPath`
+    // returns) is byte-identical to one built from every leaf; a path that folds to a
+    // different root, or a wrong index, is refused before any proving.
+    #[test]
+    fn h3_path_spend_matches_full_leaf_spend_and_refuses_bad_paths() {
+        let w = WalletKeys::new(b"h3");
+        let mut leaves = Vec::new();
+        for i in 0..5u64 {
+            leaves.push(commit_note(&w.self_note(100 + i, i + 1)));
+        }
+        let mine = w.self_note(103, 4); // leaf 3
+        let dummy = Note { value: 0, owner: [0; 32], rho: [5; 32], rcm: [6; 32] };
+        let by_leaves = build_spend(&leaves, 3, mine.clone(), &w, 0, w.self_note(103, 9), dummy.clone(), 0, [0; 32]).unwrap();
+        let (siblings, root) = full_tree_path(&leaves, 3);
+        let by_path =
+            build_spend_with_path(siblings.clone(), root, 3, mine.clone(), &w, 0, w.self_note(103, 9), dummy.clone(), 0, [0; 32])
+                .unwrap();
+        assert_eq!(by_path.public, by_leaves.public);
+        assert_eq!(by_path.witness.path.siblings, by_leaves.witness.path.siblings);
+        // a root the path does not fold to
+        let mut bad_root = root;
+        bad_root[0] ^= 1;
+        assert!(build_spend_with_path(siblings.clone(), bad_root, 3, mine.clone(), &w, 0, w.self_note(103, 9), dummy.clone(), 0, [0; 32]).is_err());
+        // the right siblings under the wrong index
+        assert!(build_spend_with_path(siblings.clone(), root, 2, mine.clone(), &w, 0, w.self_note(103, 9), dummy.clone(), 0, [0; 32]).is_err());
+        // a short path
+        assert!(build_spend_with_path(siblings[..3].to_vec(), root, 3, mine, &w, 0, w.self_note(103, 9), dummy, 0, [0; 32]).is_err());
+        // disclosure from a path folds like the leaf-list one and refuses a bad anchor
+        let d1 = build_disclosure("hk", &leaves, 3, w.owner_tag(), vec![0u8; 8], [9; 32]).unwrap();
+        let d2 = build_disclosure_with_path("hk", leaves[3], siblings.clone(), root, 3, w.owner_tag(), vec![0u8; 8], [9; 32]).unwrap();
+        assert_eq!((d1.anchor, &d1.siblings, d1.leaf_index), (d2.anchor, &d2.siblings, d2.leaf_index));
+        assert!(build_disclosure_with_path("hk", leaves[3], siblings, bad_root, 3, w.owner_tag(), vec![0u8; 8], [9; 32]).is_none());
     }
 
     #[test]

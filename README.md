@@ -4,7 +4,7 @@
 
 [**hashkinetics.org**](https://www.hashkinetics.org) · [**Live explorer**](https://www.hashkinetics.org/explorer) · [**Public RPC**](https://rpc.hashkinetics.org) · [**X @hashkinetics**](https://x.com/hashkinetics) · [**Discord**](https://discord.gg/RsSfb9gn3) · [**Telegram**](https://t.me/+tnRXX8KOCWA3YjE1) · validators@hashkinetics.org
 
-`testnet-1: LIVE since 2026-09-02` · `node v0.16.0 · wallet v0.14.0` · `seats change on the running chain (v0.14.0)` · `issued assets with issuer controls (v0.15.0)` · `spend proof: 1.24 s (GPU)` · `274 tx/s storm-measured` · `nothing is for sale`
+`testnet-1: LIVE since 2026-09-02` · `node v0.16.1 · wallet v0.14.1` · `6 seats, 2 external` · `seats change on the running chain (v0.14.0)` · `issued assets with issuer controls (v0.15.0)` · `spend proof: 1.24 s (GPU)` · `274 tx/s storm-measured` · `nothing is for sale`
 
 ---
 
@@ -133,7 +133,7 @@ Every secret file — the validator seed, `account.json`, `wallet.json`, the GUI
 
 ## Run a validator
 
-The testnet recruits external validators now — one Linux box, **no GPU, no stake, no cost** — and the first one is seated: on 2026-09-05 an independent operator who had re-verified the chain from genesis on the public kit was admitted on the running chain by a certificate from 3 of the 4 founding seats' roots (block 72219, effective 72220; 5 seats since, no new genesis, chain never paused). Your keys are generated on your machine and never leave it; your permanent identity is a stateless SLH-DSA root; exhaustion and downtime are liveness faults only, never fund-loss — proven the hard way: this network's val-0 ran its tree to zero, was revived by a root-signed cert carried through a peer (`issue-rotation` → `hk_submitRotation`), and rejoined with a fresh tree. The whole flow is in this repo.
+The testnet recruits external validators now — one Linux box, **no GPU, no stake, no cost** — and two are seated: on 2026-09-05 an independent operator who had re-verified the chain from genesis on the public kit was admitted on the running chain by a certificate from 3 of the 4 founding seats' roots (block 72219, effective 72220), and on 2026-09-06 a second operator by 4 of 5 (block 96629, effective 96630 — every approval signed from a sealed key file); 6 seats since, quorum 5, no new genesis, chain never paused. Your keys are generated on your machine and never leave it; your permanent identity is a stateless SLH-DSA root; exhaustion and downtime are liveness faults only, never fund-loss — proven the hard way: this network's val-0 ran its tree to zero, was revived by a root-signed cert carried through a peer (`issue-rotation` → `hk_submitRotation`), and rejoined with a fresh tree. The whole flow is in this repo.
 
 Read `docs/VALIDATOR-ONBOARDING.md`, then mail **validators@hashkinetics.org** with your `validator.json`. Honest framing: external operators start as **observers** (full verification, own RPC + explorer — same binary, minus the vote); since v0.14.0 a voting seat is **admitted on the running chain** by a certificate approved by more than ⅔ of the current seats' root keys — no new genesis (`docs/V1-VALIDATOR-SET-CHANGES.md`). An observer at the tip with our `app_hash`, running the current release, is the precondition; the first external operator is syncing toward exactly that, and his seat follows the moment he is there — no ceremony, no restart. How a genesis is run, with the record of this one: `docs/CEREMONY-TESTNET-1.md`.
 

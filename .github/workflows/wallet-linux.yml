@@ -13,7 +13,7 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: system libraries (eframe/winit/glow + rustls)
         run: |
           sudo apt-get update
@@ -35,7 +35,7 @@ jobs:
           cp target/release/HashKinetics-Wallet "HashKinetics-Wallet-linux-x86_64-$V"
           sha256sum "HashKinetics-Wallet-linux-x86_64-$V" | tee "HashKinetics-Wallet-linux-x86_64-$V.sha256"
           echo "WALLET_VERSION=$V" >> "$GITHUB_ENV"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: HashKinetics-Wallet-linux-x86_64-${{ env.WALLET_VERSION }}
           path: |
