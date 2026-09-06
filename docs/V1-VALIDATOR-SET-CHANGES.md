@@ -1,6 +1,6 @@
 # V1 — validator-set changes on a running chain
 
-**Status: implemented 2026-09-04 (v0.14.0); devnet gate `chain/gate-v1.sh` 25/25; rolled to every testnet-1 seat on 2026-09-04 (R7, one voter at a time, heights 55641 → 56023, chain never paused; `hk_getValidators.pending_set_changes` live on the public RPC). Activated: the first set change may now commit; minimum node version for testnet-1 becomes v0.14.0 at that moment.** This is the item that gated the soak clock: until it ships, every external cohort needs a new genesis, so no external voter can ever join testnet-1. After it, a seat is admitted or removed by a certificate that rides an ordinary block. **G1 (v0.18.0, 2026-09-06): bootstrap governance — at testnet-1 height 200,000 the four genesis seats are re-weighted to power 4 by rule (§6), and a third certificate kind, `SetPower`, moves weight by approval; devnet gate `chain/gate-v1.sh` + `chain/gate-g1.sh`.**
+**Status: implemented 2026-09-04 (v0.14.0); devnet gate `chain/gate-v1.sh` 25/25; rolled to every testnet-1 seat on 2026-09-04 (R7, one voter at a time, heights 55641 → 56023, chain never paused; `hk_getValidators.pending_set_changes` live on the public RPC). Activated: the first set change may now commit; minimum node version for testnet-1 becomes v0.14.0 at that moment.** This is the item that gated the soak clock: until it ships, every external cohort needs a new genesis, so no external voter can ever join testnet-1. After it, a seat is admitted or removed by a certificate that rides an ordinary block. **G1 (v0.18.0 → v0.18.1, 2026-09-06): bootstrap governance — at testnet-1 height 110,000 the four genesis seats are re-weighted to power 4 by rule (§6), and a third certificate kind, `SetPower`, moves weight by approval; devnet gate `chain/gate-v1.sh` + `chain/gate-g1.sh`.**
 
 ## 1 · The rule
 
@@ -56,9 +56,9 @@ Receipt of a seat: `hk_getValidators.count` up by one on every node at the same 
 
 ## 5 · Honesty
 
-Voting power was 1 per seat until v0.18.0; from testnet-1 height 200,000 the four genesis seats weigh 4 each (§6) and the approval rule is a supermajority of **power** — a bootstrap governance with a published, dated handover, not the mainnet one (bonds, slashing, governance are P-lane). Proposer scheduling is round-robin over the set, so admitting a seat shifts the schedule by construction. Nothing here changes the state machine or the state commitment; the validator set is not part of `app_hash` (it never was), it is derived deterministically by every node from the same certificates.
+Voting power was 1 per seat until v0.18.0; from testnet-1 height 110,000 the four genesis seats weigh 4 each (§6) and the approval rule is a supermajority of **power** — a bootstrap governance with a published, dated handover, not the mainnet one (bonds, slashing, governance are P-lane). Proposer scheduling is round-robin over the set, so admitting a seat shifts the schedule by construction. Nothing here changes the state machine or the state commitment; the validator set is not part of `app_hash` (it never was), it is derived deterministically by every node from the same certificates.
 
-## 6 · Bootstrap governance (G1, v0.18.0)
+## 6 · Bootstrap governance (G1, v0.18.0 → v0.18.1)
 
 **What forced it (2026-09-06).** Two external seats had joined at power 1 (§3 receipts in `CHANGELOG.md` 0.15.2): six seats, six power, quorum 5. Two consequences the founders had not intended: (a) a set change now needed an external co-signature (4 of 6 is not > ⅔), so the seventh operator's admission would have hung on a seat that was three days old; (b) **liveness depended on external machines** — both external VPSs down = the chain halts. A seat this young must hold neither a veto nor a liveness lever while the network is this small; the honest fix is at the protocol level, published, dated, and undone by the same mechanism.
 
@@ -66,7 +66,7 @@ Voting power was 1 per seat until v0.18.0; from testnet-1 height 200,000 the fou
 
 | network | activation height | founding power | source |
 |---|---|---|---|
-| testnet-1 `hashkinetics-1-4e4ea68d` | **200,000** | **4** | hard-wired by chain id (`hk-node/src/genesis.rs`; the environment cannot move it) |
+| testnet-1 `hashkinetics-1-4e4ea68d` | **110,000** | **4** | hard-wired by chain id (`hk-node/src/genesis.rs`; the environment cannot move it) |
 | any other chain id (devnets) | `HK_G1_HEIGHT` | `HK_G1_POWER` (default 4) | environment; unset = no activation |
 
 **The arithmetic (testnet-1, power 1 per external seat).** Founding power 16; quorum `2·total/3 + 1`.
@@ -85,6 +85,6 @@ So weight 4 holds strict > ⅔ up to **seven** external seats of power 1; the ei
 
 **Read it back.** `hk_getValidators` now answers `total_power, founding_power, external_power, quorum_power, max_absent_power, founders_alone_decide, bootstrap {height, founding_power, active}` and marks each validator `genesis: true|false` (`docs/RPC.md`). The activation logs `G1 BOOTSTRAP GOVERNANCE ACTIVATED — genesis seats re-weighted` on every node at the same height; a `SetPower` commit logs `Validator RE-WEIGHTED (G1 set-power)` and `hk_getBlock.set_changes[].change` reads `set_power`.
 
-**Activation discipline (the third one, after `AccountCreate` and V1).** Every node must run **≥ v0.18.0 before height 200,000**. A v0.17 node keeps counting power 1 per seat: the first commit certificate after the height that carries founding votes only (16 of 18 — valid) fails its ⅔ check at power 1 (4 of 6 — not valid) and that node stops following, loudly. It also cannot decode a block carrying a `SetPower` certificate. Announcement, checksums and the roll order are in `ops/RELEASE-NOTES-v0.18.0.md`; the founding fleet rolls first, one voter at a time, each proven voting; the external operators are told the height and the day, and the `/network` page says which versions are seen.
+**Activation discipline (the third one, after `AccountCreate` and V1).** Every node must run **≥ v0.18.1 before height 110,000** (v0.18.0 named 200,000 and was withdrawn the same evening, never rolled — the number moved BEFORE it was reached, as the rule allows; it never moves after). A v0.17 node keeps counting power 1 per seat: the first commit certificate after the height that carries founding votes only (16 of 18 — valid) fails its ⅔ check at power 1 (4 of 6 — not valid) and that node stops following, loudly. It also cannot decode a block carrying a `SetPower` certificate. Announcement, checksums and the roll order are in `ops/RELEASE-NOTES-v0.18.1.md`; the founding fleet rolls first, one voter at a time, each proven voting; the external operators are told the height and the day, and the `/network` page says which versions are seen.
 
 **Gate.** `chain/gate-g1.sh` (activation at devnet height 40 from the environment): before the height 4 seats · power 1 · quorum 3 · `bootstrap.active false`; at H+1 on every node power 4-4-4-4, total 16, quorum 11, `founders_alone_decide`, the log line, identical `app_hash`, the chain keeps deciding; a fifth (external) seat admitted with **three** founding approvals; `SetPower` 1 → 3 by certificate (`set_power` in the block; power 0 refused by shape); the external node killed — the chain advances on the founders; node0 restarted on its persisted home re-derives the weights; node5 from genesis syncs across the activation and both certificates.

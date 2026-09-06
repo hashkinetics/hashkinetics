@@ -87,12 +87,13 @@ pub struct Bootstrap {
     pub founding_power: u64,
 }
 
-/// testnet-1's activation. Chosen 2026-09-06 at tip ≈101,900 (~16 blocks/min): about four
-/// days of notice for external operators to be on v0.18.0 — a node still on v0.17 wedges at
-/// this height (its validator set, and so its state, diverge), exactly like every earlier
-/// activation. If the fleet cannot roll in time, a patch release moves the number BEFORE it
-/// is reached; it never moves after.
-pub const G1_TESTNET1_HEIGHT: u64 = 200_000;
+/// testnet-1's activation. v0.18.0 named 200,000 (chosen at tip ≈101,900: four days of
+/// notice); the founder moved it to 110,000 the same evening (v0.18.1, tip ≈105,200, ~4.5 h
+/// out) — the co-sign and liveness exposure the rule removes was live that day, and the
+/// founding fleet rolls within the hour. v0.18.0 was withdrawn unrolled: a binary that names
+/// a different height islands at whichever comes first, exactly like a node still on v0.17.
+/// The number may move by patch release BEFORE it is reached; it never moves after.
+pub const G1_TESTNET1_HEIGHT: u64 = 110_000;
 pub const G1_FOUNDING_POWER: u64 = 4;
 
 /// The re-weight this node applies for `chain_id`, if any. testnet-1 is hard-wired; any
@@ -123,10 +124,10 @@ mod g1_tests {
     fn g1_activation_is_hardwired_for_testnet1_and_env_only_elsewhere() {
         assert_eq!(
             bootstrap_from("hashkinetics-1-4e4ea68d", None, None),
-            Some(Bootstrap { height: 200_000, founding_power: 4 })
+            Some(Bootstrap { height: 110_000, founding_power: 4 })
         );
         // The env can never move testnet-1's activation.
-        assert_eq!(bootstrap_from("hashkinetics-1-4e4ea68d", Some("5"), Some("9")).unwrap().height, 200_000);
+        assert_eq!(bootstrap_from("hashkinetics-1-4e4ea68d", Some("5"), Some("9")).unwrap().height, 110_000);
         assert_eq!(bootstrap_from("hashkinetics-1-4e4ea68d", Some("5"), Some("9")).unwrap().founding_power, 4);
         // Any other chain: the env, height required, power defaulting to 4; junk and zero refused.
         assert_eq!(bootstrap_from("hashkinetics-devnet-1", Some("5"), Some("9")), Some(Bootstrap { height: 5, founding_power: 9 }));
@@ -139,7 +140,7 @@ mod g1_tests {
         if std::env::var_os("HK_G1_HEIGHT").is_none() {
             assert_eq!(bootstrap_for("hashkinetics-devnet-1"), None);
         }
-        assert_eq!(bootstrap_for("hashkinetics-1-4e4ea68d").unwrap().height, 200_000);
+        assert_eq!(bootstrap_for("hashkinetics-1-4e4ea68d").unwrap().height, 110_000);
         // The arithmetic the number was chosen for: four founders at 4 beat up to seven externals.
         let founders = 4 * G1_FOUNDING_POWER;
         assert!(3 * founders > 2 * (founders + 7));

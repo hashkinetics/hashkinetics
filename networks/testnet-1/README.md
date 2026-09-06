@@ -1,6 +1,6 @@
 # HashKinetics testnet-1 — join as a full node
 
-> **Current release: v0.18.0 — every node must run it before height 200,000 (the G1 activation; a node still on ≤ v0.17 stops following there).** (Since v0.17.0 the node verifies with a verify-only STARK client — a restart costs seconds and the resident set is tens of MiB; since v0.15.1 the kit carries the verifying keys, `vks.json`, and the node's client speaks https; since v0.15.2 your node advertises its version to its peers and shows up on [hashkinetics.org/network#live](https://www.hashkinetics.org/network#live) the moment it connects to the gateway). Minimum to sync: v0.13.0 — testnet-1 launched 2026-09-02 from a fresh
+> **Current release: v0.18.1 — every node must run it before height 110,000 (the G1 activation; a node still on ≤ v0.17 — or on the withdrawn v0.18.0, which named 200,000 — stops following there).** (Since v0.17.0 the node verifies with a verify-only STARK client — a restart costs seconds and the resident set is tens of MiB; since v0.15.1 the kit carries the verifying keys, `vks.json`, and the node's client speaks https; since v0.15.2 your node advertises its version to its peers and shows up on [hashkinetics.org/network#live](https://www.hashkinetics.org/network#live) the moment it connects to the gateway). Minimum to sync: v0.13.0 — testnet-1 launched 2026-09-02 from a fresh
 > genesis with the protocol fee (100 micro per envelope, burned) **bound in the genesis
 > from height 1** and the faucet treasury allocated at genesis — no activation heights,
 > no coordinated rolls for the fee. Appended transaction kinds activate by height instead:
@@ -14,11 +14,11 @@ can run a **full node** that syncs it, verifies every block, and serves its own 
 and explorer. External operators start as **observers**; since v0.14.0 a voting seat
 is admitted on the RUNNING chain by a certificate approved by more than ⅔ of the
 current seats' root keys — no new genesis (`docs/V1-VALIDATOR-SET-CHANGES.md`)
-(`docs/VALIDATOR-ONBOARDING.md`). From height 200,000 (v0.18.0, bootstrap governance)
+(`docs/VALIDATOR-ONBOARDING.md`). From height 110,000 (v0.18.1, bootstrap governance)
 the four genesis seats weigh 4 each by a published rule, so the founding seats hold more
 than ⅔ on their own while the network is this young; the weight returns to external
 seats by certificate on a dated milestone (`docs/V1-VALIDATOR-SET-CHANGES.md` §6).
-**Every node must run ≥ v0.18.0 before height 200,000.** Since v0.15.0 the chain carries **issued assets**:
+**Every node must run ≥ v0.18.1 before height 110,000.** Since v0.15.0 the chain carries **issued assets**:
 an issuer registers an asset, mints, burns, freezes and pauses under a policy fixed at
 registration, with supply in the state commitment (`docs/X1-ISSUED-ASSETS.md`;
 `hk-node asset …`, `hk_getAssets`). Just want to use it? `https://www.hashkinetics.org/faucet`

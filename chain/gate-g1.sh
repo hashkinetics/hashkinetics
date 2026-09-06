@@ -8,7 +8,7 @@
 #   HK_PROVER_URL=… ./gate-g1.sh
 #
 # The devnet's chain id is not testnet-1's, so the activation comes from the environment
-# (HK_G1_HEIGHT / HK_G1_POWER); testnet-1 itself is hard-wired in the binary (200,000 / 4) and
+# (HK_G1_HEIGHT / HK_G1_POWER); testnet-1 itself is hard-wired in the binary (110,000 / 4) and
 # ignores these variables — the same binary, the same code path, a different table entry.
 #
 # What it proves (each line is a PASS/FAIL):
@@ -53,7 +53,7 @@ pv(){ py "$1" hk_getValidators 'r["total_power"],r["founding_power"],r["external
 start_node(){ ( cd "$H" && exec env HK_PROVER_URL="$PROVER" RUST_LOG=info nohup "$BIN" start "$1" </dev/null >>"$2" 2>&1 ) & }
 submit(){ printf '{"method":"hk_submitSetChange","params":%s}' "$(cat "$1")" | curl -s -m 10 -X POST "http://127.0.0.1:$2" -d @-; }
 
-echo "== 1 · fresh devnet, activation at height $HK_G1_HEIGHT (env; testnet-1 is hard-wired at 200,000)"
+echo "== 1 · fresh devnet, activation at height $HK_G1_HEIGHT (env; testnet-1 is hard-wired at 110,000)"
 ./devnet.sh --fresh -n 4 --prover-url "$PROVER" >/dev/null
 wait_h 26000 5 60 && ok "devnet deciding (height $(h_of 26000))" || { bad "devnet did not reach height 5"; exit 1; }
 V=$(pv 26000); [[ "$V" == "4 4 0 3 1 True False 1-1-1-1" ]] && ok "before H: total 4 · founding 4 · quorum 3 · bootstrap inactive · powers 1-1-1-1" || bad "before H: $V"

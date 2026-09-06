@@ -32,7 +32,10 @@ c588811c38d860354c8509682de5fb7271968ee55ce5b30ab05d8e89387c9a4b  HashKinetics-W
 f6bfaf7181d0d944f3714655d132b7e18d058842c011837224426ba9ff5919d5  hk-node-v0.16.1
 17566a9e5cc258814f06924c65334631f62205358823414f4abaf587e5f8308e  HashKinetics-Wallet.exe (v0.14.1)
 8c9abbb081d10318f0fce74787d568346d5ed11596c14d45e687dfe214a51f99  HashKinetics-Wallet-linux-x86_64-v0.14.1.zip (built by GitHub Actions run #2 on the v0.16.1 tag; artifact digest as reported by GitHub — verify the downloaded zip with sha256sum / Get-FileHash)
-# v0.18.0 release — G1: bootstrap governance (genesis seats weigh 4 from height 200,000; SetPower handover certificate; hk_getValidators quorum view); CONSENSUS RULE — every node ≥ v0.18.0 before height 200,000 · wallet unchanged (v0.14.1, on the v0.16.1 release)
+# v0.18.1 release — G1 activation at height 110,000 (v0.18.0 named 200,000 and is withdrawn); CONSENSUS RULE — every node ≥ v0.18.1 before height 110,000 · wallet unchanged (v0.14.1, on the v0.16.1 release)
+70b8c7cee372a3216b07b06099e2e7c574262c4e8ad769084a2b2119dcf861d7  hk-node-v0.18.1.gz
+469cf4833e9d72da937b517791495443a214d40d46e7d5a35f2808f35dcfaaaa  hk-node-v0.18.1
+# v0.18.0 release — WITHDRAWN the same evening (it names activation height 200,000; never rolled — do not run): G1 bootstrap governance (genesis seats weigh 4; SetPower handover certificate; hk_getValidators quorum view) · wallet unchanged (v0.14.1, on the v0.16.1 release)
 c25ca0aad8e5d01fa6c3e7192fa077801bc747518f961f44ab1193fd82e1ccee  hk-node-v0.18.0.gz
 bdaefd4a0a221df6ac15ac8049e5332984aa9f5cbe8761b827115805c2b75dcc  hk-node-v0.18.0
 # v0.17.0 release — R11: verify-only SP1 client (seconds to start, small resident set; hk_chainInfo.process); client-only, no activation · wallet unchanged (v0.14.1, on the v0.16.1 release)
