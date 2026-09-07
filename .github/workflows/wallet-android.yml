@@ -1,0 +1,75 @@
+# Android wallet (WA3): the Rust core cross-compiled for arm64-v8a + x86_64 with cargo-ndk, the Kotlin
+# bindings generated from the core's own UniFFI metadata, then a debug APK built with Gradle — stored as a
+# workflow artifact with its sha256. Manual, on every push that touches the wallet, and on version tags.
+# Releases stay hand-made and immutable: download the artifact, verify the sha in the job log, attach it.
+# The debug APK is signed with the runner's throw-away debug key: sideload-only ("install unknown apps").
+name: wallet-android
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+    paths:
+      - "android/**"
+      - "chain/crates/hk-wallet-core/**"
+      - "chain/crates/hk-wallet/**"
+      - "chain/android-core.sh"
+      - ".github/workflows/wallet-android.yml"
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: toolchain (chain/rust-toolchain.toml = stable) + Android targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: chain
+      - name: cargo-ndk
+        run: cargo install cargo-ndk --locked
+      - name: NDK r27 (preinstalled on the runner image)
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-}"
+          [ -d "$NDK" ] || NDK=$(ls -d "$ANDROID_HOME"/ndk/27.* 2>/dev/null | tail -1)
+          [ -d "$NDK" ] || { echo "no NDK 27 on the image — install one"; "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;27.2.12479018"; NDK="$ANDROID_HOME/ndk/27.2.12479018"; }
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "using $NDK"
+      - name: core .so for arm64-v8a + x86_64, Kotlin bindings
+        working-directory: chain
+        run: |
+          ./android-core.sh all
+          ls -la ../android/core-out/jniLibs/*/libhk_wallet_core.so
+          sha256sum ../android/core-out/jniLibs/*/libhk_wallet_core.so
+      - name: put the core into the app tree
+        run: |
+          mkdir -p android/app/src/main/jniLibs android/app/src/main/java/org/hashkinetics/wallet/core
+          cp -r android/core-out/jniLibs/arm64-v8a android/core-out/jniLibs/x86_64 android/app/src/main/jniLibs/
+          cp android/core-out/kotlin/org/hashkinetics/wallet/core/hk_wallet_core.kt android/app/src/main/java/org/hashkinetics/wallet/core/
+          # the committed bindings must be the ones this core produces — drift means someone edited by hand
+          git diff --stat -- android/app/src/main/java/org/hashkinetics/wallet/core/hk_wallet_core.kt || true
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Gradle (wrapper properties pin 8.9; the runner's gradle bootstraps it)
+        working-directory: android
+        run: |
+          gradle wrapper --gradle-version 8.9 --no-daemon -q
+          ./gradlew --no-daemon --console=plain assembleDebug
+      - name: package + sha256
+        run: |
+          V=$(grep -o 'versionName = "[^"]*"' android/app/build.gradle.kts | cut -d'"' -f2)
+          cp android/app/build/outputs/apk/debug/app-debug.apk "HashKinetics-Wallet-android-$V-debug.apk"
+          sha256sum "HashKinetics-Wallet-android-$V-debug.apk" | tee "HashKinetics-Wallet-android-$V-debug.apk.sha256"
+          echo "APP_VERSION=$V" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: HashKinetics-Wallet-android-${{ env.APP_VERSION }}-debug
+          path: |
+            HashKinetics-Wallet-android-${{ env.APP_VERSION }}-debug.apk
+            HashKinetics-Wallet-android-${{ env.APP_VERSION }}-debug.apk.sha256
+          if-no-files-found: error
+          retention-days: 90

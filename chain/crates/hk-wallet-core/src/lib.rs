@@ -764,14 +764,23 @@ mod tests {
     }
 
     /// The whole journey against a devnet + faucet + prover (gate-wa1.sh sets the env):
-    /// HK_CORE_RPC, HK_CORE_FAUCET, HK_CORE_PROVER. Ignored otherwise.
+    /// HK_CORE_RPC, HK_CORE_FAUCET, HK_CORE_PROVER; HK_CORE_DIR keeps the wallet directory
+    /// (and leaves the passphrase in `.gate-passphrase`) so the gate can open the files the
+    /// core wrote with the CLI — the byte-compatibility receipt. Ignored otherwise.
     #[test]
     #[ignore]
     fn wa1_devnet_journey() {
         let rpc = std::env::var("HK_CORE_RPC").expect("HK_CORE_RPC");
         let faucet = std::env::var("HK_CORE_FAUCET").expect("HK_CORE_FAUCET");
         let prover = std::env::var("HK_CORE_PROVER").expect("HK_CORE_PROVER");
-        let dir = tmp_dir("journey");
+        let keep = std::env::var("HK_CORE_DIR").ok().map(PathBuf::from);
+        let dir = match &keep {
+            Some(d) => {
+                let _ = std::fs::remove_dir_all(d);
+                d.clone()
+            }
+            None => tmp_dir("journey"),
+        };
         let w = Wallet::new(dir.to_string_lossy().to_string(), Some(Endpoints { rpc, faucet, prover, explorer: EXPLORER_DEFAULT.into() }));
         let logs = Arc::new(Collect(Mutex::new(Vec::new())));
         struct Fwd(Arc<Collect>);
@@ -825,10 +834,15 @@ mod tests {
         assert_eq!(w.protect(pass.clone()).unwrap(), 2);
         w.lock();
         assert!(w.refresh().is_err());
-        w.unlock(pass).unwrap();
+        w.unlock(pass.clone()).unwrap();
         let r = w.send(id, 1_000).unwrap();
         assert_eq!(r.txid.len(), 64);
         assert!(w.state().sealed);
-        let _ = std::fs::remove_dir_all(dir);
+        match keep {
+            Some(d) => std::fs::write(d.join(".gate-passphrase"), format!("{pass}\n")).unwrap(),
+            None => {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
     }
 }

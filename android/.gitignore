@@ -1,0 +1,14 @@
+# Android Studio / Gradle
+.gradle/
+build/
+app/build/
+local.properties
+.idea/
+*.iml
+.kotlin/
+# the Rust core's native libraries are produced by chain/android-core.sh, never committed
+app/src/main/jniLibs/
+core-out/
+# signing material never enters the tree (WA3)
+*.jks
+*.keystore
