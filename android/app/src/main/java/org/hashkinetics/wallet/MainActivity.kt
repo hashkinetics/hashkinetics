@@ -21,7 +21,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.Divider
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -106,7 +106,7 @@ fun SetupSection(vm: WalletVm) {
     Section("No wallet on this phone yet") {
         Text("Keys are born on this device and never leave it. Create a fresh keychain, or restore one from its 32-byte seed (64 hex characters).")
         Button(onClick = { vm.create() }, enabled = vm.busy == null) { Text("Create keychain") }
-        Divider()
+        HorizontalDivider()
         OutlinedTextField(seed, { seed = it }, label = { Text("Seed (64 hex) to restore") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
         OutlinedButton(onClick = { vm.restore(seed) }, enabled = vm.busy == null && seed.trim().length == 64) { Text("Restore") }
     }
@@ -139,7 +139,7 @@ fun BalanceSection(vm: WalletVm) {
             Button(onClick = { vm.refresh() }, enabled = vm.busy == null) { Text("Refresh") }
             OutlinedButton(onClick = { vm.faucet() }, enabled = vm.busy == null) { Text("Get test funds") }
         }
-        Divider()
+        HorizontalDivider()
         Text("Send (transparent)", style = MaterialTheme.typography.titleSmall)
         OutlinedTextField(to, { to = it }, label = { Text("To — account id (64 hex)") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
         OutlinedTextField(amount, { amount = it }, label = { Text("Amount (e.g. 0.25)") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
@@ -163,19 +163,19 @@ fun ShieldedSection(vm: WalletVm) {
             Text("${sc.unspent} unspent note(s) · pool size ${sc.poolSize} · one-time spends used ${sc.otsUsed}/${sc.otsCapacity}", fontSize = 12.sp, color = Color.Gray)
             vm.notes.forEach { n -> NoteRow(vm, n) }
         }
-        Divider()
+        HorizontalDivider()
         OutlinedTextField(amount, { amount = it }, label = { Text("Amount to shield / unshield") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(onClick = { vm.shield(amount) }, enabled = vm.busy == null && amount.isNotBlank()) { Text("Shield") }
             OutlinedButton(onClick = { vm.unshield(amount) }, enabled = vm.busy == null && amount.isNotBlank()) { Text("Unshield") }
         }
-        Divider()
+        HorizontalDivider()
         Text("Pay shielded", style = MaterialTheme.typography.titleSmall)
         OutlinedTextField(payTo, { payTo = it }, label = { Text("To — hkaddr:…") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
         OutlinedTextField(payAmount, { payAmount = it }, label = { Text("Amount") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
         OutlinedTextField(memo, { memo = it }, label = { Text("Memo (sealed to the recipient)") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
         Button(onClick = { vm.payShielded(payTo, payAmount, memo) }, enabled = vm.busy == null && payTo.startsWith("hkaddr:") && payAmount.isNotBlank()) { Text("Pay shielded") }
-        Divider()
+        HorizontalDivider()
         Text("Disclose one received payment (auditor package)", style = MaterialTheme.typography.titleSmall)
         OutlinedTextField(discloseCm, { discloseCm = it }, label = { Text("Commitment (64 hex)") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
         OutlinedButton(onClick = { vm.disclose(discloseCm) }, enabled = vm.busy == null && discloseCm.trim().length == 64) { Text("Build package") }
@@ -199,7 +199,7 @@ fun BackupSection(vm: WalletVm) {
         Text("The seed restores the transparent account anywhere; shield.json (in this app's files) is the shielded side and must be backed up as a file — it cannot be re-derived. Write the seed down; never screenshot it.", fontSize = 12.sp, color = Color.Gray)
         if (vm.seedShown == null) OutlinedButton(onClick = { vm.showSeed() }, enabled = vm.busy == null) { Text("Show seed") }
         else { Mono(vm.seedShown!!); TextButton(onClick = { vm.hideSeed() }) { Text("hide") } }
-        Divider()
+        HorizontalDivider()
         Text(if (st?.sealed == true) "Files are sealed on disk (HKE1, Argon2id 256 MiB)." else "Files are PLAIN on disk — set a passphrase.", fontSize = 12.sp)
         OutlinedTextField(pass, { pass = it }, label = { Text(if (st?.protected == true) "New passphrase" else "Passphrase (≥ 12 chars or 4+ words)") }, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(), singleLine = true)
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -208,7 +208,7 @@ fun BackupSection(vm: WalletVm) {
             if (st?.protected == true) TextButton(onClick = { vm.unprotect() }, enabled = vm.busy == null) { Text("Remove") }
             if (st?.protected == true) TextButton(onClick = { vm.lock() }, enabled = vm.busy == null) { Text("Lock") }
         }
-        Divider()
+        HorizontalDivider()
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Switch(checked = vm.deviceLock, onCheckedChange = { vm.setDeviceLock(it) }, enabled = vm.busy == null)
             Column {

@@ -34,8 +34,9 @@ jobs:
         run: cargo install cargo-ndk --locked
       - name: NDK r27 (preinstalled on the runner image)
         run: |
-          NDK="${ANDROID_NDK_LATEST_HOME:-}"
-          [ -d "$NDK" ] || NDK=$(ls -d "$ANDROID_HOME"/ndk/27.* 2>/dev/null | tail -1)
+          # r27 (LTS) first — the image's LATEST is 29 and the build script says 27; fall back to whatever is there
+          NDK=$(ls -d "$ANDROID_HOME"/ndk/27.* 2>/dev/null | tail -1)
+          [ -d "$NDK" ] || NDK="${ANDROID_NDK_LATEST_HOME:-}"
           [ -d "$NDK" ] || { echo "no NDK 27 on the image — install one"; "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;27.2.12479018"; NDK="$ANDROID_HOME/ndk/27.2.12479018"; }
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
           echo "using $NDK"
@@ -49,18 +50,23 @@ jobs:
         run: |
           mkdir -p android/app/src/main/jniLibs android/app/src/main/java/org/hashkinetics/wallet/core
           cp -r android/core-out/jniLibs/arm64-v8a android/core-out/jniLibs/x86_64 android/app/src/main/jniLibs/
-          cp android/core-out/kotlin/org/hashkinetics/wallet/core/hk_wallet_core.kt android/app/src/main/java/org/hashkinetics/wallet/core/
+          KT=$(find android/core-out/kotlin -name 'hk_wallet_core.kt' | head -1)
+          [ -n "$KT" ] || { echo "no bindings generated:"; find android/core-out -type f | head; exit 1; }
+          case "$KT" in *org/hashkinetics/wallet/core/*) ;; *) echo "bindings in the wrong package ($KT) — crates/hk-wallet-core/uniffi.toml missing from the checkout?"; exit 1;; esac
+          cp "$KT" android/app/src/main/java/org/hashkinetics/wallet/core/
           # the committed bindings must be the ones this core produces — drift means someone edited by hand
           git diff --stat -- android/app/src/main/java/org/hashkinetics/wallet/core/hk_wallet_core.kt || true
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
-      - name: Gradle (wrapper properties pin 8.9; the runner's gradle bootstraps it)
+      - name: Gradle 8.9 (the version the wrapper properties pin; AGP 8.6 does not configure under the image's Gradle 9)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+      - name: assembleDebug
         working-directory: android
-        run: |
-          gradle wrapper --gradle-version 8.9 --no-daemon -q
-          ./gradlew --no-daemon --console=plain assembleDebug
+        run: gradle --no-daemon --console=plain assembleDebug
       - name: package + sha256
         run: |
           V=$(grep -o 'versionName = "[^"]*"' android/app/build.gradle.kts | cut -d'"' -f2)

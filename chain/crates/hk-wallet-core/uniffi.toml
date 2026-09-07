@@ -1,0 +1,5 @@
+# UniFFI bindings config (WA1). Kotlin package the generated file lives in; the cdylib
+# the JNA loader looks for (`libhk_wallet_core.so` under jniLibs/<abi>/).
+[bindings.kotlin]
+package_name = "org.hashkinetics.wallet.core"
+cdylib_name = "hk_wallet_core"
