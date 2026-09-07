@@ -210,7 +210,7 @@ fun BackupSection(vm: WalletVm) {
         }
         HorizontalDivider()
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Switch(checked = vm.deviceLock, onCheckedChange = { vm.setDeviceLock(it) }, enabled = vm.busy == null)
+            Switch(checked = vm.deviceLock, onCheckedChange = { vm.toggleDeviceLock(it) }, enabled = vm.busy == null)
             Column {
                 Text("Device lock (key file in the Android Keystore)", fontSize = 13.sp)
                 Text("On: the sealed files need this device too — export the key file before restoring elsewhere. Re-protect after switching.", fontSize = 11.sp, color = Color.Gray)

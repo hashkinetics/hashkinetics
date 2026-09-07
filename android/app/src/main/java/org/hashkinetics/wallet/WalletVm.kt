@@ -119,7 +119,7 @@ class WalletVm(app: Application) : AndroidViewModel(app) {
     /** Device-bound second factor: a 32-byte key file kept encrypted in the Android Keystore.
      *  Off by default so a phone backup restores on a PC with the passphrase alone; on, the
      *  files need this device (or the exported key file) as well. */
-    fun setDeviceLock(on: Boolean) = run(if (on) "enabling device lock" else "disabling device lock") {
+    fun toggleDeviceLock(on: Boolean) = run(if (on) "enabling device lock" else "disabling device lock") {
         if (on) {
             val bytes = keyfile.load() ?: wallet.newKeyfile().also { keyfile.store(it) }
             wallet.setKeyfile(bytes)
