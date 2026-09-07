@@ -55,8 +55,9 @@ bindings)
     grep -oE "fun [a-zA-Z]+\(" "$KT" | sort -u | tr '\n' ' ' | fold -w 160 | sed 's/^/   /'
     ;;
 all)
-    "$0" build
-    "$0" bindings
+    # `bash "$0"`, not "$0": a checkout without the exec bit (Windows/NTFS mounts, some CI) must still work
+    bash "$0" build
+    bash "$0" bindings
     echo
     echo "copy into the app:  jniLibs/  → android/app/src/main/jniLibs/   ·   kotlin/org/…/hk_wallet_core.kt → android/app/src/main/java/org/hashkinetics/wallet/core/"
     ;;

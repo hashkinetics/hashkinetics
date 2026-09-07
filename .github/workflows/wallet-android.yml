@@ -7,6 +7,8 @@ name: wallet-android
 on:
   workflow_dispatch:
   push:
+    # a `tags:` filter alone would silence branch pushes (GitHub ANDs the filters): name main too
+    branches: ["main"]
     tags: ["v*"]
     paths:
       - "android/**"
@@ -40,7 +42,7 @@ jobs:
       - name: core .so for arm64-v8a + x86_64, Kotlin bindings
         working-directory: chain
         run: |
-          ./android-core.sh all
+          bash ./android-core.sh all   # bash, not ./: the file mode in git may be 644 (NTFS checkout)
           ls -la ../android/core-out/jniLibs/*/libhk_wallet_core.so
           sha256sum ../android/core-out/jniLibs/*/libhk_wallet_core.so
       - name: put the core into the app tree
