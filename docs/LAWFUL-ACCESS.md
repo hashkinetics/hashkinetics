@@ -1,6 +1,6 @@
 # HashKinetics — The Lawful-Access Model
 
-**One page for regulators, law enforcement, and diligence. Decision D8 (2026-08-26, constitutional): there is no master view key, and one can never be added — the commitment scheme has no slot for it. What exists instead is stronger for lawful process. ⚠ DRAFT — counsel review required before use with any official.**
+**One page for regulators, law enforcement, and diligence. Decision D8 (2026-08-26, constitutional): there is no master view key, and one can never be added — the commitment scheme has no slot for it. What exists instead is stronger for lawful process. ⚠ DRAFT — counsel review in progress; not to be used with any official until it lands.**
 
 ## The principle
 
@@ -30,4 +30,4 @@ Disclosure on HashKinetics is **selective, process-bound, and cryptographically 
 
 Deterministic, self-verifying evidence instead of heuristics · mandatory, consensus-enforced travel-rule data at ramps instead of best-effort VASP compliance · bonded truthfulness of compelled disclosures · regulator-required standing visibility over regulated entities' agent fleets · and a clean legal theory: the subpoena target is always an identifiable person or licensed entity, exactly as in banking.
 
-*Confidential draft · not legal advice · counsel sign-off required before external use · provenance: LIVE items are demo-gated on the running devnet; P3/P4 items carry their build-plan references.*
+*Public draft (published with the source; summarized on the front page at hashkinetics.org/#lawful-access) · not legal advice · counsel review in progress (the questions are with counsel, September 2026) — nothing here is to be represented to an official as settled until that review lands · provenance: LIVE items are demo-gated on the running chain (the one-payment disclosure receipt: 1 opened, 0 of the other 21; epoch viewing keys in the wallet); P3/P4 items carry their build-plan references.*
