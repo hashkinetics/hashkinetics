@@ -22,7 +22,7 @@ seats by certificate on a dated milestone (`docs/V1-VALIDATOR-SET-CHANGES.md` §
 an issuer registers an asset, mints, burns, freezes and pauses under a policy fixed at
 registration, with supply in the state commitment (`docs/X1-ISSUED-ASSETS.md`;
 `hk-node asset …`, `hk_getAssets`). Just want to use it? `https://www.hashkinetics.org/faucet`
-and the Windows wallet (`docs/WALLET-GUIDE.md`); every transaction pays 100 micro.
+and the wallets — Windows and Android (`docs/WALLET-GUIDE.md`); every transaction pays 100 micro.
 
 **Identity, not topology, defines the network.** The `genesis.json` here — chain id,
 validator roots, vk pins — IS the network. A node on this genesis with these peers is

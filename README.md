@@ -4,7 +4,7 @@
 
 [**hashkinetics.org**](https://www.hashkinetics.org) · [**Live explorer**](https://www.hashkinetics.org/explorer) · [**Public RPC**](https://rpc.hashkinetics.org) · [**X @hashkinetics**](https://x.com/hashkinetics) · [**Discord**](https://discord.gg/RsSfb9gn3) · [**Telegram**](https://t.me/+tnRXX8KOCWA3YjE1) · validators@hashkinetics.org
 
-`testnet-1: LIVE since 2026-09-02` · `node v0.18.1 · wallet v0.14.1` · `7 seats, 3 external` · `seats change on the running chain (v0.14.0)` · `bootstrap governance: genesis seats weigh 4 from height 110,000 (v0.18.1)` · `issued assets with issuer controls (v0.15.0)` · `spend proof: 1.24 s (GPU)` · `274 tx/s storm-measured` · `nothing is for sale`
+`testnet-1: LIVE since 2026-09-02` · `node v0.18.1 · wallet v0.14.1 · Android wallet v0.2.0` · `7 seats, 3 external` · `seats change on the running chain (v0.14.0)` · `bootstrap governance: genesis seats weigh 4 from height 110,000 (v0.18.1)` · `issued assets with issuer controls (v0.15.0)` · `spend proof: 1.24 s (GPU)` · `274 tx/s storm-measured` · `nothing is for sale`
 
 ---
 
@@ -142,13 +142,14 @@ Read `docs/VALIDATOR-ONBOARDING.md`, then mail **validators@hashkinetics.org** w
 | Path | What |
 |---|---|
 | `chain/` | The Rust workspace — state machine, mandates, shielded pool, channels, consensus adapter (Malachite BFT), node, wallet, RPC |
+| `android/` | The Android wallet (Kotlin + Jetpack Compose over `chain/crates/hk-wallet-core` via UniFFI; `android/README.md`) — built and signed by `.github/workflows/wallet-android.yml` |
 | `chain/crates/hk-crypto` | Hash-based signatures: LMS/HSS (RFC 8554) with reserve-then-sign persistence, SLH-DSA-SHAKE-192s roots (FIPS 205), PayWord, KAT-verified |
 | `zkvm-bakeoff/` | The shared spend circuit (`no_std`) + SP1/RISC0/OpenVM harnesses, the GPU prover service, and the aggregation guest |
 | `docs/CAPACITY-SHEET.md` | Every measured number with date, hardware, and the command that produced it |
 | `networks/testnet-1/` | The join kit: pinned genesis, bootstrap peers, `CHECKSUMS` for every release |
 | `docs/VALIDATOR-ONBOARDING.md` | Join the network: keygen → observer → seat (admitted on the running chain since v0.14.0) → operating rules |
 | `docs/V1-VALIDATOR-SET-CHANGES.md` · `docs/X1-ISSUED-ASSETS.md` | The v0.14 / v0.15 consensus rules: seat changes and issued assets — rule, wire, activation, runbooks |
-| `docs/RPC.md` · `docs/FEES.md` · `docs/WALLET-GUIDE.md` | Every RPC method with its fields; the protocol fee as a genesis fact; the Windows wallet guide |
+| `docs/RPC.md` · `docs/FEES.md` · `docs/WALLET-GUIDE.md` | Every RPC method with its fields; the protocol fee as a genesis fact; the wallet guide (Windows + Android) |
 | `docs/AUDIT-SCOPE.md` | Trust boundaries, crypto inventory, consensus invariants (incl. V1 and X1) — the audit work-packages, prepared before the auditors |
 | `explorer/` | The single-file explorer behind hashkinetics.org/explorer — runs against any node RPC |
 | `chain/rehearsal.sh` · `chain/gate-v1.sh` · `chain/gate-x1.sh` | The devnet gates every release passes: ceremony + restore shapes, seat changes (25/25), issued assets (40/40) |

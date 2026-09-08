@@ -1,18 +1,31 @@
-# HashKinetics Wallet — user guide (Windows · v0.14.1 · testnet-1)
+# HashKinetics Wallet — user guide (Windows v0.14.1 · Android v0.2.0 · testnet-1)
 
 **What to click first, how to hide money, how to show it again, how to pay someone privately, and how to prove one payment to one person.** The same guide exists as a slide deck (`HashKinetics-Wallet-Guide.pptx` / `.pdf`, screenshots in `wallet-guide-shots/`); this is the text version for the repository and the website (`/wallet`). Everything here was done on the live network on 2026-09-02 — the transaction ids are real and searchable in the explorer.
 
-> Test units only. Nothing in this wallet has monetary value, nothing is for sale, and the build is unsigned. Keys never leave your machine.
+> Test units only. Nothing in this wallet has monetary value, nothing is for sale; the Windows build is unsigned (verify the hash), the Android build is signed with the HashKinetics release key (verify the hash and the signer). Keys never leave your machine — or your phone.
 
 ## 0 · Before you start
 
-1. Download `HashKinetics-Wallet.exe` from the **v0.13.1 release** (`github.com/hashkinetics/hashkinetics/releases/tag/v0.13.1`, 6.4 MB). Screenshots below are from v0.13.0 — v0.13.1 adds the spend-key budget line and the version in the footer, nothing else moves.
+1. Download `HashKinetics-Wallet.exe` from the **v0.16.1 release** (`github.com/hashkinetics/hashkinetics/releases/tag/v0.16.1` — wallet v0.14.1, 6.6 MB). Screenshots below are from v0.13.x; v0.14.0 added *Protect with a passphrase* (§5a), v0.14.1 the incremental scan (§8) — the screens are otherwise the same.
 2. Verify it — the only trust step: in PowerShell, `Get-FileHash .\HashKinetics-Wallet.exe` must print
-   `FB330C291C656E71A7D3473F9CFFABB7A449A98EA7F8DDBCC09BD7062E16FB15`.
+   `17566A9E5CC258814F06924C65334631F62205358823414F4ABAF587E5F8308E` (v0.14.1; the v0.13.1 build was `FB330C29…`).
 3. Windows SmartScreen will warn on first run (unsigned build): *More info → Run anyway*. Do not trust the popup either way — trust the hash.
 4. The wallet talks to `https://rpc.hashkinetics.org` (chain), `https://faucet.hashkinetics.org` (test funds) and `https://prover.hashkinetics.org` (proofs). No installer, no registry, no admin rights.
 
 **Every transaction pays the protocol fee: 0.000100, burned.** The wallet shows it under your balance and keeps it in mind for you (`docs/FEES.md`).
+
+## 0a · Android (v0.2.0)
+
+The same wallet as a phone app — the desktop's Rust library called through UniFFI, the same `account.json` / `shield.json` / `disclosure-*.json` (a phone backup restores on a PC and vice-versa). Release: [`wallet-android-v0.2.0`](https://github.com/hashkinetics/hashkinetics/releases/tag/wallet-android-v0.2.0).
+
+1. **Download** `HashKinetics-Wallet-android-0.2.0.apk` from the release. Android 8.0 or newer on a 64-bit phone (arm64-v8a).
+2. **Verify** — two checks, both published on the release page: `sha256sum HashKinetics-Wallet-android-0.2.0.apk` → `3510d1c8bad8506ff406ea64ae6a7a7a06a3b68e2a6ec4539b0cdda6919d3904`; `apksigner verify --print-certs HashKinetics-Wallet-android-0.2.0.apk` (Android build-tools) → signer certificate SHA-256 `b296799ed6bea902f6a30ed3bcd497adce7374eb15ec9f8d587ef0575902d6d3`. Every future release is signed by the same key (valid to 2054), so Android upgrades it in place; a build whose signer differs is not ours.
+3. **Install** (sideload): allow "install unknown apps" for your browser or file manager, open the APK. If a `-debug` build from a workflow artifact is on the phone, uninstall it first — different key; that deletes its testnet wallet.
+4. **Four screens behind a bottom bar** — *Wallet* (balance, fee, height · Refresh · Get test funds · Receive with a QR of your account id · Send), *Shielded* (stealth address with a QR · Scan · notes · Shield / Unshield · Pay shielded with a memo · Disclose one payment), *Backup* (Show seed · passphrase Protect / Change / Lock · device lock · key-file export), *Activity* (every core call's report, with explorer links). Before a wallet exists the app shows *Welcome* (Create keychain / Restore from a 64-hex seed); while the files are sealed it shows *Unlock*. §1–§13 below apply unchanged.
+5. **What is different on a phone.** *Protect* seals both files with Argon2id at **256 MiB** (the desktop uses 512 MiB; the parameters ride in the envelope, so either side opens the other's files). **Device lock** (off by default): a 32-byte key file wrapped by an AES-GCM key in the Android Keystore becomes a second factor — the sealed files then need this phone, or the exported key file (`HK_WALLET_KEYFILE` on a PC), as well as the passphrase; re-protect after switching it. Files live in the app's private storage (`files/wallet/`), cloud backup of them is disabled (`allowBackup=false`) — write the seed down, export `shield.json` yourself (it cannot be re-derived).
+6. **Not yet:** camera QR scanning and biometric key release (v0.3), in-app proving (the public prover proves for you; a shielded operation takes a minute or two), iOS, a Play Store listing (after the first month). Unaudited testnet software.
+
+Source: `android/` (Kotlin + Jetpack Compose) over `chain/crates/hk-wallet-core` (Rust); built and signed by `.github/workflows/wallet-android.yml`; gate `chain/gate-wa1.sh` (the whole journey on a devnet + the CLI opening the phone's sealed files).
 
 ## 1 · Create or restore a wallet (first launch)
 
@@ -131,8 +144,8 @@ Every note has a **disclose** button. It writes `disclosure-<id>.json` next to y
 | opens to **This wallet is protected** | the files are sealed (v0.14.0) | type the passphrase; there is no reset — use the seed backup if it is lost |
 | `Could not unlock: wrong passphrase` | typo, or a file was tampered with | retry; the wallet never half-opens a sealed file |
 
-Files: `%USERPROFILE%\.hashkinetics\account.json` · `shield.json` · `disclosure-*.json`. The prover URL field defaults to `https://prover.hashkinetics.org`; point it at your own `hk-prove` if you run one.
+Files: `%USERPROFILE%\.hashkinetics\account.json` · `shield.json` · `disclosure-*.json` (Android: the app's private `files/wallet/`, plus `files/keyfile.bin` when the device lock is on). The prover URL field defaults to `https://prover.hashkinetics.org`; point it at your own `hk-prove` if you run one.
 
 ## 15 · What this wallet is — and is not
 
-It is a real client of a real post-quantum chain: every transaction you make is a hash-signed consensus transaction, every shielded operation is a real STARK verified by every validator, and the receipts above are searchable in the explorer. It is **not** audited, **not** code-signed, and it holds **test units** on **testnet-1** — balances from the retired staging-1 network did not carry over (same seed, re-fund through the faucet). Keys sit in plaintext JSON on your disk (passphrase protection is on the plan). No master view key exists, ever.
+It is a real client of a real post-quantum chain: every transaction you make is a hash-signed consensus transaction, every shielded operation is a real STARK verified by every validator, and the receipts above are searchable in the explorer. It is **not** audited; the Windows build is **not** code-signed (the Android APK is signed with the HashKinetics release key — verify the digest), and it holds **test units** on **testnet-1** — balances from the retired staging-1 network did not carry over (same seed, re-fund through the faucet). Keys sit in JSON on your disk or in the app's private storage — plain by default, sealed with a passphrase if you choose (v0.14.0 / Android v0.2.0, §5a / §0a). No master view key exists, ever.
