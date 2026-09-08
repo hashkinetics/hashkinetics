@@ -20,10 +20,25 @@ android {
         }
     }
 
+    // WA3 — the release key lives OUTSIDE the tree. CI decodes it from a repository secret into a temp file and
+    // points HK_ANDROID_KEYSTORE at it (see .github/workflows/wallet-android.yml); a developer machine without
+    // the variables falls back to the local debug key, so `assembleRelease` always works — just not upgradable
+    // over a published build. Nothing here is ever the key itself.
+    val releaseKeystore = System.getenv("HK_ANDROID_KEYSTORE")
+    signingConfigs {
+        if (!releaseKeystore.isNullOrEmpty()) {
+            create("release") {
+                storeFile = file(releaseKeystore)
+                storePassword = System.getenv("HK_ANDROID_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("HK_ANDROID_KEY_ALIAS")
+                keyPassword = System.getenv("HK_ANDROID_KEY_PASSWORD")
+            }
+        }
+    }
     buildTypes {
         release {
             isMinifyEnabled = false // keep the UniFFI/JNA symbols untouched for the first releases
-            signingConfig = signingConfigs.getByName("debug") // WA3: a release key kept out of the tree
+            signingConfig = if (!releaseKeystore.isNullOrEmpty()) signingConfigs.getByName("release") else signingConfigs.getByName("debug")
         }
     }
     compileOptions {

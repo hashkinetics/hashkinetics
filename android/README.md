@@ -44,6 +44,24 @@ No in-app proving (proofs are made on the public prover; a shielded operation ta
 QR *scanning* of addresses (the camera; v0.3), no biometric release of the key file (v0.3: `setUserAuthenticationRequired`),
 no push notifications, no iOS. Unaudited testnet software; nothing is for sale.
 
+## Release signing (WA3)
+
+The release key is **not in this tree**. `app/build.gradle.kts` reads `HK_ANDROID_KEYSTORE` (a path),
+`HK_ANDROID_KEYSTORE_PASSWORD`, `HK_ANDROID_KEY_ALIAS`, `HK_ANDROID_KEY_PASSWORD` from the environment; CI
+(`.github/workflows/wallet-android.yml`) decodes the keystore from the repository secret `HK_ANDROID_KEYSTORE_B64`
+into a temp file for the one Gradle step and ships a release-signed `HashKinetics-Wallet-android-<version>.apk`
+with its sha256 and the signer's certificate digest (`apksigner verify --print-certs`). Without the secrets
+(forks, pull requests, a developer machine) the build falls back to the local debug key and the artifact is named
+`-debug`: it runs, but Android will not upgrade it over a published build (uninstall first — that deletes the
+wallet files on the phone).
+
+Releases are tag-first and immutable: `wallet-android-vX.Y.Z` must equal `versionName` (the workflow checks),
+the tag's run produces the artifact, the APK + `.sha256` are attached to the GitHub release by hand, and the row
+goes into `networks/testnet-1/CHECKSUMS`. Verify a download with `sha256sum` / `Get-FileHash`, and the signer
+with `apksigner verify --print-certs HashKinetics-Wallet-android-<version>.apk` (the digest is in the release
+text). Losing the key means every future build is a different app to Android — the keystore and its passphrase
+are backed up off the fleet like the treasury passphrase.
+
 ## Files on the phone
 
 `filesDir/wallet/account.json`, `…/shield.json`, `…/disclosure-*.json` (byte-compatible with the desktop wallet);

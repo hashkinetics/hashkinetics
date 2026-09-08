@@ -1,15 +1,24 @@
 # Android wallet (WA3): the Rust core cross-compiled for arm64-v8a + x86_64 with cargo-ndk, the Kotlin
-# bindings generated from the core's own UniFFI metadata, then a debug APK built with Gradle — stored as a
-# workflow artifact with its sha256. Manual, on every push that touches the wallet, and on version tags.
-# Releases stay hand-made and immutable: download the artifact, verify the sha in the job log, attach it.
-# The debug APK is signed with the runner's throw-away debug key: sideload-only ("install unknown apps").
+# bindings generated from the core's own UniFFI metadata, then the APK built with Gradle — stored as a
+# workflow artifact with its sha256 and the signer's certificate digest.
+#
+# Signing. The release key is NOT in the tree: it is a repository secret (HK_ANDROID_KEYSTORE_B64 = the
+# .jks base64, HK_ANDROID_KEYSTORE_PASSWORD, HK_ANDROID_KEY_ALIAS, HK_ANDROID_KEY_PASSWORD) decoded into a
+# temp file for the one Gradle step. With the secrets present every run (main pushes and wallet tags) ships
+# a release-signed APK — installs upgrade in place; without them (forks, pull requests) the build falls back
+# to the runner's throw-away debug key and the artifact is named -debug.
+#
+# Releases stay hand-made and immutable: tag `wallet-android-vX.Y.Z` (must equal versionName), download the
+# artifact of the tag's run, verify the sha in the job log, attach the APK + .sha256 to the GitHub release,
+# add the row to networks/testnet-1/CHECKSUMS.
 name: wallet-android
 on:
   workflow_dispatch:
   push:
-    # a `tags:` filter alone would silence branch pushes (GitHub ANDs the filters): name main too
+    # a `tags:` filter alone would silence branch pushes (GitHub ANDs the filters): name main too.
+    # Wallet releases carry their own tag prefix so node releases (v*) do not spend a build here.
     branches: ["main"]
-    tags: ["v*"]
+    tags: ["wallet-android-v*"]
     paths:
       - "android/**"
       - "chain/crates/hk-wallet-core/**"
@@ -21,8 +30,18 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    env:
+      # `if:` cannot read secrets — mirror the key's presence into a plain variable
+      HAS_RELEASE_KEY: ${{ secrets.HK_ANDROID_KEYSTORE_B64 != '' }}
     steps:
       - uses: actions/checkout@v5
+      - name: the tag must name the version in the build file (tag-first, immutable releases)
+        if: github.ref_type == 'tag'
+        run: |
+          V=$(grep -o 'versionName = "[^"]*"' android/app/build.gradle.kts | cut -d'"' -f2)
+          T="${GITHUB_REF_NAME#wallet-android-v}"
+          [ "$T" = "$V" ] || { echo "tag $GITHUB_REF_NAME names $T but android/app/build.gradle.kts says versionName $V"; exit 1; }
+          echo "release $GITHUB_REF_NAME = versionName $V"
       - name: toolchain (chain/rust-toolchain.toml = stable) + Android targets
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -64,20 +83,49 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.9"
-      - name: assembleDebug
+      - name: release key (decoded from the repository secret into a temp file; never in the tree)
+        if: env.HAS_RELEASE_KEY == 'true'
+        env:
+          KS_B64: ${{ secrets.HK_ANDROID_KEYSTORE_B64 }}
+        run: |
+          KS="$RUNNER_TEMP/hk-release.jks"
+          printf '%s' "$KS_B64" | base64 -d > "$KS"
+          chmod 600 "$KS"
+          echo "HK_ANDROID_KEYSTORE=$KS" >> "$GITHUB_ENV"
+          echo "release key present ($(stat -c %s "$KS") bytes)"
+      - name: assemble (release-signed when the key is present, else debug)
         working-directory: android
-        run: gradle --no-daemon --console=plain assembleDebug
-      - name: package + sha256
+        env:
+          HK_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.HK_ANDROID_KEYSTORE_PASSWORD }}
+          HK_ANDROID_KEY_ALIAS: ${{ secrets.HK_ANDROID_KEY_ALIAS }}
+          HK_ANDROID_KEY_PASSWORD: ${{ secrets.HK_ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ "$HAS_RELEASE_KEY" = "true" ]; then
+            gradle --no-daemon --console=plain assembleRelease
+          else
+            echo "no release key in this repository's secrets — debug-signed build"
+            gradle --no-daemon --console=plain assembleDebug
+          fi
+      - name: package + sha256 + signer certificate
         run: |
           V=$(grep -o 'versionName = "[^"]*"' android/app/build.gradle.kts | cut -d'"' -f2)
-          cp android/app/build/outputs/apk/debug/app-debug.apk "HashKinetics-Wallet-android-$V-debug.apk"
-          sha256sum "HashKinetics-Wallet-android-$V-debug.apk" | tee "HashKinetics-Wallet-android-$V-debug.apk.sha256"
-          echo "APP_VERSION=$V" >> "$GITHUB_ENV"
+          if [ "$HAS_RELEASE_KEY" = "true" ]; then
+            SRC=android/app/build/outputs/apk/release/app-release.apk; NAME="HashKinetics-Wallet-android-$V"
+          else
+            SRC=android/app/build/outputs/apk/debug/app-debug.apk; NAME="HashKinetics-Wallet-android-$V-debug"
+          fi
+          cp "$SRC" "$NAME.apk"
+          sha256sum "$NAME.apk" | tee "$NAME.apk.sha256"
+          # the signer's certificate digest — publish it; anyone can check an APK with `apksigner verify --print-certs`
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          "$BT/apksigner" verify --print-certs "$NAME.apk" | tee "$NAME.apk.signer.txt"
+          echo "APK_NAME=$NAME" >> "$GITHUB_ENV"
       - uses: actions/upload-artifact@v5
         with:
-          name: HashKinetics-Wallet-android-${{ env.APP_VERSION }}-debug
+          name: ${{ env.APK_NAME }}
           path: |
-            HashKinetics-Wallet-android-${{ env.APP_VERSION }}-debug.apk
-            HashKinetics-Wallet-android-${{ env.APP_VERSION }}-debug.apk.sha256
+            ${{ env.APK_NAME }}.apk
+            ${{ env.APK_NAME }}.apk.sha256
+            ${{ env.APK_NAME }}.apk.signer.txt
           if-no-files-found: error
           retention-days: 90
