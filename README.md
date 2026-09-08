@@ -83,7 +83,7 @@ Every claim in the table above has a command that reproduces it.
 
 ## Get ON the chain (since v0.11 — the front door; v0.13.0 pays shielded too)
 
-You no longer need a genesis seat — and you no longer need a terminal. **Windows users: download `HashKinetics-Wallet.exe` from the latest release** (unsigned testnet build — SmartScreen will warn; verify the published sha256): create a wallet, tap the faucet, pay anyone. Your keys never leave your machine, and your first payment signs with your own hash-based one-time key at index 0.
+You no longer need a genesis seat — and you no longer need a terminal. **Windows users: download `HashKinetics-Wallet.exe` from the latest release** (unsigned testnet build — SmartScreen will warn; verify the published sha256): create a wallet, tap the faucet, pay anyone. **Android users: [`HashKinetics-Wallet-android-0.2.0.apk`](https://github.com/hashkinetics/hashkinetics/releases/tag/wallet-android-v0.2.0) (sideload; sha256 `3510d1c8…`, signed by the HashKinetics release key — verify the certificate digest on the release page)** — the same journey, the same files, receive by QR. Your keys never leave your machine, and your first payment signs with your own hash-based one-time key at index 0.
 
 Prefer the CLI? Generate a keychain locally, paste one string into the faucet, and you hold a funded, spendable account whose id nobody can squat (`id = H(auth commit)`, checked in consensus):
 
