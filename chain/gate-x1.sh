@@ -16,7 +16,7 @@
 #   5. pause → transfer refused `asset paused`, mint refused; unpause → mint lands.
 #   6. non-issuer mint refused; burn with a destination → burned counter, conserved.
 #   7. every validator reports the same registry + app_hash; a validator restarted from
-#      snapshot3.bin rejoins at the same app_hash; a fresh node synced from genesis
+#      snapshot4.bin rejoins at the same app_hash; a fresh node synced from genesis
 #      derives the same registry (replay across the registration).
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -104,13 +104,13 @@ V=$(aview 26000 "$ASSET"); [[ "$V" == "True 6000000 1000000 False 0 True" ]] && 
 K=$(rpc 26000 hk_getAccountTxs "{\"id\":\"$ALICE\",\"limit\":20}" | python3 -c 'import sys,json;print(",".join(sorted({t["kind"] for t in json.load(sys.stdin)["result"]["txs"]})))' 2>/dev/null)
 [[ "$K" == *asset_burn* && "$K" == *asset_mint* ]] && ok "explorer/tx index names the kinds: $K" || bad "tx index kinds: $K"
 
-echo "== 7 · every node agrees; restart from snapshot3; sync from genesis"
+echo "== 7 · every node agrees; restart from snapshot4; sync from genesis"
 A0=$(ah_of 26000); AGREE=1
 for p in 26001 26002 26003; do [[ "$(ah_of $p)" == "$A0" && "$(aview $p "$ASSET")" == "$(aview 26000 "$ASSET")" ]] || AGREE=0; done
 [[ "$AGREE" == 1 ]] && ok "4/4 same app_hash + same registry view" || bad "nodes disagree (app_hash/registry)"
 T=$(( ($(h_of 26000) / 16 + 1) * 16 + 2 )); wait_h 26000 "$T" 120 || bad "did not reach a snapshot boundary"
 pkill -f "hk-node start $H/node1" ; sleep 2
-[[ -f "$H/node1/snapshot3.bin" ]] && ok "node1 wrote snapshot3.bin" || bad "no snapshot3.bin on node1 ($(ls $H/node1 | tr '\n' ' '))"
+[[ -f "$H/node1/snapshot4.bin" ]] && ok "node1 wrote snapshot4.bin" || bad "no snapshot4.bin on node1 ($(ls $H/node1 | tr '\n' ' '))"
 start_node "$H/node1" "$H/node1.log"
 T=$(( $(h_of 26000) + 6 )); wait_h 26001 "$T" 120 && ok "node1 back at $T" || bad "node1 did not rejoin"
 sleep 3; [[ "$(ah_of 26001)" == "$(ah_of 26000)" ]] && ok "node1 app_hash == node0 after restore" || bad "node1 app_hash mismatch after restore"

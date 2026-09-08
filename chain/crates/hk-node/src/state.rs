@@ -169,6 +169,8 @@ pub struct SharedHandles {
     /// Wallets read it to rebuild auth paths (`hk_getPoolLeaves`) and to SCAN for notes
     /// addressed to them (`hk_getPoolNotes`). Devnet: in-memory, fresh per run.
     pub pool_notes: Arc<Mutex<Vec<(hk_primitives::H256, Vec<u8>)>>>,
+    /// P6: the leaf feeds of the additional per-asset pools (the legacy feed is above).
+    pub pool_notes_by_asset: Arc<Mutex<std::collections::BTreeMap<hk_primitives::AssetId, Vec<(hk_primitives::H256, Vec<u8>)>>>>,
     /// P2.3: aggregation bundles submitted via `hk_submitBundle`.
     pub bundles: Arc<Mutex<Vec<(Vec<SignedTx>, Vec<u8>)>>>,
     pub chain_id: String,
@@ -319,6 +321,8 @@ pub struct HkApp {
     pub receipts: Arc<Mutex<ReceiptLog>>,
     /// Pool-note index for wallet path rebuilds + scanning (see SharedHandles docs).
     pub pool_notes: Arc<Mutex<Vec<(hk_primitives::H256, Vec<u8>)>>>,
+    /// P6: per-asset pool feeds (see SharedHandles docs).
+    pub pool_notes_by_asset: Arc<Mutex<std::collections::BTreeMap<hk_primitives::AssetId, Vec<(hk_primitives::H256, Vec<u8>)>>>>,
     /// P2.3: pending aggregation bundles (proof-less pool txs + ONE aggregate STARK);
     /// the proposer includes a whole bundle per block.
     pub bundles: Arc<Mutex<Vec<(Vec<SignedTx>, Vec<u8>)>>>,
@@ -505,6 +509,7 @@ impl HkApp {
             mempool: Arc::new(Mutex::new(crate::mempool::Mempool::default())),
             receipts: Arc::new(Mutex::new(ReceiptLog::new(4096))),
             pool_notes: Arc::new(Mutex::new(Vec::new())),
+            pool_notes_by_asset: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             bundles: Arc::new(Mutex::new(Vec::new())),
             agg,
             chain_id: "hashkinetics-devnet-1".to_string(),
@@ -556,6 +561,10 @@ impl HkApp {
     pub fn set_genesis_digest(&mut self, digest: [u8; 32]) {
         self.genesis_digest = digest;
         self.chain_id = format!("hashkinetics-1-{}", hex::encode(&digest[..4]));
+        // P6: the multi-pool activation is a chain-id fact (config, never snapshotted).
+        let from = crate::genesis::multi_pool_from_for(&self.chain_id);
+        self.chain.lock().unwrap().multi_pool_from = from;
+        info!(chain_id = %self.chain_id, multi_pool_from = from, "P6 multi-asset pool activation");
     }
 
     /// Clonable handles for the RPC server (call before moving self into the loop).
@@ -565,6 +574,7 @@ impl HkApp {
             mempool: self.mempool.clone(),
             receipts: self.receipts.clone(),
             pool_notes: self.pool_notes.clone(),
+            pool_notes_by_asset: self.pool_notes_by_asset.clone(),
             bundles: self.bundles.clone(),
             chain_id: self.chain_id.clone(),
             genesis_digest: self.genesis_digest,
@@ -1113,27 +1123,43 @@ impl HkApp {
                 });
             }
 
-            // Pool-note index: every commitment that entered the tree this block, with its
+            // Pool-note index: every commitment that entered a tree this block, with its
             // stealth payload, in tx order == insertion order (wallets rebuild auth paths
-            // and SCAN from this).
+            // and SCAN from this). P6: one feed per pool — a shield routes by its asset, a
+            // spend by its anchor (still a recent anchor of its pool: sealing is at block
+            // end and the window is long), exactly as the state machine routed it.
             {
                 use hk_state::tx::Tx;
+                use hk_state::PoolKey;
                 let mut notes = self.pool_notes.lock().unwrap();
+                let mut by_asset = self.pool_notes_by_asset.lock().unwrap();
                 for (tx, r) in txs.iter().zip(receipts.iter()) {
                     if r.result.is_ok() {
                         match &tx.payload {
-                            Tx::MintToPool { commitment, stealth_ct, .. } => {
-                                notes.push((*commitment, stealth_ct.clone()))
+                            Tx::MintToPool { asset, commitment, stealth_ct, .. } => {
+                                match chain.pool_key_of_asset(asset) {
+                                    Ok(PoolKey::Asset(a)) => by_asset
+                                        .entry(a)
+                                        .or_default()
+                                        .push((*commitment, stealth_ct.clone())),
+                                    _ => notes.push((*commitment, stealth_ct.clone())),
+                                }
                             }
                             Tx::ShieldedSpend {
+                                anchor,
                                 out_commitment,
                                 out2_commitment,
                                 stealth_ct,
                                 stealth_ct2,
                                 ..
                             } => {
-                                notes.push((*out_commitment, stealth_ct.clone()));
-                                notes.push((*out2_commitment, stealth_ct2.clone()));
+                                let feed: &mut Vec<(hk_primitives::H256, Vec<u8>)> =
+                                    match chain.pool_key_of_anchor(anchor) {
+                                        Some(PoolKey::Asset(a)) => by_asset.entry(a).or_default(),
+                                        _ => &mut *notes,
+                                    };
+                                feed.push((*out_commitment, stealth_ct.clone()));
+                                feed.push((*out2_commitment, stealth_ct2.clone()));
                             }
                             _ => {}
                         }
@@ -1627,6 +1653,7 @@ impl HkApp {
             height,
             state,
             pool_notes: self.pool_notes.lock().unwrap().clone(),
+            pool_notes_by_asset: self.pool_notes_by_asset.lock().unwrap().clone(),
             receipts: self.receipts.lock().unwrap().entries(),
             mempool: self.mempool.lock().unwrap().iter().cloned().collect(),
             validators: self
@@ -1662,15 +1689,16 @@ impl HkApp {
             // Config survives the image swap (a snapshot must not smuggle in policy):
             // the verifier AND the U4 fee parameters are re-injected from the running
             // configuration, exactly as `HkApp::new` set them.
-            let (verifier, fee_micro, fee_from, fee_asset) = {
+            let (verifier, fee_micro, fee_from, fee_asset, multi_pool_from) = {
                 let c = self.chain.lock().unwrap();
-                (c.verifier.clone(), c.fee_micro, c.fee_from, c.fee_asset)
+                (c.verifier.clone(), c.fee_micro, c.fee_from, c.fee_asset, c.multi_pool_from)
             };
             let mut st = hk_state::State::from_snapshot(snap.state);
             st.verifier = verifier;
             st.fee_micro = fee_micro;
             st.fee_from = fee_from;
             st.fee_asset = fee_asset; // X1: genesis fact, config-like on restore
+            st.multi_pool_from = multi_pool_from; // P6: chain-id fact, config-like on restore
             let got = st.state_commitment().0;
             if got != snap.app_hash {
                 return Err(eyre!(
@@ -1683,6 +1711,7 @@ impl HkApp {
             }
             *self.chain.lock().unwrap() = st;
             *self.pool_notes.lock().unwrap() = snap.pool_notes;
+            *self.pool_notes_by_asset.lock().unwrap() = snap.pool_notes_by_asset;
             self.receipts.lock().unwrap().restore(snap.receipts);
             {
                 // Rebuild WITH indexes (C2); duplicate frames in an old image are suppressed.

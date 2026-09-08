@@ -69,6 +69,8 @@ Doctrine first, because it decides the shape: **money on this chain moves only u
 
 ### X5 · Shielded pool policy per asset (design note + one flag)
 
+> **2026-09-09 — the multi-asset pool is being built as P6 (`docs/P6-MULTI-ASSET-POOL.md`): one pool per pool-eligible asset, no circuit change, activation by height on testnet-1 (v0.19.0). The paragraph below is the v1 position it replaces.**
+
 An issuer's freeze cannot reach a note in the pool — that is the point of the pool — so whether a stablecoin may be shielded is the issuer's call, expressed as `pool_eligible` at registration and enforced at `MintToPool`. Our compliance answer stays the one we already ship: holder-produced, single-payment, offline-verifiable disclosure (CVA), no master view key — plus per-asset pool caps if an issuer wants them (the value-cap machinery from the guarded-mainnet plan). Multi-asset pool = P6, after the soak. Size: S now (policy + flag), P6 later.
 
 ### X6 · Fees and the "gas in USDC" question
@@ -109,6 +111,8 @@ The doctrine line for the site: *"External facts enter HashKinetics only through
 | receipt | end-to-end on testnet-1 with Circle's testnet: Sepolia USDC → `USDC.hk` → burn → Sepolia USDC | — | the demo video and the receipts page entry | after partnership |
 
 **Engineering total:** ~3 weeks of chain + service work, most of it parallel to V1/R11. **The one scheduling truth:** X1–X3 change consensus, so they must be on testnet-1 *before* the 30-day soak starts and inside the audit-scope freeze; doing them now costs ~2 weeks of Sprint 2–3 capacity and saves a second consensus roll (and a soak restart) later. Recommended.
+
+**B1 (2026-09-09):** the first concrete build — Sepolia USDC ↔ testnet-1 through a vault contract + `hk-attest`, plain X1 mint, receipts first — is planned in `docs/BRIDGE-SEPOLIA-USDC-PLAN.md`; X2 follows it.
 
 ## 6 · What only the founder can do
 

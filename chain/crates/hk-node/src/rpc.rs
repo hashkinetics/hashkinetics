@@ -19,13 +19,15 @@
 //!   hk_mandateAvailable {leaf, at?}           -> {available}         (string | null)
 //!   hk_submitTx     {tx}                       -> {accepted, txid}
 //!   hk_getReceipt   {txid}                     -> {found, detail}
-//!   hk_getPoolInfo                             -> {version, asset?, root, latest_anchor,
+//!   hk_getPoolInfo  {asset?}                   -> {legacy, version, asset?, root, latest_anchor,
 //!                                                  next_index, nullifiers, total_shielded}
-//!   hk_getPoolLeaves {from?, limit?<=10000}    -> {leaves: [hex; ...], from, count, total, next}  (H3: paged)
-//!   hk_getPoolNotes  {from?, limit?<=10000}    -> {notes: [{index, commitment, stealth_ct}], from,
+//!                                                 (P6: `asset` = that asset's pool; absent = legacy)
+//!   hk_getPools                                -> {count, multi_pool_from, pools: [hk_getPoolInfo…]}  (P6)
+//!   hk_getPoolLeaves {asset?, from?, limit?<=10000} -> {asset, leaves: [hex; ...], from, count, total, next}  (H3: paged)
+//!   hk_getPoolNotes  {asset?, from?, limit?<=10000} -> {asset, notes: [{index, commitment, stealth_ct}], from,
 //!                                                 count, total, next}   (H3, v0.16.1: paged — `next`
 //!                                                 is the wallet's scan cursor; null = end)
-//!   hk_getPoolPath   {index}                   -> {index, commitment, siblings[TREE_DEPTH], root, total}
+//!   hk_getPoolPath   {asset?, index}           -> {asset, index, commitment, siblings[TREE_DEPTH], root, total}
 //!                                                 (H3: one authentication path; spenders no longer
 //!                                                 download every commitment)
 //!
@@ -446,16 +448,25 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
             }
         }
         "hk_getPoolInfo" => {
+            // P6: `asset` (64-hex, optional) selects a per-asset pool; absent = the legacy
+            // pool — every pre-P6 wallet keeps working unchanged.
             let chain = h.chain.lock().unwrap_or_else(|e| e.into_inner());
-            let p = &chain.pool;
+            match pool_key_param(params, &chain) {
+                Err(e) => json!({"error": e}),
+                Ok(key) => match chain.pool_ref(key) {
+                    None => json!({"error": "no pool for that asset yet"}),
+                    Some(p) => json!({"result": pool_json(key, p)}),
+                },
+            }
+        }
+        "hk_getPools" => {
+            // P6: every pool, the legacy one first.
+            let chain = h.chain.lock().unwrap_or_else(|e| e.into_inner());
+            let pools: Vec<Value> = chain.pools_iter().map(|(k, p)| pool_json(k, p)).collect();
             json!({"result": {
-                "version": p.version,
-                "asset": p.asset.map(|a| hex::encode(a.0)),
-                "root": hex::encode(p.tree.root()),
-                "latest_anchor": p.latest_anchor().map(hex::encode),
-                "next_index": p.tree.next_index(),
-                "nullifiers": p.nullifiers.len(),
-                "total_shielded": p.total_shielded.to_string(),
+                "count": pools.len(),
+                "multi_pool_from": if chain.multi_pool_from == u64::MAX { Value::Null } else { json!(chain.multi_pool_from) },
+                "pools": pools,
             }})
         }
         // ---- H3 (v0.16.1): the pool feed is PAGED. `from` (leaf index, default 0) and
@@ -464,54 +475,68 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
         // asks only for what it has not seen; a spender asks `hk_getPoolPath` for one
         // authentication path instead of downloading every commitment.
         "hk_getPoolLeaves" => {
-            let notes = h.pool_notes.lock().unwrap_or_else(|e| e.into_inner());
-            let (from, to, next) = pool_page(params, notes.len());
-            json!({"result": {
-                "leaves": notes[from..to].iter().map(|(l, _)| hex::encode(l.0)).collect::<Vec<_>>(),
-                "from": from,
-                "count": to - from,
-                "total": notes.len(),
-                "next": next,
-            }})
+            // P6: `asset` (optional) selects the per-asset feed; absent = the legacy pool.
+            match pool_feed(h, params) {
+                Err(e) => json!({"error": e}),
+                Ok((notes, asset)) => {
+                    let (from, to, next) = pool_page(params, notes.len());
+                    json!({"result": {
+                        "asset": asset,
+                        "leaves": notes[from..to].iter().map(|(l, _)| hex::encode(l.0)).collect::<Vec<_>>(),
+                        "from": from,
+                        "count": to - from,
+                        "total": notes.len(),
+                        "next": next,
+                    }})
+                }
+            }
         }
         "hk_getPoolNotes" => {
-            // For scanners: (leaf index, commitment, stealth payload).
-            let notes = h.pool_notes.lock().unwrap_or_else(|e| e.into_inner());
-            let (from, to, next) = pool_page(params, notes.len());
-            json!({"result": {
-                "notes": notes[from..to].iter().enumerate().map(|(i, (l, ct))| json!({
-                    "index": from + i,
-                    "commitment": hex::encode(l.0),
-                    "stealth_ct": hex::encode(ct),
-                })).collect::<Vec<_>>(),
-                "from": from,
-                "count": to - from,
-                "total": notes.len(),
-                "next": next,
-            }})
+            // For scanners: (leaf index, commitment, stealth payload). P6: per pool.
+            match pool_feed(h, params) {
+                Err(e) => json!({"error": e}),
+                Ok((notes, asset)) => {
+                    let (from, to, next) = pool_page(params, notes.len());
+                    json!({"result": {
+                        "asset": asset,
+                        "notes": notes[from..to].iter().enumerate().map(|(i, (l, ct))| json!({
+                            "index": from + i,
+                            "commitment": hex::encode(l.0),
+                            "stealth_ct": hex::encode(ct),
+                        })).collect::<Vec<_>>(),
+                        "from": from,
+                        "count": to - from,
+                        "total": notes.len(),
+                        "next": next,
+                    }})
+                }
+            }
         }
         "hk_getPoolPath" => {
             // One leaf's authentication path (siblings bottom→top) + the root it folds to,
             // computed from the node's full leaf list. The proof binds the root; the chain
             // accepts it only while that root is a recent anchor — a wrong path can only
-            // cost the spender a rejected tx, never a coin.
+            // cost the spender a rejected tx, never a coin. P6: per pool (`asset`).
             match params.get("index").and_then(|v| v.as_u64()) {
-                Some(index) => {
-                    let notes = h.pool_notes.lock().unwrap_or_else(|e| e.into_inner());
-                    if (index as usize) >= notes.len() {
-                        json!({"error": format!("index {index} out of range (pool has {} commitments)", notes.len())})
-                    } else {
-                        let leaves: Vec<[u8; 32]> = notes.iter().map(|(l, _)| l.0).collect();
-                        let (siblings, root) = hk_state::pool::full_tree_path(&leaves, index);
-                        json!({"result": {
-                            "index": index,
-                            "commitment": hex::encode(leaves[index as usize]),
-                            "siblings": siblings.iter().map(hex::encode).collect::<Vec<_>>(),
-                            "root": hex::encode(root),
-                            "total": leaves.len(),
-                        }})
+                Some(index) => match pool_feed(h, params) {
+                    Err(e) => json!({"error": e}),
+                    Ok((notes, asset)) => {
+                        if (index as usize) >= notes.len() {
+                            json!({"error": format!("index {index} out of range (pool has {} commitments)", notes.len())})
+                        } else {
+                            let leaves: Vec<[u8; 32]> = notes.iter().map(|(l, _)| l.0).collect();
+                            let (siblings, root) = hk_state::pool::full_tree_path(&leaves, index);
+                            json!({"result": {
+                                "asset": asset,
+                                "index": index,
+                                "commitment": hex::encode(leaves[index as usize]),
+                                "siblings": siblings.iter().map(hex::encode).collect::<Vec<_>>(),
+                                "root": hex::encode(root),
+                                "total": leaves.len(),
+                            }})
+                        }
                     }
-                }
+                },
                 None => json!({"error": "index (leaf index, integer) required"}),
             }
         }
@@ -598,9 +623,16 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
         "hk_nullifierSpent" => match param_h256(params, "nullifier") {
             // Wallets use this to tell spent notes from live ones (a nullifier reveals
             // nothing by itself — it is unlinkable to any commitment without nk).
+            // P6: `asset` (optional) selects the pool; absent = the legacy pool.
             Some(nf) => {
                 let chain = h.chain.lock().unwrap_or_else(|e| e.into_inner());
-                json!({"result": {"spent": chain.pool.nullifiers.contains(&nf.0)}})
+                match pool_key_param(params, &chain) {
+                    Err(e) => json!({"error": e}),
+                    Ok(key) => {
+                        let spent = chain.pool_ref(key).is_some_and(|p| p.nullifiers.contains(&nf.0));
+                        json!({"result": {"spent": spent}})
+                    }
+                }
             }
             None => json!({"error": "nullifier must be 64-char hex"}),
         },
@@ -968,7 +1000,61 @@ fn asset_json(id: &H256, info: &hk_state::assets::AssetInfo, chain: &hk_state::S
         "paused": info.paused,
         "frozen_count": info.frozen.len(),
         "registered_at": info.registered_at,
+        // P6: this asset's shielded ledger across every pool that denominates it.
+        "shielded": chain.shielded_of(id).to_string(),
     })
+}
+
+/// P6: the pool an RPC call addresses — `asset` (64-hex) names a per-asset pool, or the
+/// legacy pool when it is that pool's pinned asset; absent = the legacy pool.
+fn pool_key_param(params: &Value, chain: &hk_state::State) -> Result<hk_state::PoolKey, String> {
+    match params.get("asset") {
+        None | Some(Value::Null) => Ok(hk_state::PoolKey::Legacy),
+        Some(_) => match param_h256(params, "asset") {
+            None => Err("asset must be 64-char hex".into()),
+            Some(a) => {
+                if chain.pool.asset == Some(a) {
+                    Ok(hk_state::PoolKey::Legacy)
+                } else {
+                    Ok(hk_state::PoolKey::Asset(a))
+                }
+            }
+        },
+    }
+}
+
+/// P6: one pool's public view.
+fn pool_json(key: hk_state::PoolKey, p: &hk_state::pool::PoolState) -> Value {
+    json!({
+        "legacy": matches!(key, hk_state::PoolKey::Legacy),
+        "version": p.version,
+        "asset": p.asset.map(|a| hex::encode(a.0)),
+        "root": hex::encode(p.tree.root()),
+        "latest_anchor": p.latest_anchor().map(hex::encode),
+        "next_index": p.tree.next_index(),
+        "nullifiers": p.nullifiers.len(),
+        "total_shielded": p.total_shielded.to_string(),
+    })
+}
+
+/// P6: the leaf feed an RPC call addresses (cloned out of its lock) + the asset label.
+/// An `asset` that is the legacy pool's pinned asset reads the legacy feed; an asset
+/// without a pool yet reads an empty feed (a scanner sees `total: 0`).
+fn pool_feed(h: &SharedHandles, params: &Value) -> Result<(Vec<(H256, Vec<u8>)>, Option<String>), String> {
+    let key = {
+        let chain = h.chain.lock().unwrap_or_else(|e| e.into_inner());
+        pool_key_param(params, &chain)?
+    };
+    match key {
+        hk_state::PoolKey::Legacy => {
+            let notes = h.pool_notes.lock().unwrap_or_else(|e| e.into_inner());
+            Ok((notes.clone(), None))
+        }
+        hk_state::PoolKey::Asset(a) => {
+            let by = h.pool_notes_by_asset.lock().unwrap_or_else(|e| e.into_inner());
+            Ok((by.get(&a).cloned().unwrap_or_default(), Some(hex::encode(a.0))))
+        }
+    }
 }
 
 fn param_h256(params: &Value, key: &str) -> Option<H256> {

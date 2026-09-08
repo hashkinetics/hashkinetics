@@ -150,11 +150,31 @@ pub(crate) fn wait_tx<F: FnMut() -> bool>(
     base: &str,
     label: &str,
     txid: &str,
-    pred: F,
+    mut pred: F,
 ) -> bool {
-    if wait(label, pred) {
-        return true;
+    if txid.starts_with("submit-failed") {
+        return false; // already loud
     }
+    // P6: a tx the chain has already REJECTED will never satisfy `pred` — say so at once
+    // instead of waiting the full 30 s (gates run dozens of refusals).
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last_probe = Instant::now();
+    while Instant::now() < deadline {
+        if pred() {
+            return true;
+        }
+        if last_probe.elapsed() >= Duration::from_millis(900) {
+            last_probe = Instant::now();
+            if let Some(r) = receipt(base, txid) {
+                if r.starts_with("rejected") {
+                    println!("   ⛔ consensus receipt for {txid}: {r}");
+                    return false;
+                }
+            }
+        }
+        sleep(Duration::from_millis(400));
+    }
+    println!("   ⚠ timed out waiting for: {label}");
     match receipt(base, txid) {
         Some(r) => println!("   ⛔ consensus receipt for {txid}: {r}"),
         None => println!("   ∅ no receipt for {txid} — the tx was NEVER included in a block"),
@@ -163,7 +183,12 @@ pub(crate) fn wait_tx<F: FnMut() -> bool>(
 }
 
 pub(crate) fn balance(base: &str, id: &H256) -> Amount {
-    let v = rpc(base, "hk_balance", json!({ "id": hex::encode(id.0), "asset": hex::encode(usd().0) }));
+    balance_of(base, id, &usd())
+}
+
+/// P6: the transparent balance of `id` in `asset`.
+pub(crate) fn balance_of(base: &str, id: &H256, asset: &H256) -> Amount {
+    let v = rpc(base, "hk_balance", json!({ "id": hex::encode(id.0), "asset": hex::encode(asset.0) }));
     v.get("result")
         .and_then(|r| r.get("amount"))
         .and_then(|a| a.as_str())
@@ -211,8 +236,17 @@ pub(crate) fn wait<F: FnMut() -> bool>(label: &str, mut f: F) -> bool {
     false
 }
 
+/// `$2`, `$0.5`, `$1.000001` — whole units, with the fraction only when there is one
+/// (P6: sub-unit notes are common once a second asset is in play; `$0` for 0.5 was a lie).
 pub(crate) fn dollars(a: Amount) -> String {
-    format!("${}", a / M)
+    let whole = a / M;
+    let frac = a % M;
+    if frac == 0 {
+        format!("${whole}")
+    } else {
+        let f = format!("{frac:06}");
+        format!("${whole}.{}", f.trim_end_matches('0'))
+    }
 }
 
 // ---------------------------------------------------------------------------

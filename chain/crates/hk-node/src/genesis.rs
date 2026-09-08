@@ -116,6 +116,43 @@ pub fn bootstrap_from(chain_id: &str, env_height: Option<&str>, env_power: Optio
     Some(Bootstrap { height, founding_power })
 }
 
+/// P6 (docs/P6-MULTI-ASSET-POOL.md): the height from which testnet-1 nodes open a
+/// shielded pool per additional asset. Named 2026-09-08 21:53 UTC at tip 163,659 with the
+/// chain at 1.80 s/block (one external seat still on v0.18.2's predecessor): ≈ 13 h out at
+/// that rate, ≈ 7 h if every seat runs at the 1 s floor — the founder chose ~12 h of notice
+/// (v0.19.0). A node that is not on the release at this height rejects the first
+/// second-asset shield and forks. The number may move by patch release BEFORE it is
+/// reached; it never moves after (the G1 rule).
+pub const P6_TESTNET1_HEIGHT: u64 = 190_000;
+
+/// The multi-pool activation this node applies for `chain_id`: testnet-1 hard-wired;
+/// any OTHER chain reads `HK_P6_HEIGHT` (unset ⇒ 0 = active from genesis, so every
+/// devnet gate runs multi-asset from block 1; set it to exercise the pre-activation
+/// refusal). Never the public network.
+pub fn multi_pool_from_for(chain_id: &str) -> u64 {
+    multi_pool_from_from(chain_id, std::env::var("HK_P6_HEIGHT").ok().as_deref())
+}
+
+pub fn multi_pool_from_from(chain_id: &str, env_height: Option<&str>) -> u64 {
+    if chain_id == "hashkinetics-1-4e4ea68d" {
+        return P6_TESTNET1_HEIGHT;
+    }
+    env_height.and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod p6_tests {
+    use super::*;
+
+    #[test]
+    fn p6_activation_is_hardwired_for_testnet1_and_env_only_elsewhere() {
+        assert_eq!(multi_pool_from_from("hashkinetics-1-4e4ea68d", Some("5")), P6_TESTNET1_HEIGHT);
+        assert_eq!(multi_pool_from_from("hashkinetics-devnet-1", None), 0);
+        assert_eq!(multi_pool_from_from("hashkinetics-devnet-1", Some("40")), 40);
+        assert_eq!(multi_pool_from_from("hashkinetics-devnet-1", Some("junk")), 0);
+    }
+}
+
 #[cfg(test)]
 mod g1_tests {
     use super::*;

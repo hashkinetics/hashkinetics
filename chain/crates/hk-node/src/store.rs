@@ -7,7 +7,7 @@
 //!   DTO) + this node's aggregate verdict, so replay reproduces the exact same
 //!   receipts WITHOUT needing a prover connection.
 //! - **Snapshot**: every [`SNAPSHOT_EVERY`] blocks, the full node image
-//!   (`snapshot3.bin`; `snapshot2.bin`/`snapshot.bin` are read for in-place upgrades —
+//!   (`snapshot4.bin` since P6; `snapshot3.bin`/`snapshot2.bin`/`snapshot.bin` are read for in-place upgrades —
 //!   the file name is the format version): Σ (via `hk_state::StateSnapshot`), the pool-note index,
 //!   receipts, mempool, validator set + rotation epochs, and the app_hash the image
 //!   must recompute to. Restore REFUSES to run on a commitment mismatch — the same
@@ -130,6 +130,74 @@ pub struct NodeSnapshot {
     pub validators: Vec<ValidatorDto>,
     pub current_epoch: u64,
     pub highest_issued_epoch: u64,
+    /// P6 (snapshot format v4 — `snapshot4.bin`): the leaf feed of every ADDITIONAL
+    /// per-asset pool (the legacy pool's stays in `pool_notes`). bincode is positional:
+    /// this MUST stay the last field; `snapshot3.bin` is read through a v3 mirror.
+    pub pool_notes_by_asset: std::collections::BTreeMap<hk_primitives::AssetId, Vec<(H256, Vec<u8>)>>,
+}
+
+/// P6/v0.19: pre-multi-pool `StateSnapshot` layout (v3: has `assets`, no `pools`) —
+/// read-only mirror for `snapshot3.bin`. Pools restore EMPTY from a v3 file; on a chain
+/// that already had a second-asset pool the recomputed commitment then differs from
+/// the recorded one and restore refuses (resync from genesis) — never a silent
+/// divergence. New snapshots are written as `snapshot4.bin`.
+#[cfg_attr(test, derive(Serialize))]
+#[derive(Deserialize)]
+struct V3StateSnapshot {
+    pub height: u64,
+    pub time: hk_primitives::Timestamp,
+    pub accounts: std::collections::BTreeMap<hk_primitives::AccountId, hk_state::Account>,
+    pub balances:
+        std::collections::BTreeMap<(hk_primitives::AccountId, hk_primitives::AssetId), hk_primitives::Amount>,
+    pub mandates: hk_mandate::MandateTree,
+    pub root_funding: std::collections::BTreeMap<hk_primitives::MandateId, hk_primitives::AccountId>,
+    pub channels: std::collections::BTreeMap<hk_primitives::ChannelId, hk_state::Channel>,
+    pub pool: hk_state::pool::PoolState,
+    pub fees_burned: hk_primitives::Amount,
+    pub assets: std::collections::BTreeMap<hk_primitives::AssetId, hk_state::assets::AssetInfo>,
+}
+
+#[cfg_attr(test, derive(Serialize))]
+#[derive(Deserialize)]
+struct V3NodeSnapshot {
+    pub app_hash: [u8; 32],
+    pub height: u64,
+    pub state: V3StateSnapshot,
+    pub pool_notes: Vec<(H256, Vec<u8>)>,
+    pub receipts: Vec<([u8; 32], String)>,
+    pub mempool: Vec<SignedTx>,
+    pub validators: Vec<ValidatorDto>,
+    pub current_epoch: u64,
+    pub highest_issued_epoch: u64,
+}
+
+impl From<V3NodeSnapshot> for NodeSnapshot {
+    fn from(l: V3NodeSnapshot) -> Self {
+        NodeSnapshot {
+            app_hash: l.app_hash,
+            height: l.height,
+            state: StateSnapshot {
+                height: l.state.height,
+                time: l.state.time,
+                accounts: l.state.accounts,
+                balances: l.state.balances,
+                mandates: l.state.mandates,
+                root_funding: l.state.root_funding,
+                channels: l.state.channels,
+                pool: l.state.pool,
+                fees_burned: l.state.fees_burned,
+                assets: l.state.assets,
+                pools: std::collections::BTreeMap::new(), // pre-P6 history by definition
+            },
+            pool_notes: l.pool_notes,
+            receipts: l.receipts,
+            mempool: l.mempool,
+            validators: l.validators,
+            current_epoch: l.current_epoch,
+            highest_issued_epoch: l.highest_issued_epoch,
+            pool_notes_by_asset: std::collections::BTreeMap::new(),
+        }
+    }
 }
 
 /// U4/v0.12: pre-fee `StateSnapshot` layout (no `fees_burned`) — read-only mirror
@@ -198,6 +266,7 @@ impl From<V2NodeSnapshot> for NodeSnapshot {
                 pool: l.state.pool,
                 fees_burned: l.state.fees_burned,
                 assets: std::collections::BTreeMap::new(), // pre-registry history by definition
+                pools: std::collections::BTreeMap::new(),
             },
             pool_notes: l.pool_notes,
             receipts: l.receipts,
@@ -205,6 +274,7 @@ impl From<V2NodeSnapshot> for NodeSnapshot {
             validators: l.validators,
             current_epoch: l.current_epoch,
             highest_issued_epoch: l.highest_issued_epoch,
+            pool_notes_by_asset: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -238,6 +308,7 @@ impl From<LegacyNodeSnapshot> for NodeSnapshot {
                 pool: l.state.pool,
                 fees_burned: 0, // pre-fee history by definition
                 assets: std::collections::BTreeMap::new(),
+                pools: std::collections::BTreeMap::new(),
             },
             pool_notes: l.pool_notes,
             receipts: l.receipts,
@@ -245,6 +316,7 @@ impl From<LegacyNodeSnapshot> for NodeSnapshot {
             validators: l.validators,
             current_epoch: l.current_epoch,
             highest_issued_epoch: l.highest_issued_epoch,
+            pool_notes_by_asset: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -252,6 +324,8 @@ impl From<LegacyNodeSnapshot> for NodeSnapshot {
 pub struct NodeStore {
     blocks_dir: PathBuf,
     snapshot_path: PathBuf,
+    /// P6: the pre-multi-pool format (`snapshot3.bin`), read through the v3 mirror.
+    v3_snapshot_path: PathBuf,
     v2_snapshot_path: PathBuf,
     legacy_snapshot_path: PathBuf,
     wal_path: PathBuf,
@@ -273,7 +347,8 @@ impl NodeStore {
             .wrap_err_with(|| format!("creating block dir {}", blocks_dir.display()))?;
         Ok(Self {
             blocks_dir,
-            snapshot_path: home.join("snapshot3.bin"),
+            snapshot_path: home.join("snapshot4.bin"),
+            v3_snapshot_path: home.join("snapshot3.bin"),
             v2_snapshot_path: home.join("snapshot2.bin"),
             legacy_snapshot_path: home.join("snapshot.bin"),
             wal_path: home.join("mempool.wal"),
@@ -561,7 +636,12 @@ impl NodeStore {
         let mut candidates: Vec<NodeSnapshot> = Vec::new();
         if self.snapshot_path.exists() {
             let bytes = std::fs::read(&self.snapshot_path)?;
-            candidates.push(bincode::deserialize(&bytes).wrap_err("corrupt snapshot3.bin")?);
+            candidates.push(bincode::deserialize(&bytes).wrap_err("corrupt snapshot4.bin")?);
+        }
+        if self.v3_snapshot_path.exists() {
+            let bytes = std::fs::read(&self.v3_snapshot_path)?;
+            let snap: V3NodeSnapshot = bincode::deserialize(&bytes).wrap_err("corrupt snapshot3.bin")?;
+            candidates.push(snap.into());
         }
         if self.v2_snapshot_path.exists() {
             let bytes = std::fs::read(&self.v2_snapshot_path)?;
@@ -602,11 +682,11 @@ impl NodeStore {
 
     // ---- S3: snapshot rotation knob ----
 
-    /// Keep the previous snapshot as `snapshot3.prev.bin` (`HK_KEEP_PREV_SNAPSHOT=1`):
+    /// Keep the previous snapshot as `snapshot4.prev.bin` (`HK_KEEP_PREV_SNAPSHOT=1`):
     /// an operator's escape hatch if the newest image ever fails its commitment check.
     pub fn rotate_snapshot_if_configured(&self) {
         if std::env::var("HK_KEEP_PREV_SNAPSHOT").map(|v| v == "1").unwrap_or(false) && self.snapshot_path.exists() {
-            let prev = self.snapshot_path.with_file_name("snapshot3.prev.bin");
+            let prev = self.snapshot_path.with_file_name("snapshot4.prev.bin");
             if let Err(e) = std::fs::copy(&self.snapshot_path, &prev) {
                 tracing::warn!(%e, "could not keep the previous snapshot");
             }
@@ -833,6 +913,7 @@ mod tests {
             validators: Vec::new(),
             current_epoch: 2,
             highest_issued_epoch: 3,
+            pool_notes_by_asset: std::collections::BTreeMap::new(),
         };
         store.save_snapshot(&snap).unwrap();
         let got = store.load_snapshot().unwrap().expect("snapshot loads");
@@ -845,6 +926,66 @@ mod tests {
         // The restored Σ recomputes to the recorded commitment (the restore guard).
         let restored = hk_state::State::from_snapshot(got.state);
         assert_eq!(restored.state_commitment().0, got.app_hash);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// P6 roll insurance: a `snapshot3.bin` in the v0.18.x layout (no pools, no per-asset
+    /// feeds) loads through the v3 mirror at the SAME app_hash — the fleet restarts from
+    /// its existing image, never from genesis.
+    #[test]
+    fn p6_v3_snapshot_loads_through_the_mirror() {
+        let home = tmpdir("snap3");
+        let store = NodeStore::open(&home).unwrap();
+        let st = hk_state::State::default();
+        let s3 = st.to_snapshot();
+        let v3 = V3NodeSnapshot {
+            app_hash: st.state_commitment().0,
+            height: 7,
+            state: V3StateSnapshot {
+                height: s3.height,
+                time: s3.time,
+                accounts: s3.accounts,
+                balances: s3.balances,
+                mandates: s3.mandates,
+                root_funding: s3.root_funding,
+                channels: s3.channels,
+                pool: s3.pool,
+                fees_burned: s3.fees_burned,
+                assets: s3.assets,
+            },
+            pool_notes: vec![(H256([9; 32]), vec![4, 5])],
+            receipts: vec![([1; 32], "ok: 0 event(s)".into())],
+            mempool: vec![dummy_tx(2)],
+            validators: Vec::new(),
+            current_epoch: 5,
+            highest_issued_epoch: 6,
+        };
+        std::fs::write(home.join("snapshot3.bin"), bincode::serialize(&v3).unwrap()).unwrap();
+        let got = store.load_snapshot().unwrap().expect("v3 snapshot loads through the mirror");
+        assert_eq!(got.height, 7);
+        assert_eq!(got.app_hash, v3.app_hash);
+        assert!(got.state.pools.is_empty(), "pools restore empty from a v3 file");
+        assert!(got.pool_notes_by_asset.is_empty());
+        assert_eq!(got.pool_notes.len(), 1);
+        assert_eq!(got.current_epoch, 5);
+        let restored = hk_state::State::from_snapshot(got.state);
+        assert_eq!(restored.state_commitment().0, v3.app_hash, "the restore guard passes on a pre-P6 image");
+        // A newer v4 image next to it wins by height (the rolled-back-voter rule).
+        let mut v4 = NodeSnapshot {
+            app_hash: v3.app_hash,
+            height: 9,
+            state: hk_state::State::default().to_snapshot(),
+            pool_notes: Vec::new(),
+            receipts: Vec::new(),
+            mempool: Vec::new(),
+            validators: Vec::new(),
+            current_epoch: 5,
+            highest_issued_epoch: 6,
+            pool_notes_by_asset: std::collections::BTreeMap::new(),
+        };
+        v4.state.height = 9;
+        store.save_snapshot(&v4).unwrap();
+        assert_eq!(store.load_snapshot().unwrap().unwrap().height, 9);
         std::fs::remove_dir_all(&home).ok();
     }
 

@@ -268,11 +268,22 @@ fn pool_line(base: &str) -> String {
 /// CLI reads it whole, page by page — the GUI wallet keeps a cursor instead.
 #[allow(clippy::type_complexity)]
 pub(crate) fn pool_notes(base: &str) -> eyre::Result<(Vec<Hash>, Vec<(u64, Hash, Vec<u8>)>)> {
+    pool_notes_of(base, None)
+}
+
+/// P6: the feed of one pool — `asset` names a per-asset pool (or the legacy pool when it
+/// is that pool's pinned asset); `None` = the legacy pool.
+#[allow(clippy::type_complexity)]
+pub(crate) fn pool_notes_of(base: &str, asset: Option<&H256>) -> eyre::Result<(Vec<Hash>, Vec<(u64, Hash, Vec<u8>)>)> {
     let mut leaves = Vec::new();
     let mut entries: Vec<(u64, Hash, Vec<u8>)> = Vec::new();
     let mut from = 0u64;
     loop {
-        let v = rpc(base, "hk_getPoolNotes", json!({ "from": from, "limit": 5_000 }));
+        let mut params = json!({ "from": from, "limit": 5_000 });
+        if let Some(a) = asset {
+            params["asset"] = json!(hex::encode(a.0));
+        }
+        let v = rpc(base, "hk_getPoolNotes", params);
         let r = v.get("result").ok_or_else(|| eyre::eyre!("hk_getPoolNotes failed: {v}"))?;
         let arr = r.get("notes").and_then(|n| n.as_array()).ok_or_else(|| eyre::eyre!("hk_getPoolNotes failed: {v}"))?;
         for e in arr {

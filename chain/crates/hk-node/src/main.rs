@@ -13,7 +13,7 @@
 
 /// The release label this binary reports (`hk-node --version`, the usage banner).
 /// Bump with every node release; the crate version is workspace-wide and not it.
-pub const NODE_VERSION: &str = "v0.18.2";
+pub const NODE_VERSION: &str = "v0.19.0";
 
 mod account;
 mod app;
@@ -389,10 +389,15 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
             // H3 (v0.16.1): fetch ONE authentication path from a node and prove, locally,
             // that it folds to the root the node states AND to the pool's current root —
             // what the GUI wallet does before every spend, as a one-line diagnostic.
-            let usage = "usage: hk-node pool-path <RPC> <LEAF-INDEX>";
+            let usage = "usage: hk-node pool-path <RPC> <LEAF-INDEX> [ASSET-hex64]   (P6: the asset's pool; default the legacy pool)";
             let rpc = args.get(2).cloned().ok_or_else(|| eyre::eyre!(usage))?;
             let index: u64 = args.get(3).and_then(|s| s.parse().ok()).ok_or_else(|| eyre::eyre!(usage))?;
-            let v = demo::rpc(&rpc, "hk_getPoolPath", serde_json::json!({ "index": index }));
+            let asset = args.get(4).cloned();
+            let mut params = serde_json::json!({ "index": index });
+            if let Some(a) = &asset {
+                params["asset"] = serde_json::json!(a);
+            }
+            let v = demo::rpc(&rpc, "hk_getPoolPath", params);
             let r = v.get("result").ok_or_else(|| eyre::eyre!("hk_getPoolPath: {v}"))?;
             let h32 = |s: Option<&serde_json::Value>| -> eyre::Result<[u8; 32]> {
                 let b = hex::decode(s.and_then(|x| x.as_str()).unwrap_or(""))?;
@@ -408,7 +413,11 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
                 .map(|s| h32(Some(s)))
                 .collect::<eyre::Result<Vec<_>>>()?;
             let folded = hk_wallet::fold_path(&cm, &siblings, index);
-            let pool_root = demo::rpc(&rpc, "hk_getPoolInfo", serde_json::json!({}))
+            let mut info_params = serde_json::json!({});
+            if let Some(a) = &asset {
+                info_params["asset"] = serde_json::json!(a);
+            }
+            let pool_root = demo::rpc(&rpc, "hk_getPoolInfo", info_params)
                 .get("result")
                 .and_then(|i| i.get("root"))
                 .and_then(|s| s.as_str())

@@ -275,6 +275,27 @@ pub struct State {
     pub fee_asset: AssetId,
     /// X1: the issued-asset registry — REAL state, in Σ once non-empty, snapshotted (v3).
     pub assets: BTreeMap<AssetId, AssetInfo>,
+    /// P6 (docs/P6-MULTI-ASSET-POOL.md): one shielded pool per ADDITIONAL asset — the
+    /// legacy `pool` stays pinned to the first asset ever shielded; every other
+    /// pool-eligible asset gets its own tree, anchors, nullifiers and conservation
+    /// ledger here, created on its first shield. REAL state: in Σ once non-empty
+    /// (tag 0xB6), snapshotted (v4). The circuit is unchanged — a note is "value units
+    /// of the pool it lives in"; membership is proven against one tree, so a note can
+    /// never cross pools.
+    pub pools: BTreeMap<AssetId, PoolState>,
+    /// P6: first height at which additional pools may be created (activation
+    /// boundary, CONFIG like `fee_from` — injected by the node from the chain-id
+    /// table / `HK_P6_HEIGHT`, never snapshotted). u64::MAX = never (v1 behaviour).
+    pub multi_pool_from: u64,
+}
+
+/// P6: which pool a shielded operation acts on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolKey {
+    /// The v1 pool (`State::pool`), pinned to the first asset ever shielded.
+    Legacy,
+    /// An additional per-asset pool (`State::pools[asset]`).
+    Asset(AssetId),
 }
 
 /// The persistent image of [`State`] (P3.0/WS-B): every field that feeds the state
@@ -295,9 +316,14 @@ pub struct StateSnapshot {
     /// U4 (snapshot format v2 — see `NodeStore`): total protocol fees burned.
     pub fees_burned: Amount,
     /// X1 (snapshot format v3 — `snapshot3.bin`): the asset registry. bincode is
-    /// positional, so this MUST stay the last field; the node keeps a v2 mirror to
-    /// read older files (an absent registry restores empty).
+    /// positional; the node keeps a v2 mirror to read older files (an absent
+    /// registry restores empty).
     pub assets: BTreeMap<AssetId, AssetInfo>,
+    /// P6 (snapshot format v4 — `snapshot4.bin`): the additional per-asset pools.
+    /// MUST stay the last field; the node keeps a v3 mirror (pools restore empty —
+    /// the recorded app_hash then disagrees on a chain that has them, and restore
+    /// refuses rather than diverging).
+    pub pools: BTreeMap<AssetId, PoolState>,
 }
 
 impl Default for State {
@@ -318,6 +344,8 @@ impl Default for State {
             fees_burned: 0,
             fee_asset: FEE_ASSET,
             assets: BTreeMap::new(),
+            pools: BTreeMap::new(),
+            multi_pool_from: u64::MAX,
         }
     }
 }
@@ -337,6 +365,30 @@ pub fn expected_spend_public(
         fee: fee as u64,
         tx_binding: tx_binding_for(&credit_bytes, fee as u64),
     }
+}
+
+/// One pool's contribution to the state commitment (v1 layout, unchanged): version +
+/// pinned asset + tree (index, root) + anchors + nullifiers + conservation ledger.
+fn commit_pool_into(buf: &mut Vec<u8>, p: &PoolState) {
+    buf.push(p.version);
+    match p.asset {
+        Some(a) => {
+            buf.push(1);
+            buf.extend_from_slice(&a.0);
+        }
+        None => buf.push(0),
+    }
+    buf.extend_from_slice(&p.tree.next_index().to_le_bytes());
+    buf.extend_from_slice(&p.tree.root());
+    buf.extend_from_slice(&(p.anchors().count() as u64).to_le_bytes());
+    for a in p.anchors() {
+        buf.extend_from_slice(a);
+    }
+    buf.extend_from_slice(&(p.nullifiers.len() as u64).to_le_bytes());
+    for nf in &p.nullifiers {
+        buf.extend_from_slice(nf);
+    }
+    buf.extend_from_slice(&p.total_shielded.to_le_bytes());
 }
 
 /// The MINT public statement the chain expects.
@@ -445,8 +497,11 @@ impl State {
             receipts.push(Receipt { index: i, result });
         }
         // Block end: this block's pool root becomes a spendable anchor (dedup + window),
-        // and any aggregation coverage expires with the block.
+        // and any aggregation coverage expires with the block. P6: every pool seals.
         self.pool.seal_anchor();
+        for p in self.pools.values_mut() {
+            p.seal_anchor();
+        }
         self.agg_cover.clear();
         Ok(receipts)
     }
@@ -993,6 +1048,73 @@ impl State {
 
     // ---- shielded pool (P2.0 — docs/P2-BUILD-PLAN.md WS1) ----
 
+    /// P6: the pool a SHIELD of `asset` goes to. The legacy pool takes its pinned asset
+    /// (or the first asset ever, when unpinned) — v1 behaviour byte for byte. Any other
+    /// asset gets its own pool from `multi_pool_from` on; before that the v1 refusal.
+    /// Pure routing — eligibility (registered + `pool_eligible`) is checked by the caller.
+    pub fn pool_key_of_asset(&self, asset: &AssetId) -> Result<PoolKey, StateError> {
+        match self.pool.asset {
+            None => Ok(PoolKey::Legacy),
+            Some(a) if a == *asset => Ok(PoolKey::Legacy),
+            Some(_) => {
+                // `self.height` is the block being applied (as `fee_from` reads it).
+                if self.height >= self.multi_pool_from || self.pools.contains_key(asset) {
+                    Ok(PoolKey::Asset(*asset))
+                } else {
+                    Err(StateError::PoolAssetMismatch)
+                }
+            }
+        }
+    }
+
+    /// P6: the pool a SPEND under `anchor` acts on — the one whose recent anchors carry
+    /// it. Non-empty roots are unique across pools (every commitment carries note
+    /// randomness) and an empty tree has nothing to spend, so this is unambiguous.
+    pub fn pool_key_of_anchor(&self, anchor: &H256) -> Option<PoolKey> {
+        if self.pool.is_recent_anchor(&anchor.0) {
+            return Some(PoolKey::Legacy);
+        }
+        self.pools
+            .iter()
+            .find(|(_, p)| p.is_recent_anchor(&anchor.0))
+            .map(|(a, _)| PoolKey::Asset(*a))
+    }
+
+    /// The pool behind a key (`None` only for an `Asset` key with no pool yet).
+    pub fn pool_ref(&self, key: PoolKey) -> Option<&PoolState> {
+        match key {
+            PoolKey::Legacy => Some(&self.pool),
+            PoolKey::Asset(a) => self.pools.get(&a),
+        }
+    }
+
+    /// The asset a pool's notes denominate: the legacy pool's pinned asset (None until
+    /// the first shield), or the per-asset pool's asset.
+    pub fn pool_asset(&self, key: PoolKey) -> Option<AssetId> {
+        match key {
+            PoolKey::Legacy => self.pool.asset,
+            PoolKey::Asset(a) => Some(a),
+        }
+    }
+
+    /// Every pool: the legacy one first, then per asset (BTree order).
+    pub fn pools_iter(&self) -> impl Iterator<Item = (PoolKey, &PoolState)> {
+        std::iter::once((PoolKey::Legacy, &self.pool))
+            .chain(self.pools.iter().map(|(a, p)| (PoolKey::Asset(*a), p)))
+    }
+
+    /// Σ shielded of `asset` across every pool that denominates it.
+    pub fn shielded_of(&self, asset: &AssetId) -> Amount {
+        let mut total: Amount = 0;
+        if self.pool.asset == Some(*asset) {
+            total = total.saturating_add(self.pool.total_shielded);
+        }
+        if let Some(p) = self.pools.get(asset) {
+            total = total.saturating_add(p.total_shielded);
+        }
+        total
+    }
+
     /// SHIELD: debit `value` transparently, admit `commitment` to the tree. The mint proof
     /// guarantees the commitment opens to exactly `value` (inflation guard) — owner, rho,
     /// rcm never touch the chain.
@@ -1005,22 +1127,25 @@ impl State {
         if value > u64::MAX as Amount {
             return Err(StateError::PoolValueRange); // note values are u64 in-circuit
         }
-        // v1: single-asset pool; the first mint pins the asset.
-        if let Some(a) = self.pool.asset {
-            if a != *asset {
-                return Err(StateError::PoolAssetMismatch);
-            }
-        }
-        // X1/X5: a registered asset enters the pool only if its issuer allowed it
+        // X1/X5: a registered asset enters a pool only if its issuer allowed it
         // (a note is unreachable by freeze — that is the point), and never while
-        // paused or from a frozen account.
+        // paused or from a frozen account. P6: the pool is chosen by asset below.
         if let Some(info) = self.assets.get(asset) {
             if !info.policy.pool_eligible {
                 return Err(StateError::NotPoolEligible);
             }
         }
         self.asset_gate(asset, Some(sender), None)?;
-        if self.pool.tree.is_full() {
+        // P6: which pool. A per-asset pool exists only for a registered, pool-eligible
+        // asset (X5); the legacy pool keeps its v1 rules below.
+        let key = self.pool_key_of_asset(asset)?;
+        if let PoolKey::Asset(_) = key {
+            match self.assets.get(asset) {
+                Some(info) if info.policy.pool_eligible => {}
+                _ => return Err(StateError::NotPoolEligible),
+            }
+        }
+        if self.pool_ref(key).is_some_and(|p| p.tree.is_full()) {
             return Err(StateError::PoolFull);
         }
         let expected = expected_mint_public(commitment, value);
@@ -1036,9 +1161,22 @@ impl State {
             return Err(StateError::PoolProofInvalid);
         }
         self.debit(sender, asset, value)?; // last fallible step — a failed tx mutates nothing
-        self.pool.asset.get_or_insert(*asset);
-        self.pool.tree.append(commitment.0).expect("capacity checked above");
-        self.pool.total_shielded = self.pool.total_shielded.saturating_add(value);
+        let version = self.pool.version;
+        let pool = match key {
+            PoolKey::Legacy => &mut self.pool,
+            PoolKey::Asset(a) => self.pools.entry(a).or_insert_with(|| {
+                // A new per-asset pool starts on the current circuit version with its
+                // empty root sealed as the first anchor (as the legacy pool does at genesis).
+                let mut p = PoolState::default();
+                p.version = version;
+                p.asset = Some(a);
+                p.seal_anchor();
+                p
+            }),
+        };
+        pool.asset.get_or_insert(*asset);
+        pool.tree.append(commitment.0).expect("capacity checked above");
+        pool.total_shielded = pool.total_shielded.saturating_add(value);
         Ok(vec![Event::PoolMinted { commitment: *commitment, value }])
     }
 
@@ -1072,8 +1210,11 @@ impl State {
             }
             self.mandates.check(m, fee, self.time)?; // read-only; the iconic receipt
         }
-        // A fee pays out in the pool's pinned asset (no asset → nothing was ever minted).
-        let asset = match (fee > 0, self.pool.asset) {
+        // P6: the pool is the one whose recent anchors carry `anchor` (the legacy pool
+        // first — v1 behaviour); no pool knows it → unknown anchor, as before.
+        let key = self.pool_key_of_anchor(anchor).ok_or(StateError::PoolUnknownAnchor)?;
+        // A fee pays out in the pool's asset (no asset → nothing was ever minted).
+        let asset = match (fee > 0, self.pool_asset(key)) {
             (true, None) => return Err(StateError::PoolAssetMismatch),
             (_, a) => a,
         };
@@ -1082,14 +1223,14 @@ impl State {
         if fee > 0 {
             self.asset_gate(&asset.expect("checked above"), None, credit.as_ref())?;
         }
-        if !self.pool.is_recent_anchor(&anchor.0) {
-            return Err(StateError::PoolUnknownAnchor);
-        }
-        if self.pool.nullifiers.contains(&nullifier.0) {
-            return Err(StateError::PoolDoubleSpend);
-        }
-        if !self.pool.tree.has_capacity(2) {
-            return Err(StateError::PoolFull);
+        {
+            let pool = self.pool_ref(key).expect("resolved by anchor");
+            if pool.nullifiers.contains(&nullifier.0) {
+                return Err(StateError::PoolDoubleSpend);
+            }
+            if !pool.tree.has_capacity(2) {
+                return Err(StateError::PoolFull);
+            }
         }
         let expected =
             expected_spend_public(anchor, nullifier, out_commitment, out2_commitment, fee, credit);
@@ -1110,13 +1251,21 @@ impl State {
             self.mandates.spend(m, fee, self.time)?;
         }
         // Infallible from here. BOTH outputs enter the tree, in order.
-        self.pool.nullifiers.insert(nullifier.0);
-        self.pool.tree.append(out_commitment.0).expect("capacity checked above");
-        self.pool.tree.append(out2_commitment.0).expect("capacity checked above");
+        {
+            let pool = match key {
+                PoolKey::Legacy => &mut self.pool,
+                PoolKey::Asset(a) => self.pools.get_mut(&a).expect("resolved by anchor"),
+            };
+            pool.nullifiers.insert(nullifier.0);
+            pool.tree.append(out_commitment.0).expect("capacity checked above");
+            pool.tree.append(out2_commitment.0).expect("capacity checked above");
+            if fee > 0 {
+                pool.total_shielded = pool.total_shielded.saturating_sub(fee);
+            }
+        }
         if fee > 0 {
             let to = credit.expect("checked above");
             self.credit(&to, &asset.expect("checked above"), fee);
-            self.pool.total_shielded = self.pool.total_shielded.saturating_sub(fee);
         }
         Ok(vec![Event::PoolSpent {
             nullifier: *nullifier,
@@ -1144,6 +1293,7 @@ impl State {
             pool: self.pool.clone(),
             fees_burned: self.fees_burned,
             assets: self.assets.clone(),
+            pools: self.pools.clone(),
         }
     }
 
@@ -1168,6 +1318,8 @@ impl State {
             fees_burned: s.fees_burned,
             fee_asset: FEE_ASSET, // config-like: the node re-injects genesis.fee.asset
             assets: s.assets,
+            pools: s.pools,
+            multi_pool_from: u64::MAX, // config-like: the node re-injects the activation
         }
     }
 
@@ -1205,25 +1357,7 @@ impl State {
         }
         // Shielded pool: version + asset + tree (index, root) + anchors + nullifiers +
         // conservation ledger. All BTree/VecDeque iteration — deterministic.
-        buf.push(self.pool.version);
-        match self.pool.asset {
-            Some(a) => {
-                buf.push(1);
-                buf.extend_from_slice(&a.0);
-            }
-            None => buf.push(0),
-        }
-        buf.extend_from_slice(&self.pool.tree.next_index().to_le_bytes());
-        buf.extend_from_slice(&self.pool.tree.root());
-        buf.extend_from_slice(&(self.pool.anchors().count() as u64).to_le_bytes());
-        for a in self.pool.anchors() {
-            buf.extend_from_slice(a);
-        }
-        buf.extend_from_slice(&(self.pool.nullifiers.len() as u64).to_le_bytes());
-        for nf in &self.pool.nullifiers {
-            buf.extend_from_slice(nf);
-        }
-        buf.extend_from_slice(&self.pool.total_shielded.to_le_bytes());
+        commit_pool_into(&mut buf, &self.pool);
         // U4: fees enter the commitment ONLY once nonzero. A zero counter keeps the
         // buffer byte-identical to the pre-fee layout, so upgraded and pre-upgrade
         // nodes agree on every block until the activation height actually burns a
@@ -1241,6 +1375,17 @@ impl State {
             for (id, info) in &self.assets {
                 buf.extend_from_slice(&id.0);
                 info.commit_into(&mut buf);
+            }
+        }
+        // P6: the additional per-asset pools enter the commitment ONLY once one exists —
+        // the same trick again: pre-P6 and P6 nodes agree on every block until the first
+        // second-asset shield commits (which only a P6 node accepts, after the height).
+        if !self.pools.is_empty() {
+            buf.push(0xB6); // pools-section tag
+            buf.extend_from_slice(&(self.pools.len() as u64).to_le_bytes());
+            for (asset, p) in &self.pools {
+                buf.extend_from_slice(&asset.0);
+                commit_pool_into(&mut buf, p);
             }
         }
         H256(shake256_32(DOM_STATE_COMMIT, &[&buf]))
@@ -1266,6 +1411,9 @@ impl State {
         }
         if self.pool.asset == Some(*asset) {
             held = held.saturating_add(self.pool.total_shielded);
+        }
+        if let Some(p) = self.pools.get(asset) {
+            held = held.saturating_add(p.total_shielded);
         }
         let mut issued = info.supply.saturating_sub(info.burned);
         if *asset == self.fee_asset {

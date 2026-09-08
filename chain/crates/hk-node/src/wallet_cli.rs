@@ -13,6 +13,8 @@
 //!   hk-node wallet unshield <DIR> <USD> [RPC] [PROVER]
 //!   hk-node wallet pay      <DIR> <HKADDR> <USD> [MEMO] [RPC] [PROVER]
 //!   hk-node wallet disclose <DIR> <COMMITMENT-hex64> <OUT.json> [RPC]
+//!   (+ `--asset <64-hex>` anywhere, P6: act in that asset — its transparent balance,
+//!    its transfers, and its own shielded pool; default: the test asset)
 //!
 //! Devnet-grade truths (stated, not hidden):
 //! - **Accounts are genesis-only until WS-F's account-creation tx** — `init` binds to a
@@ -38,8 +40,8 @@ use hk_wallet::{
     scan_at, seal_note, Address, Discovered, WalletKeys,
 };
 
-use crate::demo::{account_id, account_nonce, balance, chain_height, dollars, rpc, submit, usd, Wallet};
-use crate::demo_shielded::{pool_notes, take_proof};
+use crate::demo::{account_id, account_nonce, balance_of, chain_height, dollars, rpc, submit, usd, Wallet};
+use crate::demo_shielded::{pool_notes_of, take_proof};
 
 const M: Amount = 1_000_000;
 const DEFAULT_RPC: &str = "http://127.0.0.1:26000";
@@ -155,8 +157,8 @@ fn addr_decode(s: &str) -> Result<Address> {
     Ok(Address { tag: b[..32].try_into().unwrap(), kem_pk: b[32..].to_vec() })
 }
 
-fn nullifier_spent(base: &str, nf: &Hash) -> bool {
-    rpc(base, "hk_nullifierSpent", json!({"nullifier": hex::encode(nf)}))
+fn nullifier_spent(base: &str, nf: &Hash, asset: &H256) -> bool {
+    rpc(base, "hk_nullifierSpent", json!({"nullifier": hex::encode(nf), "asset": hex::encode(asset.0)}))
         .get("result")
         .and_then(|r| r.get("spent"))
         .and_then(|s| s.as_bool())
@@ -173,21 +175,44 @@ fn require_prover(prover: &str) -> Result<()> {
     Ok(())
 }
 
-/// All notes this wallet ever received (epochs 0..=current), with spent status.
-fn my_notes(base: &str, k: &WalletKeys) -> Result<(Vec<Hash>, Vec<(Discovered, bool)>)> {
-    let (leaves, entries) = pool_notes(base)?;
+/// All notes this wallet ever received (epochs 0..=current) in the pool of `asset`,
+/// with spent status. P6: one pool per asset — the feed, the paths and the nullifier
+/// set all belong to that pool.
+fn my_notes(base: &str, k: &WalletKeys, asset: &H256) -> Result<(Vec<Hash>, Vec<(Discovered, bool)>)> {
+    let (leaves, entries) = pool_notes_of(base, Some(asset))?;
     let cur = epoch_of(chain_height(base));
     let nk = k.nk();
     let mut out: Vec<(Discovered, bool)> = Vec::new();
     for e in 0..=cur {
         for d in scan_at(k, e, &entries) {
             if !out.iter().any(|(x, _)| x.commitment == d.commitment) {
-                let spent = nullifier_spent(base, &nullifier(&nk, &d.note.rho));
+                let spent = nullifier_spent(base, &nullifier(&nk, &d.note.rho), asset);
                 out.push((d, spent));
             }
         }
     }
     Ok((leaves, out))
+}
+
+/// P6: `--asset <64-hex>` anywhere in the argument list selects the asset (transparent
+/// balance, transfers, and the shielded pool the notes live in); default: the test asset.
+/// Returns the asset and the arguments with the pair removed, so positional parsing is untouched.
+fn take_asset(args: &[String]) -> Result<(H256, Vec<String>)> {
+    let mut asset = usd();
+    let mut rest = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--asset" {
+            let hex_s = args.get(i + 1).ok_or_else(|| eyre!("--asset needs a 64-char hex asset id"))?;
+            let b = hex::decode(hex_s.trim())?;
+            asset = H256(b.as_slice().try_into().map_err(|_| eyre!("--asset must be 32 bytes hex"))?);
+            i += 2;
+        } else {
+            rest.push(args[i].clone());
+            i += 1;
+        }
+    }
+    Ok((asset, rest))
 }
 
 /// Pick the SMALLEST single unspent note covering `amt` (circuit v3: one input/spend).
@@ -222,6 +247,8 @@ fn dummy_note() -> Note {
 // ---------------------------------------------------------------------------
 
 pub fn run(args: &[String]) -> Result<()> {
+    let (asset, args) = take_asset(args)?;
+    let args = &args[..];
     let usage = "usage: hk-node wallet <init DIR ACCOUNT [RPC] | status DIR [RPC] | address DIR [RPC] | scan DIR [RPC] | transfer DIR TO USD [RPC] | shield DIR USD [RPC] [PROVER] | unshield DIR USD [RPC] [PROVER] | pay DIR HKADDR USD [MEMO] [RPC] [PROVER] | disclose DIR COMMITMENT OUT.json [RPC]>";
     let cmd = args.first().map(String::as_str).ok_or_else(|| eyre!(usage))?;
     let dir = PathBuf::from(args.get(1).ok_or_else(|| eyre!(usage))?);
@@ -246,7 +273,7 @@ pub fn run(args: &[String]) -> Result<()> {
             println!("  transparent account : {} ({})", account, hex::encode(account_id(&account).0));
             println!("  stealth address     : {}", addr_encode(&k.address_at(0)));
             match account_nonce(&base, &account_id(&account)) {
-                Some(n) => println!("  on-chain            : ✓ exists (nonce {n}, balance {})", dollars(balance(&base, &account_id(&account)))),
+                Some(n) => println!("  on-chain            : ✓ exists (nonce {n}, balance {})", dollars(balance_of(&base, &account_id(&account), &asset))),
                 None => println!("  on-chain            : ⚠ NOT FOUND on {base} — devnet accounts are genesis-only until WS-F"),
             }
             println!("  ⚠ back up wallet.json — it contains the shield master seed.");
@@ -260,10 +287,10 @@ pub fn run(args: &[String]) -> Result<()> {
             println!("=== wallet status — {} ===", w.account);
             println!("  chain height        : {}", chain_height(&base));
             match account_nonce(&base, &id) {
-                Some(n) => println!("  transparent         : {} (nonce {n})", dollars(balance(&base, &id))),
+                Some(n) => println!("  transparent         : {} (nonce {n})", dollars(balance_of(&base, &id, &asset))),
                 None => println!("  transparent         : account not on this chain"),
             }
-            let (_, notes) = my_notes(&base, &k)?;
+            let (_, notes) = my_notes(&base, &k, &asset)?;
             let unspent: Vec<&Discovered> = notes.iter().filter(|(_, s)| !s).map(|(d, _)| d).collect();
             let total: Amount = unspent.iter().map(|d| d.note.value as Amount).sum();
             println!("  shielded (mine)     : {} across {} unspent note(s) ({} total discovered)", dollars(total), unspent.len(), notes.len());
@@ -285,7 +312,7 @@ pub fn run(args: &[String]) -> Result<()> {
         "scan" => {
             let base = args.get(2).cloned().unwrap_or_else(|| DEFAULT_RPC.into());
             let k = keys(&load(&dir)?)?;
-            let (_, notes) = my_notes(&base, &k)?;
+            let (_, notes) = my_notes(&base, &k, &asset)?;
             if notes.is_empty() {
                 println!("no notes addressed to this wallet (scanned every pool ciphertext by trial decapsulation).");
                 return Ok(());
@@ -313,11 +340,11 @@ pub fn run(args: &[String]) -> Result<()> {
             } else {
                 account_id(to_s)
             };
-            let before = balance(&base, &to);
-            let txid = submit(&base, &s.sign(Tx::Transfer { to, asset: usd(), amount: amt }));
-            let ok = crate::demo::wait_tx(&base, "transfer committed", &txid, || balance(&base, &to) == before + amt);
+            let before = balance_of(&base, &to, &asset);
+            let txid = submit(&base, &s.sign(Tx::Transfer { to, asset, amount: amt }));
+            let ok = crate::demo::wait_tx(&base, "transfer committed", &txid, || balance_of(&base, &to, &asset) == before + amt);
             if ok {
-                println!("✓ sent {} → {} (their balance: {})", dollars(amt), to_s, dollars(balance(&base, &to)));
+                println!("✓ sent {} → {} (their balance: {})", dollars(amt), to_s, dollars(balance_of(&base, &to, &asset)));
             }
             Ok(())
         }
@@ -329,7 +356,7 @@ pub fn run(args: &[String]) -> Result<()> {
             let mut w = load(&dir)?;
             let k = keys(&w)?;
             let mut s = signer(&w, &base)?;
-            let my0 = balance(&base, &s.id);
+            let my0 = balance_of(&base, &s.id, &asset);
             if my0 < amt {
                 return Err(eyre!("transparent balance {} < {}", dollars(my0), dollars(amt)));
             }
@@ -344,13 +371,13 @@ pub fn run(args: &[String]) -> Result<()> {
             let (proof, ms) = take_proof(&pr)?;
             println!("✓ proof in {ms} ms — submitting");
             let txid = submit(&base, &s.sign(Tx::MintToPool {
-                asset: usd(),
+                asset,
                 value: amt,
                 commitment: H256(public.commitment),
                 proof,
                 stealth_ct: ct,
             }));
-            if crate::demo::wait_tx(&base, "shield committed", &txid, || balance(&base, &s.id) == my0 - amt) {
+            if crate::demo::wait_tx(&base, "shield committed", &txid, || balance_of(&base, &s.id, &asset) == my0 - amt) {
                 println!("✓ {} shielded. It is now invisible — run `wallet scan` to see it as yours.", dollars(amt));
             }
             Ok(())
@@ -363,7 +390,7 @@ pub fn run(args: &[String]) -> Result<()> {
             let mut w = load(&dir)?;
             let k = keys(&w)?;
             let mut s = signer(&w, &base)?;
-            let (leaves, notes) = my_notes(&base, &k)?;
+            let (leaves, notes) = my_notes(&base, &k, &asset)?;
             let input = pick_note(&notes, amt)?;
             let change_v = input.note.value as Amount - amt;
             let tag = reserve_tag(&dir, &mut w)?;
@@ -378,7 +405,7 @@ pub fn run(args: &[String]) -> Result<()> {
             let pr = rpc(&prover, "prove_spend", json!({"witness": serde_json::to_value(&plan.witness)?}));
             let (proof, ms) = take_proof(&pr)?;
             println!("✓ proof in {ms} ms — submitting");
-            let my0 = balance(&base, &s.id);
+            let my0 = balance_of(&base, &s.id, &asset);
             let txid = submit(&base, &s.sign(Tx::ShieldedSpend {
                 anchor: H256(plan.public.merkle_root),
                 nullifier: H256(plan.public.nullifier),
@@ -391,7 +418,7 @@ pub fn run(args: &[String]) -> Result<()> {
                 stealth_ct: change_ct,
                 stealth_ct2: Vec::new(),
             }));
-            if crate::demo::wait_tx(&base, "unshield committed", &txid, || balance(&base, &s.id) == my0 + amt) {
+            if crate::demo::wait_tx(&base, "unshield committed", &txid, || balance_of(&base, &s.id, &asset) == my0 + amt) {
                 println!("✓ {} unshielded to your transparent account ({} change went back into hiding).", dollars(amt), dollars(change_v));
             }
             Ok(())
@@ -416,7 +443,7 @@ pub fn run(args: &[String]) -> Result<()> {
             let mut w = load(&dir)?;
             let k = keys(&w)?;
             let mut s = signer(&w, &base)?;
-            let (leaves, notes) = my_notes(&base, &k)?;
+            let (leaves, notes) = my_notes(&base, &k, &asset)?;
             let input = pick_note(&notes, amt)?;
             let change_v = input.note.value as Amount - amt;
             let out = build_output(&to, amt as u64, &fresh32(), &fresh32(), memo.as_bytes())
@@ -446,7 +473,7 @@ pub fn run(args: &[String]) -> Result<()> {
                 stealth_ct: out.stealth_ct.clone(),
                 stealth_ct2: change_ct,
             }));
-            if crate::demo::wait_tx(&base, "stealth payment committed", &txid, || nullifier_spent(&base, &nf)) {
+            if crate::demo::wait_tx(&base, "stealth payment committed", &txid, || nullifier_spent(&base, &nf, &asset)) {
                 println!("✓ {} sent, fully shielded. The chain saw one nullifier and two commitments —", dollars(amt));
                 println!("  who paid whom: invisible. The recipient discovers it by scanning.");
                 println!("  ({} change returned to you; keep wallet.json — it holds your disclosure capability.)", dollars(change_v));
@@ -461,7 +488,7 @@ pub fn run(args: &[String]) -> Result<()> {
             let k = keys(&w)?;
             let cm_b = hex::decode(cm_hex)?;
             let cm: Hash = cm_b.as_slice().try_into().map_err(|_| eyre!("commitment must be 32 bytes hex"))?;
-            let (leaves, entries) = pool_notes(&base)?;
+            let (leaves, entries) = pool_notes_of(&base, Some(&asset))?;
             let (idx, _, ct) = entries
                 .iter()
                 .find(|(_, c, _)| *c == cm)

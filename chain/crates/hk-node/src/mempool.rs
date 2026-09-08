@@ -168,14 +168,17 @@ impl Mempool {
         }
         // Pool preconditions.
         if let Tx::ShieldedSpend { anchor, nullifier, .. } = &tx.payload {
-            if chain.pool.nullifiers.contains(&nullifier.0) {
+            // P6: the pool is the one whose recent anchors carry `anchor` (the state
+            // machine routes the same way); no pool knows it → unknown anchor.
+            let pool = match chain.pool_key_of_anchor(anchor).and_then(|k| chain.pool_ref(k)) {
+                Some(p) => p,
+                None => return Err(AdmitError::UnknownAnchor),
+            };
+            if pool.nullifiers.contains(&nullifier.0) {
                 return Err(AdmitError::NullifierSpent);
             }
             if self.nullifiers.contains(&nullifier.0) {
                 return Err(AdmitError::NullifierPending);
-            }
-            if !chain.pool.is_recent_anchor(&anchor.0) {
-                return Err(AdmitError::UnknownAnchor);
             }
         }
         self.index(&tx, id);

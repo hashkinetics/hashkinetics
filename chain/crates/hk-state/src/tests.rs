@@ -1157,3 +1157,227 @@ fn x1_gates_reach_mandates_channels_and_the_pool() {
     assert_eq!(r[0].result.as_ref().unwrap_err(), "asset is not pool-eligible");
     org.rollback();
 }
+
+// ---------------------------------------------------------------------------------
+// P6 — one shielded pool per asset (docs/P6-MULTI-ASSET-POOL.md)
+// ---------------------------------------------------------------------------------
+
+/// A shield of `value` into a pool, as the wallet would build it (JsonEcho proof).
+fn p6_shield(asset: H256, value: Amount, master: &[u8], rho: u8) -> (circuit::Note, [u8; 32], Tx) {
+    let nk = circuit::derive_nk(master);
+    let owner = circuit::address_tag(&circuit::spend_root(master, 2), &nk);
+    let note = circuit::Note { value: value as u64, owner, rho: [rho; 32], rcm: [rho ^ 0xFF; 32] };
+    let cm = circuit::commit_note(&note);
+    let public = circuit::MintPublic { commitment: cm, value: value as u64 };
+    let tx = Tx::MintToPool {
+        asset,
+        value,
+        commitment: H256(cm),
+        proof: serde_json::to_vec(&public).unwrap(),
+        stealth_ct: Vec::new(),
+    };
+    (note, cm, tx)
+}
+
+/// A spend of `note` (leaf `index` of `leaves`, under the pool whose root that folds to),
+/// unshielding `fee` to `credit`, authorized with spend-tree leaf `ots`.
+fn p6_spend(
+    note: &circuit::Note, leaves: &[[u8; 32]], index: u64, master: &[u8], ots: u32, fee: Amount,
+    credit: &H256, rho: u8,
+) -> ([u8; 32], circuit::SpendPublic, Tx) {
+    let nk = circuit::derive_nk(master);
+    let owner = circuit::address_tag(&circuit::spend_root(master, 2), &nk);
+    let (siblings, root) = full_tree_path(leaves, index);
+    let out_note = circuit::Note { value: note.value - fee as u64, owner, rho: [rho; 32], rcm: [rho ^ 0xAA; 32] };
+    let out2_note = circuit::Note { value: 0, owner: [0x0F; 32], rho: [rho ^ 1; 32], rcm: [rho ^ 0xBB; 32] };
+    let binding = circuit::tx_binding_for(&credit.0, fee as u64);
+    let (sig, ots_path) = circuit::spend_auth(master, 2, ots, &binding);
+    let witness = circuit::SpendWitness {
+        in_note: note.clone(),
+        path: circuit::MerklePath { siblings, index },
+        sig,
+        ots_path,
+        nk,
+        out_note,
+        out2_note,
+        fee: fee as u64,
+        tx_binding: binding,
+    };
+    let public = circuit::run(&witness).expect("witness satisfies the statement");
+    assert_eq!(public.merkle_root, root);
+    let tx = Tx::ShieldedSpend {
+        anchor: H256(root),
+        nullifier: H256(public.nullifier),
+        out_commitment: H256(public.out_commitment),
+        out2_commitment: H256(public.out2_commitment),
+        fee,
+        credit: Some(*credit),
+        mandate: None,
+        proof: serde_json::to_vec(&public).unwrap(),
+        stealth_ct: Vec::new(),
+        stealth_ct2: Vec::new(),
+    };
+    (root, public, tx)
+}
+
+#[test]
+fn p6_second_asset_gets_its_own_pool_and_spends_route_by_anchor() {
+    use crate::assets::derive_asset_id;
+    use crate::PoolKey;
+    const M: Amount = 1_000_000;
+    let usd = h(9);
+    let mut issuer = Keychain::new(b"p6-issuer");
+    let mut org = Keychain::new(b"p6-org");
+    let mut merchant = Keychain::new(b"p6-merchant");
+    let genesis = Genesis {
+        time: 1_000,
+        accounts: vec![issuer.genesis(), org.genesis(), merchant.genesis()],
+        alloc: vec![(org.id, usd, 10 * M)],
+        fee: None,
+        assets: vec![],
+    };
+    let mut st = State::from_genesis(&genesis).unwrap();
+    st.verifier = Arc::new(JsonEchoVerifier);
+    st.multi_pool_from = 0; // a devnet: active from genesis
+    let usdc = derive_asset_id(&issuer.id, "USDC.t");
+    let eur = derive_asset_id(&issuer.id, "EUR.t"); // registered without `s`
+    let mut height = 0u64;
+    let mut next = || { height += 1; height };
+
+    for (asset, sym, flags) in [(usdc, "USDC.t", "mfps"), (eur, "EUR.t", "mfp")] {
+        let reg = issuer.sign(Tx::AssetRegister { asset, symbol: sym.into(), decimals: 6, policy: x1_policy(flags) });
+        assert!(x1_apply(&mut st, next(), reg).is_ok());
+        let mint = issuer.sign(Tx::AssetMint { asset, to: org.id, amount: 10 * M });
+        assert!(x1_apply(&mut st, next(), mint).is_ok());
+    }
+    let before = st.state_commitment();
+
+    // 1. The legacy pool pins the first asset shielded (the test asset), exactly as v1.
+    let (usd_note, usd_cm, usd_shield) = p6_shield(usd, 5 * M, b"p6-master-usd", 0x11);
+    assert!(x1_apply(&mut st, next(), org.sign(usd_shield)).is_ok());
+    assert_eq!(st.pool.asset, Some(usd));
+    assert!(st.pools.is_empty(), "no additional pool yet");
+    assert_eq!(st.pool_key_of_asset(&usd).unwrap(), PoolKey::Legacy);
+
+    // 2. A second, pool-eligible asset gets its OWN pool; the legacy pool is untouched.
+    let legacy_root_before = st.pool.tree.root();
+    let (usdc_note, usdc_cm, usdc_shield) = p6_shield(usdc, 3 * M, b"p6-master-usdc", 0x21);
+    assert!(x1_apply(&mut st, next(), org.sign(usdc_shield)).is_ok());
+    assert_eq!(st.pool_key_of_asset(&usdc).unwrap(), PoolKey::Asset(usdc));
+    let p = st.pools.get(&usdc).expect("USDC.t pool exists");
+    assert_eq!(p.asset, Some(usdc));
+    assert_eq!(p.tree.next_index(), 1);
+    assert_eq!(p.total_shielded, 3 * M);
+    assert_eq!(st.pool.tree.root(), legacy_root_before, "legacy pool untouched");
+    assert_eq!(st.pool.tree.next_index(), 1);
+    assert_eq!(st.balance(&org.id, &usdc), 7 * M);
+    assert_ne!(st.state_commitment(), before, "the 0xB6 section entered the commitment");
+    x1_held_equals_issued(&st, &usdc);
+    assert_eq!(st.shielded_of(&usdc), 3 * M);
+    assert_eq!(st.shielded_of(&usd), 5 * M);
+
+    // 3. An asset registered WITHOUT `s` never gets a pool (checked before any proof).
+    let (_, _, eur_shield) = p6_shield(eur, M, b"p6-master-eur", 0x31);
+    assert_eq!(x1_apply(&mut st, next(), org.sign(eur_shield)).unwrap_err(), "asset is not pool-eligible");
+    org.rollback();
+    assert!(!st.pools.contains_key(&eur));
+
+    // 4. Spends route by ANCHOR: the USDC.t note spends in the USDC.t pool (credit in USDC.t),
+    //    the legacy pool's nullifier set and tree do not move.
+    let (usdc_root, usdc_public, usdc_spend) =
+        p6_spend(&usdc_note, &[usdc_cm], 0, b"p6-master-usdc", 0, M, &merchant.id, 0x41);
+    assert_eq!(st.pool_key_of_anchor(&H256(usdc_root)), Some(PoolKey::Asset(usdc)));
+    assert!(x1_apply(&mut st, next(), merchant.sign(usdc_spend.clone())).is_ok());
+    assert_eq!(st.balance(&merchant.id, &usdc), M, "unshield credited in the pool's asset");
+    assert_eq!(st.balance(&merchant.id, &usd), 0);
+    let p = st.pools.get(&usdc).unwrap();
+    assert!(p.nullifiers.contains(&usdc_public.nullifier));
+    assert_eq!(p.tree.next_index(), 3, "shield + two spend outputs");
+    assert_eq!(p.total_shielded, 2 * M);
+    assert!(!st.pool.nullifiers.contains(&usdc_public.nullifier), "nullifier lives in its pool only");
+    assert_eq!(st.pool.tree.next_index(), 1);
+    x1_held_equals_issued(&st, &usdc);
+
+    // 5. The same nullifier again → double spend in ITS pool (routing is stable).
+    assert!(x1_apply(&mut st, next(), merchant.sign(usdc_spend)).unwrap_err().contains("double spend"));
+    merchant.rollback();
+
+    // 6. The legacy note spends in the legacy pool, credit in the test asset.
+    let (usd_root, _, usd_spend) = p6_spend(&usd_note, &[usd_cm], 0, b"p6-master-usd", 0, M, &merchant.id, 0x51);
+    assert_eq!(st.pool_key_of_anchor(&H256(usd_root)), Some(PoolKey::Legacy));
+    assert!(x1_apply(&mut st, next(), merchant.sign(usd_spend)).is_ok());
+    assert_eq!(st.balance(&merchant.id, &usd), M);
+    assert_eq!(st.pool.total_shielded, 4 * M);
+    assert_eq!(st.pools[&usdc].total_shielded, 2 * M, "USDC.t pool untouched by a legacy spend");
+
+    // 7. Snapshot round trip carries every pool; the commitment agrees.
+    let snap = st.to_snapshot();
+    let mut back = State::from_snapshot(snap);
+    back.multi_pool_from = 0;
+    assert_eq!(back.state_commitment(), st.state_commitment());
+    assert_eq!(back.pools.len(), 1);
+
+    // 8. Block end seals every pool: the USDC.t root is a recent anchor after a quiet block.
+    let quiet_root = st.pools[&usdc].tree.root();
+    height += 1;
+    st.apply_block(height, 1_000 + height, &[]).unwrap();
+    assert!(st.pools[&usdc].is_recent_anchor(&quiet_root));
+}
+
+#[test]
+fn p6_before_the_activation_height_a_second_asset_is_refused_exactly_as_v1() {
+    use crate::assets::derive_asset_id;
+    const M: Amount = 1_000_000;
+    let usd = h(9);
+    let mut issuer = Keychain::new(b"p6b-issuer");
+    let mut org = Keychain::new(b"p6b-org");
+    let genesis = Genesis {
+        time: 1_000,
+        accounts: vec![issuer.genesis(), org.genesis()],
+        alloc: vec![(org.id, usd, 10 * M)],
+        fee: None,
+        assets: vec![],
+    };
+    let mut st = State::from_genesis(&genesis).unwrap();
+    st.verifier = Arc::new(JsonEchoVerifier);
+    st.multi_pool_from = 100; // the activation is ahead
+    let usdc = derive_asset_id(&issuer.id, "USDC.t");
+    let eurc = derive_asset_id(&issuer.id, "EURC.t");
+    let mut hgt = 0u64;
+    for (asset, sym) in [(usdc, "USDC.t"), (eurc, "EURC.t")] {
+        let reg = issuer.sign(Tx::AssetRegister { asset, symbol: sym.into(), decimals: 6, policy: x1_policy("mfps") });
+        hgt += 1;
+        assert!(x1_apply(&mut st, hgt, reg).is_ok());
+        hgt += 1;
+        assert!(x1_apply(&mut st, hgt, issuer.sign(Tx::AssetMint { asset, to: org.id, amount: 10 * M })).is_ok());
+    }
+    // The legacy pool takes the FIRST asset shielded, whatever it is (v1 rule).
+    let (_, _, s1) = p6_shield(usdc, M, b"p6b-m1", 0x61);
+    hgt += 1;
+    assert!(x1_apply(&mut st, hgt, org.sign(s1)).is_ok());
+    assert_eq!(st.pool.asset, Some(usdc));
+    // A second asset before the height: the v1 refusal, no pool created, commitment layout intact.
+    let c = st.state_commitment();
+    let (_, _, s2) = p6_shield(eurc, M, b"p6b-m2", 0x71);
+    hgt += 1;
+    assert_eq!(x1_apply(&mut st, hgt, org.sign(s2.clone())).unwrap_err(), "pool asset mismatch");
+    org.rollback();
+    assert!(st.pools.is_empty());
+    // The unregistered genesis asset can never open a per-asset pool (X5 needs a registration).
+    let (_, _, s3) = p6_shield(usd, M, b"p6b-m3", 0x81);
+    hgt += 1;
+    assert_eq!(x1_apply(&mut st, hgt, org.sign(s3.clone())).unwrap_err(), "pool asset mismatch");
+    org.rollback();
+    // Same shields at the activation height: EURC.t is accepted into its own pool; the
+    // unregistered asset is refused for eligibility now, not for the height.
+    while hgt < 99 {
+        hgt += 1;
+        st.apply_block(hgt, 1_000 + hgt, &[]).unwrap();
+    }
+    assert!(x1_apply(&mut st, 100, org.sign(s2)).is_ok());
+    assert_eq!(st.pools.len(), 1);
+    assert!(st.pools.contains_key(&eurc));
+    assert_ne!(st.state_commitment(), c);
+    assert_eq!(x1_apply(&mut st, 101, org.sign(s3)).unwrap_err(), "asset is not pool-eligible");
+    org.rollback();
+}

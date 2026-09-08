@@ -6,7 +6,7 @@
 #
 # What it proves (each line is a PASS/FAIL):
 #   1. S2/S3: with HK_KEEP_PREV_SNAPSHOT=1 and HK_INDEX_PERSIST_EVERY=8 a validator writes
-#      index3.bin and snapshot3.prev.bin; hk_chainInfo.history.retain_blocks is null (archive);
+#      index3.bin and snapshot4.prev.bin; hk_chainInfo.history.retain_blocks is null (archive);
 #      a restart logs "search index restored from disk (S2)" and RESTORE COMPLETE, keeps deciding.
 #   2. C2.8 reporting: an observer started with HK_RETAIN_BLOCKS=64 reports retain_blocks=64.
 #   3. K2: a WEAK passphrase is refused before anything is written; `key-seal` turns
@@ -53,7 +53,7 @@ unset HK_SNAPSHOT_EVERY HK_INDEX_PERSIST_EVERY HK_KEEP_PREV_SNAPSHOT
 wait_h 26000 20 90 && ok "devnet deciding (height $(h_of 26000))" || { bad "devnet did not reach height 20"; exit 1; }
 sleep 3
 [[ -s "$H/node0/index3.bin" ]] && ok "node0 wrote index3.bin (S2 persisted index)" || bad "no index3.bin in node0"
-[[ -s "$H/node0/snapshot3.prev.bin" ]] && ok "node0 kept snapshot3.prev.bin (S3 HK_KEEP_PREV_SNAPSHOT=1)" || bad "no snapshot3.prev.bin"
+[[ -s "$H/node0/snapshot4.prev.bin" ]] && ok "node0 kept snapshot4.prev.bin (S3 HK_KEEP_PREV_SNAPSHOT=1)" || bad "no snapshot4.prev.bin"
 has "$H/node0.log" "search index persisted \(S2\)" && ok "node0 log: search index persisted (S2)" || bad "no S2 persist line in node0.log"
 V=$(rpc 26000 hk_chainInfo | jq_ 'r["history"]["retain_blocks"]')
 [[ "$V" == "None" ]] && ok "hk_chainInfo.history.retain_blocks = null (archive node)" || bad "retain_blocks on an archive node: $V"
