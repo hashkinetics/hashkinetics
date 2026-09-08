@@ -52,12 +52,23 @@ Seats are not capped by the protocol: a seat is admitted by certificate (V1) and
 
 | Date | Seats | Window | Blocks/s | Mean interval | Commit sigs/block | Empty block bytes (≈ certificate) | RSS/node | Blocks needing round > 0 (last 20) | Notes |
 |---|---|---|---|---|---|---|---|---|---|
-| _(pending)_ | 4 | 120 s | | | | | | | baseline = the fleet's shape |
-| _(pending)_ | 8 | 120 s | | | | | | | |
-| _(pending)_ | 16 | 120 s | | | | | | | |
-| _(pending)_ | 32 | 120 s | | | | | | | one box may starve here — note the CPU count |
+| 2026-09-08 | 4 | 120 s | 0.675 | 1.48 s | 3 | 27,633 | 32 MiB | 0/20 | one box, unverified devnet, 192 CPUs — baseline = the fleet's shape |
+| 2026-09-08 | 8 | 120 s | 0.675 | 1.48 s | 6 | 55,137 | 43 MiB | 0/20 | one box, unverified devnet, 192 CPUs |
+| 2026-09-08 | 16 | 120 s | 0.650 | 1.54 s | 11 | 100,977 | 61 MiB | 0/20 | one box, unverified devnet, 192 CPUs |
+| _(pending)_ | 32 | 120 s | | | | | | | the 2026-09-08 run printed no row — re-run alone (`bash ./bench-seats.sh 32 120 2>&1 \| tail -5`) |
+| 2026-09-08 | 64 | 120 s | 0.333 | 3.00 s | 43 | 394,353 | 203 MiB | 0/20 | one box, unverified devnet, 192 CPUs — 64 processes share the box: a LOWER bound on WAN cadence |
+| 2026-09-08 | 4 | 120 s | **8.773** | **0.11 s** | 3 | 27,633 | 55 MiB | 0/20 | **v0.18.2 (R15), floor 0 ms** — raw consensus cost; the rows above were measured with the v0.18.1 signer (~18 ms per signature on this box with the aux cache silently unused; ~450 ms on a typical server core); re-run 8 → 16 → 32 → 64 on v0.18.2 |
+| 2026-09-08 | 4 | 120 s | 0.908 | 1.10 s | 3 | 27,633 | 32 MiB | 0/20 | **v0.18.2, floor 1000 ms (the default)** — what a fleet does: the floor + one round trip |
 
 Quote rule: "N seats measured at X blocks/s on one machine" — never "the chain supports N seats" from this table alone.
+
+**Reading (2026-09-08, five runs on Yadu's 192-thread box, `bench-seats.sh N 120`):**
+- **Cadence is flat to 16 seats** (1.48 → 1.54 s per block) and **halves at 64** (3.00 s) — 64 processes on one box each verifying 43+ hash-based signatures per block plus a 64-way gossip fan-out; a WAN spreads the CPU but adds latency, so the one-box number is a lower bound on cadence and the WAN number is the one to measure next (the 32-seat row is the missing knee).
+- **The commit certificate costs ≈ 9.2 KB per signature** (27,633 B / 3 sigs … 394,353 B / 43 sigs — LMS/HSS signatures are kilobytes, that is the price of hash-based votes) and a certificate carries the signatures collected by commit time (≈ ⅔ of the seats + the stragglers). At testnet-1's ~3.3 s blocks that is **chain growth of ≈ 2.6 GB/day at 16 seats, ≈ 5 GB/day at 32 (extrapolated), ≈ 10–11 GB/day at 64** from empty blocks alone — validators need `HK_RETAIN_BLOCKS` retention (v0.16.0) at any seat count above the current seven, archive nodes need terabytes a year, and **P2 proof-of-consensus** (one STARK-aggregated certificate of ~200 KB per block, `P3.2 §P`) is the mainnet answer, not bigger disks.
+- Memory is a non-issue: 32 → 203 MiB resident from 4 to 64 seats.
+- Round changes: 0/20 at every size — no seat missed a proposal on one box; on a WAN it was **signing CPU** that made a seat miss (~0.45 s per signature on v0.18.1 — VALIDATOR-ONBOARDING §0; the storage-latency reading first written here was wrong), fixed in v0.18.2 (R15: 179 µs per signature).
+- **All five rows above are v0.18.1 numbers.** With R15 the per-signature cost on this box fell from ~18 ms to ~0.18 ms, so the table is conservative for v0.18.2: the seat budget (N = 32) stands until re-measured, and is expected to widen, not shrink. The certificate size per signature (≈ 9.2 KB) does not change — the bytes are the signatures themselves.
+- **What this buys the Genesis Validator Program (the mainnet seat program; its terms live in the private data room): a genesis set of 32 seats is inside the measured envelope** (16 flat, 64 at 2× on one box) once the 32-seat row confirms it; the honest costs to state are ~5 GB/day of certificate growth and a WAN cadence still to be measured; seats beyond 32 wait for P2.
 
 ## g · Node resident set and restart time (added 2026-09-06 with R11 / v0.17.0)
 

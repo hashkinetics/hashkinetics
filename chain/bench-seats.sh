@@ -22,6 +22,10 @@ h_of() { rpc "$1" hk_chainInfo | jq_ 'r["height"]' || echo 0; }
 
 echo "== bench-seats: $N seats, ${DUR}s sample, unverified devnet (consensus cost only)"
 export HK_ALLOW_UNVERIFIED=1
+# R15b (v0.18.2): the node paces round-0 proposals to HK_MIN_BLOCK_INTERVAL_MS (default 1000 ms).
+# This bench measures the RAW consensus cost per seat, so it runs unpaced unless told otherwise —
+# a paced row would read "1.00 s" at every size and hide the scaling signal. Say which in the row.
+export HK_MIN_BLOCK_INTERVAL_MS="${HK_MIN_BLOCK_INTERVAL_MS:-0}"
 ./devnet.sh --fresh -n "$N" >/dev/null || { echo "devnet failed to launch"; exit 1; }
 echo "   waiting for height 10 on node0 (keygen + verifier-less start)…"
 for _ in $(seq 120); do [[ "$(h_of 26000)" -ge 10 ]] && break; sleep 2; done
@@ -46,5 +50,5 @@ echo
 echo "seats=$N  window=${DUR}s  blocks=$BLOCKS  blocks/s=$RATE  mean_interval_s=$INTERVAL  commit_sigs/block=$SIGS  empty_block_bytes=$BYTES  rss_per_node_MiB=$RSS  round>0_in_last_20=$R1"
 echo
 echo "docs/CAPACITY-SHEET.md §f row (single box, unverified devnet — a lower bound on WAN cadence):"
-echo "| $(date -u +%F) | $N | ${DUR} s | $RATE | $INTERVAL s | $SIGS | $BYTES | $RSS MiB | $R1/20 | one box, unverified devnet, $(nproc) CPUs |"
+echo "| $(date -u +%F) | $N | ${DUR} s | $RATE | $INTERVAL s | $SIGS | $BYTES | $RSS MiB | $R1/20 | one box, unverified devnet, $(nproc) CPUs, floor ${HK_MIN_BLOCK_INTERVAL_MS} ms |"
 ./devnet.sh stop >/dev/null

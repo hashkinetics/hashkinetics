@@ -49,7 +49,7 @@ only).
 | SHAKE-256 (all non-circuit hashing, domains, AEAD) | `sha3` crate | test-vectored upstream | Medium |
 | SHA-256 (in-circuit + chain pool hashing) | `sha2` crate (+ SP1/RISC0 precompile patches, OpenVM lib) | patch-equality observed via cycle counts + identical outputs | **High** (patch paths) |
 | Lamport + L-ratchet (account auth v0) | `hk-crypto::lamport` | unit tests; retry-hygiene caveat documented | Medium (replaced by LMS later) |
-| LMS/HSS (consensus votes) | vendored `hbs-lms` (RFC 8554) | **KAT-verified**; live on devnet | **High** |
+| LMS/HSS (consensus votes) | vendored `hbs-lms` (RFC 8554) **+ the R15 patch (v0.18.2, 2026-09-08): `src/hss/aux.rs` MAC-compare bound, `src/hss/mod.rs` `HssSigningSession` (~250 lines) — a HashKinetics change to a vendored crypto crate, in scope by name** | **KAT-verified**; live on testnet-1; R15 tests: byte-equality vs `hss_sign` across rollovers, rollback, failed-write, restart | **High** (leaf reuse = catastrophic; the session must never advance a leaf it has not persisted) |
 | SLH-DSA-SHAKE-192s (roots) | `fips205` crate | KAT'd upstream; live (RotationCert) | **High** |
 | WOTS w=16, 67 chains (in-circuit spend auth) | `hk-spend-circuit` (hand-written) | 16 native tests incl. forgery paths; **NO external KAT (bench-grade plain W-OTS, not WOTS+)** | **Highest** |
 | Spend-tree Merkle (depth 10) + address tag + nullifier | `hk-spend-circuit` | native + keystone tests | **Highest** |

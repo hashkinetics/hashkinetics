@@ -40,8 +40,16 @@ pub async fn run(state: &mut HkApp, channels: &mut Channels<HkContext>) -> eyre:
                 }
             }
 
-            AppMsg::GetValue { height, round, timeout: _, reply } => {
+            AppMsg::GetValue { height, round, timeout, reply } => {
                 info!(%height, %round, "Consensus requests a value to propose");
+
+                // R15b: the block-time floor — a round-0 proposer waits out the remainder of
+                // `HK_MIN_BLOCK_INTERVAL_MS` since its last commit before it builds (clamped
+                // to half the propose timeout; rounds > 0 never wait).
+                let wait = state.propose_wait(round, timeout);
+                if !wait.is_zero() {
+                    tokio::time::sleep(wait).await;
+                }
 
                 let proposal = match state.previously_built(height, round) {
                     Some(p) => {
@@ -98,6 +106,7 @@ pub async fn run(state: &mut HkApp, channels: &mut Channels<HkContext>) -> eyre:
 
                 match state.commit(certificate, extensions) {
                     Ok(()) => {
+                        state.note_decided();
                         if reply
                             .send(Next::Start(state.current_height, state.validator_set()))
                             .is_err()

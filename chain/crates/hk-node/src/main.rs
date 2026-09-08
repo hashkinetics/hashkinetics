@@ -13,7 +13,7 @@
 
 /// The release label this binary reports (`hk-node --version`, the usage banner).
 /// Bump with every node release; the crate version is workspace-wide and not it.
-pub const NODE_VERSION: &str = "v0.18.1";
+pub const NODE_VERSION: &str = "v0.18.2";
 
 mod account;
 mod app;
@@ -604,6 +604,9 @@ enabled = true
 # `timeout_propose` only bites when a proposer is ABSENT (round change), so 2 s detects a
 # dead proposer a second faster than the old 3 s without risking premature round changes
 # (proposals arrive ~300 ms after round start). Don't go much lower on this devnet.
+# v0.18.2 (R15): signing is ~0.2 ms, so blocks decide as fast as the round trips allow; the
+# node paces its own round-0 proposals to a floor (HK_MIN_BLOCK_INTERVAL_MS, default 1000 —
+# keep it below timeout_propose / 2; the node clamps it there anyway).
 timeout_propose = "2s"
 timeout_propose_delta = "500ms"
 timeout_prevote = "2s"

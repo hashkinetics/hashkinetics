@@ -99,10 +99,22 @@ pub fn hss_expand_aux_data<'a, H: HashChain>(
         layer_sizes[index] = (H::OUTPUT_SIZE as usize) << index;
     }
 
-    // Check if data is valid
+    // Check if data is valid.
+    //
+    // HashKinetics R15 (2026-09-08): the MAC is exactly `H::OUTPUT_SIZE` bytes and sits
+    // right after the stored layers. The original code compared it against EVERYTHING
+    // after the layers, so a caller passing a slice longer than the finalized cache (a
+    // keygen buffer that was larger than needed) failed the constant-time compare and
+    // silently lost the cache — every signature then rebuilt the top tree's
+    // authentication path from the leaves (~1,000 LM-OTS key generations for H10).
+    let hash_size = H::OUTPUT_SIZE as usize;
+    let len_aux_data = index + layer_sizes.iter().sum::<usize>();
+    if aux_data.len() < len_aux_data + hash_size {
+        return None;
+    }
     if let Some(seed) = seed {
-        let len_aux_data = index + layer_sizes.iter().sum::<usize>();
-        let (aux_data, aux_data_mac) = aux_data.split_at(len_aux_data);
+        let (aux_data, rest) = aux_data.split_at(len_aux_data);
+        let aux_data_mac = &rest[..hash_size];
 
         let key = compute_seed_derive::<H>(seed);
         if !bool::from(compute_hmac::<H>(&key, aux_data).ct_eq(aux_data_mac)) {
@@ -122,7 +134,8 @@ pub fn hss_expand_aux_data<'a, H: HashChain>(
         expanded_aux_data.data[index] = Some(data);
         aux_data = data_rest;
     }
-    expanded_aux_data.hmac = aux_data;
+    // The MAC slot is exactly one hash wide, whatever the caller's buffer length.
+    expanded_aux_data.hmac = &mut aux_data[..hash_size];
 
     Some(expanded_aux_data)
 }

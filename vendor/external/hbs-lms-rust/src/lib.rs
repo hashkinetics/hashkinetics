@@ -83,6 +83,7 @@
 //! signatures can be split to multiple threads using the `HBS_LMS_THREADS`.
 
 extern crate core;
+extern crate alloc; // R15: the signing session keeps a heap-allocated node cache for the bottom tree
 
 mod constants;
 mod hasher;
@@ -115,6 +116,7 @@ pub use crate::hss::hss_sign as sign;
 pub use crate::hss::hss_sign_mut as sign_mut;
 pub use crate::hss::hss_verify as verify;
 pub use crate::hss::{SigningKey, VerifyingKey};
+pub use crate::hss::HssSigningSession;
 
 use core::convert::TryFrom;
 use signature::Error;

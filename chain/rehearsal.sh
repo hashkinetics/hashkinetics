@@ -17,6 +17,9 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/hk-target-chain}"
+# v0.18.2 lesson: start_node cd's into $H before exec, so a RELATIVE target dir (CARGO_TARGET_DIR=target)
+# launched nothing and every check failed with an empty v*.log. Absolutize it here, once.
+CARGO_TARGET_DIR="$(cd "$CARGO_TARGET_DIR" 2>/dev/null && pwd || echo "$CARGO_TARGET_DIR")"; export CARGO_TARGET_DIR
 BIN="$CARGO_TARGET_DIR/release/hk-node"
 H="${HK_REHEARSAL_HOME:-$HOME/hk-rehearsal}"
 PROVER="${HK_PROVER_URL:-http://127.0.0.1:9911}"

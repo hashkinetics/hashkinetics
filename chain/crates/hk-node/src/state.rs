@@ -373,6 +373,18 @@ pub struct HkApp {
     /// Demo/ops override: if set, ALSO rotate every N committed heights (`HK_ROTATE_EVERY`).
     /// The production trigger is the R1 leaf-budget threshold — always on, no env needed.
     rotate_every: Option<u64>,
+    /// R15b (v0.18.2): the block-time FLOOR. With signing at ~0.2 ms (R15) a devnet decides
+    /// every ~0.11 s and a WAN fleet would run as fast as its round trips — and every block
+    /// carries kilobytes of hash-based commit signatures, a restarting seat must out-run the
+    /// chain to rejoin, and slow seats drop out of certificates. So a proposer at ROUND 0
+    /// waits until `min_block_interval` has passed since its previous decision before it
+    /// builds. Local pacing only (no consensus rule: a paced and an unpaced node agree on
+    /// every block); rounds > 0 never wait; the wait is clamped to half the propose timeout
+    /// so a misconfigured floor cannot cause round changes. `HK_MIN_BLOCK_INTERVAL_MS`
+    /// (default 1000; 0 = unpaced, for benches).
+    min_block_interval: std::time::Duration,
+    /// When this node last committed a height (R15b pacing reference).
+    last_decided_at: std::time::Instant,
     /// Certs we've issued but not yet seen committed (included when we next propose).
     pending_rotations: Vec<RotationCert>,
     /// R2: root-signed certs submitted by OTHER validators via `hk_submitRotation` —
@@ -476,6 +488,16 @@ impl HkApp {
             .and_then(|s| s.parse::<u64>().ok())
             .filter(|n| *n > 0);
         let signer_gauge = Arc::new(Mutex::new((0u64, op_handle.remaining())));
+        let min_block_interval = std::time::Duration::from_millis(
+            std::env::var("HK_MIN_BLOCK_INTERVAL_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(1000),
+        );
+        info!(
+            min_block_interval_ms = min_block_interval.as_millis() as u64,
+            "R15b block-time floor (proposer pacing at round 0; HK_MIN_BLOCK_INTERVAL_MS)"
+        );
         Ok(Self {
             address,
             validators: Arc::new(Mutex::new(validators)),
@@ -506,6 +528,8 @@ impl HkApp {
             op_handle,
             home_dir,
             rotate_every,
+            min_block_interval,
+            last_decided_at: std::time::Instant::now(),
             pending_rotations: Vec::new(),
             tx_index: Arc::new(Mutex::new(std::collections::HashMap::new())),
             acct_index: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -1992,6 +2016,24 @@ fn tx_counterparty(tx: &hk_state::tx::Tx) -> Option<hk_primitives::AccountId> {
 /// [15%, 25%] of its capacity, the exact point derived from its (public, permanent)
 /// root key — deterministic across restarts, different per seat, reproducible by
 /// anyone. `capacity * 1500..=2500 / 10000`.
+impl HkApp {
+    /// R15b: remember when this node committed a height (the pacing reference).
+    pub fn note_decided(&mut self) {
+        self.last_decided_at = std::time::Instant::now();
+    }
+
+    /// R15b: how long a round-0 proposer should wait before building, so that consecutive
+    /// blocks are at least `min_block_interval` apart on this node's clock. Zero for rounds
+    /// > 0 (liveness first) and never more than half the engine's propose timeout.
+    pub fn propose_wait(&self, round: Round, timeout: std::time::Duration) -> std::time::Duration {
+        if round != Round::new(0) || self.min_block_interval.is_zero() {
+            return std::time::Duration::ZERO;
+        }
+        let want = self.min_block_interval.saturating_sub(self.last_decided_at.elapsed());
+        want.min(timeout / 2)
+    }
+}
+
 pub fn rotation_threshold(capacity: u64, root_pk: &[u8]) -> u64 {
     let h = hk_crypto::hash::shake256_32("hk/v1/rotation-jitter", &[root_pk]);
     let jitter = u16::from_le_bytes([h[0], h[1]]) as u64 % 1001; // 0..=1000 → 15.00%..25.00%

@@ -23,7 +23,7 @@
 use std::path::PathBuf;
 
 use hbs_lms::{
-    keygen, sign as hss_sign, verify as hss_verify, HssParameter, LmotsAlgorithm, LmsAlgorithm,
+    keygen, verify as hss_verify, HssParameter, HssSigningSession, LmotsAlgorithm, LmsAlgorithm,
     Seed, Shake256_256,
 };
 
@@ -42,6 +42,14 @@ pub const CONSENSUS_CAPACITY: u64 = 1 << 15;
 /// Aux-data cache size (bytes). hbs-lms caches upper Merkle-tree nodes here so signing
 /// is O(tree-height) instead of O(2^height) — the difference between ~800 ms/sig and
 /// ~tens of ms/sig for our H10 trees. 256 KiB comfortably caches useful levels.
+///
+/// R15 (2026-09-08, found by testnet-1 seat #1): until v0.18.2 this cache was silently
+/// DISCARDED at every signature — hbs-lms compared its HMAC against everything after the
+/// stored layers, and this buffer is longer than the finalized cache — so every vote
+/// rebuilt the H10 authentication path from ~1,000 LM-OTS key generations (~450 ms).
+/// Fixed in the vendored crate (`hss/aux.rs`), and the signer now keeps the expanded key
+/// alive between signatures (`HssSigningSession`) instead of rebuilding the bottom tree
+/// and re-signing its public key on every call.
 pub const AUX_CACHE_SIZE: usize = 256 * 1024;
 
 /// A stateful hash-based signer. `state` is the LMS/HSS private key bytes (advances on
@@ -55,6 +63,9 @@ pub struct HashSigner {
     used: u64,
     capacity: u64,
     persist: Option<PathBuf>,
+    /// The expanded HSS key kept between signatures (R15). Always derived from `state`;
+    /// dropped whenever `state` is replaced from outside or a persistence write fails.
+    session: Option<HssSigningSession<H>>,
 }
 
 /// Public verifying key bytes (LMS/HSS public key).
@@ -82,7 +93,7 @@ fn gen_with(
         keygen::<H>(params, &seed, None).expect("hbs-lms keygen")
     };
     (
-        HashSigner { state: sk.as_slice().to_vec(), aux, used: 0, capacity, persist: None },
+        HashSigner { state: sk.as_slice().to_vec(), aux, used: 0, capacity, persist: None, session: None },
         HashSigPublic(vk.as_slice().to_vec()),
     )
 }
@@ -150,6 +161,7 @@ impl HashSigner {
     /// ⚠ Never load an OLDER state than the last one persisted — that reuses leaves.
     pub fn load_state(&mut self, bytes: Vec<u8>) {
         self.state = bytes;
+        self.session = None;
     }
 
     /// Signatures already produced by this tree.
@@ -172,6 +184,7 @@ impl HashSigner {
                 u.copy_from_slice(&blob[..8]);
                 self.used = u64::from_le_bytes(u);
                 self.state = blob[8..].to_vec();
+                self.session = None;
             }
         }
         self.persist = Some(path);
@@ -181,9 +194,61 @@ impl HashSigner {
     /// Sign `msg`, advancing the key state. Returns the signature bytes, or `None`
     /// if the key is exhausted or signing fails.
     ///
-    /// The `hbs-lms` update callback delivers the new key bytes; we persist them to
-    /// `self.state` (a durable store in production) — this IS the state advance.
+    /// R15: the expanded HSS key lives in `self.session` between calls, so a signature costs
+    /// one LM-OTS signature plus the bottom tree's authentication path — not a rebuild of the
+    /// bottom tree and a fresh top-tree signature over it (that only happens on rollover,
+    /// once per 32 signatures, and after a restart).
+    ///
+    /// Reserve-then-sign discipline, unchanged: the ADVANCED compressed state is written
+    /// durably BEFORE the signature is released and before the in-memory key adopts it. If
+    /// the durable write fails we release nothing, roll the session back (the next call
+    /// rebuilds it from the persisted state) and the same leaf is retried — never reused,
+    /// because the signature computed here never leaves this function.
     pub fn sign(&mut self, msg: &[u8]) -> Option<Vec<u8>> {
+        if self.remaining() == 0 {
+            return None;
+        }
+        if self.session.is_none() {
+            self.session = Some(HssSigningSession::<H>::open(&self.state).ok()?);
+        }
+        let sig = {
+            let session = self.session.as_mut()?;
+            let res = if self.aux.is_empty() {
+                session.sign(msg, None)
+            } else {
+                // Use the aux cache when present (consensus keys) — O(height) top-tree paths.
+                let mut a: &mut [u8] = &mut self.aux;
+                session.sign(msg, Some(&mut a))
+            };
+            match res {
+                Ok(sig) => sig,
+                Err(_) => {
+                    self.session = None;
+                    return None;
+                }
+            }
+        };
+        let next = self.session.as_ref()?.pending_private_key()?.as_slice().to_vec();
+        if let Some(path) = &self.persist {
+            if write_atomic(path, &encode_blob(self.used + 1, &next)).is_err() {
+                if let Some(session) = self.session.as_mut() {
+                    session.rollback();
+                }
+                return None;
+            }
+        }
+        self.session.as_mut()?.commit();
+        self.state = next;
+        self.used += 1;
+        Some(sig.as_ref().to_vec())
+    }
+
+    /// The pre-R15 signing path — a fresh expansion through `hbs_lms::sign` on every call.
+    /// Kept as the reference the cached path is tested against (byte-identical signatures,
+    /// identical state advance); not used by the node.
+    #[cfg(test)]
+    fn sign_uncached(&mut self, msg: &[u8]) -> Option<Vec<u8>> {
+        use hbs_lms::sign as hss_sign;
         if self.remaining() == 0 {
             return None;
         }
@@ -193,16 +258,12 @@ impl HashSigner {
             advanced = Some(new_key.to_vec());
             Ok(())
         };
-        // Use the aux cache when present (consensus keys) — O(height) signing.
         let sig = if self.aux.is_empty() {
             hss_sign::<H>(msg, &current, &mut update, None).ok()?
         } else {
             let mut a: &mut [u8] = &mut self.aux;
             hss_sign::<H>(msg, &current, &mut update, Some(&mut a)).ok()?
         };
-        // Reserve-then-sign discipline: durably record the ADVANCED state BEFORE the
-        // signature is released, then commit it in memory. If the durable write fails
-        // we release nothing and don't advance — the same leaf is retried, never reused.
         if let Some(ns) = advanced {
             if let Some(path) = &self.persist {
                 if write_atomic(path, &encode_blob(self.used + 1, &ns)).is_err() {
@@ -211,6 +272,7 @@ impl HashSigner {
             }
             self.state = ns;
             self.used += 1;
+            self.session = None;
         }
         Some(sig.as_ref().to_vec())
     }
@@ -362,6 +424,116 @@ mod tests {
             assert_eq!(s2.used(), 3);
 
             let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    /// R15: the cached session path must be byte-identical to the pre-R15 fresh-expansion
+    /// path for the same seed — signatures AND advancing state — across two bottom-tree
+    /// rollovers (H5 = 32 leaves; 70 signatures cross 32 and 64).
+    #[test]
+    fn r15_cached_signing_matches_uncached_across_rollover() {
+        on_big_stack(|| {
+            let (mut cached, pk) = generate_consensus(&[15u8; 32]);
+            let (mut reference, pk2) = generate_consensus(&[15u8; 32]);
+            assert_eq!(pk, pk2);
+            for i in 0u32..70 {
+                let msg = format!("hk vote h={} r=0", i);
+                let a = cached.sign(msg.as_bytes()).expect("cached sign");
+                let b = reference.sign_uncached(msg.as_bytes()).expect("uncached sign");
+                assert_eq!(a, b, "signature {} differs between cached and uncached", i);
+                assert_eq!(cached.state_bytes(), reference.state_bytes(), "state {} differs", i);
+                assert_eq!(cached.used(), reference.used());
+                assert!(verify(msg.as_bytes(), &a, &pk), "signature {} must verify", i);
+            }
+            assert_eq!(cached.remaining(), CONSENSUS_CAPACITY - 70);
+        });
+    }
+
+    /// R15: a failed durable write releases nothing and retries the SAME leaf next time.
+    #[test]
+    fn r15_persistence_failure_retries_the_same_leaf() {
+        on_big_stack(|| {
+            let (mut signer, pk) = generate_consensus(&[16u8; 32]);
+            let (mut reference, _) = generate_consensus(&[16u8; 32]);
+            // One good signature first so the session is warm.
+            let m0 = b"h=1 prevote";
+            assert_eq!(signer.sign(m0).unwrap(), reference.sign_uncached(m0).unwrap());
+
+            // A persistence path whose parent directory does not exist: write_atomic fails.
+            let bad = std::env::temp_dir()
+                .join(format!("hk_r15_missing_dir_{}", std::process::id()))
+                .join("state.bin");
+            signer.persist = Some(bad);
+            let m1 = b"h=1 precommit";
+            assert!(signer.sign(m1).is_none(), "a failed durable write must release nothing");
+            assert_eq!(signer.used(), 1, "the leaf counter must not advance");
+
+            // Persistence restored: the same leaf signs — identical bytes to the reference,
+            // which never failed.
+            signer.persist = None;
+            let again = signer.sign(m1).expect("sign after the failure");
+            assert_eq!(again, reference.sign_uncached(m1).unwrap(), "the same leaf must be used");
+            assert!(verify(m1, &again, &pk));
+            assert_eq!(signer.state_bytes(), reference.state_bytes());
+        });
+    }
+
+    /// R15: a restart (fresh keygen + persisted state) continues with the session exactly
+    /// where the reference path would — no leaf skipped, none reused.
+    #[test]
+    fn r15_restart_resumes_identically() {
+        on_big_stack(|| {
+            let path = std::env::temp_dir()
+                .join(format!("hk_r15_restart_{}.bin", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            let (mut s1, pk) = generate_consensus(&[17u8; 32]);
+            let (mut reference, _) = generate_consensus(&[17u8; 32]);
+            s1.attach_persistence(path.clone()).unwrap();
+            for i in 0..40u32 {
+                let msg = format!("h={} vote", i);
+                assert_eq!(s1.sign(msg.as_bytes()).unwrap(), reference.sign_uncached(msg.as_bytes()).unwrap());
+            }
+            drop(s1);
+            let (mut s2, pk2) = generate_consensus(&[17u8; 32]);
+            assert_eq!(pk, pk2);
+            s2.attach_persistence(path.clone()).unwrap();
+            assert_eq!(s2.used(), 40);
+            for i in 40..45u32 {
+                let msg = format!("h={} vote", i);
+                let a = s2.sign(msg.as_bytes()).expect("post-restart sign");
+                assert_eq!(a, reference.sign_uncached(msg.as_bytes()).unwrap(), "post-restart {} differs", i);
+                assert!(verify(msg.as_bytes(), &a, &pk));
+            }
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    /// R15 receipt: cached signing must be at least 5x faster than the fresh-expansion path
+    /// (the fresh path does a whole bottom-tree build + a top-tree signature per call).
+    /// Prints both medians; run with `-- --nocapture` for the numbers.
+    #[test]
+    fn r15_cached_signing_is_faster() {
+        on_big_stack(|| {
+            let (mut cached, _) = generate_consensus(&[18u8; 32]);
+            let (mut reference, _) = generate_consensus(&[18u8; 32]);
+            let n = 12u32;
+            let bench = |f: &mut dyn FnMut(&[u8]) -> Option<Vec<u8>>| -> u128 {
+                let mut samples: Vec<u128> = Vec::new();
+                for i in 0..n {
+                    let msg = format!("bench {}", i);
+                    let t = std::time::Instant::now();
+                    f(msg.as_bytes()).expect("sign");
+                    samples.push(t.elapsed().as_micros());
+                }
+                samples.sort();
+                samples[samples.len() / 2]
+            };
+            let warm = cached.sign(b"warm").unwrap();
+            assert!(!warm.is_empty());
+            let fast = bench(&mut |m| cached.sign(m));
+            let slow = bench(&mut |m| reference.sign_uncached(m));
+            println!("R15 median per signature: cached {} us, uncached {} us", fast, slow);
+            assert!(fast * 5 <= slow, "cached ({} us) should be >= 5x faster than uncached ({} us)", fast, slow);
         });
     }
 }
