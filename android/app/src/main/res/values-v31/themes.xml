@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Android 12+: the system splash uses the launcher icon on this background. -->
+    <style name="Theme.HKWallet" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/hk_bg</item>
+        <item name="android:colorPrimary">@color/hk_cyan</item>
+        <item name="android:colorAccent">@color/hk_cyan</item>
+        <item name="android:statusBarColor">@color/hk_bg</item>
+        <item name="android:navigationBarColor">@color/hk_bg</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowSplashScreenBackground">@color/hk_bg</item>
+    </style>
+</resources>

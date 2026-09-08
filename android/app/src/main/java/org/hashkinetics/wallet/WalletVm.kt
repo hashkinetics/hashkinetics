@@ -67,7 +67,7 @@ class WalletVm(app: Application) : AndroidViewModel(app) {
     val log = mutableStateListOf<LogLine>()
     val coreVersion: String get() = wallet.coreVersion()
 
-    init { refreshState() }
+    init { refresh() } // read the files, then the chain if an account is readable
 
     private fun pushLog(level: String, line: String, link: String?) {
         val t = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())

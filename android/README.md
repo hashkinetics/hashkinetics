@@ -23,18 +23,25 @@ same `HKE1` envelope (phone-sized Argon2id profile) when a passphrase is set.
    Without the IDE (WSL): `sdkmanager "platforms;android-35" "build-tools;35.0.0"` from the command-line tools,
    then `gradle wrapper && ./gradlew assembleDebug` → `app/build/outputs/apk/debug/app-debug.apk` (sideload).
 
-## What it does (v0.1)
+## What it does (v0.2)
 
-Create / restore a keychain · balance + fee + height · faucet · transparent send · shielded: stealth address,
-scan (incremental, cached in `shield.json`), shield / unshield / pay with memo / disclose · backup: seed once,
-passphrase (Argon2id 256 MiB, sealed files), optional device lock (a 32-byte key file wrapped by the Android
-Keystore — the sealed files then need this device or the exported key file; off by default so a phone backup
-restores on a PC with the passphrase alone) · activity log with explorer links.
+Four sections behind a bottom bar, in the brand theme (`app/src/main/java/org/hashkinetics/wallet/ui/Theme.kt` —
+the site's engineering-dark palette; the launcher icon is the brand mark drawn as vector paths):
+
+- **Wallet** — balance + fee + height, faucet, receive (account id with a QR + copy), transparent send.
+- **Shielded** — hidden balance, stealth address (QR + copy), scan (incremental, cached in `shield.json`), notes,
+  shield / unshield / pay with a memo / disclose one payment.
+- **Backup** — seed once, passphrase (Argon2id 256 MiB, sealed files), optional device lock (a 32-byte key file
+  wrapped by the Android Keystore — the sealed files then need this device or the exported key file; off by default
+  so a phone backup restores on a PC with the passphrase alone).
+- **Activity** — every core call's report, with explorer links.
+
+Before a wallet exists: Welcome (create / restore). While the files are sealed: Unlock. The chain is read on open.
 
 ## What it does NOT do (yet)
 
 No in-app proving (proofs are made on the public prover; a shielded operation takes a minute or two), no
-QR scanning of addresses (v0.2), no biometric release of the key file (v0.2: `setUserAuthenticationRequired`),
+QR *scanning* of addresses (the camera; v0.3), no biometric release of the key file (v0.3: `setUserAuthenticationRequired`),
 no push notifications, no iOS. Unaudited testnet software; nothing is for sale.
 
 ## Files on the phone

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The engineering-dark palette shared with the site, the deck and the desktop wallet (vercel/app/globals.css). -->
+<resources>
+    <color name="hk_bg">#FF06080F</color>
+    <color name="hk_panel">#FF0F1730</color>
+    <color name="hk_ink">#FFE7EAF6</color>
+    <color name="hk_cyan">#FF4EF0D0</color>
+    <color name="hk_violet">#FF8B7BFF</color>
+</resources>

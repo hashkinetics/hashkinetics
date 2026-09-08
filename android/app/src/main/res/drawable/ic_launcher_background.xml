@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path android:pathData="M0,0 h108 v108 h-108 Z" android:fillColor="#FF06080F" />
+    <!-- the two brand glows of icon.svg -->
+    <path android:pathData="M0,0 h108 v108 h-108 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient android:type="radial" android:centerX="32" android:centerY="30" android:gradientRadius="70">
+                <item android:offset="0" android:color="#294EF0D0" />
+                <item android:offset="1" android:color="#004EF0D0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+    <path android:pathData="M0,0 h108 v108 h-108 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient android:type="radial" android:centerX="81" android:centerY="86" android:gradientRadius="70">
+                <item android:offset="0" android:color="#268B7BFF" />
+                <item android:offset="1" android:color="#008B7BFF" />
+            </gradient>
+        </aapt:attr>
+    </path>
+</vector>

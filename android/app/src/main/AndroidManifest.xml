@@ -4,9 +4,11 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <application
         android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:allowBackup="false"
         android:supportsRtl="true"
-        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        android:theme="@style/Theme.HKWallet">
         <!-- allowBackup=false: the wallet files are the keys; a cloud backup of them is not ours to make.
              The in-app Backup screen shows the seed once; shield.json is exported by the user. -->
         <activity

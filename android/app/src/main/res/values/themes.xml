@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The window behind Compose: dark from the first frame (no white flash), light system-bar icons. -->
+    <style name="Theme.HKWallet" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/hk_bg</item>
+        <item name="android:colorPrimary">@color/hk_cyan</item>
+        <item name="android:colorAccent">@color/hk_cyan</item>
+        <item name="android:statusBarColor">@color/hk_bg</item>
+        <item name="android:navigationBarColor">@color/hk_bg</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

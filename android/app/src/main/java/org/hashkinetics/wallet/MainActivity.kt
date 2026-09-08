@@ -4,233 +4,448 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Button
-import androidx.compose.material3.Card
-import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.List
+import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import org.hashkinetics.wallet.core.NoteView
+import org.hashkinetics.wallet.ui.Bg
+import org.hashkinetics.wallet.ui.ControlShape
+import org.hashkinetics.wallet.ui.CopyRow
+import org.hashkinetics.wallet.ui.Cyan
+import org.hashkinetics.wallet.ui.Danger
+import org.hashkinetics.wallet.ui.Faint
+import org.hashkinetics.wallet.ui.Field
+import org.hashkinetics.wallet.ui.GhostButton
+import org.hashkinetics.wallet.ui.Gold
+import org.hashkinetics.wallet.ui.Hint
+import org.hashkinetics.wallet.ui.HkTheme
+import org.hashkinetics.wallet.ui.Ink
+import org.hashkinetics.wallet.ui.Kicker
+import org.hashkinetics.wallet.ui.Line
+import org.hashkinetics.wallet.ui.Mono
+import org.hashkinetics.wallet.ui.Muted
+import org.hashkinetics.wallet.ui.Ok
+import org.hashkinetics.wallet.ui.Panel
+import org.hashkinetics.wallet.ui.PanelShape
+import org.hashkinetics.wallet.ui.Pill
+import org.hashkinetics.wallet.ui.PrimaryButton
+import org.hashkinetics.wallet.ui.Qr
+import org.hashkinetics.wallet.ui.Surface1
+import org.hashkinetics.wallet.ui.Surface2
+import org.hashkinetics.wallet.ui.Violet
+import org.hashkinetics.wallet.ui.Wordmark
 
 /**
- * WA2 v0.1 — one Activity, one scrolling screen, the desktop wallet's journey top to bottom:
- * Setup (create / restore) → Unlock → Balance + faucet + send → Shielded (address, scan, notes,
- * shield / unshield / pay / disclose) → Backup (seed, passphrase, device lock) → Activity log.
- * Every button hands one call to the ViewModel; nothing here touches the core directly.
+ * WA2 v0.2 — one Activity, the brand theme, four sections behind a bottom bar: Wallet (balance, receive,
+ * send) · Shielded (stealth address, scan, notes, shield / unshield / pay / disclose) · Backup (seed,
+ * passphrase, device lock) · Activity (what the core reported). Before a wallet exists: Welcome; while it
+ * is sealed: Unlock. Every button hands one call to the ViewModel; nothing here touches the core directly.
  */
 class MainActivity : ComponentActivity() {
     private val vm: WalletVm by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge(statusBarStyle = SystemBarStyle.dark(Bg.toArgb()), navigationBarStyle = SystemBarStyle.dark(Bg.toArgb()))
         super.onCreate(savedInstanceState)
-        setContent { MaterialTheme { WalletScreen(vm) } }
+        setContent { HkTheme { WalletApp(vm) } }
     }
 }
 
+private enum class Section(val label: String, val icon: ImageVector) {
+    Wallet("Wallet", Icons.Filled.Home),
+    Shielded("Shielded", Icons.Filled.Lock),
+    Backup("Backup", Icons.Filled.Settings),
+    Activity("Activity", Icons.AutoMirrored.Filled.List),
+}
+
 @Composable
-fun WalletScreen(vm: WalletVm) {
+fun WalletApp(vm: WalletVm) {
     val ctx = LocalContext.current
     val st = vm.state
-    Scaffold { pad ->
+    var tab by rememberSaveable { mutableStateOf(0) }
+    val home = st != null && st.exists && !st.locked
+    Scaffold(
+        containerColor = Bg,
+        topBar = { Header(vm) },
+        bottomBar = { if (home) BottomBar(tab) { tab = it } },
+    ) { pad ->
         Column(
-            Modifier.fillMaxSize().padding(pad).padding(16.dp).verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+            Modifier.fillMaxSize().padding(pad).verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Text("HashKinetics Wallet", style = MaterialTheme.typography.headlineSmall)
-            Text("testnet-1 · app 0.1.0 · core ${vm.coreVersion} · unaudited test software, nothing here is for sale", fontSize = 12.sp, color = Color.Gray)
-            vm.busy?.let { Row { CircularProgressIndicator(Modifier.width(18.dp).height(18.dp)); Spacer(Modifier.width(8.dp)); Text(it) } }
-            vm.error?.let { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(12.dp)) { Text(it, color = MaterialTheme.colorScheme.error); TextButton(onClick = { vm.clearError() }) { Text("dismiss") } } } }
-
+            vm.busy?.let { BusyLine(it) }
+            vm.error?.let { ErrorBanner(it) { vm.clearError() } }
             when {
-                st == null -> Text("…")
-                !st.exists -> SetupSection(vm)
-                st.locked -> UnlockSection(vm, st.needsKeyfile)
-                else -> {
-                    BalanceSection(vm)
-                    ShieldedSection(vm)
-                    BackupSection(vm)
+                st == null -> Hint("…")
+                !st.exists -> WelcomeScreen(vm)
+                st.locked -> UnlockScreen(vm, st.needsKeyfile)
+                else -> when (Section.entries[tab]) {
+                    Section.Wallet -> WalletTab(vm)
+                    Section.Shielded -> ShieldedTab(vm)
+                    Section.Backup -> BackupTab(vm)
+                    Section.Activity -> ActivityTab(vm) { url -> ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
                 }
             }
-            ActivitySection(vm) { url -> ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+            Spacer(Modifier.height(8.dp))
+        }
+    }
+}
+
+// ---- chrome ----------------------------------------------------------------------------------------
+
+@Composable
+private fun Header(vm: WalletVm) {
+    Row(
+        Modifier.fillMaxWidth().background(Bg).statusBarsPadding().padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Image(painterResource(R.drawable.hk_mark), contentDescription = null, modifier = Modifier.size(40.dp))
+        Spacer(Modifier.width(10.dp))
+        Column {
+            Wordmark(13.5.sp)
+            Text("wallet 0.2.0 · core ${vm.coreVersion}", color = Faint, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+        }
+        Spacer(Modifier.weight(1f))
+        Pill("TESTNET-1")
+    }
+}
+
+@Composable
+private fun BottomBar(selected: Int, onSelect: (Int) -> Unit) {
+    NavigationBar(containerColor = Surface1, contentColor = Muted) {
+        Section.entries.forEachIndexed { i, s ->
+            NavigationBarItem(
+                selected = selected == i,
+                onClick = { onSelect(i) },
+                icon = { Icon(s.icon, contentDescription = s.label) },
+                label = { Text(s.label, fontSize = 11.sp) },
+                colors = NavigationBarItemDefaults.colors(
+                    selectedIconColor = Cyan, selectedTextColor = Cyan, indicatorColor = Surface2,
+                    unselectedIconColor = Muted, unselectedTextColor = Muted,
+                ),
+            )
         }
     }
 }
 
 @Composable
-private fun Section(title: String, content: @Composable () -> Unit) {
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(title, style = MaterialTheme.typography.titleMedium)
-            content()
-        }
+private fun BusyLine(label: String) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        LinearProgressIndicator(modifier = Modifier.fillMaxWidth().clip(ControlShape), color = Cyan, trackColor = Surface2)
+        Text(label, color = Cyan, fontSize = 12.sp)
     }
 }
 
 @Composable
-private fun Mono(text: String) = SelectionContainer { Text(text, fontFamily = FontFamily.Monospace, fontSize = 12.sp) }
+private fun ErrorBanner(msg: String, dismiss: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().background(Danger.copy(alpha = 0.10f), PanelShape).border(1.dp, Danger.copy(alpha = 0.5f), PanelShape)
+            .padding(start = 14.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(msg, color = Danger, fontSize = 13.sp, modifier = Modifier.weight(1f))
+        TextButton(onClick = dismiss) { Text("dismiss", color = Danger) }
+    }
+}
+
+// ---- before a wallet exists / while sealed --------------------------------------------------------
 
 @Composable
-fun SetupSection(vm: WalletVm) {
+private fun WelcomeScreen(vm: WalletVm) {
     var seed by remember { mutableStateOf("") }
-    Section("No wallet on this phone yet") {
-        Text("Keys are born on this device and never leave it. Create a fresh keychain, or restore one from its 32-byte seed (64 hex characters).")
-        Button(onClick = { vm.create() }, enabled = vm.busy == null) { Text("Create keychain") }
-        HorizontalDivider()
-        OutlinedTextField(seed, { seed = it }, label = { Text("Seed (64 hex) to restore") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
-        OutlinedButton(onClick = { vm.restore(seed) }, enabled = vm.busy == null && seed.trim().length == 64) { Text("Restore") }
+    Column(Modifier.fillMaxWidth().padding(top = 16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Image(painterResource(R.drawable.hk_mark), contentDescription = null, modifier = Modifier.size(112.dp))
+        Wordmark(18.sp)
+        Text("The quantum-proof private settlement rail.", color = Muted, fontSize = 14.sp, textAlign = TextAlign.Center)
+        Spacer(Modifier.height(4.dp))
+        Panel("New wallet") {
+            Hint("Keys are born on this phone and never leave it. Back the seed up once it exists; the shielded side is a file you export.")
+            PrimaryButton("Create keychain", vm.busy == null, Modifier.fillMaxWidth()) { vm.create() }
+        }
+        Panel("Restore", Violet) {
+            Field(seed, { seed = it }, "Seed (64 hex characters)", mono = true)
+            GhostButton("Restore keychain", vm.busy == null && seed.trim().length == 64, Modifier.fillMaxWidth(), Violet) { vm.restore(seed) }
+        }
+        Text("Unaudited testnet software · nothing here is for sale", color = Faint, fontSize = 11.sp, textAlign = TextAlign.Center)
     }
 }
 
 @Composable
-fun UnlockSection(vm: WalletVm, needsKeyfile: Boolean) {
+private fun UnlockScreen(vm: WalletVm, needsKeyfile: Boolean) {
     var pass by remember { mutableStateOf("") }
-    Section("Unlock") {
-        Text(if (needsKeyfile) "This wallet is sealed with a passphrase and this device's key file." else "This wallet is sealed with a passphrase (Argon2id, once per session).")
-        OutlinedTextField(pass, { pass = it }, label = { Text("Passphrase") }, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(), singleLine = true)
-        Button(onClick = { vm.unlock(pass); pass = "" }, enabled = vm.busy == null && pass.isNotEmpty()) { Text("Unlock") }
+    Column(Modifier.fillMaxWidth().padding(top = 16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Image(painterResource(R.drawable.hk_mark), contentDescription = null, modifier = Modifier.size(96.dp))
+        Wordmark(18.sp)
+        Panel("Sealed", Gold) {
+            Hint(if (needsKeyfile) "This wallet is sealed with a passphrase and this device's key file." else "This wallet is sealed with a passphrase (Argon2id, once per session).")
+            Field(pass, { pass = it }, "Passphrase", password = true)
+            PrimaryButton("Unlock", vm.busy == null && pass.isNotEmpty(), Modifier.fillMaxWidth()) { vm.unlock(pass); pass = "" }
+        }
     }
 }
 
+// ---- Wallet ----------------------------------------------------------------------------------------
+
 @Composable
-fun BalanceSection(vm: WalletVm) {
+private fun WalletTab(vm: WalletVm) {
+    BalanceCard(vm)
+    vm.state?.accountId?.let { ReceiveCard(it) }
+    SendCard(vm)
+}
+
+@Composable
+private fun BalanceCard(vm: WalletVm) {
     val s = vm.status
-    var to by remember { mutableStateOf("") }
-    var amount by remember { mutableStateOf("") }
-    Section("Balance") {
-        vm.state?.accountId?.let { Text("Account id (share this to receive)"); Mono(it) }
+    Column(
+        Modifier.fillMaxWidth().background(Surface1, PanelShape)
+            .border(1.dp, Brush.linearGradient(listOf(Cyan.copy(alpha = 0.8f), Violet.copy(alpha = 0.8f))), PanelShape)
+            .padding(18.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Kicker("Balance")
         if (s == null) {
-            Text("Tap Refresh to read the chain.")
+            Text("—", color = Ink, fontSize = 34.sp, fontWeight = FontWeight.ExtraBold)
+            Hint("Refresh reads the chain.")
         } else {
-            Text(if (s.onChain) "${vm.formatMicro(s.balanceMicro)}  (fee ${vm.formatMicro(s.feeMicro)} per tx · max sendable ${vm.formatMicro(s.maxSendableMicro)})" else "Not on-chain yet — get test funds to be created + funded.", style = MaterialTheme.typography.titleLarge)
-            Text("${s.chainId} · height ${s.height} · node ${s.nodeVersion}", fontSize = 12.sp, color = Color.Gray)
+            Row(verticalAlignment = Alignment.Bottom) {
+                Text(vm.formatMicro(s.balanceMicro), color = Ink, fontSize = 34.sp, fontWeight = FontWeight.ExtraBold, fontFamily = FontFamily.Monospace)
+                Spacer(Modifier.width(8.dp))
+                Text("HKN", color = Cyan, fontSize = 14.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 7.dp))
+            }
+            if (s.onChain) Hint("fee ${vm.formatMicro(s.feeMicro)} per tx · max sendable ${vm.formatMicro(s.maxSendableMicro)}")
+            else Hint("Not on-chain yet — Get test funds creates and funds the account.", Gold)
+            Text("${s.chainId} · height ${s.height} · node ${s.nodeVersion}", color = Faint, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = { vm.refresh() }, enabled = vm.busy == null) { Text("Refresh") }
-            OutlinedButton(onClick = { vm.faucet() }, enabled = vm.busy == null) { Text("Get test funds") }
+            GhostButton("Refresh", vm.busy == null, Modifier.weight(1f)) { vm.refresh() }
+            PrimaryButton("Get test funds", vm.busy == null, Modifier.weight(1f)) { vm.faucet() }
         }
-        HorizontalDivider()
-        Text("Send (transparent)", style = MaterialTheme.typography.titleSmall)
-        OutlinedTextField(to, { to = it }, label = { Text("To — account id (64 hex)") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
-        OutlinedTextField(amount, { amount = it }, label = { Text("Amount (e.g. 0.25)") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
-        Button(onClick = { vm.send(to, amount) }, enabled = vm.busy == null && to.trim().length == 64 && amount.isNotBlank()) { Text("Send") }
     }
 }
 
 @Composable
-fun ShieldedSection(vm: WalletVm) {
+private fun ReceiveCard(id: String) {
+    Panel("Receive", Violet) {
+        Hint("Your account id — share it (or the code) to receive HKN.")
+        Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) { Qr(id) }
+        Mono(id)
+        CopyRow("account id · 64 hex", id)
+    }
+}
+
+@Composable
+private fun SendCard(vm: WalletVm) {
+    var to by remember { mutableStateOf("") }
+    var amount by remember { mutableStateOf("") }
+    Panel("Send") {
+        Field(to, { to = it }, "To — account id (64 hex)", mono = true)
+        Field(amount, { amount = it }, "Amount, e.g. 0.25")
+        PrimaryButton("Send", vm.busy == null && to.trim().length == 64 && amount.isNotBlank(), Modifier.fillMaxWidth()) { vm.send(to, amount) }
+    }
+}
+
+// ---- Shielded --------------------------------------------------------------------------------------
+
+@Composable
+private fun ShieldedTab(vm: WalletVm) {
     val sc = vm.scan
     var amount by remember { mutableStateOf("") }
     var payTo by remember { mutableStateOf("") }
     var payAmount by remember { mutableStateOf("") }
     var memo by remember { mutableStateOf("") }
-    var discloseCm by remember { mutableStateOf("") }
-    Section("Shielded") {
-        Text("Balances and counterparties in the pool are invisible on-chain; the fee is paid from the transparent balance. Proofs are made on the prover — a shielded operation takes a minute or two.", fontSize = 12.sp, color = Color.Gray)
-        Button(onClick = { vm.scanPool() }, enabled = vm.busy == null) { Text(if (sc == null) "Scan the pool" else "Rescan") }
+    var commitment by remember { mutableStateOf("") }
+
+    Panel("Shielded pool", Violet) {
+        Hint("Balances and counterparties in the pool are invisible on-chain; the fee is paid from the transparent balance. Proofs are made on the prover — a shielded operation takes a minute or two.")
         if (sc != null) {
-            Text("Your stealth address (share to receive shielded)"); Mono(sc.stealthAddress)
-            Text("${sc.unspent} unspent note(s) · pool size ${sc.poolSize} · one-time spends used ${sc.otsUsed}/${sc.otsCapacity}", fontSize = 12.sp, color = Color.Gray)
-            vm.notes.forEach { n -> NoteRow(vm, n) }
+            val hidden = sc.notes.filter { !it.spent }.fold(0UL) { acc, n -> acc + n.valueMicro }
+            Row(verticalAlignment = Alignment.Bottom) {
+                Text(vm.formatMicro(hidden), color = Ink, fontSize = 28.sp, fontWeight = FontWeight.ExtraBold, fontFamily = FontFamily.Monospace)
+                Spacer(Modifier.width(8.dp))
+                Text("HKN hidden", color = Violet, fontSize = 13.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 5.dp))
+            }
+            Text("${sc.unspent} unspent note(s) · pool ${sc.poolSize} · one-time spends ${sc.otsUsed}/${sc.otsCapacity}", color = Faint, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
         }
-        HorizontalDivider()
-        OutlinedTextField(amount, { amount = it }, label = { Text("Amount to shield / unshield") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+        GhostButton(if (sc == null) "Scan the pool" else "Rescan", vm.busy == null, Modifier.fillMaxWidth(), Violet) { vm.scanPool() }
+    }
+
+    if (sc != null) {
+        Panel("Receive shielded", Violet) {
+            Hint("Your stealth address for the chain's current epoch — share it to be paid in the pool.")
+            Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) { Qr(sc.stealthAddress) }
+            Mono(sc.stealthAddress)
+            CopyRow("stealth address", sc.stealthAddress)
+        }
+        if (vm.notes.isNotEmpty()) Panel("Notes", Violet) {
+            vm.notes.forEachIndexed { i, n ->
+                if (i > 0) HorizontalDivider(color = Line)
+                NoteRow(vm, n)
+            }
+        }
+    }
+
+    Panel("Shield · unshield") {
+        Field(amount, { amount = it }, "Amount")
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = { vm.shield(amount) }, enabled = vm.busy == null && amount.isNotBlank()) { Text("Shield") }
-            OutlinedButton(onClick = { vm.unshield(amount) }, enabled = vm.busy == null && amount.isNotBlank()) { Text("Unshield") }
+            PrimaryButton("Shield", vm.busy == null && amount.isNotBlank(), Modifier.weight(1f)) { vm.shield(amount) }
+            GhostButton("Unshield", vm.busy == null && amount.isNotBlank(), Modifier.weight(1f)) { vm.unshield(amount) }
         }
-        HorizontalDivider()
-        Text("Pay shielded", style = MaterialTheme.typography.titleSmall)
-        OutlinedTextField(payTo, { payTo = it }, label = { Text("To — hkaddr:…") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
-        OutlinedTextField(payAmount, { payAmount = it }, label = { Text("Amount") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
-        OutlinedTextField(memo, { memo = it }, label = { Text("Memo (sealed to the recipient)") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
-        Button(onClick = { vm.payShielded(payTo, payAmount, memo) }, enabled = vm.busy == null && payTo.startsWith("hkaddr:") && payAmount.isNotBlank()) { Text("Pay shielded") }
-        HorizontalDivider()
-        Text("Disclose one received payment (auditor package)", style = MaterialTheme.typography.titleSmall)
-        OutlinedTextField(discloseCm, { discloseCm = it }, label = { Text("Commitment (64 hex)") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
-        OutlinedButton(onClick = { vm.disclose(discloseCm) }, enabled = vm.busy == null && discloseCm.trim().length == 64) { Text("Build package") }
-        vm.lastDisclosure?.let { Text("Package (also saved next to the wallet files):", fontSize = 12.sp); Mono(it.take(600) + if (it.length > 600) "…" else "") }
+    }
+
+    Panel("Pay shielded", Violet) {
+        Field(payTo, { payTo = it }, "To — hkaddr:…", mono = true)
+        Field(payAmount, { payAmount = it }, "Amount")
+        Field(memo, { memo = it }, "Memo (sealed to the recipient)")
+        PrimaryButton("Pay shielded", vm.busy == null && payTo.trim().startsWith("hkaddr:") && payAmount.isNotBlank(), Modifier.fillMaxWidth()) { vm.payShielded(payTo, payAmount, memo) }
+    }
+
+    Panel("Disclose one payment", Gold) {
+        Hint("An auditor package for one received note: value, memo and the on-chain commitment, verifiable with hk-node verify-disclosure.")
+        Field(commitment, { commitment = it }, "Commitment (64 hex)", mono = true)
+        GhostButton("Build package", vm.busy == null && commitment.trim().length == 64, Modifier.fillMaxWidth(), Gold) { vm.disclose(commitment) }
+        vm.lastDisclosure?.let {
+            Hint("Package (also saved next to the wallet files):")
+            Mono(it.take(600) + if (it.length > 600) "…" else "", Muted, 11.sp)
+        }
     }
 }
 
 @Composable
 private fun NoteRow(vm: WalletVm, n: NoteView) {
-    Column(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
-        Text("${vm.formatMicro(n.valueMicro)}  ${if (n.spent) "spent" else "unspent"}  leaf ${n.leafIndex}${if (n.memo.isNotEmpty()) "  “${n.memo}”" else ""}", fontSize = 13.sp)
-        Mono(n.commitment)
+    Column(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(vm.formatMicro(n.valueMicro), color = if (n.spent) Faint else Ink, fontSize = 15.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f))
+            Pill(if (n.spent) "SPENT" else "UNSPENT", if (n.spent) Faint else Ok)
+        }
+        Text("leaf ${n.leafIndex}" + if (n.memo.isNotEmpty()) "  ·  “${n.memo}”" else "", color = Muted, fontSize = 12.sp)
+        Mono(n.commitment, Faint, 10.sp)
     }
 }
 
+// ---- Backup ----------------------------------------------------------------------------------------
+
 @Composable
-fun BackupSection(vm: WalletVm) {
+private fun BackupTab(vm: WalletVm) {
     var pass by remember { mutableStateOf("") }
     val st = vm.state
-    Section("Backup & protection") {
-        Text("The seed restores the transparent account anywhere; shield.json (in this app's files) is the shielded side and must be backed up as a file — it cannot be re-derived. Write the seed down; never screenshot it.", fontSize = 12.sp, color = Color.Gray)
-        if (vm.seedShown == null) OutlinedButton(onClick = { vm.showSeed() }, enabled = vm.busy == null) { Text("Show seed") }
-        else { Mono(vm.seedShown!!); TextButton(onClick = { vm.hideSeed() }) { Text("hide") } }
-        HorizontalDivider()
-        Text(if (st?.sealed == true) "Files are sealed on disk (HKE1, Argon2id 256 MiB)." else "Files are PLAIN on disk — set a passphrase.", fontSize = 12.sp)
-        OutlinedTextField(pass, { pass = it }, label = { Text(if (st?.protected == true) "New passphrase" else "Passphrase (≥ 12 chars or 4+ words)") }, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(), singleLine = true)
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = { vm.protect(pass); pass = "" }, enabled = vm.busy == null && pass.isNotEmpty()) { Text(if (st?.protected == true) "Change" else "Protect") }
-            OutlinedButton(onClick = { pass = vm.generatePassphrase() }, enabled = vm.busy == null) { Text("Generate 7 words") }
-            if (st?.protected == true) TextButton(onClick = { vm.unprotect() }, enabled = vm.busy == null) { Text("Remove") }
-            if (st?.protected == true) TextButton(onClick = { vm.lock() }, enabled = vm.busy == null) { Text("Lock") }
+    val sealed = st?.sealed == true
+    val hasPass = st?.`protected` == true
+
+    Panel("Seed", Gold) {
+        Hint("The seed restores the transparent account anywhere. shield.json (in this app's files) is the shielded side and must be backed up as a file — it cannot be re-derived. Write the seed down; never screenshot it.")
+        if (vm.seedShown == null) {
+            GhostButton("Show seed", vm.busy == null, Modifier.fillMaxWidth(), Gold) { vm.showSeed() }
+        } else {
+            Mono(vm.seedShown!!)
+            TextButton(onClick = { vm.hideSeed() }) { Text("hide", color = Gold) }
         }
-        HorizontalDivider()
+    }
+
+    Panel("Passphrase", if (sealed) Cyan else Gold) {
+        Hint(if (sealed) "Files are sealed on disk (HKE1, Argon2id 256 MiB)." else "Files are PLAIN on disk — set a passphrase.", if (sealed) Ok else Gold)
+        Field(pass, { pass = it }, if (hasPass) "New passphrase" else "Passphrase (≥ 12 chars or 4+ words)", password = true)
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Switch(checked = vm.deviceLock, onCheckedChange = { vm.toggleDeviceLock(it) }, enabled = vm.busy == null)
-            Column {
-                Text("Device lock (key file in the Android Keystore)", fontSize = 13.sp)
-                Text("On: the sealed files need this device too — export the key file before restoring elsewhere. Re-protect after switching.", fontSize = 11.sp, color = Color.Gray)
+            PrimaryButton(if (hasPass) "Change" else "Protect", vm.busy == null && pass.isNotEmpty(), Modifier.weight(1f)) { vm.protect(pass); pass = "" }
+            GhostButton("Generate 7 words", vm.busy == null, Modifier.weight(1f)) { pass = vm.generatePassphrase() }
+        }
+        if (hasPass) Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            GhostButton("Lock now", vm.busy == null, Modifier.weight(1f)) { vm.lock() }
+            GhostButton("Remove passphrase", vm.busy == null, Modifier.weight(1f), Danger) { vm.unprotect() }
+        }
+    }
+
+    Panel("Device lock") {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("Key file in the Android Keystore", color = Ink, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                Hint("On: the sealed files need this device too — export the key file before restoring elsewhere. Re-protect after switching.")
             }
+            Spacer(Modifier.width(12.dp))
+            Switch(
+                checked = vm.deviceLock, onCheckedChange = { vm.toggleDeviceLock(it) }, enabled = vm.busy == null,
+                colors = SwitchDefaults.colors(checkedThumbColor = Bg, checkedTrackColor = Cyan, uncheckedThumbColor = Muted, uncheckedTrackColor = Surface2, uncheckedBorderColor = Line),
+            )
         }
-        if (vm.deviceLock) vm.exportKeyfileHex()?.let { Text("Key file (HK_WALLET_KEYFILE on a PC):", fontSize = 12.sp); Mono(it) }
+        if (vm.deviceLock) vm.exportKeyfileHex()?.let {
+            Hint("Key file (HK_WALLET_KEYFILE on a PC):")
+            Mono(it, Muted, 11.sp)
+            CopyRow("32 bytes, hex", it)
+        }
+    }
+
+    Panel("Files on this phone") {
+        Hint("filesDir/wallet/account.json · shield.json · disclosure-*.json — byte-compatible with the desktop wallet and hk-node account-*. No cloud backup is ever made of them.")
     }
 }
 
+// ---- Activity --------------------------------------------------------------------------------------
+
 @Composable
-fun ActivitySection(vm: WalletVm, open: (String) -> Unit) {
-    Section("Activity") {
-        if (vm.log.isEmpty()) Text("—", color = Color.Gray)
-        vm.log.take(60).forEach { l ->
-            val color = when (l.level) { "ok" -> Color(0xFF2E7D32); "error" -> MaterialTheme.colorScheme.error; else -> Color.DarkGray }
-            Row(Modifier.fillMaxWidth()) {
-                Text("${l.time}  ", fontFamily = FontFamily.Monospace, fontSize = 11.sp, color = Color.Gray)
-                Column {
-                    Text(l.text, fontSize = 12.sp, color = color)
-                    l.link?.let { TextButton(onClick = { open(it) }) { Text("open in explorer", fontSize = 11.sp) } }
+private fun ActivityTab(vm: WalletVm, open: (String) -> Unit) {
+    Panel("Activity") {
+        if (vm.log.isEmpty()) Hint("Nothing yet — every call into the core reports here.", Faint)
+        vm.log.take(80).forEach { l ->
+            val color: Color = when (l.level) { "ok" -> Ok; "error" -> Danger; else -> Muted }
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
+                Text(l.time, color = Faint, fontSize = 11.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.padding(end = 10.dp, top = 2.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(l.text, color = color, fontSize = 12.sp, lineHeight = 16.sp)
+                    l.link?.let { TextButton(onClick = { open(it) }, contentPadding = PaddingValues(0.dp)) { Text("open in explorer", fontSize = 11.sp, color = Cyan) } }
                 }
             }
         }

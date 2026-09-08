@@ -12,8 +12,8 @@ android {
         applicationId = "org.hashkinetics.wallet"
         minSdk = 26            // Argon2id at 256 MiB + ML-KEM want a 64-bit device; 26 = Android 8.0
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"  // shown next to the core's own CORE_VERSION
+        versionCode = 2
+        versionName = "0.2.0"  // shown next to the core's own CORE_VERSION
         ndk {
             // the Rust core ships for these two only (chain/android-core.sh): phones + the emulator
             abiFilters += listOf("arm64-v8a", "x86_64")
@@ -47,6 +47,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.material:material-icons-core") // the bottom bar's four glyphs
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     // UniFFI's Kotlin bindings load the cdylib through JNA (the @aar carries the Android natives).

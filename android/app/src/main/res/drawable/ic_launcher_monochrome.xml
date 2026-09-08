@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- themed-icon layer (Android 13+): one colour, the launcher tints it -->
+    <group android:translateX="22" android:translateY="22">
+        <path
+            android:pathData="M32,3 L57.11,17.5 L57.11,46.5 L32,61 L6.89,46.5 L6.89,17.5 Z"
+            android:strokeWidth="3.5"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeLineJoin="round"
+            android:fillColor="#00000000" />
+        <path android:pathData="M14.5,21.5 h4.5 v8.75 h7 v-8.75 h4.5 v22 h-4.5 v-8.75 h-7 v8.75 h-4.5 Z" android:fillColor="#FFFFFFFF" />
+        <path android:pathData="M34,21.5 h4.5 v22 h-4.5 Z" android:fillColor="#FFFFFFFF" />
+        <path android:pathData="M37.5,32.5 L48.5,23" android:strokeWidth="4.5" android:strokeColor="#FFFFFFFF" />
+        <path android:pathData="M37.5,32.5 L48.5,42" android:strokeWidth="4.5" android:strokeColor="#FFFFFFFF" />
+        <path android:pathData="M25.4,50.9 L30.5,46.9" android:strokeWidth="2.2" android:strokeColor="#FFFFFFFF" android:strokeLineCap="round" />
+        <path android:pathData="M34.8,50.9 L39.9,46.9" android:strokeWidth="2.2" android:strokeColor="#FFFFFFFF" android:strokeLineCap="round" />
+    </group>
+</vector>
