@@ -14,7 +14,7 @@ forge --version
 
 ```bash
 # libs go under lib/ (gitignored — never submodules in the private tree); pinned tags
-cd "/mnt/c/Quranium projects/Quranium/Yadu Projects/HashKinetics/bridge/contracts" && mkdir -p lib \
+cd bridge/contracts && mkdir -p lib \   # from the repo root
   && ([ -d lib/forge-std ] || git clone -q --depth 1 --branch v1.9.6 https://github.com/foundry-rs/forge-std lib/forge-std) \
   && ([ -d lib/openzeppelin-contracts ] || git clone -q --depth 1 --branch v5.1.0 https://github.com/OpenZeppelin/openzeppelin-contracts lib/openzeppelin-contracts) \
   && forge build 2>&1 | tail -3 && forge test -vv 2>&1 | tail -40
@@ -30,7 +30,7 @@ cast wallet import hk-deployer --interactive
 ```
 
 ```bash
-cd "/mnt/c/Quranium projects/Quranium/Yadu Projects/HashKinetics/bridge/contracts"
+cd bridge/contracts                                   # from the repo root
 export SEPOLIA_RPC_URL="https://…"                    # your provider URL (a credential; never in the tree)
 export ETHERSCAN_API_KEY="…"                          # for --verify
 export VAULT_TOKEN=0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238   # Circle Sepolia USDC (6 dec)
