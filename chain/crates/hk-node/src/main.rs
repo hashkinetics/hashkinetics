@@ -13,7 +13,7 @@
 
 /// The release label this binary reports (`hk-node --version`, the usage banner).
 /// Bump with every node release; the crate version is workspace-wide and not it.
-pub const NODE_VERSION: &str = "v0.19.0";
+pub const NODE_VERSION: &str = "v0.19.1";
 
 mod account;
 mod app;
@@ -457,7 +457,7 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
             eprintln!("keys at rest (K1/K2): key-seal|key-unseal HOME (priv_validator_key.json; HK_KEY_PASSPHRASE[_FILE] / LoadCredential=hk-key-passphrase) · account-seal|account-unseal DIR (account.json + wallet.json; HK_WALLET_PASSPHRASE[_FILE] / LoadCredential=hk-wallet-passphrase) · keyfile-new PATH (second factor via HK_KEY_KEYFILE / HK_WALLET_KEYFILE) · passphrase-new [WORDS]");
             eprintln!("bridge (B1): attest-serve CONFIG.toml · attest-cosign CONFIG.toml · attest-ledger LEDGER list [STATE] | resolve KIND ID STATE [--hk-txid X] [--eth-tx X] · attest-key-new OUT-FILE   (docs/BRIDGE-SEPOLIA-USDC-PLAN.md)");
             eprintln!("issued assets (X1): asset-id ISSUER|DIR SYMBOL · asset register DIR RPC SYMBOL DECIMALS FLAGS(m/f/p/s|-) · asset mint DIR RPC ASSET TO MICRO · asset burn DIR RPC ASSET MICRO [DEST-hex] · asset freeze|unfreeze DIR RPC ASSET ACCOUNT · asset pause|unpause DIR RPC ASSET · asset info RPC ASSET|SYMBOL@ISSUER · asset list RPC");
-            eprintln!("wallet: init DIR ACCOUNT [RPC] · status DIR [RPC] · address DIR [RPC] · scan DIR [RPC] · transfer DIR TO USD [RPC] · shield DIR USD [RPC] [PROVER] · unshield DIR USD [RPC] [PROVER] · pay DIR HKADDR USD [MEMO] [RPC] [PROVER] · disclose DIR COMMITMENT OUT.json [RPC]");
+            eprintln!("wallet: init DIR ACCOUNT-DIR|demo-name [RPC] · status DIR [RPC] · address DIR [RPC] · scan DIR [RPC] · transfer DIR TO USD [RPC] · shield DIR USD [RPC] [PROVER] · unshield DIR USD [RPC] [PROVER] · pay DIR HKADDR USD [MEMO] [RPC] [PROVER] · disclose DIR COMMITMENT OUT.json [RPC]");
             eprintln!("pool (H3): pool-path RPC LEAF-INDEX  — fetch one authentication path and re-fold it locally");
             // v0.16.1: an unknown command is a FAILURE (exit 2), not a successful usage print —
             // `hk-node account-unseal DIR && shred -u passfile` on an older binary shredded the

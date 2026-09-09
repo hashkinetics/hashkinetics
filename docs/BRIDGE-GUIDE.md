@@ -85,6 +85,22 @@ cast send 0x24159bE1577f3016AD64beA7D1430e5F2313DB26 "burn(uint256,bytes32)" 100
 
 Check any line yourself: `hk_getTx {"txid": …}` on `https://rpc.hashkinetics.org`, `hk_getAsset` for supply/burned, Etherscan for the Sepolia side.
 
+**The first external user (16:42 UTC the same day):** Eddy, an external seat operator, bridged 5 USDC from [hashkinetics.org/bridge](https://www.hashkinetics.org/bridge) from his own wallet — lock tx [`0x313bcd3e…25ad`](https://sepolia.etherscan.io/tx/0x313bcd3ec771f0c505bdd8962e25db471f199f259902dbe9f08a3016669825ad) (block 11,669,182) naming an account he had created through the faucet → after finality the bridge minted 5 USDC.sep to it (txid `af28c8e834d63c429e7b164dc4115211e54783aab50afe0325d51b9391c9f570`, height 211,097). Nobody on our side was at the keyboard. Vault 20 = supply 25 − burned 5.
+
+## Shielding bridged USDC (P6, since height 190,000)
+
+`USDC.sep` is pool-eligible: it can be shielded into its own pool, paid privately and unshielded, exactly like the test asset. From v0.19.1 the CLI wallet binds to the account directory `account-new` made:
+
+```bash
+hk-node wallet init ~/my-wallet ~/my-account https://rpc.hashkinetics.org
+hk-node wallet shield ~/my-wallet 2 https://rpc.hashkinetics.org https://prover.hashkinetics.org --asset 0c3c3f40884ef40aee41d2ae2b823c8cc1e2c0859172ef20ff899f015442c0f1
+hk-node wallet scan ~/my-wallet https://rpc.hashkinetics.org --asset 0c3c3f40884ef40aee41d2ae2b823c8cc1e2c0859172ef20ff899f015442c0f1        # LIVE $2 @ index …
+hk-node wallet pay ~/my-wallet hkaddr:<their stealth address> 0.5 https://rpc.hashkinetics.org https://prover.hashkinetics.org --asset 0c3c3f40…   # fee 0, zero transparent trace
+hk-node wallet unshield ~/my-wallet 1 https://rpc.hashkinetics.org https://prover.hashkinetics.org --asset 0c3c3f40…
+```
+
+**Receipts (2026-09-09 ~17:55–18:00 UTC):** shield 2 USDC.sep — txid `5ae652ee3955bdd1a5476100135534c042a5966eb3c30378f01b7d0f954fc7b6`, height 214,097, proof 1,056 ms on the public prover, `hk_getPools` count 1 → 2 (the USDC.sep pool opened on first use) · pay 0.5 to a second wallet, fee 0 — txid `4ddf106e040ce3362296664e81bdeddc68cc8f792642fa8da8f2f23f67282dd0`, height 214,209 (one nullifier, two commitments; the recipient scanned a LIVE $0.5 note at leaf 1) · unshield 1 — txid `ddf359d25d86153f4daadb6bd116ac76ada8169a9bb5af11b68a783c35593600`, height 214,225. After: the USDC.sep pool has 5 leaves, 2 nullifiers and a conservation total of 1,000,000; the account holds 14 USDC.sep transparent. Shielding does not change `supply − burned`, so the bridge invariant is untouched by it.
+
 ## Run it yourself
 
 Contracts: `bridge/contracts` (Foundry; `forge test` → 28 tests). Service: `hk-node attest-serve CONFIG.toml` (`chain/crates/hk-node/src/attest.rs` + `eth.rs`), config `ops/attest.toml.example`, unit `ops/hk-attest.service`. The end-to-end receipt on a local devnet + `anvil`: `chain/gate-b1.sh` (11 sections, 50 checks). A second attestor joins with `hk-node attest-cosign` — it re-checks every burn on its own node before signing.

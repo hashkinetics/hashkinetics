@@ -129,19 +129,67 @@ fn fresh32() -> [u8; 32] {
 }
 
 /// The transparent signer, nonce synced from the chain (the account must EXIST).
+/// The wallet's transparent account is either a real account DIRECTORY (`account-new` — the seed
+/// and the L-ratchet index in `account.json`, sealed or plain; testnet-1 accounts) or, on a
+/// devnet, one of the genesis demo names (`org`, `agent-a`, …). v0.19.1: the directory form.
+fn account_dir(account: &str) -> Option<PathBuf> {
+    let p = PathBuf::from(account);
+    if p.join("account.json").exists() { Some(p) } else { None }
+}
+
+/// The account id this wallet signs as (directory → the id in account.json; name → the demo id).
+fn resolve_id(account: &str) -> Result<H256> {
+    match account_dir(account) {
+        Some(d) => crate::account::AccountFile::load(&d)?.id_h256(),
+        None => Ok(account_id(account)),
+    }
+}
+
 fn signer(w: &WalletFile, base: &str) -> Result<Wallet> {
-    let mut s = Wallet::new(&w.account);
+    let mut s = match account_dir(&w.account) {
+        Some(d) => {
+            let f = crate::account::AccountFile::load(&d)?;
+            Wallet::from_seed(f.seed_bytes()?, f.id_h256()?, f.next_nonce)
+        }
+        None => Wallet::new(&w.account),
+    };
     match account_nonce(base, &s.id) {
         Some(n) => {
-            s.next_nonce = n;
+            // the chain's next nonce wins: a signature at any lower index would be refused, and a
+            // ratchet must never sign the same index twice
+            s.next_nonce = s.next_nonce.max(n);
             Ok(s)
         }
         None => Err(eyre!(
-            "account '{}' does not exist on this chain — devnet accounts are genesis-only \
-             until the account-creation tx lands (WS-F). Known: org, agent-a, agent-b, agent-c, merchant",
+            "account '{}' does not exist on this chain — create it through the faucet (a directory from \
+             account-new), or on a devnet use a genesis name: org, agent-a, agent-b, agent-c, merchant",
             w.account
         )),
     }
+}
+
+/// Sign + submit with the account CLI's reserve-then-sign discipline: for a directory-bound
+/// wallet the advanced ratchet index is written to account.json BEFORE the envelope leaves the
+/// process (and rolled back if the submit itself fails). Demo names keep their in-memory nonce.
+fn submit_signed(w: &WalletFile, base: &str, s: &mut Wallet, payload: Tx) -> Result<String> {
+    let tx = s.sign(payload);
+    let dir = account_dir(&w.account);
+    if let Some(d) = &dir {
+        let mut f = crate::account::AccountFile::load(d)?;
+        f.next_nonce = s.next_nonce;
+        f.save(d)?;
+    }
+    let txid = submit(base, &tx);
+    if txid.starts_with("submit-failed") {
+        if let Some(d) = &dir {
+            if let Ok(mut f) = crate::account::AccountFile::load(d) {
+                f.next_nonce = s.next_nonce - 1;
+                let _ = f.save(d);
+            }
+        }
+        return Err(eyre!("{txid}"));
+    }
+    Ok(txid)
 }
 
 fn addr_encode(a: &Address) -> String {
@@ -249,7 +297,7 @@ fn dummy_note() -> Note {
 pub fn run(args: &[String]) -> Result<()> {
     let (asset, args) = take_asset(args)?;
     let args = &args[..];
-    let usage = "usage: hk-node wallet <init DIR ACCOUNT [RPC] | status DIR [RPC] | address DIR [RPC] | scan DIR [RPC] | transfer DIR TO USD [RPC] | shield DIR USD [RPC] [PROVER] | unshield DIR USD [RPC] [PROVER] | pay DIR HKADDR USD [MEMO] [RPC] [PROVER] | disclose DIR COMMITMENT OUT.json [RPC]>";
+    let usage = "usage: hk-node wallet <init DIR ACCOUNT-DIR|demo-name [RPC] | status DIR [RPC] | address DIR [RPC] | scan DIR [RPC] | transfer DIR TO USD [RPC] | shield DIR USD [RPC] [PROVER] | unshield DIR USD [RPC] [PROVER] | pay DIR HKADDR USD [MEMO] [RPC] [PROVER] | disclose DIR COMMITMENT OUT.json [RPC]>";
     let cmd = args.first().map(String::as_str).ok_or_else(|| eyre!(usage))?;
     let dir = PathBuf::from(args.get(1).ok_or_else(|| eyre!(usage))?);
     match cmd {
@@ -270,11 +318,12 @@ pub fn run(args: &[String]) -> Result<()> {
             save(&dir, &w)?;
             let k = keys(&w)?;
             println!("✓ wallet created at {}", wpath(&dir).display());
-            println!("  transparent account : {} ({})", account, hex::encode(account_id(&account).0));
+            let id = resolve_id(&account)?;
+            println!("  transparent account : {} ({})", account, hex::encode(id.0));
             println!("  stealth address     : {}", addr_encode(&k.address_at(0)));
-            match account_nonce(&base, &account_id(&account)) {
-                Some(n) => println!("  on-chain            : ✓ exists (nonce {n}, balance {})", dollars(balance_of(&base, &account_id(&account), &asset))),
-                None => println!("  on-chain            : ⚠ NOT FOUND on {base} — devnet accounts are genesis-only until WS-F"),
+            match account_nonce(&base, &id) {
+                Some(n) => println!("  on-chain            : ✓ exists (nonce {n}, balance {})", dollars(balance_of(&base, &id, &asset))),
+                None => println!("  on-chain            : ⚠ NOT FOUND on {base} — create it through the faucet first (or use a devnet genesis name)"),
             }
             println!("  ⚠ back up wallet.json — it contains the shield master seed.");
             Ok(())
@@ -283,7 +332,7 @@ pub fn run(args: &[String]) -> Result<()> {
             let base = args.get(2).cloned().unwrap_or_else(|| DEFAULT_RPC.into());
             let w = load(&dir)?;
             let k = keys(&w)?;
-            let id = account_id(&w.account);
+            let id = resolve_id(&w.account)?;
             println!("=== wallet status — {} ===", w.account);
             println!("  chain height        : {}", chain_height(&base));
             match account_nonce(&base, &id) {
@@ -341,7 +390,7 @@ pub fn run(args: &[String]) -> Result<()> {
                 account_id(to_s)
             };
             let before = balance_of(&base, &to, &asset);
-            let txid = submit(&base, &s.sign(Tx::Transfer { to, asset, amount: amt }));
+            let txid = submit_signed(&w, &base, &mut s, Tx::Transfer { to, asset, amount: amt })?;
             let ok = crate::demo::wait_tx(&base, "transfer committed", &txid, || balance_of(&base, &to, &asset) == before + amt);
             if ok {
                 println!("✓ sent {} → {} (their balance: {})", dollars(amt), to_s, dollars(balance_of(&base, &to, &asset)));
@@ -370,13 +419,13 @@ pub fn run(args: &[String]) -> Result<()> {
             let pr = rpc(&prover, "prove_mint", json!({"witness": serde_json::to_value(&witness)?}));
             let (proof, ms) = take_proof(&pr)?;
             println!("✓ proof in {ms} ms — submitting");
-            let txid = submit(&base, &s.sign(Tx::MintToPool {
+            let txid = submit_signed(&w, &base, &mut s, Tx::MintToPool {
                 asset,
                 value: amt,
                 commitment: H256(public.commitment),
                 proof,
                 stealth_ct: ct,
-            }));
+            })?;
             if crate::demo::wait_tx(&base, "shield committed", &txid, || balance_of(&base, &s.id, &asset) == my0 - amt) {
                 println!("✓ {} shielded. It is now invisible — run `wallet scan` to see it as yours.", dollars(amt));
             }
@@ -406,18 +455,19 @@ pub fn run(args: &[String]) -> Result<()> {
             let (proof, ms) = take_proof(&pr)?;
             println!("✓ proof in {ms} ms — submitting");
             let my0 = balance_of(&base, &s.id, &asset);
-            let txid = submit(&base, &s.sign(Tx::ShieldedSpend {
+            let credit = Some(s.id);
+            let txid = submit_signed(&w, &base, &mut s, Tx::ShieldedSpend {
                 anchor: H256(plan.public.merkle_root),
                 nullifier: H256(plan.public.nullifier),
                 out_commitment: H256(plan.public.out_commitment),
                 out2_commitment: H256(plan.public.out2_commitment),
                 fee: amt,
-                credit: Some(s.id),
+                credit,
                 mandate: None,
                 proof,
                 stealth_ct: change_ct,
                 stealth_ct2: Vec::new(),
-            }));
+            })?;
             if crate::demo::wait_tx(&base, "unshield committed", &txid, || balance_of(&base, &s.id, &asset) == my0 + amt) {
                 println!("✓ {} unshielded to your transparent account ({} change went back into hiding).", dollars(amt), dollars(change_v));
             }
@@ -461,7 +511,7 @@ pub fn run(args: &[String]) -> Result<()> {
             let (proof, ms) = take_proof(&pr)?;
             println!("✓ proof in {ms} ms — submitting (fee 0: zero transparent trace)");
             let nf = plan.public.nullifier;
-            let txid = submit(&base, &s.sign(Tx::ShieldedSpend {
+            let txid = submit_signed(&w, &base, &mut s, Tx::ShieldedSpend {
                 anchor: H256(plan.public.merkle_root),
                 nullifier: H256(nf),
                 out_commitment: H256(plan.public.out_commitment),
@@ -472,7 +522,7 @@ pub fn run(args: &[String]) -> Result<()> {
                 proof,
                 stealth_ct: out.stealth_ct.clone(),
                 stealth_ct2: change_ct,
-            }));
+            })?;
             if crate::demo::wait_tx(&base, "stealth payment committed", &txid, || nullifier_spent(&base, &nf, &asset)) {
                 println!("✓ {} sent, fully shielded. The chain saw one nullifier and two commitments —", dollars(amt));
                 println!("  who paid whom: invisible. The recipient discovers it by scanning.");
