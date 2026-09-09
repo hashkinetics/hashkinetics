@@ -17,6 +17,7 @@ pub const NODE_VERSION: &str = "v0.19.0";
 
 mod account;
 mod app;
+mod attest;
 mod batch;
 mod faucet;
 mod bench_agg;
@@ -28,6 +29,7 @@ mod demo_disclose;
 mod demo_economy;
 mod demo_mandates;
 mod demo_shielded;
+mod eth;
 mod genesis;
 mod gossip;
 mod keys;
@@ -318,6 +320,20 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
             }
             cmd_vks_fetch(&url, &out, gen.as_deref())
         }
+        // ---- B1: the bridge attestation service (docs/BRIDGE-SEPOLIA-USDC-PLAN.md) ----------
+        Some("attest-serve") => {
+            let cfg = PathBuf::from(args.get(2).cloned().ok_or_else(|| eyre::eyre!("usage: hk-node attest-serve <CONFIG.toml>   (env: ETH_RPC_URL, ETH_ATTESTOR_KEY_FILE, HK_WALLET_PASSPHRASE_FILE)"))?);
+            attest::cmd_serve(&cfg)
+        }
+        Some("attest-cosign") => {
+            let cfg = PathBuf::from(args.get(2).cloned().ok_or_else(|| eyre::eyre!("usage: hk-node attest-cosign <CONFIG.toml>   (env: ETH_ATTESTOR_KEY_FILE)"))?);
+            attest::cmd_cosign(&cfg)
+        }
+        Some("attest-ledger") => attest::cmd_ledger(&args[2..]),
+        Some("attest-key-new") => {
+            let out = PathBuf::from(args.get(2).cloned().ok_or_else(|| eyre::eyre!("usage: hk-node attest-key-new <OUT-FILE>   (writes 32 bytes of hex, 0600; prints only the address)"))?);
+            attest::cmd_key_new(&out)
+        }
         Some("faucet-serve") => {
             let usage = "usage: hk-node faucet-serve <WALLET-DIR> <RPC> [--listen 127.0.0.1:9922] [--drip MICRO] [--asset HEX] [--cooldown-secs N] [--daily-cap N] [--low-micro N] [--reserve-micro N]   (env: HK_FAUCET_LOW_MICRO, HK_FAUCET_RESERVE_MICRO)";
             let dir = PathBuf::from(args.get(2).cloned().ok_or_else(|| eyre::eyre!(usage))?);
@@ -439,6 +455,7 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
             eprintln!("accounts (U1): account-new DIR · account-info DIR · account-balance RPC ID|DIR · account-send DIR RPC TO MICRO [ASSET] · account-create DIR RPC AUTH_COMMIT MICRO [ASSET] · faucet-serve DIR RPC [--drip …]");
             eprintln!("verifying keys (K6): vks-fetch PROVER_URL [-o vks.json] [--genesis genesis.json]  — a node reads HK_VKS_FILE or <HOME>/vks.json and needs no prover to verify");
             eprintln!("keys at rest (K1/K2): key-seal|key-unseal HOME (priv_validator_key.json; HK_KEY_PASSPHRASE[_FILE] / LoadCredential=hk-key-passphrase) · account-seal|account-unseal DIR (account.json + wallet.json; HK_WALLET_PASSPHRASE[_FILE] / LoadCredential=hk-wallet-passphrase) · keyfile-new PATH (second factor via HK_KEY_KEYFILE / HK_WALLET_KEYFILE) · passphrase-new [WORDS]");
+            eprintln!("bridge (B1): attest-serve CONFIG.toml · attest-cosign CONFIG.toml · attest-ledger LEDGER list [STATE] | resolve KIND ID STATE [--hk-txid X] [--eth-tx X] · attest-key-new OUT-FILE   (docs/BRIDGE-SEPOLIA-USDC-PLAN.md)");
             eprintln!("issued assets (X1): asset-id ISSUER|DIR SYMBOL · asset register DIR RPC SYMBOL DECIMALS FLAGS(m/f/p/s|-) · asset mint DIR RPC ASSET TO MICRO · asset burn DIR RPC ASSET MICRO [DEST-hex] · asset freeze|unfreeze DIR RPC ASSET ACCOUNT · asset pause|unpause DIR RPC ASSET · asset info RPC ASSET|SYMBOL@ISSUER · asset list RPC");
             eprintln!("wallet: init DIR ACCOUNT [RPC] · status DIR [RPC] · address DIR [RPC] · scan DIR [RPC] · transfer DIR TO USD [RPC] · shield DIR USD [RPC] [PROVER] · unshield DIR USD [RPC] [PROVER] · pay DIR HKADDR USD [MEMO] [RPC] [PROVER] · disclose DIR COMMITMENT OUT.json [RPC]");
             eprintln!("pool (H3): pool-path RPC LEAF-INDEX  — fetch one authentication path and re-fold it locally");

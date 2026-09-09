@@ -42,6 +42,10 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 rand = "0.8"
+# B1 (hk-attest, `hk-node attest-serve`): the ONE ECDSA key in the system — the Ethereum-side attestor —
+# and keccak for ABI/EIP-712. Both already in the lock file transitively; no alloy/ethers on purpose (eth.rs).
+k256 = { version = "0.13", features = ["ecdsa"] }
+tiny-keccak = { version = "2", features = ["keccak"] }
 ed25519-consensus = { version = "2.1", features = ["serde"] }
 
 # Vendored Malachite (pins in vendor/external/PINS.md); renamed to the engine's import convention.
