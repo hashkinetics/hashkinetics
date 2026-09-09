@@ -4,6 +4,8 @@
 
 **Trust label, said first.** On the HashKinetics side every balance moves under hash-based authority: the mint is signed by the bridge issuer account's key, your burn by yours. On the Ethereum side the vault trusts a threshold of attestor keys, which are ECDSA because Ethereum verifies nothing else. Today that threshold is **1 of 1**, and the key is run by the founders on the gateway host: the bridge is exactly as safe as that key and the attestation service's code. The next steps — deposit ids checked by consensus (X2) and a committee of founding operators (B2) — are on the [backlog](BACKLOG.md); the plan is [BRIDGE-SEPOLIA-USDC-PLAN.md](BRIDGE-SEPOLIA-USDC-PLAN.md).
 
+**Prefer a browser?** [hashkinetics.org/bridge](https://www.hashkinetics.org/bridge) does the Sepolia side from your own wallet — approve + lock, the transfer followed to its testnet-1 txid, the wHKT.sep burn-back — and shows the vault reserves against `supply − burned` live. The CLI path below is the same calls by hand.
+
 ## The addresses and ids (Sepolia chain id 11155111 · testnet-1 `hashkinetics-1-4e4ea68d`)
 
 | What | Where |
