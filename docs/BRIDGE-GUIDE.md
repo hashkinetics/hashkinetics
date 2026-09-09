@@ -47,9 +47,17 @@ cast call 0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238 "balanceOf(address)(uint256
 
 The burn's txid is the `burnId`; the vault keeps `processed[burnId]`, so a burn is paid at most once. If the vault is paused (any attestor can pause; only the owner unpauses) or the day's cap is used up, the burn waits in the queue and is paid when the vault reopens — it is never lost.
 
-## The reverse leg (`HKT` → `wHKT.sep`)
+## The reverse leg (`HKT` → `wHKT.sep` → `HKT`)
 
-The same machinery wraps an HK-issued asset as an ERC-20 on Sepolia: burn `HKT` on testnet-1 naming a Sepolia address → the bridge mints `wHKT.sep` there; `HKWrapped.burn(amount, hkAccount)` on Sepolia → the issuer mints `HKT` back to that account. `HKT` is a test asset the bridge issuer mints as a float; wrapping the real HKN after TGE is a policy decision for counsel, not a build question.
+The same machinery wraps an HK-issued asset as an ERC-20 on Sepolia: burn `HKT` on testnet-1 naming a Sepolia address → the bridge mints `wHKT.sep` there (no finality wait: a HashKinetics commit is final); `HKWrapped.burn(amount, hkAccount)` on Sepolia → after Ethereum finality the issuer mints `HKT` back to that account. `HKT` is a test asset the bridge issuer mints as a float; wrapping the real HKN after TGE is a policy decision for counsel, not a build question.
+
+```bash
+hk-node asset burn ~/my-account https://rpc.hashkinetics.org f2b88facb835a9e331b51772cf98cbcb95d6c86233324d252fd4c9edd8fbbcea 4000000 <40 hex chars of your Sepolia address>
+cast call 0x24159bE1577f3016AD64beA7D1430e5F2313DB26 "balanceOf(address)(uint256)" 0x<your Sepolia address> --rpc-url https://ethereum-sepolia-rpc.publicnode.com   # 4000000 within ~2 min
+cast send 0x24159bE1577f3016AD64beA7D1430e5F2313DB26 "burn(uint256,bytes32)" 1000000 0x<your 64-hex account id> --rpc-url https://ethereum-sepolia-rpc.publicnode.com --account <your keystore>   # ~13 min later: +1 HKT on the account
+```
+
+**Receipts (2026-09-09, UTC):** float — the issuer minted 10 HKT to `cf1d6719…` (txid `25e8af8618d00a29d44fdbb2f1edf093f572b35ca95365bb8a4f46417cd326fa`, height 194,176) · burn 4 HKT naming `7a0543ee…` (txid `34e1a6af1a477e2f0380ef44417f69643d52247321485b38ebd72d3c49a2a5cd`, height 194,328) → `HKWrapped.mint` 4 wHKT.sep tx [`0x725ed38d…45af6`](https://sepolia.etherscan.io/tx/0x725ed38d361eef393f7193aa99631b9ee992b8ae4ba053ea575ad04f91d45af6), block 11,667,365, about a minute later · `HKWrapped.burn` 1 wHKT.sep naming `cf1d6719…` tx [`0x0cb4ac11…4fdd`](https://sepolia.etherscan.io/tx/0x0cb4ac118eda828fc1c71a7d8b7446ddf364625c3ac076402d4ecd84359f4fdd), block 11,667,380, 10:30:24, burnId `0x83ee199193df66e588ec12273ffbe45345c41f6c5c960fc434443164aa8c4201` → Sepolia finalized it at ≈ 10:47 → the issuer minted 1 HKT back to `cf1d6719…` (txid `54d57650533d7aa8ddb4f5e88c08d54c2e9a5b2acf095829a132c77c6220f79e`, height 195,196). After: the account holds 7 HKT (10 − 4 + 1), `HKT` supply 11 / burned 4, `wHKT.sep` total supply 3,000,000 = HKT burned − HKT re-minted.
 
 ## What can go wrong, and what happens then
 

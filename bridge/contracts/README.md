@@ -13,8 +13,8 @@ forge --version
 ```
 
 ```bash
-# libs go under lib/ (gitignored — never submodules in the private tree); pinned tags
-cd bridge/contracts && mkdir -p lib \   # from the repo root
+# from the repo root; libs go under lib/ (gitignored — never submodules in the private tree); pinned tags
+cd bridge/contracts && mkdir -p lib \
   && ([ -d lib/forge-std ] || git clone -q --depth 1 --branch v1.9.6 https://github.com/foundry-rs/forge-std lib/forge-std) \
   && ([ -d lib/openzeppelin-contracts ] || git clone -q --depth 1 --branch v5.1.0 https://github.com/OpenZeppelin/openzeppelin-contracts lib/openzeppelin-contracts) \
   && forge build 2>&1 | tail -3 && forge test -vv 2>&1 | tail -40
