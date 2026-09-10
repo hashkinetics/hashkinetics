@@ -2,6 +2,12 @@
 
 All notable changes to this project. Versions are project-level (see `version.md` for per-crate status). Dates are IST-day of work.
 
+## [Unreleased] — 2026-09-10
+
+- **The privacy chains, side by side (`docs/PRIVACY-CHAIN-COMPARISON.md` + the home page `#compare`).** Monero, Zcash, Firo, Pirate Chain, Dash, Decred, Secret, Oasis, Horizen, Beldex against HashKinetics on thirty properties — privacy default, what is hidden, primitive, trusted setup, post-quantum status split into spend signatures / validator keys / the privacy layer itself, disclosure and viewing keys, master key, regulated-asset controls, consensus budgets, multi-asset shielding, bridge, proof cost, per-block aggregation, throughput, audits, governance, liquidity. Competitor cells from each project's public documentation (neutral by intent, corrections invited); every HashKinetics cell measured or labelled plan; the audit and liquidity rows say what they have and we do not. The home page carries a 10-row condensed table and four "major differences" cards. Throughput is stated two ways and labelled both ways: 274 tx/s on-chain (4-validator lab chain, measured) and ~180,000 payments/s effective through native PayWord channels (183 settles/s × 1,000 payments per settle — arithmetic on measured constants, never a measured run).
+- **`hk-node storm` on a public chain.** `HK_STORM_SENDERS=DIR,DIR,…` signs the load from real account directories (`account-new`, funded) instead of the lab chain's genesis names — the chain's nonce wins on load, fee affordability is printed per sender, and every sender's ratchet index is written back at the end. This is the harness for the 30-minute testnet-1 run (the capacity sheet's M1 row), after which the site's throughput label changes from "lab chain" to "testnet-1, measured".
+- Site wording: "devnet" no longer appears on the site — provenance stays exact as "4-validator lab chain" / "local chain".
+
 ## [0.19.1] — 2026-09-09 — 🌉 B1: the Sepolia USDC ↔ testnet-1 bridge, LIVE on the testnets both ways · the first shielded USDC.sep · the CLI wallet binds to a real account (client-only: no consensus change, no deadline, no roll needed)
 
 - **Release:** `hk-node-v0.19.1.gz` sha256 `a8e6c78af9f320452881030b6d848869bc463956fa97e1f411591410bb9a8654` · unpacked binary sha256 `a6a4a56ffc0d8339564ccd6392140e4890316cd001f2e04e22bedd168eaaf22d` · `hk-node --version` → `hk-node v0.19.1`. Client-only: a v0.19.0 seat keeps voting and never needs it.

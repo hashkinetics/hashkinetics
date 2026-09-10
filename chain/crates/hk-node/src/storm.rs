@@ -6,8 +6,13 @@
 //! the explorer RPC and prints the capacity numbers that matter:
 //! sustained included-tx/s · block fill · real block interval · admission behavior.
 //!
-//! Run:  hk-node storm <RPC> [RATE_TX_S] [DURATION_S]
+//! Run:  hk-node storm <RPC> [RATE_TX_S] [DURATION_S] [NODES]
 //!       RATE_TX_S 0 (default) = flood as fast as signing+submission allows.
+//!       HK_STORM_SENDERS=DIR,DIR,…  (v0.19.1) sign from real account directories (`account-new`,
+//!       funded on the public chain) instead of the five devnet genesis names — the testnet M1 run.
+//!       Each sender pays the protocol fee per transfer; fund ~10 units per sender for 30 minutes.
+//!       The ratchet index of every sender is written back to its account.json at the end (and the
+//!       chain's nonce wins on the next load), so never sign from these directories elsewhere mid-run.
 //!
 //! Scope v1 (honest): transparent txs only — this measures the STATE-APPLY and
 //! consensus/gossip path (C1 items a/b/e). The shielded/aggregation scaling curve
@@ -100,37 +105,68 @@ pub fn run(base: &str, rate: u64, duration_s: u64, nodes: u64) -> eyre::Result<(
         eyre::bail!("node not reachable at {base}");
     }
 
-    // ---- senders: sync nonces; fund the non-org accounts if they're dry ----
-    let mut senders: Vec<Wallet> = SENDERS.iter().map(|n| Wallet::new(n)).collect();
+    // ---- senders: real account directories (HK_STORM_SENDERS, the public-chain run) or the five
+    //      devnet genesis names; sync nonces; on a devnet fund the non-org accounts if they're dry ----
+    let sender_dirs: Vec<std::path::PathBuf> = std::env::var("HK_STORM_SENDERS")
+        .ok()
+        .map(|v| v.split(',').filter(|s| !s.trim().is_empty()).map(|s| std::path::PathBuf::from(s.trim())).collect())
+        .unwrap_or_default();
+    let from_dirs = !sender_dirs.is_empty();
+    let mut senders: Vec<Wallet> = if from_dirs {
+        let mut v = Vec::new();
+        for d in &sender_dirs {
+            let f = crate::account::AccountFile::load(d)?;
+            v.push(Wallet::from_seed(f.seed_bytes()?, f.id_h256()?, f.next_nonce));
+        }
+        println!("    senders: {} account directories (HK_STORM_SENDERS) — each pays the protocol fee per transfer", v.len());
+        v
+    } else {
+        SENDERS.iter().map(|n| Wallet::new(n)).collect()
+    };
     for w in senders.iter_mut() {
         match account_nonce(base, &w.id) {
-            Some(n) => w.next_nonce = n,
-            None => eyre::bail!("genesis account missing on this chain — use a devnet/testnet genesis"),
+            Some(n) => w.next_nonce = w.next_nonce.max(n),
+            None => eyre::bail!("sender account {} does not exist on this chain — create + fund it first (devnet: use a genesis with the demo accounts)", hex::encode(w.id.0)),
         }
-    }
-    let org_bal = balance(base, &senders[0].id);
-    if org_bal < 5 * M {
-        eyre::bail!("org has {} micro — storm wants a reasonably funded devnet (fresh, or post-demo)", org_bal);
     }
     let targets: Vec<_> = senders.iter().map(|w| w.id).collect();
-    let mut funded = 0;
-    for i in 1..senders.len() {
-        if balance(base, &targets[i]) < M / 2 {
-            let t = targets[i];
-            let tx = senders[0].sign(Tx::Transfer { to: t, asset: usd(), amount: M });
-            submit_quiet(base, &tx);
-            funded += 1;
+    if from_dirs {
+        let fee_micro = crate::demo::rpc(base, "hk_chainInfo", json!({}))
+            .get("result").and_then(|r| r.get("fee")).and_then(|f| f.get("micro"))
+            .and_then(|m| m.as_str()).and_then(|m| m.parse::<u128>().ok()).unwrap_or(100);
+        for w in senders.iter() {
+            let b = balance(base, &w.id);
+            let txs_affordable = if fee_micro + 1 > 0 { b / (fee_micro + 1) } else { 0 };
+            println!("    {}…: {} micro → ≈ {} transfers at the {fee_micro}-micro fee", &hex::encode(w.id.0)[..8], b, txs_affordable);
+            if b < 100 * (fee_micro + 1) {
+                eyre::bail!("sender {}… holds {} micro — fund it first", &hex::encode(w.id.0)[..8], b);
+            }
+        }
+    } else {
+        let org_bal = balance(base, &senders[0].id);
+        if org_bal < 5 * M {
+            eyre::bail!("org has {} micro — storm wants a reasonably funded devnet (fresh, or post-demo)", org_bal);
+        }
+        let mut funded = 0;
+        for i in 1..senders.len() {
+            if balance(base, &targets[i]) < M / 2 {
+                let t = targets[i];
+                let tx = senders[0].sign(Tx::Transfer { to: t, asset: usd(), amount: M });
+                submit_quiet(base, &tx);
+                funded += 1;
+            }
+        }
+        if funded > 0 {
+            println!("[setup] funding {funded} sender(s) with $1 each…");
+            let need: Vec<_> = targets[1..].to_vec();
+            wait("senders funded", || need.iter().all(|t| balance(base, t) >= M / 2));
+        }
+        // Re-sync org's nonce after funding txs committed.
+        if let Some(n) = account_nonce(base, &senders[0].id) {
+            senders[0].next_nonce = n;
         }
     }
-    if funded > 0 {
-        println!("[setup] funding {funded} sender(s) with $1 each…");
-        let need: Vec<_> = targets[1..].to_vec();
-        wait("senders funded", || need.iter().all(|t| balance(base, t) >= M / 2));
-    }
-    // Re-sync org's nonce after funding txs committed.
-    if let Some(n) = account_nonce(base, &senders[0].id) {
-        senders[0].next_nonce = n;
-    }
+    let n_senders = senders.len();
 
     // ---- the storm: one thread per sender (nonce order preserved per sender) ----
     let submitted = Arc::new(AtomicU64::new(0));
@@ -139,13 +175,15 @@ pub fn run(base: &str, rate: u64, duration_s: u64, nodes: u64) -> eyre::Result<(
     let start_h = chain_height(base);
     let t0 = Instant::now();
     let per_thread_gap = if rate == 0 { None } else {
-        Some(Duration::from_secs_f64(SENDERS.len() as f64 / rate as f64))
+        Some(Duration::from_secs_f64(n_senders as f64 / rate as f64))
     };
 
     let port0 = base_port(base);
-    println!("[storm] flooding from {} senders for {duration_s}s (start height {start_h})…", SENDERS.len());
+    println!("[storm] flooding from {} senders for {duration_s}s (start height {start_h})…", n_senders);
+    let final_nonces: Arc<std::sync::Mutex<Vec<(usize, u64)>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     std::thread::scope(|s| {
         for (idx, mut w) in senders.drain(..).enumerate() {
+            let final_nonces = final_nonces.clone();
             // Home node per sender: nonce ordering is preserved inside one mempool,
             // and every proposer in the rotation has transactions to include.
             let home = with_port(base, port0 + (idx as u64 % nodes.max(1)));
@@ -169,6 +207,7 @@ pub fn run(base: &str, rate: u64, duration_s: u64, nodes: u64) -> eyre::Result<(
                         }
                     }
                 }
+                final_nonces.lock().unwrap().push((idx, w.next_nonce));
             });
         }
         // Sampler thread: real wall-clock height + mempool depth once a second.
@@ -194,6 +233,16 @@ pub fn run(base: &str, rate: u64, duration_s: u64, nodes: u64) -> eyre::Result<(
         stop.store(true, Ordering::Relaxed);
     });
     let flood_wall = t0.elapsed().as_secs_f64();
+    // Directory-bound senders: write the advanced ratchet index back (the chain's nonce wins on the next load).
+    if from_dirs {
+        for (idx, n) in final_nonces.lock().unwrap().iter() {
+            if let Ok(mut f) = crate::account::AccountFile::load(&sender_dirs[*idx]) {
+                f.next_nonce = f.next_nonce.max(*n);
+                let _ = f.save(&sender_dirs[*idx]);
+            }
+        }
+        println!("[storm] sender ratchet indices written back to their account.json files");
+    }
 
     // ---- drain: let the mempool clear (bounded) ----
     println!("[drain] letting the mempool clear…");
