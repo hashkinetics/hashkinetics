@@ -1,6 +1,6 @@
 # Privacy chains vs HashKinetics — the in-depth chart (draft for review, 2026-09-10)
 
-**How to read this.** One row per property, one column per chain. Every HashKinetics cell says *measured*, *live*, or *plan*; nothing in the HK column is claimed that has not run on testnet-1 or a gated devnet, and the last rows say plainly what the others have that we do not (years of mainnet, audits, liquidity). The competitor cells are taken from each project's public documentation as of September 2026; they are stated neutrally and a wrong cell is a bug — please correct it before this goes on the site. Rule for the site version: no adjective we cannot measure, no price, nothing for sale.
+**How to read this.** One row per property, one column per chain. Every HashKinetics cell says *measured*, *live*, or *plan*; nothing in the HK column is claimed that has not run on testnet-1 or a gated devnet, and the last rows say plainly what the others have that we do not (years of mainnet, audits, liquidity). The competitor cells are taken from each project's public documentation as of September 2026; they are stated neutrally and a wrong cell is a bug — please correct it before this goes on the site. Rule for the site version: no adjective we cannot measure, no price.
 
 The ten chains Yadu listed fall into four families, and the families matter more than the names:
 
@@ -46,7 +46,7 @@ Legend: ● yes · ○ no · ◐ partial / optional · **T** testnet-only claim 
 | Independent audits | **none yet** — CertiK engaged, scope frozen at tag `audit-2026-09`, mainnet gated behind them | many, over a decade | many (NCC, Least Authority, QED-it…) | several (Lelantus/Spark audited) | inherits Sapling audits | several | several | several | several | several | ~ |
 | Governance today | founders decide alone under bootstrap governance (16 of 20 power) — said on the site; handover by dated milestone | community/PoW | ZF/ECC/Shielded Labs, dev fund | community + masternodes | community | masternode votes | on-chain Politeia | on-chain | on-chain | Horizen DAO | masternode votes |
 | Open source | ● MIT/Apache since 2026-08-26 | ● | ● | ● | ● | ● | ● | ● | ● | ● | ● |
-| Liquidity / listings | none — nothing is for sale | wide (delisted in several jurisdictions) | wide | moderate | limited | wide | moderate | moderate | wide | moderate | limited |
+| Liquidity / listings | none (testnet) | wide (delisted in several jurisdictions) | wide | moderate | limited | wide | moderate | moderate | wide | moderate | limited |
 
 ## What the chart says, in five lines
 
@@ -68,7 +68,7 @@ Columns: **HashKinetics** · Monero · Zcash · Firo · Secret / Oasis (TEE) · 
 | Trusted setup | none | none | Sapling yes / Orchard none | none | hardware trust | none |
 | Lawful access without a master key | one-time offline-verifiable disclosure · epoch viewing keys · issuer freeze/pause | view key | viewing keys | view keys | viewing keys / permits | n/a |
 | Budgets enforced by consensus over hidden balances | **● unique** | ○ | ○ | ○ | ◐ in a contract | ○ |
-| Status | **testnet-1, 8 seats, pre-audit, nothing for sale** | mainnet since 2014 | mainnet since 2016 | mainnet since 2016 | mainnet since 2020 | mainnet since 2014 / 2016 |
+| Status | **testnet-1, 11 seats, pre-audit** | mainnet since 2014 | mainnet since 2016 | mainnet since 2016 | mainnet since 2020 | mainnet since 2014 / 2016 |
 
 Caption for the site: *"Every cell about another chain comes from its public documentation as of September 2026 and is neutral by intent — tell us what we got wrong. Every cell about us is measured on a testnet or labelled a plan. The full chart, with sources: docs/PRIVACY-CHAIN-COMPARISON.md."*
 

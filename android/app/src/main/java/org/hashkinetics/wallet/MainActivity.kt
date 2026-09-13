@@ -225,7 +225,7 @@ private fun WelcomeScreen(vm: WalletVm) {
             Field(seed, { seed = it }, "Seed (64 hex characters)", mono = true)
             GhostButton("Restore keychain", vm.busy == null && seed.trim().length == 64, Modifier.fillMaxWidth(), Violet) { vm.restore(seed) }
         }
-        Text("Unaudited testnet software · nothing here is for sale", color = Faint, fontSize = 11.sp, textAlign = TextAlign.Center)
+        Text("Unaudited testnet software · test units only", color = Faint, fontSize = 11.sp, textAlign = TextAlign.Center)
     }
 }
 

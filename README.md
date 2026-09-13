@@ -4,7 +4,7 @@
 
 [**hashkinetics.org**](https://www.hashkinetics.org) · [**Live explorer**](https://www.hashkinetics.org/explorer) · [**Public RPC**](https://rpc.hashkinetics.org) · [**X @hashkinetics**](https://x.com/hashkinetics) · [**Discord**](https://discord.gg/RsSfb9gn3) · [**Telegram**](https://t.me/+tnRXX8KOCWA3YjE1) · validators@hashkinetics.org
 
-`testnet-1: LIVE since 2026-09-02` · `node v0.19.3 (client-only) · consensus v0.19.0 · wallet v0.15.0 (test USDC) · Android wallet v0.3.0 (test USDC)` · `11 seats, 7 external` · `seats change on the running chain (v0.14.0)` · `bootstrap governance: genesis seats weigh 4 from height 110,000 (v0.18.1)` · `issued assets with issuer controls (v0.15.0)` · `spend proof: 1.24 s (GPU)` · `274 tx/s storm-measured` · `nothing is for sale`
+`testnet-1: LIVE since 2026-09-02` · `node v0.19.3 (client-only) · consensus v0.19.0 · wallet v0.15.0 (test USDC) · Android wallet v0.3.0 (test USDC)` · `11 seats, 7 external` · `seats change on the running chain (v0.14.0)` · `bootstrap governance: genesis seats weigh 4 from height 110,000 (v0.18.1)` · `issued assets with issuer controls (v0.15.0)` · `spend proof: 1.24 s (GPU)` · `274 tx/s storm-measured` · `testnet only`
 
 ---
 
@@ -184,4 +184,4 @@ MIT OR Apache-2.0, at your option. Vendored third-party trees keep their own lic
 
 ---
 
-*HashKinetics — kinetic money on hash-based trust. Nothing is for sale; the chain is the pitch.*
+*HashKinetics — kinetic money on hash-based trust. Testnet-1 is live; the chain is the pitch.*

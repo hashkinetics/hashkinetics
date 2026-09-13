@@ -2,7 +2,7 @@
 
 **What to click first, how to hide money, how to show it again, how to pay someone privately, and how to prove one payment to one person.** The same guide exists as a slide deck (`HashKinetics-Wallet-Guide.pptx` / `.pdf`, screenshots in `wallet-guide-shots/`); this is the text version for the repository and the website (`/wallet`). Everything here was done on the live network on 2026-09-02 — the transaction ids are real and searchable in the explorer.
 
-> Test units only. Nothing in this wallet has monetary value, nothing is for sale; the Windows build is unsigned (verify the hash), the Android build is signed with the HashKinetics release key (verify the hash and the signer). Keys never leave your machine — or your phone.
+> Test units only. Nothing in this wallet has monetary value; the Windows build is unsigned (verify the hash), the Android build is signed with the HashKinetics release key (verify the hash and the signer). Keys never leave your machine — or your phone.
 
 ## 0 · Before you start
 

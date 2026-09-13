@@ -42,7 +42,7 @@ Before a wallet exists: Welcome (create / restore). While the files are sealed: 
 
 No in-app proving (proofs are made on the public prover; a shielded operation takes a minute or two), no
 QR *scanning* of addresses (the camera; v0.3), no biometric release of the key file (v0.3: `setUserAuthenticationRequired`),
-no push notifications, no iOS. Unaudited testnet software; nothing is for sale.
+no push notifications, no iOS. Unaudited testnet software.
 
 ## Release signing (WA3)
 
