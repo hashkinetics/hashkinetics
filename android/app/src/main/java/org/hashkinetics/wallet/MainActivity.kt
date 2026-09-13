@@ -11,6 +11,10 @@ import androidx.activity.viewModels
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
+import org.hashkinetics.wallet.core.AssetInfo
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -158,7 +162,7 @@ private fun Header(vm: WalletVm) {
         Spacer(Modifier.width(10.dp))
         Column {
             Wordmark(13.5.sp)
-            Text("wallet 0.2.0 · core ${vm.coreVersion}", color = Faint, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+            Text("wallet 0.3.0 · core ${vm.coreVersion}", color = Faint, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
         }
         Spacer(Modifier.weight(1f))
         Pill("TESTNET-1")
@@ -243,45 +247,79 @@ private fun UnlockScreen(vm: WalletVm, needsKeyfile: Boolean) {
 
 @Composable
 private fun WalletTab(vm: WalletVm) {
+    AssetPicker(vm)
     BalanceCard(vm)
-    vm.state?.accountId?.let { ReceiveCard(it) }
+    vm.state?.accountId?.let { ReceiveCard(it, vm.selected.symbol) }
     SendCard(vm)
+}
+
+/** P6.2: the asset every widget acts in — one chip per asset the chain knows, native first. */
+@Composable
+private fun AssetPicker(vm: WalletVm) {
+    Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        vm.assets.forEach { a ->
+            val on = a.id == vm.selected.id
+            FilterChip(
+                selected = on,
+                onClick = { if (!on && vm.busy == null) vm.selectAsset(a) },
+                label = { Text(if (a.isNative) "${a.symbol} · test units" else a.symbol, fontSize = 12.sp, fontWeight = if (on) FontWeight.Bold else FontWeight.Normal) },
+                colors = FilterChipDefaults.filterChipColors(
+                    containerColor = Surface1, labelColor = Muted,
+                    selectedContainerColor = Cyan.copy(alpha = 0.16f), selectedLabelColor = Cyan,
+                ),
+                border = FilterChipDefaults.filterChipBorder(enabled = true, selected = on, borderColor = Line, selectedBorderColor = Cyan.copy(alpha = 0.7f)),
+            )
+        }
+    }
 }
 
 @Composable
 private fun BalanceCard(vm: WalletVm) {
     val s = vm.status
+    val a = vm.selected
     Column(
         Modifier.fillMaxWidth().background(Surface1, PanelShape)
             .border(1.dp, Brush.linearGradient(listOf(Cyan.copy(alpha = 0.8f), Violet.copy(alpha = 0.8f))), PanelShape)
             .padding(18.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        Kicker("Balance")
-        if (s == null) {
+        Kicker(if (a.isNative) "Balance" else "Balance · ${a.symbol}")
+        val bal = vm.selectedBalance()
+        if (s == null || bal == null) {
             Text("—", color = Ink, fontSize = 34.sp, fontWeight = FontWeight.ExtraBold)
             Hint("Refresh reads the chain.")
         } else {
             Row(verticalAlignment = Alignment.Bottom) {
-                Text(vm.formatMicro(s.balanceMicro), color = Ink, fontSize = 34.sp, fontWeight = FontWeight.ExtraBold, fontFamily = FontFamily.Monospace)
+                Text(vm.formatMicro(bal), color = Ink, fontSize = 34.sp, fontWeight = FontWeight.ExtraBold, fontFamily = FontFamily.Monospace)
                 Spacer(Modifier.width(8.dp))
-                Text("HKN", color = Cyan, fontSize = 14.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 7.dp))
+                Text(a.symbol, color = Cyan, fontSize = 14.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 7.dp))
             }
-            if (s.onChain) Hint("fee ${vm.formatMicro(s.feeMicro)} per tx · max sendable ${vm.formatMicro(s.maxSendableMicro)}")
-            else Hint("Not on-chain yet — Get test funds creates and funds the account.", Gold)
+            when {
+                !s.onChain -> Hint("Not on-chain yet — Get test funds creates and funds the account.", Gold)
+                a.isNative -> Hint("fee ${vm.formatNative(s.feeMicro)} per tx · max sendable ${vm.formatNative(s.maxSendableMicro)}")
+                else -> Hint("fee ${vm.formatNative(s.feeMicro)} per tx, paid from your ${vm.assets.first().symbol} balance (${vm.formatNative(s.balanceMicro)}) · test asset, no monetary value")
+            }
             Text("${s.chainId} · height ${s.height} · node ${s.nodeVersion}", color = Faint, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             GhostButton("Refresh", vm.busy == null, Modifier.weight(1f)) { vm.refresh() }
             PrimaryButton("Get test funds", vm.busy == null, Modifier.weight(1f)) { vm.faucet() }
         }
+        if (!a.isNative) {
+            val ctx = LocalContext.current
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                GhostButton("Get test ${a.symbol}", vm.busy == null, Modifier.weight(1f), Gold) { vm.faucetAsset() }
+                GhostButton("Bridge from Sepolia", vm.busy == null, Modifier.weight(1f), Violet) { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(BuildConfigDefaults.BRIDGE))) }
+            }
+            Hint("The test ${a.symbol} the faucet drips was bridged in from Sepolia by the founders — never minted from nothing, so the bridge's own invariant holds.", Faint)
+        }
     }
 }
 
 @Composable
-private fun ReceiveCard(id: String) {
+private fun ReceiveCard(id: String, symbol: String) {
     Panel("Receive", Violet) {
-        Hint("Your account id — share it (or the code) to receive HKN.")
+        Hint("Your account id — share it (or the code) to receive $symbol or any other asset.")
         Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) { Qr(id) }
         Mono(id)
         CopyRow("account id · 64 hex", id)
@@ -292,10 +330,12 @@ private fun ReceiveCard(id: String) {
 private fun SendCard(vm: WalletVm) {
     var to by remember { mutableStateOf("") }
     var amount by remember { mutableStateOf("") }
-    Panel("Send") {
+    val a = vm.selected
+    Panel("Send ${a.symbol}") {
         Field(to, { to = it }, "To — account id (64 hex)", mono = true)
         Field(amount, { amount = it }, "Amount, e.g. 0.25")
-        PrimaryButton("Send", vm.busy == null && to.trim().length == 64 && amount.isNotBlank(), Modifier.fillMaxWidth()) { vm.send(to, amount) }
+        if (!a.isNative) Hint("The network fee comes out of your ${vm.assets.first().symbol} balance, not the ${a.symbol} amount.", Faint)
+        PrimaryButton("Send ${a.symbol}", vm.busy == null && to.trim().length == 64 && amount.isNotBlank(), Modifier.fillMaxWidth()) { vm.send(to, amount) }
     }
 }
 
@@ -310,53 +350,58 @@ private fun ShieldedTab(vm: WalletVm) {
     var memo by remember { mutableStateOf("") }
     var commitment by remember { mutableStateOf("") }
 
-    Panel("Shielded pool", Violet) {
-        Hint("Balances and counterparties in the pool are invisible on-chain; the fee is paid from the transparent balance. Proofs are made on the prover — a shielded operation takes a minute or two.")
-        if (sc != null) {
-            val hidden = sc.notes.filter { !it.spent }.fold(0UL) { acc, n -> acc + n.valueMicro }
-            Row(verticalAlignment = Alignment.Bottom) {
-                Text(vm.formatMicro(hidden), color = Ink, fontSize = 28.sp, fontWeight = FontWeight.ExtraBold, fontFamily = FontFamily.Monospace)
-                Spacer(Modifier.width(8.dp))
-                Text("HKN hidden", color = Violet, fontSize = 13.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 5.dp))
-            }
-            Text("${sc.unspent} unspent note(s) · pool ${sc.poolSize} · one-time spends ${sc.otsUsed}/${sc.otsCapacity}", color = Faint, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+    val a = vm.selected
+    AssetPicker(vm)
+    Panel("Shielded pool · ${a.symbol}", Violet) {
+        if (!a.poolEligible) {
+            Hint("${a.symbol} is not pool-eligible on this chain — it cannot be shielded. Pick another asset above.", Gold)
+        } else {
+            Hint("Balances and counterparties in the ${a.symbol} pool are invisible on-chain; the fee is paid from the transparent ${vm.assets.first().symbol} balance. Proofs are made on the prover — a shielded operation takes a minute or two.")
         }
-        GhostButton(if (sc == null) "Scan the pool" else "Rescan", vm.busy == null, Modifier.fillMaxWidth(), Violet) { vm.scanPool() }
+        val hidden = vm.notes.filter { !it.spent }.fold(0UL) { acc, n -> acc + n.valueMicro }
+        Row(verticalAlignment = Alignment.Bottom) {
+            Text(vm.formatMicro(hidden), color = Ink, fontSize = 28.sp, fontWeight = FontWeight.ExtraBold, fontFamily = FontFamily.Monospace)
+            Spacer(Modifier.width(8.dp))
+            Text("${a.symbol} hidden", color = Violet, fontSize = 13.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 5.dp))
+        }
+        if (sc != null) Text("${sc.unspent} unspent note(s) · pool ${sc.poolSize} · one-time spends ${sc.otsUsed}/${sc.otsCapacity} (shared by every asset)", color = Faint, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+        GhostButton(if (sc == null) "Scan the ${a.symbol} pool" else "Rescan", vm.busy == null && a.poolEligible, Modifier.fillMaxWidth(), Violet) { vm.scanPool() }
     }
 
     if (sc != null) {
         Panel("Receive shielded", Violet) {
-            Hint("Your stealth address for the chain's current epoch — share it to be paid in the pool.")
+            Hint("Your stealth address for the chain's current epoch — share it to be paid in any asset's pool.")
             Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) { Qr(sc.stealthAddress) }
             Mono(sc.stealthAddress)
             CopyRow("stealth address", sc.stealthAddress)
         }
-        if (vm.notes.isNotEmpty()) Panel("Notes", Violet) {
-            vm.notes.forEachIndexed { i, n ->
-                if (i > 0) HorizontalDivider(color = Line)
-                NoteRow(vm, n)
-            }
+    }
+    if (vm.notes.isNotEmpty()) Panel("Notes · ${a.symbol}", Violet) {
+        vm.notes.forEachIndexed { i, n ->
+            if (i > 0) HorizontalDivider(color = Line)
+            NoteRow(vm, n)
         }
     }
 
-    Panel("Shield · unshield") {
+    val can = vm.busy == null && a.poolEligible
+    Panel("Shield · unshield ${a.symbol}") {
         Field(amount, { amount = it }, "Amount")
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            PrimaryButton("Shield", vm.busy == null && amount.isNotBlank(), Modifier.weight(1f)) { vm.shield(amount) }
-            GhostButton("Unshield", vm.busy == null && amount.isNotBlank(), Modifier.weight(1f)) { vm.unshield(amount) }
+            PrimaryButton("Shield", can && amount.isNotBlank(), Modifier.weight(1f)) { vm.shield(amount) }
+            GhostButton("Unshield", can && amount.isNotBlank(), Modifier.weight(1f)) { vm.unshield(amount) }
         }
     }
 
-    Panel("Pay shielded", Violet) {
+    Panel("Pay ${a.symbol} shielded", Violet) {
         Field(payTo, { payTo = it }, "To — hkaddr:…", mono = true)
         Field(payAmount, { payAmount = it }, "Amount")
         Field(memo, { memo = it }, "Memo (sealed to the recipient)")
-        PrimaryButton("Pay shielded", vm.busy == null && payTo.trim().startsWith("hkaddr:") && payAmount.isNotBlank(), Modifier.fillMaxWidth()) { vm.payShielded(payTo, payAmount, memo) }
+        PrimaryButton("Pay shielded", can && payTo.trim().startsWith("hkaddr:") && payAmount.isNotBlank(), Modifier.fillMaxWidth()) { vm.payShielded(payTo, payAmount, memo) }
     }
 
     Panel("Disclose one payment", Gold) {
         Hint("An auditor package for one received note: value, memo and the on-chain commitment, verifiable with hk-node verify-disclosure.")
-        Field(commitment, { commitment = it }, "Commitment (64 hex)", mono = true)
+        Field(commitment, { commitment = it }, "Commitment (64 hex, from the ${a.symbol} pool)", mono = true)
         GhostButton("Build package", vm.busy == null && commitment.trim().length == 64, Modifier.fillMaxWidth(), Gold) { vm.disclose(commitment) }
         vm.lastDisclosure?.let {
             Hint("Package (also saved next to the wallet files):")

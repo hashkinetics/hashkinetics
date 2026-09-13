@@ -89,7 +89,11 @@ Check any line yourself: `hk_getTx {"txid": …}` on `https://rpc.hashkinetics.o
 
 ## Shielding bridged USDC (P6, since height 190,000)
 
-`USDC.sep` is pool-eligible: it can be shielded into its own pool, paid privately and unshielded, exactly like the test asset. From v0.19.1 the CLI wallet binds to the account directory `account-new` made:
+`USDC.sep` is pool-eligible: it can be shielded into its own pool, paid privately and unshielded, exactly like the test asset.
+
+**Without a terminal (P6.2, wallet v0.15.0 / Android v0.3.0):** open the wallet, pick **USDC.sep** in the asset dropdown next to the balance, press **Get test USDC** (5 USDC.sep from the faucet — bridged in by a founder lock, so `supply − burned == vault` still holds) or bring your own across from this page, then use the same three buttons as for test units: **Shield → pool**, **Pay shielded** to an `hkaddr:` address, **Pool → me**. The shielded section shows the USDC.sep pool's notes; switching the dropdown switches pools. The network fee is always paid from the test-unit balance. CLI users can take the same drip from the faucet page ("Get test USDC") or with `POST /drip {"account": "<id>", "asset": "0c3c3f40…"}`.
+
+From v0.19.1 the CLI wallet binds to the account directory `account-new` made:
 
 ```bash
 hk-node wallet init ~/my-wallet ~/my-account https://rpc.hashkinetics.org

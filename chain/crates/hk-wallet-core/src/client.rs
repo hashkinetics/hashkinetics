@@ -1,5 +1,10 @@
 //! HTTP plumbing (blocking, ureq): the node RPC, the faucet and the prover — the same three
 //! calls the desktop wallet makes, parameterised by endpoints instead of env vars.
+//!
+//! P6.2 (2026-09-13): the client knows about ISSUED ASSETS — the registry (`hk_getAssets`:
+//! symbol, decimals, pool-eligibility), an account's balances by asset (`hk_getAccount`),
+//! and a balance in any one asset (`hk_balance`). The native test unit is [`USD`]; it is
+//! never in the registry, so the wallet synthesises its entry.
 
 use std::time::Duration;
 
@@ -10,6 +15,16 @@ use crate::{Endpoints, WalletError};
 
 /// The transparent test unit (32 × 0x09) — the fee asset on testnet-1.
 pub const USD: H256 = H256([9u8; 32]);
+
+/// One entry of the chain's issued-asset registry, as a wallet needs it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssetMeta {
+    pub id: H256,
+    pub symbol: String,
+    pub decimals: u8,
+    pub pool_eligible: bool,
+    pub paused: bool,
+}
 
 pub struct Http {
     pub ep: Endpoints,
@@ -34,8 +49,14 @@ impl Http {
             .map_err(|e| WalletError::msg(format!("rpc parse: {e}")))
     }
 
+    /// The native (fee) balance.
     pub fn balance(&self, id: &H256) -> Result<Amount, WalletError> {
-        let v = self.rpc("hk_balance", json!({ "id": hex::encode(id.0), "asset": hex::encode(USD.0) }))?;
+        self.balance_of(id, &USD)
+    }
+
+    /// P6.2: the balance in ANY asset (the chain answers 0 for an asset never held).
+    pub fn balance_of(&self, id: &H256, asset: &H256) -> Result<Amount, WalletError> {
+        let v = self.rpc("hk_balance", json!({ "id": hex::encode(id.0), "asset": hex::encode(asset.0) }))?;
         Ok(v.get("result")
             .and_then(|r| r.get("amount"))
             .and_then(|a| a.as_str())
@@ -52,6 +73,53 @@ impl Http {
         } else {
             Ok(None)
         }
+    }
+
+    /// P6.2: every transparent balance this account holds — `(asset, symbol, amount)` from
+    /// `hk_getAccount.balances[]` (X1). Empty when the account is not on-chain.
+    pub fn account_balances(&self, id: &H256) -> Result<Vec<(H256, Option<String>, Amount)>, WalletError> {
+        let v = self.rpc("hk_getAccount", json!({ "id": hex::encode(id.0) }))?;
+        let r = v.get("result").ok_or_else(|| WalletError::msg("rpc: no result"))?;
+        if !r.get("found").and_then(|f| f.as_bool()).unwrap_or(false) {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        if let Some(arr) = r.get("balances").and_then(|b| b.as_array()) {
+            for b in arr {
+                let asset = match b.get("asset").and_then(|a| a.as_str()).and_then(|s| hex::decode(s).ok()) {
+                    Some(raw) if raw.len() == 32 => H256(raw.try_into().unwrap()),
+                    _ => continue,
+                };
+                let symbol = b.get("symbol").and_then(|s| s.as_str()).map(str::to_string);
+                let amount: Amount = b.get("amount").and_then(|a| a.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0);
+                out.push((asset, symbol, amount));
+            }
+        }
+        Ok(out)
+    }
+
+    /// P6.2: the issued-asset registry (`hk_getAssets`). The native unit is NOT in it.
+    pub fn assets(&self) -> Result<Vec<AssetMeta>, WalletError> {
+        let v = self.rpc("hk_getAssets", json!({}))?;
+        let r = v.get("result").ok_or_else(|| WalletError::msg(format!("hk_getAssets: {v}")))?;
+        let mut out = Vec::new();
+        if let Some(arr) = r.get("assets").and_then(|a| a.as_array()) {
+            for a in arr {
+                let id = match a.get("asset").and_then(|x| x.as_str()).and_then(|s| hex::decode(s).ok()) {
+                    Some(raw) if raw.len() == 32 => H256(raw.try_into().unwrap()),
+                    _ => continue,
+                };
+                out.push(AssetMeta {
+                    id,
+                    symbol: a.get("symbol").and_then(|s| s.as_str()).unwrap_or("?").to_string(),
+                    decimals: a.get("decimals").and_then(|d| d.as_u64()).unwrap_or(6).min(18) as u8,
+                    pool_eligible: a.get("policy").and_then(|p| p.get("pool_eligible")).and_then(|b| b.as_bool()).unwrap_or(false),
+                    paused: a.get("paused").and_then(|b| b.as_bool()).unwrap_or(false),
+                });
+            }
+        }
+        out.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+        Ok(out)
     }
 
     pub fn receipt(&self, txid: &str) -> Option<String> {

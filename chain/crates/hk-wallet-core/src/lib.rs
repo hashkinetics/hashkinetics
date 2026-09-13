@@ -18,6 +18,13 @@
 //! Mobile specifics: a caller-chosen KDF profile (`set_mobile_kdf`), an app-supplied key-file
 //! second factor (`set_keyfile` — Android Keystore bytes), amounts as `u64` micro-units on the
 //! FFI (UniFFI has no u128; 2^64 micro is 18 trillion units — enough).
+//!
+//! P6.2 (2026-09-13, core v0.2.0): ISSUED ASSETS. The wallet lists the chain's assets
+//! (`assets()`), shows every balance the account holds (`Status.balances`), and every money
+//! operation exists in an `_asset` form that names the asset by id: transparent send, faucet
+//! drip, shield / unshield / shielded pay / scan / notes / disclose — each shielded operation
+//! acting in that asset's own pool (P6). The un-suffixed methods keep doing exactly what they
+//! did: the native test unit. The network fee is always paid in the native unit.
 
 #![allow(clippy::new_without_default)]
 
@@ -34,19 +41,25 @@ use hk_primitives::{Amount, H256};
 use hk_state::tx::Tx;
 use serde_json::json;
 
-use crate::account::{commit_at, fmt_amount, parse_amount, parse_h256, sign_tx, AccountFile};
-use crate::client::{Http, USD};
+use crate::account::{commit_at, fmt_amount, fmt_amount_dec, parse_amount, parse_amount_dec, parse_h256, sign_tx, AccountFile};
+use crate::client::{AssetMeta, Http, USD};
 use crate::vault::{mobile_profile, write_atomic, Vault};
 
 uniffi::setup_scaffolding!();
 
 /// Bumped with every core release; the app shows it next to its own version.
-pub const CORE_VERSION: &str = "v0.1.0";
+pub const CORE_VERSION: &str = "v0.2.0";
 
 pub const RPC_DEFAULT: &str = "https://rpc.hashkinetics.org";
 pub const FAUCET_DEFAULT: &str = "https://faucet.hashkinetics.org";
 pub const PROVER_DEFAULT: &str = "https://prover.hashkinetics.org";
 pub const EXPLORER_DEFAULT: &str = "https://www.hashkinetics.org/explorer/";
+
+/// What the native unit is called on screens (the chain's unit; on testnet-1 it is a test unit
+/// with no monetary value). It has no registry entry (it is the fee asset, 32 × 0x09) and six
+/// decimals like everything else on testnet-1.
+pub const NATIVE_SYMBOL: &str = "HKN";
+pub const NATIVE_DECIMALS: u8 = 6;
 
 // ---------------------------------------------------------------------------
 // FFI types
@@ -106,19 +119,43 @@ pub struct WalletState {
     pub core_version: String,
 }
 
+/// P6.2: one asset as the screens need it. `id` is the 64-hex asset id the chain uses;
+/// the native unit's id is the fee asset and `is_native` is true for it alone.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct AssetInfo {
+    pub id: String,
+    pub symbol: String,
+    pub decimals: u8,
+    /// May be shielded into its own pool (P6).
+    pub pool_eligible: bool,
+    pub is_native: bool,
+    /// The issuer has paused every move of this asset.
+    pub paused: bool,
+}
+
+/// P6.2: one transparent balance, in the asset's base units.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct AssetBalance {
+    pub asset: AssetInfo,
+    pub balance_micro: u64,
+}
+
 /// One refresh: chain + this account.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct Status {
     pub chain_id: String,
     pub height: u64,
     pub node_version: String,
-    /// The fee charged on a transaction sent now (micro).
+    /// The fee charged on a transaction sent now (micro, native unit).
     pub fee_micro: u64,
     pub on_chain: bool,
+    /// The NATIVE balance (micro) — what the fee is paid from.
     pub balance_micro: u64,
     pub account_id: String,
-    /// "max sendable" = balance − fee (0 when nothing is sendable).
+    /// "max sendable" = native balance − fee (0 when nothing is sendable).
     pub max_sendable_micro: u64,
+    /// P6.2: every balance this account holds, the native unit first (present even at 0).
+    pub balances: Vec<AssetBalance>,
 }
 
 /// A committed transaction.
@@ -149,17 +186,42 @@ pub struct ScanResult {
     pub fresh_entries: u64,
     pub pool_size: u64,
     pub unspent: u32,
-    /// Our receiving address for the chain's current epoch (`hkaddr:…`).
+    /// Our receiving address for the chain's current epoch (`hkaddr:…`) — one for every pool.
     pub stealth_address: String,
-    /// One-time spend leaves used / capacity (64 per shield master).
+    /// One-time spend leaves used / capacity (64 per shield master) — shared by every pool.
     pub ots_used: u32,
     pub ots_capacity: u32,
+    /// P6.2: the asset whose pool was scanned (64-hex).
+    pub asset: String,
 }
 
 /// Progress lines for the ACTIVITY panel. `level`: "info" | "ok" | "error".
 #[uniffi::export(callback_interface)]
 pub trait Progress: Send + Sync {
     fn on_log(&self, level: String, line: String, link: Option<String>);
+}
+
+/// The asset an operation acts in — id plus what the messages need. Built once per call from
+/// the registry (native: synthesised, no network).
+#[derive(Clone, Debug)]
+pub(crate) struct AssetCtx {
+    pub id: H256,
+    pub symbol: String,
+    pub decimals: u8,
+}
+
+impl AssetCtx {
+    pub fn fmt(&self, base: Amount) -> String {
+        fmt_amount_dec(base, self.decimals)
+    }
+}
+
+fn native_info() -> AssetInfo {
+    AssetInfo { id: hex::encode(USD.0), symbol: NATIVE_SYMBOL.into(), decimals: NATIVE_DECIMALS, pool_eligible: true, is_native: true, paused: false }
+}
+
+fn meta_info(m: &AssetMeta) -> AssetInfo {
+    AssetInfo { id: hex::encode(m.id.0), symbol: m.symbol.clone(), decimals: m.decimals, pool_eligible: m.pool_eligible, is_native: false, paused: m.paused }
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +234,8 @@ pub struct Wallet {
     endpoints: Mutex<Endpoints>,
     vault: Mutex<Vault>,
     listener: Mutex<Option<Box<dyn Progress>>>,
+    /// P6.2: the registry as last read (symbols/decimals for messages without a round trip).
+    assets: Mutex<Vec<AssetMeta>>,
 }
 
 #[uniffi::export]
@@ -184,6 +248,7 @@ impl Wallet {
             endpoints: Mutex::new(endpoints.unwrap_or_default()),
             vault: Mutex::new(Vault::default()),
             listener: Mutex::new(None),
+            assets: Mutex::new(Vec::new()),
         })
     }
 
@@ -363,21 +428,80 @@ impl Wallet {
         Ok(self.require_account()?.id)
     }
 
+    /// The auth commitment at ratchet 0 — what the web faucet asks a new account for.
+    pub fn auth_commit(&self) -> Result<String, WalletError> {
+        let a = self.require_account()?;
+        Ok(hex::encode(commit_at(&a.seed_bytes()?, 0).0))
+    }
+
+    // ---- assets (P6.2) ----
+
+    /// The native unit — always first in every list, never in the chain's registry.
+    pub fn native_asset(&self) -> AssetInfo {
+        native_info()
+    }
+
+    /// Every asset the wallet can act in: the native unit, then the chain's registry
+    /// (`hk_getAssets`), sorted by symbol. One RPC; the result is cached for messages.
+    pub fn assets(&self) -> Result<Vec<AssetInfo>, WalletError> {
+        let metas = self.http().assets()?;
+        let mut out = vec![native_info()];
+        out.extend(metas.iter().map(meta_info));
+        *self.assets.lock().unwrap_or_else(|e| e.into_inner()) = metas;
+        Ok(out)
+    }
+
+    /// Look one asset up by id (64-hex) — from the cache, then the chain.
+    pub fn asset_info(&self, asset_hex: String) -> Result<AssetInfo, WalletError> {
+        let id = parse_h256(&asset_hex)?;
+        let c = self.asset_ctx(&id)?;
+        Ok(self.ctx_info(&c))
+    }
+
+    /// "0.25" → base units for an asset with `decimals` decimals.
+    pub fn parse_amount_dec(&self, text: String, decimals: u8) -> Option<u64> {
+        parse_amount_dec(&text, decimals).map(clamp_u64)
+    }
+
+    pub fn format_amount_dec(&self, base: u64, decimals: u8) -> String {
+        fmt_amount_dec(base as Amount, decimals)
+    }
+
     // ---- transparent journey ----
 
-    /// Chain + account snapshot (fee policy, on-chain status, balance).
+    /// Chain + account snapshot (fee policy, on-chain status, every balance).
     pub fn refresh(&self) -> Result<Status, WalletError> {
         let http = self.http();
         let a = self.require_account()?;
         let id = a.id_h256()?;
         let ci = http.chain_info()?;
         let fee = ci.fee_now();
-        let (on_chain, balance) = match http.nonce(&id)? {
-            Some(_) => (true, http.balance(&id)?),
-            None => (false, 0),
+        let (on_chain, balance, held) = match http.nonce(&id)? {
+            Some(_) => (true, http.balance(&id)?, http.account_balances(&id)?),
+            None => (false, 0, Vec::new()),
         };
         if !on_chain {
             self.log("info", "Not on-chain yet — tap “Get test funds” to be created + funded.", None);
+        }
+        // P6.2: the native balance first (even at 0), then every issued asset held, with the
+        // registry's symbol/decimals (one RPC, cached) — unknown ids still show, by id.
+        let mut balances = vec![AssetBalance { asset: native_info(), balance_micro: clamp_u64(balance) }];
+        if held.iter().any(|(asset, _, _)| *asset != USD) {
+            let metas = self.registry(&http);
+            for (asset, symbol, amount) in held {
+                if asset == USD {
+                    continue;
+                }
+                let info = metas.iter().find(|m| m.id == asset).map(meta_info).unwrap_or_else(|| AssetInfo {
+                    id: hex::encode(asset.0),
+                    symbol: symbol.unwrap_or_else(|| format!("{}…", &hex::encode(asset.0)[..8])),
+                    decimals: 6,
+                    pool_eligible: false,
+                    is_native: false,
+                    paused: false,
+                });
+                balances.push(AssetBalance { asset: info, balance_micro: clamp_u64(amount) });
+            }
         }
         Ok(Status {
             chain_id: ci.chain_id,
@@ -388,61 +512,40 @@ impl Wallet {
             balance_micro: clamp_u64(balance),
             account_id: a.id,
             max_sendable_micro: clamp_u64(balance.saturating_sub(fee)),
+            balances,
         })
     }
 
     /// Faucet: create+fund if new (auth commit at ratchet 0), top-up if existing.
     pub fn faucet(&self) -> Result<TxResult, WalletError> {
-        let http = self.http();
-        let a = self.require_account()?;
-        let id = a.id_h256()?;
-        let seed = a.seed_bytes()?;
-        self.log("info", "Requesting test funds…", None);
-        let body = match http.nonce(&id)? {
-            Some(_) => json!({ "account": hex::encode(id.0) }),
-            None => json!({ "auth_commit": hex::encode(commit_at(&seed, 0).0) }),
-        };
-        let v = http.faucet_post(body)?;
-        if v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
-            let amt = v.get("amount_micro").map(|a| a.to_string()).unwrap_or_default();
-            let txid = v.get("txid").and_then(|t| t.as_str()).unwrap_or("?").to_string();
-            let summary = format!("Faucet dripped {amt} micro");
-            self.log("ok", format!("{summary} — tx {}…", short(&txid)), Some(self.explorer_tx(&txid)));
-            // Give the chain a couple of blocks before the app refreshes.
-            std::thread::sleep(Duration::from_secs(3));
-            Ok(TxResult { explorer_url: self.explorer_tx(&txid), txid, receipt: "ok".into(), summary })
-        } else {
-            let err = v.get("error").and_then(|e| e.as_str()).unwrap_or("faucet refused").to_string();
-            let retry = v
-                .get("retry_after_secs")
-                .and_then(|r| r.as_u64())
-                .map(|s| format!(" (retry in ~{}h{:02}m)", s / 3600, (s % 3600) / 60))
-                .unwrap_or_default();
-            Err(WalletError::msg(format!("{err}{retry}")))
-        }
+        self.do_faucet(None)
     }
 
-    /// Transparent payment: fee check → chain-nonce sync → reserve-then-sign → submit → receipt.
+    /// P6.2: a drip of an issued asset (e.g. USDC.sep) from the same faucet. An account that
+    /// is not on-chain yet is created + funded with the native drip first — the asset drip is
+    /// an ordinary transfer and needs an existing account to land in.
+    pub fn faucet_asset(&self, asset_hex: String) -> Result<TxResult, WalletError> {
+        let id = parse_h256(&asset_hex)?;
+        if id == USD {
+            return self.do_faucet(None);
+        }
+        let a = self.require_account()?;
+        if self.http().nonce(&a.id_h256()?)?.is_none() {
+            self.log("info", "Not on-chain yet — taking the native drip first so the account exists.", None);
+            self.do_faucet(None)?;
+        }
+        self.do_faucet(Some(id))
+    }
+
+    /// Transparent payment in the native unit: fee check → chain-nonce sync → reserve-then-sign → submit → receipt.
     pub fn send(&self, to_hex: String, amount_micro: u64) -> Result<TxResult, WalletError> {
-        let http = self.http();
-        let (seed, id) = self.signer()?;
-        let to = parse_h256(&to_hex)?;
-        let amount = amount_micro as Amount;
-        if amount == 0 {
-            return Err(WalletError::msg("amount must be above zero"));
-        }
-        let fee = http.chain_info()?.fee_now();
-        let bal = http.balance(&id)?;
-        if fee > 0 && amount.saturating_add(fee) > bal {
-            return Err(WalletError::msg(format!(
-                "Not enough for amount + network fee ({}). Balance {} → max sendable {}.",
-                fmt_amount(fee),
-                fmt_amount(bal),
-                fmt_amount(bal.saturating_sub(fee))
-            )));
-        }
-        self.log("info", format!("Sending {} to {}…", fmt_amount(amount), &to_hex.trim()[..12.min(to_hex.trim().len())]), None);
-        self.send_payload(&http, &seed, id, Tx::Transfer { to, asset: USD, amount }, "Paid ✓")
+        self.do_send(to_hex, amount_micro, &self.native_ctx())
+    }
+
+    /// P6.2: the same payment in any asset; the fee is still paid in the native unit.
+    pub fn send_asset(&self, to_hex: String, amount_micro: u64, asset_hex: String) -> Result<TxResult, WalletError> {
+        let ctx = self.asset_ctx(&parse_h256(&asset_hex)?)?;
+        self.do_send(to_hex, amount_micro, &ctx)
     }
 
     /// "0.25" → micro-units (the app validates input with this).
@@ -467,29 +570,58 @@ impl Wallet {
     }
 
     pub fn scan(&self) -> Result<ScanResult, WalletError> {
-        self.do_scan()
+        self.do_scan(&self.native_ctx())
+    }
+
+    pub fn scan_asset(&self, asset_hex: String) -> Result<ScanResult, WalletError> {
+        let ctx = self.asset_ctx(&parse_h256(&asset_hex)?)?;
+        self.do_scan(&ctx)
     }
 
     /// The notes from the last scan, without touching the network.
     pub fn notes(&self) -> Result<Vec<NoteView>, WalletError> {
-        self.cached_notes()
+        self.cached_notes(&USD)
+    }
+
+    pub fn notes_asset(&self, asset_hex: String) -> Result<Vec<NoteView>, WalletError> {
+        self.cached_notes(&parse_h256(&asset_hex)?)
     }
 
     pub fn shield(&self, amount_micro: u64) -> Result<TxResult, WalletError> {
-        self.do_shield(amount_micro as Amount)
+        self.do_shield(amount_micro as Amount, &self.native_ctx())
+    }
+
+    pub fn shield_asset(&self, amount_micro: u64, asset_hex: String) -> Result<TxResult, WalletError> {
+        let ctx = self.asset_ctx(&parse_h256(&asset_hex)?)?;
+        self.do_shield(amount_micro as Amount, &ctx)
     }
 
     pub fn unshield(&self, amount_micro: u64) -> Result<TxResult, WalletError> {
-        self.do_unshield(amount_micro as Amount)
+        self.do_unshield(amount_micro as Amount, &self.native_ctx())
+    }
+
+    pub fn unshield_asset(&self, amount_micro: u64, asset_hex: String) -> Result<TxResult, WalletError> {
+        let ctx = self.asset_ctx(&parse_h256(&asset_hex)?)?;
+        self.do_unshield(amount_micro as Amount, &ctx)
     }
 
     pub fn pay_shielded(&self, to_address: String, amount_micro: u64, memo: String) -> Result<TxResult, WalletError> {
-        self.do_pay(&to_address, amount_micro as Amount, &memo)
+        self.do_pay(&to_address, amount_micro as Amount, &memo, &self.native_ctx())
+    }
+
+    pub fn pay_shielded_asset(&self, to_address: String, amount_micro: u64, memo: String, asset_hex: String) -> Result<TxResult, WalletError> {
+        let ctx = self.asset_ctx(&parse_h256(&asset_hex)?)?;
+        self.do_pay(&to_address, amount_micro as Amount, &memo, &ctx)
     }
 
     /// Returns the disclosure package JSON (also written next to the wallet files).
     pub fn disclose(&self, commitment_hex: String) -> Result<String, WalletError> {
-        self.do_disclose(&commitment_hex)
+        self.do_disclose(&commitment_hex, &self.native_ctx())
+    }
+
+    pub fn disclose_asset(&self, commitment_hex: String, asset_hex: String) -> Result<String, WalletError> {
+        let ctx = self.asset_ctx(&parse_h256(&asset_hex)?)?;
+        self.do_disclose(&commitment_hex, &ctx)
     }
 }
 
@@ -526,6 +658,61 @@ impl Wallet {
 
     pub(crate) fn log_info(&self, line: impl Into<String>) {
         self.log("info", line, None);
+    }
+
+    fn native_ctx(&self) -> AssetCtx {
+        AssetCtx { id: USD, symbol: NATIVE_SYMBOL.into(), decimals: NATIVE_DECIMALS }
+    }
+
+    fn ctx_info(&self, c: &AssetCtx) -> AssetInfo {
+        if c.id == USD {
+            return native_info();
+        }
+        let cache = self.assets.lock().unwrap_or_else(|e| e.into_inner());
+        cache.iter().find(|m| m.id == c.id).map(meta_info).unwrap_or(AssetInfo {
+            id: hex::encode(c.id.0),
+            symbol: c.symbol.clone(),
+            decimals: c.decimals,
+            pool_eligible: false,
+            is_native: false,
+            paused: false,
+        })
+    }
+
+    /// The registry, from the cache when it has the asset, else re-read from the chain.
+    fn registry(&self, http: &Http) -> Vec<AssetMeta> {
+        let cached = self.assets.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if !cached.is_empty() {
+            return cached;
+        }
+        match http.assets() {
+            Ok(m) => {
+                *self.assets.lock().unwrap_or_else(|e| e.into_inner()) = m.clone();
+                m
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// The context for an asset id: native without a round trip; issued assets from the
+    /// registry (cached, re-read once on a miss). An id the chain does not know is refused —
+    /// sending to a made-up asset would be refused by the chain, at the cost of a ratchet index.
+    pub(crate) fn asset_ctx(&self, id: &H256) -> Result<AssetCtx, WalletError> {
+        if *id == USD {
+            return Ok(self.native_ctx());
+        }
+        let http = self.http();
+        let find = |metas: &[AssetMeta]| metas.iter().find(|m| m.id == *id).cloned();
+        let hit = find(&self.assets.lock().unwrap_or_else(|e| e.into_inner()));
+        let meta = match hit {
+            Some(m) => m,
+            None => {
+                let fresh = http.assets()?;
+                *self.assets.lock().unwrap_or_else(|e| e.into_inner()) = fresh.clone();
+                find(&fresh).ok_or_else(|| WalletError::msg(format!("asset {}… is not registered on this chain", &hex::encode(id.0)[..8])))?
+            }
+        };
+        Ok(AssetCtx { id: meta.id, symbol: meta.symbol, decimals: meta.decimals })
     }
 
     /// `Ok(Some)` plain or opened; `Ok(None)` sealed and locked.
@@ -595,6 +782,92 @@ impl Wallet {
         Ok(n)
     }
 
+    /// The faucet call: native (`asset = None`) or an issued asset. The server answers the
+    /// same shape for both; the asset drip is refused for an account that does not exist.
+    fn do_faucet(&self, asset: Option<H256>) -> Result<TxResult, WalletError> {
+        let http = self.http();
+        let a = self.require_account()?;
+        let id = a.id_h256()?;
+        let seed = a.seed_bytes()?;
+        let what = match asset {
+            Some(x) => self.asset_ctx(&x).map(|c| c.symbol).unwrap_or_else(|_| "asset".into()),
+            None => "test funds".into(),
+        };
+        self.log("info", format!("Requesting {what}…"), None);
+        let mut body = match http.nonce(&id)? {
+            Some(_) => json!({ "account": hex::encode(id.0) }),
+            None => json!({ "auth_commit": hex::encode(commit_at(&seed, 0).0) }),
+        };
+        if let Some(x) = asset {
+            body["asset"] = json!(hex::encode(x.0));
+        }
+        let v = http.faucet_post(body)?;
+        if v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
+            let amt = v.get("amount_micro").map(|a| a.to_string()).unwrap_or_default();
+            let txid = v.get("txid").and_then(|t| t.as_str()).unwrap_or("?").to_string();
+            // Name what actually landed: a P6.2 faucet echoes the asset it dripped; an older
+            // faucet ignores the `asset` field and drips the native unit — say so, do not
+            // label a native drip with the asset the user asked for (seen 2026-09-13).
+            let got = v.get("asset").and_then(|a| a.as_str()).map(|s| s.to_ascii_lowercase());
+            let label = match (asset, got) {
+                (Some(x), Some(g)) if g == hex::encode(x.0) => what.clone(),
+                (Some(_), _) => format!("test funds — this faucet does not serve {what} yet (it dripped the native unit)"),
+                (None, _) => what.clone(),
+            };
+            let summary = format!("Faucet dripped {amt} base units of {label}");
+            self.log("ok", format!("{summary} — tx {}…", short(&txid)), Some(self.explorer_tx(&txid)));
+            // Give the chain a couple of blocks before the app refreshes.
+            std::thread::sleep(Duration::from_secs(3));
+            Ok(TxResult { explorer_url: self.explorer_tx(&txid), txid, receipt: "ok".into(), summary })
+        } else {
+            let err = v.get("error").and_then(|e| e.as_str()).unwrap_or("faucet refused").to_string();
+            let retry = v
+                .get("retry_after_secs")
+                .and_then(|r| r.as_u64())
+                .map(|s| format!(" (retry in ~{}h{:02}m)", s / 3600, (s % 3600) / 60))
+                .unwrap_or_default();
+            Err(WalletError::msg(format!("{err}{retry}")))
+        }
+    }
+
+    /// Transparent payment in `asset`: fee check (native) + balance check (asset) →
+    /// chain-nonce sync → reserve-then-sign → submit → receipt.
+    fn do_send(&self, to_hex: String, amount_micro: u64, a: &AssetCtx) -> Result<TxResult, WalletError> {
+        let http = self.http();
+        let (seed, id) = self.signer()?;
+        let to = parse_h256(&to_hex)?;
+        let amount = amount_micro as Amount;
+        if amount == 0 {
+            return Err(WalletError::msg("amount must be above zero"));
+        }
+        let fee = http.chain_info()?.fee_now();
+        let native = http.balance(&id)?;
+        if a.id == USD {
+            if fee > 0 && amount.saturating_add(fee) > native {
+                return Err(WalletError::msg(format!(
+                    "Not enough for amount + network fee ({}). Balance {} → max sendable {}.",
+                    fmt_amount(fee),
+                    fmt_amount(native),
+                    fmt_amount(native.saturating_sub(fee))
+                )));
+            }
+        } else {
+            if native < fee {
+                return Err(WalletError::msg(format!(
+                    "The network fee ({} {NATIVE_SYMBOL}) is paid from your native balance, which is {} — get test funds first.",
+                    fmt_amount(fee),
+                    fmt_amount(native)
+                )));
+            }
+            let bal = http.balance_of(&id, &a.id)?;
+            if amount > bal {
+                return Err(WalletError::msg(format!("Not enough {}: sending {} but the balance is {}.", a.symbol, a.fmt(amount), a.fmt(bal))));
+            }
+        }
+        self.log("info", format!("Sending {} {} to {}…", a.fmt(amount), a.symbol, &to_hex.trim()[..12.min(to_hex.trim().len())]), None);
+        self.send_payload(&http, &seed, id, Tx::Transfer { to, asset: a.id, amount }, &format!("Paid {} {} ✓", a.fmt(amount), a.symbol))
+    }
+
     /// The one way this wallet puts a transaction on the chain — shared by the transparent
     /// send and every shielded operation: chain-nonce sync → RESERVE-THEN-SIGN → submit →
     /// receipt, with the nonce rolled back (and persisted) only on a definitive refusal.
@@ -642,7 +915,7 @@ impl Wallet {
                 if r.starts_with("rejected") {
                     rollback(&mut file);
                     let why = if r.contains("protocol fee") {
-                        "the network fee could not be paid — keep a little transparent balance back for it".to_string()
+                        "the network fee could not be paid — keep a little native balance back for it".to_string()
                     } else {
                         r.clone()
                     };
@@ -696,6 +969,7 @@ mod tests {
         let w2 = Wallet::new(dir2.to_string_lossy().to_string(), None);
         assert_eq!(w2.restore(seed).unwrap(), id);
         assert!(w2.restore("00".repeat(32)).is_err());
+        assert_eq!(w.auth_commit().unwrap().len(), 64);
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(dir2);
     }
@@ -763,6 +1037,22 @@ mod tests {
         assert_eq!(w.endpoints().rpc, "http://127.0.0.1:26000");
     }
 
+    #[test]
+    fn p62_native_asset_needs_no_network_and_is_first() {
+        let w = Wallet::new(tmp_dir("native").to_string_lossy().to_string(), None);
+        let n = w.native_asset();
+        assert!(n.is_native && n.pool_eligible && n.decimals == 6 && n.symbol == NATIVE_SYMBOL);
+        assert_eq!(n.id, hex::encode(USD.0));
+        // The native id resolves without a round trip (no endpoints reachable in a unit test).
+        w.set_endpoints(Endpoints { rpc: "http://127.0.0.1:1".into(), ..Endpoints::default() });
+        assert_eq!(w.asset_info(n.id.clone()).unwrap(), n);
+        // An issued asset the chain cannot be asked about is refused, not guessed.
+        assert!(w.asset_info("11".repeat(32)).is_err());
+        assert!(w.asset_info("zz".into()).is_err());
+        assert_eq!(w.parse_amount_dec("1.5".into(), 2), Some(150));
+        assert_eq!(w.format_amount_dec(150, 2), "1.50");
+    }
+
     /// The whole journey against a devnet + faucet + prover (gate-wa1.sh sets the env):
     /// HK_CORE_RPC, HK_CORE_FAUCET, HK_CORE_PROVER; HK_CORE_DIR keeps the wallet directory
     /// (and leaves the passphrase in `.gate-passphrase`) so the gate can open the files the
@@ -799,6 +1089,7 @@ mod tests {
         assert_eq!(drip.txid.len(), 64);
         let st = w.refresh().unwrap();
         assert!(st.on_chain && st.balance_micro > 0, "after the drip: {st:?}");
+        assert!(st.balances[0].asset.is_native && st.balances[0].balance_micro == st.balance_micro);
         let bal0 = st.balance_micro;
         // 2) transparent send to a fresh account of ours (created by the transfer? no — to a
         //    known id: pay ourselves is refused? send to a second wallet's id (not on-chain)
@@ -844,5 +1135,69 @@ mod tests {
                 let _ = std::fs::remove_dir_all(dir);
             }
         }
+    }
+
+    /// P6.2: the same journey in an ISSUED asset (gate-p6-2.sh sets HK_CORE_ASSET to an asset
+    /// the faucet drips — a devnet `USDC.t`). Ignored without the env.
+    #[test]
+    #[ignore]
+    fn p62_devnet_asset_journey() {
+        let rpc = std::env::var("HK_CORE_RPC").expect("HK_CORE_RPC");
+        let faucet = std::env::var("HK_CORE_FAUCET").expect("HK_CORE_FAUCET");
+        let prover = std::env::var("HK_CORE_PROVER").expect("HK_CORE_PROVER");
+        let asset = std::env::var("HK_CORE_ASSET").expect("HK_CORE_ASSET (64-hex)");
+        let dir = tmp_dir("asset-journey");
+        let w = Wallet::new(dir.to_string_lossy().to_string(), Some(Endpoints { rpc, faucet, prover, explorer: EXPLORER_DEFAULT.into() }));
+        struct Print;
+        impl Progress for Print {
+            fn on_log(&self, level: String, line: String, _link: Option<String>) {
+                eprintln!("  [{level}] {line}");
+            }
+        }
+        w.set_listener(Box::new(Print));
+        let id = w.create().unwrap();
+        // The registry knows the asset; the native unit is listed first.
+        let list = w.assets().unwrap();
+        assert!(list[0].is_native);
+        let info = list.iter().find(|a| a.id == asset).expect("asset registered").clone();
+        assert!(info.pool_eligible, "the gate's asset must be pool-eligible: {info:?}");
+        // 1) the asset drip on a NOT-YET-ON-CHAIN wallet: native drip first, then the asset.
+        let d = w.faucet_asset(asset.clone()).unwrap();
+        assert_eq!(d.txid.len(), 64);
+        let st = w.refresh().unwrap();
+        assert!(st.on_chain && st.balance_micro > 0, "native drip landed: {st:?}");
+        let held = st.balances.iter().find(|b| b.asset.id == asset).expect("asset balance shown");
+        assert!(held.balance_micro > 0, "asset drip landed: {st:?}");
+        let a0 = held.balance_micro;
+        // 2) transparent send of the asset (self-transfer), fee in the native unit.
+        let r = w.send_asset(id.clone(), 1_000, asset.clone()).unwrap();
+        assert_eq!(r.txid.len(), 64);
+        let st = w.refresh().unwrap();
+        let held = st.balances.iter().find(|b| b.asset.id == asset).unwrap();
+        assert_eq!(held.balance_micro, a0, "a self-transfer moves nothing in the asset: {st:?}");
+        // 3) shield into the asset's own pool; the NATIVE pool stays empty.
+        let s = w.shield_asset(50_000, asset.clone()).unwrap();
+        assert_eq!(s.txid.len(), 64);
+        let sc = w.scan_asset(asset.clone()).unwrap();
+        assert_eq!(sc.asset, asset);
+        assert!(sc.notes.iter().any(|n| n.value_micro == 50_000 && !n.spent), "asset scan: {sc:?}");
+        let native = w.scan().unwrap();
+        assert!(native.notes.is_empty(), "notes must not leak across pools: {native:?}");
+        // 4) unshield part, pay the rest to ourselves in the same pool, disclose it.
+        let u = w.unshield_asset(20_000, asset.clone()).unwrap();
+        assert_eq!(u.txid.len(), 64);
+        let sc = w.scan_asset(asset.clone()).unwrap();
+        assert!(sc.notes.iter().any(|n| n.value_micro == 30_000 && !n.spent), "change: {sc:?}");
+        let p = w.pay_shielded_asset(sc.stealth_address.clone(), 10_000, "asset memo".into(), asset.clone()).unwrap();
+        assert_eq!(p.txid.len(), 64);
+        let sc = w.scan_asset(asset.clone()).unwrap();
+        let paid = sc.notes.iter().find(|n| n.value_micro == 10_000 && n.memo == "asset memo").expect("paid note");
+        let pkg = w.disclose_asset(paid.commitment.clone(), asset.clone()).unwrap();
+        assert!(pkg.contains("\"asset\""), "the package names its pool: {pkg}");
+        assert_eq!(sc.ots_used, 2, "leaves are shared across pools");
+        // 5) cached notes per pool, and the file still opens.
+        assert!(!w.notes_asset(asset).unwrap().is_empty());
+        assert!(w.notes().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

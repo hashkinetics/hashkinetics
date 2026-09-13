@@ -3459,16 +3459,8 @@ name = "hk-wallet-gui"
 version = "0.0.1"
 dependencies = [
  "eframe",
- "hex",
- "hk-crypto",
- "hk-primitives",
- "hk-spend-circuit",
- "hk-state",
  "hk-wallet",
- "rand 0.8.7",
- "serde",
- "serde_json",
- "ureq",
+ "hk-wallet-core",
 ]
 
 [[package]]

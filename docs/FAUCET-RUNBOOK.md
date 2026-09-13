@@ -88,6 +88,19 @@ curl -s https://faucet.hashkinetics.org/health | grep -o '"low":[a-z]*'
 ```
 Post the txid in `#receipts` — a refill is a public event on a public chain anyway.
 
+## 5b · The test-USDC float (P6.2, 2026-09-13)
+
+The faucet also drips an issued asset — `--drip-asset <asset-hex>:<base units>` on `faucet-serve`
+(on testnet-1: `USDC.sep`, 5 USDC.sep per drip). That float is **never minted**: `USDC.sep`'s
+`supply − burned` must equal the vault's Sepolia USDC (the bridge page checks it live), so the
+float is **bridged in** — a founder locks Sepolia USDC on `hashkinetics.org/bridge` naming the
+faucet's hot account, and after finality the bridge mints the float to it like any other deposit.
+The refill signal is `/health.assets[].low` (under 10 drips) and the human number is
+`drips_left`; the refill is another lock naming the same account (the vault's daily cap is
+1,000 USDC). An asset drip needs the account to exist (the native drip creates it), is keyed
+per (address, asset) for the cooldown, and is refused with 503 when the float is under one
+drip — the native drip keeps working. Nothing about the cold treasury changes.
+
 ## 6 · Rotating the hot account
 
 If the faucet host is ever suspected compromised: make a new hot account (§2), fund it

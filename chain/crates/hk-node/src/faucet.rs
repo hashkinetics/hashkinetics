@@ -27,6 +27,13 @@
 //!   `drips_left`; below `HK_FAUCET_RESERVE_MICRO` (default 2 drips) it refuses with 503
 //!   instead of burning a ratchet index on a doomed transfer. Its `account.json` can be
 //!   sealed (`hk-node account-seal DIR`; passphrase via `LoadCredential=hk-wallet-passphrase`).
+//! - P6.2 (2026-09-13) ISSUED-ASSET DRIPS: `--drip-asset <64-hex>:<MICRO>` (repeatable) lets the
+//!   same hot account drip an issued asset — `POST /drip {"account": …, "asset": "<hex>"}` is an
+//!   ordinary `Transfer` of that asset (the account must already exist: the native drip creates
+//!   it). The float is never minted here: for `USDC.sep` it is bridged in from Sepolia by a
+//!   founder lock naming the faucet account, so `supply − burned == vault` stays true
+//!   (docs/P6.2-WALLET-ASSETS.md §2). Cooldowns are per (address, asset) so a newcomer can take
+//!   the native drip and the USDC drip back to back; `/health.assets[]` reports each float.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -54,6 +61,17 @@ pub(crate) struct FaucetCfg {
     pub low_micro: Amount,
     /// K3: below this the faucet answers 503 rather than sign a transfer that will fail.
     pub reserve_micro: Amount,
+    /// P6.2: issued assets this faucet drips, `(asset id, drip in the asset's base units)`.
+    pub drip_assets: Vec<(H256, Amount)>,
+}
+
+impl FaucetCfg {
+    fn drip_of(&self, asset: &H256) -> Option<Amount> {
+        if *asset == self.asset {
+            return Some(self.drip);
+        }
+        self.drip_assets.iter().find(|(a, _)| a == asset).map(|(_, d)| *d)
+    }
 }
 
 struct FaucetState {
@@ -87,6 +105,13 @@ pub(crate) fn serve(cfg: FaucetCfg) -> eyre::Result<()> {
     );
     if bal < cfg.low_micro {
         println!("   ⚠ LOW: balance {bal} micro is under the watermark — refill from the cold wallet");
+    }
+    for (asset, drip) in &cfg.drip_assets {
+        let b = demo::balance_of(&cfg.node_rpc, &id, asset);
+        println!("   P6.2 asset drip: {}… · float {b} · drip {drip} · {} drips left", &hex::encode(asset.0)[..8], b / drip.max(&1));
+        if b < *drip {
+            println!("   ⚠ asset {}… float is EMPTY — bridge a float to the faucet account (P6.2 §2)", &hex::encode(asset.0)[..8]);
+        }
     }
 
     let listener = TcpListener::bind(&cfg.listen)?;
@@ -171,6 +196,23 @@ fn handle(st: std::sync::Arc<FaucetState>, mut stream: TcpStream) -> eyre::Resul
             o.insert("low_watermark_micro".into(), json!(st.cfg.low_micro));
             o.insert("reserve_micro".into(), json!(st.cfg.reserve_micro));
             o.insert("drips_left".into(), json!(bal.saturating_sub(st.cfg.reserve_micro) / st.cfg.drip.max(1)));
+            // P6.2: every issued-asset float this faucet serves.
+            let assets: Vec<Value> = st
+                .cfg
+                .drip_assets
+                .iter()
+                .map(|(asset, drip)| {
+                    let b = demo::balance_of(&st.cfg.node_rpc, &st.faucet_id, asset);
+                    json!({
+                        "asset": hex::encode(asset.0),
+                        "balance_micro": b,
+                        "drip_micro": drip,
+                        "drips_left": b / drip.max(&1),
+                        "low": b < drip.saturating_mul(10),
+                    })
+                })
+                .collect();
+            o.insert("assets".into(), json!(assets));
         }
         respond(&mut stream, "200 OK", &h);
         return Ok(());
@@ -195,6 +237,34 @@ fn handle(st: std::sync::Arc<FaucetState>, mut stream: TcpStream) -> eyre::Resul
         (true, Some(f)) => f,
         _ => peer_ip.map(|a| a.to_string()).unwrap_or_else(|| "?".into()),
     };
+    // ---- P6.2: which asset? ----------------------------------------------------------
+    // Absent = the native drip (the only one that can CREATE an account). An issued asset must
+    // be one this faucet serves. The cooldown is keyed per (address, asset) so the native drip
+    // and the USDC drip of a newcomer do not block each other; the daily cap counts both.
+    let body = text.splitn(2, "\r\n\r\n").nth(1).unwrap_or("");
+    let v: Value = serde_json::from_str(body).unwrap_or(json!({}));
+    let asset_req: Option<H256> = match v.get("asset").and_then(|a| a.as_str()) {
+        Some(s) => match parse_h256(s) {
+            Ok(a) => Some(a),
+            Err(e) => {
+                respond(&mut stream, "400 Bad Request", &json!({"error": format!("asset: {e}")}));
+                return Ok(());
+            }
+        },
+        None => None,
+    };
+    let (drip_asset, drip_amt) = match asset_req {
+        Some(a) if a != st.cfg.asset => match st.cfg.drip_of(&a) {
+            Some(d) => (a, d),
+            None => {
+                respond(&mut stream, "400 Bad Request", &json!({"error": "this faucet does not drip that asset", "asset": hex::encode(a.0)}));
+                return Ok(());
+            }
+        },
+        _ => (st.cfg.asset, st.cfg.drip),
+    };
+    let native_drip = drip_asset == st.cfg.asset;
+    let ip = if native_drip { ip } else { format!("{ip}|{}", &hex::encode(drip_asset.0)[..8]) };
     {
         let now_secs = unix_now();
         let now_day = now_secs / 86_400;
@@ -227,16 +297,14 @@ fn handle(st: std::sync::Arc<FaucetState>, mut stream: TcpStream) -> eyre::Resul
     }
 
     // ---- parse target -----------------------------------------------------
-    let body = text.splitn(2, "\r\n\r\n").nth(1).unwrap_or("");
-    let v: Value = serde_json::from_str(body).unwrap_or(json!({}));
     let (payload, target_id) = if let Some(a) = v.get("auth_commit").and_then(|x| x.as_str()) {
         match parse_h256(a) {
             Ok(auth) => {
                 let id = derived_id(&auth);
                 if demo::account_nonce(&st.cfg.node_rpc, &id).is_some() {
-                    // Already created — treat as a top-up.
-                    (Tx::Transfer { to: id, asset: st.cfg.asset, amount: st.cfg.drip }, id)
-                } else {
+                    // Already created — treat as a top-up (in whichever asset was asked for).
+                    (Tx::Transfer { to: id, asset: drip_asset, amount: drip_amt }, id)
+                } else if native_drip {
                     (
                         Tx::AccountCreate {
                             id,
@@ -246,6 +314,11 @@ fn handle(st: std::sync::Arc<FaucetState>, mut stream: TcpStream) -> eyre::Resul
                         },
                         id,
                     )
+                } else {
+                    // P6.2: an asset transfer cannot create an account.
+                    undo_stamp(&st, &ip);
+                    respond(&mut stream, "400 Bad Request", &json!({"error":"account does not exist yet — take the native drip first (it creates the account), then ask for the asset"}));
+                    return Ok(());
                 }
             }
             Err(e) => {
@@ -257,7 +330,7 @@ fn handle(st: std::sync::Arc<FaucetState>, mut stream: TcpStream) -> eyre::Resul
     } else if let Some(a) = v.get("account").and_then(|x| x.as_str()) {
         match parse_h256(a) {
             Ok(id) if demo::account_nonce(&st.cfg.node_rpc, &id).is_some() => {
-                (Tx::Transfer { to: id, asset: st.cfg.asset, amount: st.cfg.drip }, id)
+                (Tx::Transfer { to: id, asset: drip_asset, amount: drip_amt }, id)
             }
             Ok(_) => {
                 undo_stamp(&st, &ip);
@@ -279,14 +352,25 @@ fn handle(st: std::sync::Arc<FaucetState>, mut stream: TcpStream) -> eyre::Resul
     // ---- K3: reserve floor — refuse instead of burning a ratchet index --------------
     {
         let bal = demo::balance(&st.cfg.node_rpc, &st.faucet_id);
-        if bal < st.cfg.reserve_micro.saturating_add(st.cfg.drip) {
+        // The native balance pays every drip's fee; a native drip also spends the drip itself.
+        let need = if native_drip { st.cfg.reserve_micro.saturating_add(st.cfg.drip) } else { st.cfg.reserve_micro };
+        if bal < need {
             undo_stamp(&st, &ip);
-            eprintln!("⚠ faucet dry: balance {bal} micro < reserve {} + drip {} — refill from the cold wallet", st.cfg.reserve_micro, st.cfg.drip);
+            eprintln!("⚠ faucet dry: balance {bal} micro < reserve {} (+ drip {}) — refill from the cold wallet", st.cfg.reserve_micro, if native_drip { st.cfg.drip } else { 0 });
             respond(&mut stream, "503 Service Unavailable", &json!({"error":"faucet is being refilled — try again later", "faucet_balance_micro": bal}));
             return Ok(());
         }
         if bal < st.cfg.low_micro {
             eprintln!("⚠ faucet low: balance {bal} micro < watermark {} — refill from the cold wallet", st.cfg.low_micro);
+        }
+        if !native_drip {
+            let float = demo::balance_of(&st.cfg.node_rpc, &st.faucet_id, &drip_asset);
+            if float < drip_amt {
+                undo_stamp(&st, &ip);
+                eprintln!("⚠ asset {}… float {float} < drip {drip_amt} — bridge a float to the faucet account", &hex::encode(drip_asset.0)[..8]);
+                respond(&mut stream, "503 Service Unavailable", &json!({"error":"the test-asset float is empty — try again later", "asset": hex::encode(drip_asset.0), "float_micro": float}));
+                return Ok(());
+            }
         }
     }
 
@@ -332,16 +416,17 @@ fn handle(st: std::sync::Arc<FaucetState>, mut stream: TcpStream) -> eyre::Resul
                 &json!({
                     "ok": true,
                     "account": hex::encode(target_id.0),
-                    "amount_micro": st.cfg.drip,
+                    "amount_micro": drip_amt,
+                    "asset": hex::encode(drip_asset.0),
                     "txid": txid,
-                    "note": "spendable now — your ratchet starts at nonce 0",
+                    "note": if native_drip { "spendable now — your ratchet starts at nonce 0" } else { "test asset landed — shield it from the wallet" },
                 }),
             );
             return Ok(());
         }
     }
     respond(&mut stream, "202 Accepted", &json!({
-        "ok": true, "account": hex::encode(target_id.0), "txid": txid,
+        "ok": true, "account": hex::encode(target_id.0), "txid": txid, "asset": hex::encode(drip_asset.0),
         "note": "submitted; receipt pending — check the explorer",
     }));
     Ok(())

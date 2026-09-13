@@ -8,21 +8,20 @@ license.workspace = true
 # Deliberately native (egui) rather than webview: one `cargo build --release`
 # on Windows produces HashKinetics-Wallet.exe with no Node, no WebView2, no
 # bundler config — the highest-reliability path to a shippable .exe.
+#
+# P6.2 (2026-09-13, v0.15.0): the window is now a THIN SHELL over `hk-wallet-core` — the same
+# library the Android app runs. The desktop's own copies of the account file, the vault, the
+# faucet/send plumbing and the shielded flows (main.rs + shielded.rs, ~2,100 lines) are gone;
+# one implementation, one set of files, one place to fix a bug. What the shell adds: the
+# asset dropdown (native unit, USDC.sep, every registered asset), per-asset balance / send /
+# shield / unshield / pay / scan, and "Get test USDC".
 
 [[bin]]
 name = "HashKinetics-Wallet"
 path = "src/main.rs"
 
 [dependencies]
-hk-primitives = { path = "../hk-primitives" }
-hk-crypto = { path = "../hk-crypto", features = ["mlkem"] }
-hk-state = { path = "../hk-state" }
-# U3v2: the shielded side — the SAME lib the CLI wallet and every demo proved.
+hk-wallet-core = { path = "../hk-wallet-core" }
+# only for the optional key-file second factor read from HK_WALLET_KEYFILE (the core takes bytes)
 hk-wallet = { path = "../hk-wallet" }
-hk-spend-circuit = { path = "../../../zkvm-bakeoff/circuit" }
-serde = { workspace = true }
-serde_json = { workspace = true }
-hex = { workspace = true }
-rand = "0.8"
 eframe = "0.28"
-ureq = { version = "2.10", features = ["json"] }

@@ -13,7 +13,7 @@
 
 /// The release label this binary reports (`hk-node --version`, the usage banner).
 /// Bump with every node release; the crate version is workspace-wide and not it.
-pub const NODE_VERSION: &str = "v0.19.1";
+pub const NODE_VERSION: &str = "v0.19.2";
 
 mod account;
 mod app;
@@ -335,12 +335,13 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
             attest::cmd_key_new(&out)
         }
         Some("faucet-serve") => {
-            let usage = "usage: hk-node faucet-serve <WALLET-DIR> <RPC> [--listen 127.0.0.1:9922] [--drip MICRO] [--asset HEX] [--cooldown-secs N] [--daily-cap N] [--low-micro N] [--reserve-micro N]   (env: HK_FAUCET_LOW_MICRO, HK_FAUCET_RESERVE_MICRO)";
+            let usage = "usage: hk-node faucet-serve <WALLET-DIR> <RPC> [--listen 127.0.0.1:9922] [--drip MICRO] [--asset HEX] [--drip-asset HEX:MICRO]... [--cooldown-secs N] [--daily-cap N] [--low-micro N] [--reserve-micro N]   (env: HK_FAUCET_LOW_MICRO, HK_FAUCET_RESERVE_MICRO; P6.2: --drip-asset serves an issued asset from the same account — its float is bridged in, never minted)";
             let dir = PathBuf::from(args.get(2).cloned().ok_or_else(|| eyre::eyre!(usage))?);
             let rpc = args.get(3).cloned().ok_or_else(|| eyre::eyre!(usage))?;
             let mut listen = "127.0.0.1:9922".to_string();
             let mut drip: u128 = 100_000; // $0.10 default — staging supply is tiny
             let mut asset: Option<String> = None;
+            let mut drip_assets: Vec<(hk_primitives::H256, u128)> = Vec::new();
             let mut cooldown: u64 = 86_400;
             let mut daily_cap: u32 = 200;
             // K3: low watermark + reserve floor (flags win over env; defaults are drip-relative).
@@ -354,6 +355,16 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
                     "--listen" => { listen = rest.get(i + 1).cloned().ok_or_else(|| eyre::eyre!(usage))?; i += 2 }
                     "--drip" => { drip = rest.get(i + 1).and_then(|s| s.parse().ok()).ok_or_else(|| eyre::eyre!(usage))?; i += 2 }
                     "--asset" => { asset = rest.get(i + 1).cloned(); i += 2 }
+                    "--drip-asset" => {
+                        let spec = rest.get(i + 1).cloned().ok_or_else(|| eyre::eyre!(usage))?;
+                        let (hex_id, micro) = spec.split_once(':').ok_or_else(|| eyre::eyre!("--drip-asset wants <64-hex>:<MICRO>, got {spec}"))?;
+                        let id = account::parse_h256(hex_id)?;
+                        let micro: u128 = micro.trim().parse().map_err(|_| eyre::eyre!("--drip-asset: bad amount in {spec}"))?;
+                        if micro == 0 { return Err(eyre::eyre!("--drip-asset: the drip must be above zero")); }
+                        drip_assets.retain(|(a, _)| *a != id);
+                        drip_assets.push((id, micro));
+                        i += 2
+                    }
                     "--cooldown-secs" => { cooldown = rest.get(i + 1).and_then(|s| s.parse().ok()).ok_or_else(|| eyre::eyre!(usage))?; i += 2 }
                     "--daily-cap" => { daily_cap = rest.get(i + 1).and_then(|s| s.parse().ok()).ok_or_else(|| eyre::eyre!(usage))?; i += 2 }
                     "--low-micro" => { low_micro = Some(rest.get(i + 1).and_then(|s| s.parse().ok()).ok_or_else(|| eyre::eyre!(usage))?); i += 2 }
@@ -375,6 +386,7 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
                 daily_cap,
                 low_micro: low_micro.unwrap_or(drip.saturating_mul(50)),
                 reserve_micro: reserve_micro.unwrap_or(drip.saturating_mul(2)),
+                drip_assets,
             })
         }
         Some("verify-disclosure") => {

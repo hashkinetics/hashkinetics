@@ -12,12 +12,12 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import org.hashkinetics.wallet.core.AssetInfo
 import org.hashkinetics.wallet.core.Endpoints
 import org.hashkinetics.wallet.core.NoteView
 import org.hashkinetics.wallet.core.Progress
 import org.hashkinetics.wallet.core.ScanResult
 import org.hashkinetics.wallet.core.Status
-import org.hashkinetics.wallet.core.TxResult
 import org.hashkinetics.wallet.core.Wallet
 import org.hashkinetics.wallet.core.WalletException
 import org.hashkinetics.wallet.core.WalletState
@@ -33,6 +33,10 @@ data class LogLine(val time: String, val level: String, val text: String, val li
  * The app's only state holder. Every core call is blocking and runs on the IO dispatcher under
  * one mutex (the core keeps its counters on disk — one operation at a time, in order); the
  * screen only ever reads the fields below.
+ *
+ * P6.2 (v0.3.0): the wallet acts in ONE SELECTED ASSET at a time — the native unit or any
+ * registered asset (USDC.sep …). Balance, send, the faucet's asset drip and every shielded
+ * operation follow [selected]; the core keeps one pool (and one scan cursor) per asset.
  */
 class WalletVm(app: Application) : AndroidViewModel(app) {
     private val dir: File = File(app.filesDir, "wallet").apply { mkdirs() }
@@ -57,6 +61,10 @@ class WalletVm(app: Application) : AndroidViewModel(app) {
     // ---- observable state ----
     var state by mutableStateOf<WalletState?>(null); private set
     var status by mutableStateOf<Status?>(null); private set
+    /** Every asset the wallet can act in — the native unit first (from the chain's registry). */
+    var assets by mutableStateOf<List<AssetInfo>>(listOf(wallet.nativeAsset())); private set
+    /** What every money widget acts in. */
+    var selected by mutableStateOf<AssetInfo>(wallet.nativeAsset()); private set
     var scan by mutableStateOf<ScanResult?>(null); private set
     var notes by mutableStateOf<List<NoteView>>(emptyList()); private set
     var busy by mutableStateOf<String?>(null); private set
@@ -133,37 +141,68 @@ class WalletVm(app: Application) : AndroidViewModel(app) {
     }
     fun exportKeyfileHex(): String? = keyfile.load()?.joinToString("") { "%02x".format(it) }
 
+    // ---- assets (P6.2) ----
+    /** Pick the asset every widget acts in; its cached notes replace the list without a scan. */
+    fun selectAsset(a: AssetInfo) = run("switching to ${a.symbol}") {
+        selected = a
+        scan = null
+        notes = if (state?.accountId != null) wallet.notesAsset(a.id) else emptyList()
+    }
+
+    /** The selected asset's transparent balance, in its base units (null before the first refresh). */
+    fun selectedBalance(): ULong? {
+        val s = status ?: return null
+        return s.balances.firstOrNull { it.asset.id == selected.id }?.balanceMicro ?: 0UL
+    }
+
+    private fun parseSelected(amountText: String): ULong =
+        wallet.parseAmountDec(amountText, selected.decimals)
+            ?: throw WalletException.Message("amount: use digits and up to ${selected.decimals} decimals")
+
     // ---- transparent ----
     private suspend fun refreshNow() {
         val st = wallet.state()
         state = st
-        if (st.accountId != null) status = wallet.refresh()
+        if (st.accountId != null) {
+            status = wallet.refresh()
+            // The registry, with the selection kept on the same id across reloads.
+            val list = try { wallet.assets() } catch (e: WalletException) { listOf(wallet.nativeAsset()) }
+            assets = list
+            selected = list.firstOrNull { it.id == selected.id } ?: list.first()
+            // The selected pool's notes as last scanned — no network, so the tab is never empty
+            // after a restart while a scan is only a tap away.
+            if (scan == null) notes = try { wallet.notesAsset(selected.id) } catch (e: WalletException) { emptyList() }
+        }
     }
     fun refresh() = run("refreshing") { refreshNow() }
     fun faucet() = run("asking the faucet") { wallet.faucet(); refreshNow() }
-    fun send(to: String, amountText: String) = run("sending") {
-        val micro = wallet.parseAmount(amountText) ?: throw WalletException.Message("amount: use digits and up to 6 decimals")
-        wallet.send(to.trim(), micro); refreshNow()
+    /** P6.2: a drip of the SELECTED asset (a native drip first if the account does not exist yet). */
+    fun faucetAsset() = run("asking the faucet for ${selected.symbol}") { wallet.faucetAsset(selected.id); refreshNow() }
+    fun send(to: String, amountText: String) = run("sending ${selected.symbol}") {
+        val micro = parseSelected(amountText)
+        if (selected.isNative) wallet.send(to.trim(), micro) else wallet.sendAsset(to.trim(), micro, selected.id)
+        refreshNow()
     }
     fun showSeed() = run("reading seed") { seedShown = wallet.exportSeed() }
     fun hideSeed() { seedShown = null }
-    fun formatMicro(micro: ULong): String = wallet.formatAmount(micro)
+    /** Formats in the SELECTED asset's decimals. */
+    fun formatMicro(micro: ULong): String = wallet.formatAmountDec(micro, selected.decimals)
+    /** Formats in the NATIVE unit (fees, the fee balance). */
+    fun formatNative(micro: ULong): String = wallet.formatAmount(micro)
 
-    // ---- shielded ----
-    fun scanPool() = run("scanning the pool") { scan = wallet.scan(); notes = scan!!.notes; refreshNow() }
-    fun shield(amountText: String) = run("shielding (proving on the prover)") {
-        val micro = wallet.parseAmount(amountText) ?: throw WalletException.Message("amount: use digits and up to 6 decimals")
-        wallet.shield(micro); scan = wallet.scan(); notes = scan!!.notes; refreshNow()
+    // ---- shielded (in the selected asset's pool) ----
+    private suspend fun rescan() { scan = wallet.scanAsset(selected.id); notes = scan!!.notes }
+    fun scanPool() = run("scanning the ${selected.symbol} pool") { rescan(); refreshNow() }
+    fun shield(amountText: String) = run("shielding ${selected.symbol} (proving on the prover)") {
+        wallet.shieldAsset(parseSelected(amountText), selected.id); rescan(); refreshNow()
     }
-    fun unshield(amountText: String) = run("unshielding (proving on the prover)") {
-        val micro = wallet.parseAmount(amountText) ?: throw WalletException.Message("amount: use digits and up to 6 decimals")
-        wallet.unshield(micro); scan = wallet.scan(); notes = scan!!.notes; refreshNow()
+    fun unshield(amountText: String) = run("unshielding ${selected.symbol} (proving on the prover)") {
+        wallet.unshieldAsset(parseSelected(amountText), selected.id); rescan(); refreshNow()
     }
-    fun payShielded(to: String, amountText: String, memo: String) = run("paying shielded (proving on the prover)") {
-        val micro = wallet.parseAmount(amountText) ?: throw WalletException.Message("amount: use digits and up to 6 decimals")
-        wallet.payShielded(to.trim(), micro, memo); scan = wallet.scan(); notes = scan!!.notes; refreshNow()
+    fun payShielded(to: String, amountText: String, memo: String) = run("paying ${selected.symbol} shielded (proving on the prover)") {
+        wallet.payShieldedAsset(to.trim(), parseSelected(amountText), memo, selected.id); rescan(); refreshNow()
     }
-    fun disclose(commitmentHex: String) = run("building the disclosure package") { lastDisclosure = wallet.disclose(commitmentHex.trim()) }
+    fun disclose(commitmentHex: String) = run("building the disclosure package") { lastDisclosure = wallet.discloseAsset(commitmentHex.trim(), selected.id) }
     fun explorerUrl(txid: String): String = wallet.explorerTxUrl(txid)
 }
 
@@ -173,4 +212,5 @@ object BuildConfigDefaults {
     const val FAUCET = "https://faucet.hashkinetics.org"
     const val PROVER = "https://prover.hashkinetics.org"
     const val EXPLORER = "https://www.hashkinetics.org/explorer/"
+    const val BRIDGE = "https://www.hashkinetics.org/bridge"
 }

@@ -88,6 +88,40 @@ pub fn fmt_amount(micro: Amount) -> String {
     format!("{}.{:06}", micro / 1_000_000, micro % 1_000_000)
 }
 
+/// P6.2: the same two helpers for an asset with `decimals` base units per whole unit
+/// (USDC.sep and HKT are 6, like the native unit; the registry allows 0–18).
+pub fn parse_amount_dec(s: &str, decimals: u8) -> Option<Amount> {
+    let d = decimals.min(18) as usize;
+    let s = s.trim().trim_start_matches('$');
+    let (int, frac) = match s.split_once('.') {
+        Some((a, b)) => (a, b),
+        None => (s, ""),
+    };
+    if int.is_empty() && frac.is_empty() {
+        return None;
+    }
+    if !int.chars().all(|c| c.is_ascii_digit()) || !frac.chars().all(|c| c.is_ascii_digit()) || frac.len() > d {
+        return None;
+    }
+    let scale: Amount = (10 as Amount).pow(d as u32);
+    let int: Amount = if int.is_empty() { 0 } else { int.parse().ok()? };
+    let mut f = frac.to_string();
+    while f.len() < d {
+        f.push('0');
+    }
+    let frac: Amount = if f.is_empty() { 0 } else { f.parse().ok()? };
+    int.checked_mul(scale)?.checked_add(frac)
+}
+
+pub fn fmt_amount_dec(base: Amount, decimals: u8) -> String {
+    let d = decimals.min(18) as usize;
+    if d == 0 {
+        return base.to_string();
+    }
+    let scale: Amount = (10 as Amount).pow(d as u32);
+    format!("{}.{:0width$}", base / scale, base % scale, width = d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +153,24 @@ mod tests {
         assert_eq!(parse_amount(""), None);
         assert_eq!(fmt_amount(250_000), "0.250000");
         assert_eq!(fmt_amount(1_000_001), "1.000001");
+    }
+
+    #[test]
+    fn p62_amounts_follow_the_assets_decimals() {
+        // 6 decimals = the native helpers, exactly.
+        assert_eq!(parse_amount_dec("0.25", 6), parse_amount("0.25"));
+        assert_eq!(fmt_amount_dec(1_000_001, 6), fmt_amount(1_000_001));
+        // 2 decimals: cents.
+        assert_eq!(parse_amount_dec("1.5", 2), Some(150));
+        assert_eq!(parse_amount_dec("1.505", 2), None);
+        assert_eq!(fmt_amount_dec(150, 2), "1.50");
+        // 0 decimals: integers only.
+        assert_eq!(parse_amount_dec("7", 0), Some(7));
+        assert_eq!(parse_amount_dec("7.0", 0), None);
+        assert_eq!(fmt_amount_dec(7, 0), "7");
+        // 18 decimals round-trip.
+        assert_eq!(parse_amount_dec("0.000000000000000001", 18), Some(1));
+        assert_eq!(fmt_amount_dec(1, 18), "0.000000000000000001");
     }
 
     #[test]
