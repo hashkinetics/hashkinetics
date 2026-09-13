@@ -44,6 +44,15 @@ ml-kem = { path = "../vendor/external/rustcrypto-kems/ml-kem" }    # ML-KEM-768 
 # informalsystems-malachitebft-core-types     = { path = "../vendor/external/malachite/code/crates/core-types" }
 # informalsystems-malachitebft-app-channel    = { path = "../vendor/external/malachite/code/crates/app-channel" }
 
+# v0.19.3 (2026-09-13): libp2p-gossipsub 0.49.5 from crates.io, vendored with ONE behavioural patch —
+# subscriptions are re-announced to a peer on every additional connection and whenever one of its
+# connections closes while another remains. Upstream sends them only on the FIRST connection to a
+# peer id, so a validator that restarts and dials in before its old socket dies never learns our
+# topics and can publish nothing (testnet-1 seat #10, 2026-09-13). Same source otherwise
+# (vendor/external/PINS.md); the patch applies to the `libp2p` facade's copy too.
+[patch.crates-io]
+libp2p-gossipsub = { path = "../vendor/external/rust-libp2p-gossipsub" }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

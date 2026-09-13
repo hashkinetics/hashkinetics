@@ -57,3 +57,7 @@ bdaefd4a0a221df6ac15ac8049e5332984aa9f5cbe8761b827115805c2b75dcc  hk-node-v0.18.
 
 # wallet-android-v0.3.0 release (2026-09-13) — P6.2: asset chips (HKN · USDC.sep · every registered asset), Get test USDC, per-asset shielded side; same signing key as v0.2.0 (certificate SHA-256 b296799ed6bea902f6a30ed3bcd497adce7374eb15ec9f8d587ef0575902d6d3 — `apksigner verify --print-certs`), so it upgrades in place · node unchanged (v0.19.2 client-only)
 59f518ce514c298a7d539e0fae9387e4d395e001038d2f61df872cd8dbc41c90  HashKinetics-Wallet-android-0.3.0.apk
+
+# v0.19.3 release (2026-09-13) — N2: a restarted validator always learns its peers' gossipsub subscriptions (vendored libp2p-gossipsub 0.49.5 + the HK re-announce patch); hk_getPeers reconnects / last_connection_secs; client-only, no deadline — https://github.com/hashkinetics/hashkinetics/releases/tag/v0.19.3 (immutable)
+290c1aea24c123bec5ade3133353510487dafa50d98301a1fd79d6fdb59d46cb  hk-node-v0.19.3.gz
+900b7e292ec49354ab1759a722f8a00edaca3736f4268e016a0f7e55b550c7b2  hk-node-v0.19.3

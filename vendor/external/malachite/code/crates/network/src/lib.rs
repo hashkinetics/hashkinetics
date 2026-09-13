@@ -161,6 +161,13 @@ pub struct HkPeer {
     pub connected_at: u64,
     /// Live connections to this peer (libp2p may hold more than one).
     pub connections: usize,
+    /// v0.19.3: Unix seconds of the LATEST connection established to this peer, and how many
+    /// connections were established beyond the first while the entry lived. A peer that
+    /// restarts and dials in before its old connection is torn down keeps its entry (it never
+    /// hits 0 connections), so `connected_at` alone hid the 2026-09-13 1XP restart; these two
+    /// make it visible (`last_connection_at` recent + `reconnects` > 0).
+    pub last_connection_at: u64,
+    pub reconnects: u32,
 }
 
 static HK_PEERS: std::sync::OnceLock<std::sync::Mutex<HashMap<libp2p::PeerId, HkPeer>>> =
@@ -195,16 +202,30 @@ pub fn hk_islands_refused() -> u64 {
 
 fn hk_peer_connected(peer_id: &libp2p::PeerId, direction: &'static str, remote_addr: String, connections: usize) {
     let mut table = hk_peer_table().lock().unwrap_or_else(|e| e.into_inner());
-    let entry = table.entry(*peer_id).or_insert_with(|| HkPeer {
-        peer_id: peer_id.to_string(),
-        direction,
-        remote_addr: remote_addr.clone(),
-        identified: false,
-        genesis: None,
-        node_version: None,
-        connected_at: hk_unix_now(),
-        connections: 0,
+    let now = hk_unix_now();
+    let mut fresh = false;
+    let entry = table.entry(*peer_id).or_insert_with(|| {
+        fresh = true;
+        HkPeer {
+            peer_id: peer_id.to_string(),
+            direction,
+            remote_addr: remote_addr.clone(),
+            identified: false,
+            genesis: None,
+            node_version: None,
+            connected_at: now,
+            connections: 0,
+            last_connection_at: now,
+            reconnects: 0,
+        }
     });
+    if !fresh {
+        // An additional connection to a peer we already hold — a mutual dial (the founders do
+        // both directions) or a restarted process dialing in before its old socket died.
+        entry.reconnects = entry.reconnects.saturating_add(1);
+        entry.last_connection_at = now;
+        entry.remote_addr = remote_addr;
+    }
     entry.connections = connections.max(1);
 }
 

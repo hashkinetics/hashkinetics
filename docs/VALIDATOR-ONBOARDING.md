@@ -118,6 +118,20 @@ resumes from its block log + snapshot to a byte-identical state commitment. Ther
 "resync from genesis" and no state to lose. Reserve-then-sign signer persistence means a
 crash can never reuse a one-time signature leaf.
 
+**Restart with a gap — never two instances (2026-09-13, v0.19.3).** `systemctl restart` is fine: the
+old process exits, its sockets close, peers drop it, the new one dials in fresh. What is *not* fine is a
+new instance that dials in **while the old one's connection still exists** — a rolling update (new
+pod/container up before the old is down), a host that lost its network without closing sockets, a
+`kill -STOP`. Two things go wrong: (1) two processes hold the same consensus key at once — a
+double-signing hazard; (2) before v0.19.3 the gateway announced its gossipsub subscriptions only on the
+*first* connection to a peer id, so the new instance never learned them and could publish nothing —
+no proposals, no votes — while it kept receiving everything and looked in sync (seat #10 spent eight
+hours of proposer slots in round 1 that way; the gateway's v0.19.3 re-announces on every connection
+change, so this particular failure cannot recur, but the double-key hazard is yours). Rule: **stop,
+wait 45 s, start**; deploy validators with a stop-then-start strategy, not a rolling one. If your
+proposer slots keep committing in round 1 (`hk_getBlock.certificate.round` on the public RPC at
+your heights) while `hk_chainInfo` looks healthy, that is the symptom.
+
 ### 5a · Keys at rest (v0.16.0, optional but recommended)
 
 `priv_validator_key.json` is the SLH-DSA root seed — everything (votes, rotations,

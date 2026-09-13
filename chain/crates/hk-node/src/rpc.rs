@@ -40,7 +40,7 @@
 //!                                                 {self, count, inbound, outbound, public_addr,
 //!                                                  identified, islands_refused, peers[{peer_id,
 //!                                                  direction, addr (masked /24 · /48), private_addr,
-//!                                                  version, genesis, connected_secs}]}
+//!                                                  version, genesis, connected_secs, last_connection_secs, reconnects}]}
 //!   hk_submitSetChange {cert}                  -> {accepted, queued}  (V1: a seat admitted/removed
 //!                                                 by a supermajority of the current seats' roots;
 //!                                                 rides this node's next proposal)
@@ -720,6 +720,11 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
                     "identified": p.identified,
                     "connected_secs": now.saturating_sub(p.connected_at),
                     "connections": p.connections,
+                    // v0.19.3: a restart that dialed in before its old socket died keeps the entry
+                    // (connected_secs runs on) — these show it: seconds since the LATEST connection
+                    // and how many connections arrived beyond the first.
+                    "last_connection_secs": now.saturating_sub(p.last_connection_at),
+                    "reconnects": p.reconnects,
                 }));
             }
             json!({"result": {

@@ -22,3 +22,6 @@ Source-only snapshots (no .git). Re-fetch full history: tools\DOWNLOAD-VENDOR.ba
 
 librustzcash note: first vendoring pass was an incomplete clone; re-vendored clean the same day at the commit above.
 openvm/penumbra full hashes verified against `git ls-remote` HEAD 2026-08-15 (prefix-matched the clone).
+
+## rust-libp2p-gossipsub (added 2026-09-13, hk-node v0.19.3)
+`libp2p-gossipsub` **0.49.5** as published on crates.io (registry source copied verbatim — `Cargo.toml` is the registry-normalized one; `Cargo.toml.orig` is upstream's), applied through `[patch.crates-io]` in `chain/Cargo.toml`. One patch, marked `HK v0.19.3` in `src/behaviour.rs`: `on_connection_established` re-announces our subscriptions on an additional connection to a known peer instead of returning, and `on_connection_closed` re-announces them when a connection closes while others remain. Reason: upstream sends subscriptions only on the first connection to a peer id, so a peer that restarts and dials in before its previous connection is torn down never receives them and cannot publish (testnet-1 seat #10, 2026-09-13; `ops/1XP-PROPOSER-MISSES-2026-09-13.md`). Upstream: https://github.com/libp2p/rust-libp2p (protocols/gossipsub, tag libp2p-gossipsub-v0.49.5).
