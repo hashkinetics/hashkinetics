@@ -135,6 +135,14 @@
   <div class="cols">
     <div>
       <div class="card">
+        <h2><span class="spark">⇄</span> Latest transactions</h2>
+        <table id="recenttx">
+          <thead><tr><th>Block</th><th>Kind</th><th>Txid</th><th class="right">Verdict</th></tr></thead>
+          <tbody><tr><td colspan="4" class="muted">scanning recent blocks…</td></tr></tbody>
+        </table>
+        <div class="kv" style="margin-top:8px"><div><span class="muted" id="recenttx-note">—</span></div><div class="right"><span class="badge b-rot">live · new ones appear as they commit</span></div></div>
+      </div>
+      <div class="card">
         <h2><span class="spark">▮</span> Latest blocks</h2>
         <table id="blocks">
           <thead><tr><th>Height</th><th>Txs</th><th></th><th class="right">Value id</th></tr></thead>
@@ -275,6 +283,10 @@ async function loadBlocks(){
     const res=await rpc('hk_getBlocks',params);
     if(pageBefore===null && res.blocks.length && res.blocks[0].time){ const t=new Date(res.blocks[0].time*1000); $('s-time').textContent='latest block '+t.toUTCString().replace(' GMT',' UTC'); }
     const tb=$('blocks').querySelector('tbody');
+    // Latest transactions: a block with txs is on this 14-row table for ~18 s at 1.3 s/block and the
+    // chain sees a tx every few minutes, so the table read as "always 0" (2026-09-13). Every block
+    // with txs that passes through here is kept in the recent-tx card; the boot scan fills the past.
+    if(pageBefore===null) for(const b of res.blocks){ if(b.tx_count>0) noteTxBlock(b.height); }
     tb.innerHTML=res.blocks.map(b=>{
       const badges=(b.tx_count>0?'':'')+(b.aggregate?' <span class="badge b-agg" title="ONE aggregate STARK covered this block’s shielded txs">agg</span>':'')+(b.rotations>0?' <span class="badge b-rot">rotation</span>':'');
       return `<tr class="rowlink" onclick="openBlock(${b.height})">
@@ -292,6 +304,54 @@ async function loadBlocks(){
 }
 function pageOlder(){ pageBefore=window._oldest; loadBlocks(); }
 function pageNewer(){ pageBefore=null; loadBlocks(); }
+
+/* ── latest transactions (2026-09-13) ──
+   The node has no "recent txs" method yet, so the explorer builds the list itself: on boot it pages
+   back through hk_getBlocks (50 per call, at most TX_SCAN_PAGES pages ≈ 40 minutes of blocks) until
+   it holds TX_SHOW blocks that carry transactions, fetching each such block once for its tx list;
+   afterwards loadBlocks() feeds it every new block with txs as it commits. Nothing here is more
+   than the transparent skeleton the node already publishes. */
+const TX_SHOW=12, TX_SCAN_PAGES=36;
+const recentTx=new Map();            // height -> {height, txs:[{kind, txid, ok}]}
+let txScan={done:false, oldest:null, pages:0};
+async function noteTxBlock(h){
+  if(recentTx.has(h)) return;
+  recentTx.set(h,{height:h,txs:[]});   // reserve the slot so a concurrent poll does not refetch
+  try{
+    const b=await rpc('hk_getBlock',{height:h});
+    if(!b.found){ recentTx.delete(h); return; }
+    recentTx.set(h,{height:h,txs:(b.txs||[]).map(t=>({kind:t.kind||'tx',txid:t.txid,ok:(t.receipt&&t.receipt.found)?!!t.receipt.ok:null}))});
+  }catch(e){ recentTx.delete(h); return; }
+  renderRecentTx();
+}
+async function scanRecentTx(){
+  let before=null;
+  try{
+    while(txScan.pages<TX_SCAN_PAGES && recentTx.size<TX_SHOW){
+      const res=await rpc('hk_getBlocks', before===null?{limit:50}:{before,limit:50});
+      const bl=res.blocks||[]; if(!bl.length) break;
+      for(const b of bl){ if(b.tx_count>0 && recentTx.size<TX_SHOW) await noteTxBlock(b.height); }
+      before=bl[bl.length-1].height; txScan.oldest=before; txScan.pages++;
+      if(res.earliest!=null && before<=res.earliest) break;
+    }
+  }catch(e){}
+  txScan.done=true; renderRecentTx();
+}
+function renderRecentTx(){
+  const tb=$('recenttx').querySelector('tbody');
+  const rows=[...recentTx.values()].filter(r=>r.txs.length).sort((a,b)=>b.height-a.height).slice(0,TX_SHOW);
+  if(rows.length){
+    tb.innerHTML=rows.flatMap(r=>r.txs.map(t=>`<tr class="rowlink" onclick="openTx('${t.txid}')">
+      <td><b>${r.height.toLocaleString()}</b></td>
+      <td><span class="badge b-kind ${t.kind}">${t.kind.replace(/_/g,' ')}</span></td>
+      <td class="mono muted">${short(t.txid,16)}</td>
+      <td class="right">${t.ok===null?'<span class="muted">—</span>':(t.ok?'<span class="badge b-ok">ok</span>':'<span class="badge b-rej">rejected</span>')}</td></tr>`)).join('');
+  }else{
+    tb.innerHTML=`<tr><td colspan="4" class="muted">${txScan.done?'no transactions in the scanned range — the chain is idle; the next one shows up here the moment it commits':'scanning recent blocks…'}</td></tr>`;
+  }
+  const n=$('recenttx-note');
+  if(txScan.oldest!=null) n.textContent=`scanned back to block ${txScan.oldest.toLocaleString()}${txScan.done?'':' …'} · click a row for the transaction`;
+}
 
 /* ── block detail ── */
 async function openBlock(h){
@@ -406,7 +466,7 @@ window.addEventListener('hashchange',routeHash);
 setTimeout(routeHash,700);
 
 /* ── boot ── */
-pollInfo(); pollPanels();
+pollInfo(); pollPanels(); scanRecentTx();
 setInterval(pollInfo,1500);
 setInterval(pollPanels,4000);
 $('rpcurl').addEventListener('change',()=>{pageBefore=null;pollInfo();pollPanels();});
