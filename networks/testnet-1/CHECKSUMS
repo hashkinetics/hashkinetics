@@ -49,3 +49,11 @@ bdaefd4a0a221df6ac15ac8049e5332984aa9f5cbe8761b827115805c2b75dcc  hk-node-v0.18.
 # v0.17.0 release — R11: verify-only SP1 client (seconds to start, small resident set; hk_chainInfo.process); client-only, no activation · wallet unchanged (v0.14.1, on the v0.16.1 release)
 5f04af612e4a061532c40ec3ba196bbcd3d2f721643252b2065720e5280c7d5a  hk-node-v0.17.0.gz
 8d57ad976c28994b1a7b16d1ab9c71ac4255156640cfb7e8b03e889430bfb938  hk-node-v0.17.0
+
+# v0.19.2 release (2026-09-13) — P6.2 test USDC in the wallets: the faucet drips issued assets (--drip-asset <id>:<base units>, POST /drip {"account","asset"}, /health.assets[]); client-only, no deadline, consensus stays v0.19.0 — https://github.com/hashkinetics/hashkinetics/releases/tag/v0.19.2 (immutable)
+49ed3b661c03a893daa4d2f223c43eab4bc4ca080dcb7fd0ec51e63b0f565b3d  hk-node-v0.19.2.gz
+1597c43fc44f9e85b4edecbe963f7d39c4737b97b46302647d5e19b60dda5087  hk-node-v0.19.2
+6120771fbedb03100a300ade9993636e2689565a285fbf9abb673471d0e94f87  HashKinetics-Wallet.exe (v0.15.0 — a shell over hk-wallet-core v0.2.0: ASSET dropdown, per-asset send/shielded, Get test USDC; built with path remapping)
+
+# wallet-android-v0.3.0 release (2026-09-13) — P6.2: asset chips (HKN · USDC.sep · every registered asset), Get test USDC, per-asset shielded side; same signing key as v0.2.0 (certificate SHA-256 b296799ed6bea902f6a30ed3bcd497adce7374eb15ec9f8d587ef0575902d6d3 — `apksigner verify --print-certs`), so it upgrades in place · node unchanged (v0.19.2 client-only)
+59f518ce514c298a7d539e0fae9387e4d395e001038d2f61df872cd8dbc41c90  HashKinetics-Wallet-android-0.3.0.apk

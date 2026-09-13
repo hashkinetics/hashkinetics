@@ -1,4 +1,4 @@
-# HashKinetics Wallet — user guide (Windows v0.14.1 · Android v0.2.0 · testnet-1)
+# HashKinetics Wallet — user guide (Windows v0.15.0 · Android v0.3.0 · testnet-1)
 
 **What to click first, how to hide money, how to show it again, how to pay someone privately, and how to prove one payment to one person.** The same guide exists as a slide deck (`HashKinetics-Wallet-Guide.pptx` / `.pdf`, screenshots in `wallet-guide-shots/`); this is the text version for the repository and the website (`/wallet`). Everything here was done on the live network on 2026-09-02 — the transaction ids are real and searchable in the explorer.
 
@@ -14,16 +14,17 @@
 
 **Every transaction pays the protocol fee: 0.000100, burned.** The wallet shows it under your balance and keeps it in mind for you (`docs/FEES.md`).
 
-## 0a · Android (v0.2.0)
+## 0a · Android (v0.3.0)
 
-The same wallet as a phone app — the desktop's Rust library called through UniFFI, the same `account.json` / `shield.json` / `disclosure-*.json` (a phone backup restores on a PC and vice-versa). Release: [`wallet-android-v0.2.0`](https://github.com/hashkinetics/hashkinetics/releases/tag/wallet-android-v0.2.0).
+The same wallet as a phone app — the desktop's Rust library called through UniFFI, the same `account.json` / `shield.json` / `disclosure-*.json` (a phone backup restores on a PC and vice-versa). Release: [`wallet-android-v0.3.0`](https://github.com/hashkinetics/hashkinetics/releases/tag/wallet-android-v0.3.0) (2026-09-13; upgrades v0.2.0 in place).
 
-1. **Download** `HashKinetics-Wallet-android-0.2.0.apk` from the release. Android 8.0 or newer on a 64-bit phone (arm64-v8a).
-2. **Verify** — two checks, both published on the release page: `sha256sum HashKinetics-Wallet-android-0.2.0.apk` → `3510d1c8bad8506ff406ea64ae6a7a7a06a3b68e2a6ec4539b0cdda6919d3904`; `apksigner verify --print-certs HashKinetics-Wallet-android-0.2.0.apk` (Android build-tools) → signer certificate SHA-256 `b296799ed6bea902f6a30ed3bcd497adce7374eb15ec9f8d587ef0575902d6d3`. Every future release is signed by the same key (valid to 2054), so Android upgrades it in place; a build whose signer differs is not ours.
+1. **Download** `HashKinetics-Wallet-android-0.3.0.apk` (14,550,287 bytes) from the release. Android 8.0 or newer on a 64-bit phone (arm64-v8a).
+2. **Verify** — two checks, both published on the release page: `sha256sum HashKinetics-Wallet-android-0.3.0.apk` → `59f518ce514c298a7d539e0fae9387e4d395e001038d2f61df872cd8dbc41c90`; `apksigner verify --print-certs HashKinetics-Wallet-android-0.3.0.apk` (Android build-tools) → signer certificate SHA-256 `b296799ed6bea902f6a30ed3bcd497adce7374eb15ec9f8d587ef0575902d6d3`. Every future release is signed by the same key (valid to 2054), so Android upgrades it in place; a build whose signer differs is not ours.
 3. **Install** (sideload): allow "install unknown apps" for your browser or file manager, open the APK. If a `-debug` build from a workflow artifact is on the phone, uninstall it first — different key; that deletes its testnet wallet.
 4. **Four screens behind a bottom bar** — *Wallet* (balance, fee, height · Refresh · Get test funds · Receive with a QR of your account id · Send), *Shielded* (stealth address with a QR · Scan · notes · Shield / Unshield · Pay shielded with a memo · Disclose one payment), *Backup* (Show seed · passphrase Protect / Change / Lock · device lock · key-file export), *Activity* (every core call's report, with explorer links). Before a wallet exists the app shows *Welcome* (Create keychain / Restore from a 64-hex seed); while the files are sealed it shows *Unlock*. §1–§13 below apply unchanged.
 5. **What is different on a phone.** *Protect* seals both files with Argon2id at **256 MiB** (the desktop uses 512 MiB; the parameters ride in the envelope, so either side opens the other's files). **Device lock** (off by default): a 32-byte key file wrapped by an AES-GCM key in the Android Keystore becomes a second factor — the sealed files then need this phone, or the exported key file (`HK_WALLET_KEYFILE` on a PC), as well as the passphrase; re-protect after switching it. Files live in the app's private storage (`files/wallet/`), cloud backup of them is disabled (`allowBackup=false`) — write the seed down, export `shield.json` yourself (it cannot be re-derived).
-6. **Not yet:** camera QR scanning and biometric key release (v0.3), in-app proving (the public prover proves for you; a shielded operation takes a minute or two), iOS, a Play Store listing (after the first month). Unaudited testnet software.
+6. **Assets (v0.3.0).** Chips above the balance and above the shielded panel — `HKN`, `USDC.sep`, every registered asset; the balance card, Send and the whole Shielded tab follow the chip (§3a). **Get test USDC** and **Bridge from Sepolia** sit next to Get test funds.
+7. **Not yet:** camera QR scanning and biometric key release, in-app proving (the public prover proves for you; a shielded operation takes a minute or two), iOS, a Play Store listing (after the first month). Unaudited testnet software.
 
 Source: `android/` (Kotlin + Jetpack Compose) over `chain/crates/hk-wallet-core` (Rust); built and signed by `.github/workflows/wallet-android.yml`; gate `chain/gate-wa1.sh` (the whole journey on a devnet + the CLI opening the phone's sealed files).
 
@@ -55,6 +56,18 @@ The header shows the network the wallet is talking to: `wallet · hashkinetics-1
 *Screenshot: `cooldown.jpg`*
 
 Click **Get test funds**. The faucet creates your account on-chain (your first transaction is paid by the faucet's treasury) and drips **0.100000**. Within ~3 s the balance updates. A second click inside 24 hours shows the cooldown message — that's the faucet's per-address limit, not an error.
+
+## 3a · Test USDC — the asset dropdown (Windows v0.15.0 · Android v0.3.0)
+
+Since P6 every registered asset has its *own* shielded pool on testnet-1; since P6.2 the wallets know it. Next to the balance there is an **ASSET** dropdown (Android: chips): `HKN` (test units), `USDC.sep` (bridged Sepolia USDC), and anything else the chain registers. Everything below it follows the choice — the balance, **Send**, and the whole **SHIELDED** panel (**Shield → pool**, **Pay shielded**, **Pool → me**, ↻ Scan) acting in that asset's pool. The stealth address is the same for every asset (it belongs to your shield master); the one-time spend keys are shared too.
+
+1. Pick `USDC.sep`. If the dropdown only shows HKN, press ↻ Refresh — it reads the registry from the chain.
+2. Press **Get test USDC** (5 USDC.sep from the faucet). It is bridged Sepolia USDC the founders locked in the vault — never minted from nothing, so the bridge page's invariant (`USDC.sep` supply − burned = vault balance) stays true. Not on-chain yet? The wallet takes the test-units drip first, then the USDC. The faucet's cooldown is per (address, asset), so a newcomer takes both drips back to back.
+3. **Send** some to a friend's account id. The network fee is paid from your HKN balance — the line under the balance says so; keep a little HKN.
+4. Open **SHIELDED · USDC.sep**, **Shield → pool** 1 USDC.sep. The header reads `SHIELDED · USDC.sep · 1.000000 in 1 note(s)`; switch to HKN and it shows HKN's notes only.
+5. **Pay shielded** 0.5 to an `hkaddr:` address with a memo, then **Pool → me** the rest — one nullifier, two commitments, no amounts, no parties, in the USDC.sep pool. **Disclose** works per note as before; the package names the asset.
+
+Same files as before: `shield.json` grows a `pools` map on the first asset scan (older wallets ignore it); the CLI (`hk-node wallet … --asset`) reads the same pool. Real receipts from the release morning (2026-09-13, the founder's own wallet v0.15.0): shield 1 USDC.sep `c1e0cfa807167617…`, shielded pays `d78a62cc8e915fe1…` and `3cc83a668e16364c…`. Your first shielded USDC.sep is a receipt we would like to see in #testnet — txids only, nothing personal.
 
 ## 4 · Send a transparent payment
 

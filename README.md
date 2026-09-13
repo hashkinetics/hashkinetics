@@ -4,7 +4,7 @@
 
 [**hashkinetics.org**](https://www.hashkinetics.org) · [**Live explorer**](https://www.hashkinetics.org/explorer) · [**Public RPC**](https://rpc.hashkinetics.org) · [**X @hashkinetics**](https://x.com/hashkinetics) · [**Discord**](https://discord.gg/RsSfb9gn3) · [**Telegram**](https://t.me/+tnRXX8KOCWA3YjE1) · validators@hashkinetics.org
 
-`testnet-1: LIVE since 2026-09-02` · `node v0.19.2 (client-only) · consensus v0.19.0 · wallet v0.15.0 (test USDC) · Android wallet v0.2.0` · `11 seats, 7 external` · `seats change on the running chain (v0.14.0)` · `bootstrap governance: genesis seats weigh 4 from height 110,000 (v0.18.1)` · `issued assets with issuer controls (v0.15.0)` · `spend proof: 1.24 s (GPU)` · `274 tx/s storm-measured` · `nothing is for sale`
+`testnet-1: LIVE since 2026-09-02` · `node v0.19.2 (client-only) · consensus v0.19.0 · wallet v0.15.0 (test USDC) · Android wallet v0.3.0 (test USDC)` · `11 seats, 7 external` · `seats change on the running chain (v0.14.0)` · `bootstrap governance: genesis seats weigh 4 from height 110,000 (v0.18.1)` · `issued assets with issuer controls (v0.15.0)` · `spend proof: 1.24 s (GPU)` · `274 tx/s storm-measured` · `nothing is for sale`
 
 ---
 
@@ -83,7 +83,7 @@ Every claim in the table above has a command that reproduces it.
 
 ## Get ON the chain (since v0.11 — the front door; v0.13.0 pays shielded too)
 
-You no longer need a genesis seat — and you no longer need a terminal. **Windows users: download `HashKinetics-Wallet.exe` from the latest release** (unsigned testnet build — SmartScreen will warn; verify the published sha256): create a wallet, tap the faucet, pay anyone. **Android users: [`HashKinetics-Wallet-android-0.2.0.apk`](https://github.com/hashkinetics/hashkinetics/releases/tag/wallet-android-v0.2.0) (sideload; sha256 `3510d1c8…`, signed by the HashKinetics release key — verify the certificate digest on the release page)** — the same journey, the same files, receive by QR. Your keys never leave your machine, and your first payment signs with your own hash-based one-time key at index 0.
+You no longer need a genesis seat — and you no longer need a terminal. **Windows users: download `HashKinetics-Wallet.exe` from the latest release** (unsigned testnet build — SmartScreen will warn; verify the published sha256): create a wallet, tap the faucet, pay anyone. **Android users: [`HashKinetics-Wallet-android-0.3.0.apk`](https://github.com/hashkinetics/hashkinetics/releases/tag/wallet-android-v0.3.0) (sideload; sha256 `59f518ce…`, signed by the HashKinetics release key — verify the certificate digest on the release page; upgrades v0.2.0 in place)** — the same journey, the same files, receive by QR. Your keys never leave your machine, and your first payment signs with your own hash-based one-time key at index 0.
 
 Prefer the CLI? Generate a keychain locally, paste one string into the faucet, and you hold a funded, spendable account whose id nobody can squat (`id = H(auth commit)`, checked in consensus):
 
