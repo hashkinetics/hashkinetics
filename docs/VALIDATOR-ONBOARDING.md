@@ -7,6 +7,7 @@ operating post-quantum BFT.
 
 ## 0 · What you need
 
+- **Disk: 200 GB, watched.** The block log grows 2.4–3.9 GB per day at eleven seats (every commit certificate carries KB-scale hash-based signatures) and a seat keeps every block by default. A seat whose disk reaches 100 % **goes silent by design** — the signer refuses to sign anything it cannot durably persist, the node stays alive as an observer and the chain loses that seat's power without a crash to notice (INCIDENTS #13, 2026-09-14: two founding seats at once, 54 min halt). Page yourself at 85 % (`df /`), and never let another logger duplicate the journal (`rsyslog` writing `/var/log/syslog` cost ~6 GB/week on the founding hosts).
 - Linux (bare or WSL2), 4+ cores, **4 GB RAM minimum, 8 GB comfortable** (measured on
   testnet-1's own seats after the v0.17.0 roll of 2026-09-06: ~55–60 MiB resident steady, ~300 MiB
   while verifying proof-heavy blocks on a devnet — the rest is headroom for catch-up verification;
