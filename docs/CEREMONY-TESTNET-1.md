@@ -22,7 +22,8 @@ and a simultaneous start. Nothing else is shared.
 2. **Private material never moves.** `priv_validator_key.json` and `consensus_state*.bin`
    stay on their host. Only `validator.json` (public) travels to the coordinator. The
    faucet treasury's seed stays on the gateway; only its nonce-0 auth commitment enters
-   the genesis (`hk-node account-info` prints it as "genesis auth").
+   the genesis (`hk-node account-info` prints it as "genesis auth"). (Since 2026-09-05 the
+   genesis treasury is cold off-fleet — K3 — and the faucet drips from a sealed hot float.)
 3. **Fee policy is a genesis fact** (`genesis-build --fee-micro 100 --fee-from 1`). No
    activation roll, no operator environment to agree on; a node started with
    `HK_FEE_*` set on such a network logs that the override is ignored.
@@ -34,7 +35,7 @@ and a simultaneous start. Nothing else is shared.
 6. **Pinned verifying keys** (`HK_PROVER_URL` at build time) — an unpinned genesis is a
    devnet, never a public network.
 7. **Versioned binary + sha on every host** before the start; the live path
-   (`/home/yadu/hk-node`) is a copy, never a symlink into a build tree.
+   (the binary the unit's `ExecStart` points at) is a copy, never a symlink into a build tree.
 8. **Archive the predecessor before the stop**: snapshot FIRST, then the block log
    (a tar that walks blocks before the snapshot can leave the snapshot ahead of the
    tail). One full log is enough for the record; every host keeps its final snapshot.
@@ -67,9 +68,9 @@ disk path serves everything else). Receipt: see CHANGELOG [0.13.0].
 | launched | 2026-09-02 ~15:25 UTC (21:00 IST) — first blocks within minutes of the start |
 | chain id | `hashkinetics-1-4e4ea68d` |
 | genesis digest | `4e4ea68d48cba1ad4cc7155c19e7768f1fa2cbc99ba0f2b47c58948ec9e971c7` (`chain_start_time` 1788362219) |
-| validators | 4 founder-operated seats, fresh keys — consensus addresses `F874765D…`, `42C00CD6…`, `E77F5F47…`, `F7D75524…` (external seats join at the next genesis — see `VALIDATOR-ONBOARDING.md`) |
+| validators | 4 founder-operated seats at genesis, fresh keys — consensus addresses `F874765D…`, `42C00CD6…`, `E77F5F47…`, `F7D75524…`. Since V1 (v0.14.0) external seats are admitted on the running chain by certificate, no new genesis: seven admitted between 2026-09-05 and 2026-09-12 (#5–#11), eleven seats on 2026-09-14 (founding seats at power 4 since G1 at height 110,000; total power 23, quorum 16) — see `VALIDATOR-ONBOARDING.md` |
 | fee policy | 100 micro per envelope from height 1, burned |
-| treasury | `6c0466c5a22e8c003550165a8aadd8a868aca4657e4c7e9fb48ab14d4df264ad` — 1,000,000,000,000 micro at genesis (seed stays on the gateway) |
+| treasury | `6c0466c5a22e8c003550165a8aadd8a868aca4657e4c7e9fb48ab14d4df264ad` — 1,000,000,000,000 micro at genesis (the seed stayed on the gateway at launch; cold off-fleet since 2026-09-05 — K3 — with the faucet on a sealed hot float) |
 | demo accounts | org / agent-a / agent-b / agent-c / merchant (public seeds; org $50) |
 | predecessor | staging-1 (`hashkinetics-1-557f2ea6`), 2026-08-27 → 2026-09-02, stopped at height 107,182; full homes retained on every host; the gateway's complete log + final snapshot archived to object storage (`staging-1-gateway.tgz`, 2,932,293,982 bytes) — a copy of the tar also stays on the gateway |
-| node version | v0.13.0 minimum |
+| node version | v0.13.0 minimum at launch; the consensus minimum has moved with each activation (v0.14.0 first set change → v0.15.0 first asset tx → v0.18.1 at height 110,000 → **v0.19.0 at height 190,000**, the minimum on 2026-09-14); current release v0.19.3 (2026-09-13, client-only) — `networks/testnet-1/CHECKSUMS` |

@@ -1,6 +1,6 @@
 # HashKinetics Devnet Runbook
 
-**v0.15.0 (2026-09-04).** The operational manual for running, demoing, debugging, and
+**Stamped 2026-09-14 (tree at v0.19.3; text last revised for v0.15.0 on 2026-09-04, with the R11 start-up and v0.19.1 wallet-CLI corrections applied).** The operational manual for running, demoing, debugging, and
 recording the local devnet (the public network is testnet-1 — `networks/testnet-1/`; the fleet ceremony is `CEREMONY-TESTNET-1.md`; `chain/rehearsal.sh` runs the whole ceremony + restore-shape gate on one box; `chain/gate-v1.sh` proves validator-set changes and `chain/gate-x1.sh` proves issued assets end to end on a fresh devnet — run them after touching consensus) — every failure mode in the troubleshooting table was actually hit
 and diagnosed on ASUS-SERVER. Read this before touching a terminal after time away.
 Since v0.11 the devnet also carries the usage-sprint surfaces: `account-new/-info/-balance/-send/-create`
@@ -24,7 +24,7 @@ prune cost scales with queue depth). Clean devnet baseline: **123.1 tx/s** at th
 **Wallet v1 quickstart** (`hk-node wallet` — full loop gated 0.10.1):
 ```bash
 HK=~/hk-target-chain/release/hk-node; W=~/my-wallet
-$HK wallet init $W org                 # bind to a demo account — or `hk-node account-new` + the faucet for a fresh one
+$HK wallet init $W org                 # bind to a devnet demo account; since v0.19.1 `wallet init DIR <account-dir>` also takes the directory `hk-node account-new` made (sealed or plain) — a real account, funded by the faucet
 $HK wallet shield $W 3                 # transparent → hidden (mint proof ~1.3 s)
 $HK wallet scan $W                     # discover your notes (LIVE/SPENT, full commitments)
 ADDR=$($HK wallet address $W 2>/dev/null)
@@ -64,7 +64,7 @@ Windows ⇄ WSL localhost forwarding works both ways on this machine.
 silently fall back to RejectAll and every pool tx bounces.
 
 ```bash
-cd "~/hashkinetics/zkvm-bakeoff/sp1/script"
+cd <repo>/zkvm-bakeoff/sp1/script
 CARGO_TARGET_DIR=~/hk-target cargo run --release --bin serve
 # wait for: hk-prove: listening on 0.0.0.0:9911   (warm-up prove ~1.5 s happens first)
 # env: HK_PROVE_MODE=core (default) | compressed · HK_PROVE_ADDR=0.0.0.0:9911
@@ -73,7 +73,7 @@ CARGO_TARGET_DIR=~/hk-target cargo run --release --bin serve
 **B — the devnet.**
 
 ```bash
-cd "~/hashkinetics/chain"
+cd <repo>/chain
 export CARGO_TARGET_DIR=~/hk-target-chain
 ./devnet.sh --fresh --prover-url http://127.0.0.1:9911
 ./devnet.sh logs      # want: 'SP1 pool verifier wired' ×4, then Committed block, matching app_hash
@@ -81,7 +81,7 @@ export CARGO_TARGET_DIR=~/hk-target-chain
 # node homes + logs: ~/hk-devnet/node<i>{,.log}  (Linux fs on purpose — fast WAL)
 ```
 
-Startup takes ~40 s: the SP1 CpuProver init per node is one-time.
+Startup takes seconds: since R11 (v0.17.0) the node starts a verify-only SP1 client instead of building the full prover — wait for the `SP1 pool verifier wired` lines, which now appear within seconds of start (the old ~40 s CpuProver init is gone).
 
 **C — the demos.**
 
@@ -95,8 +95,8 @@ $BIN demo-agg      http://127.0.0.1:26000 http://127.0.0.1:9911   # P2.3 one STA
 $BIN demo          http://127.0.0.1:26000                          # P0 $50 storyline (transparent)
 ```
 
-Wait for `SP1 pool verifier wired` ×4 in the logs BEFORE the first demo — startup takes
-~40 s and a demo launched in the same paste will time out on "node RPC reachable".
+Wait for `SP1 pool verifier wired` ×4 in the logs BEFORE the first demo — the lines appear
+within seconds since R11, but a demo launched in the same paste can still time out on "node RPC reachable".
 
 Demos are devnet-history-tolerant (per-demo wallet seeds, relative pool counts) —
 re-runnable on a lived-in pool. On any wait timeout they print the consensus receipt
@@ -111,7 +111,7 @@ leaf (have 5000000, need 10000000)` — consensus enforcing caps over hidden bal
 ## 2 · Fast test loop (Windows, seconds)
 
 ```powershell
-cd "C:\hashkinetics\chain"
+cd <repo>\chain
 cargo test -p hk-crypto --features mlkem                   # 24
 cargo test -p hk-state -p hk-wallet -p hk-node --no-default-features
 #   → state 10 (keystone · storylines · agg coverage · mandated unshield)
@@ -140,7 +140,7 @@ Symptom of skipping this: every proof bounces with `pool proof rejected`.
 | Demo times out; `∅ no receipt — never included` printed | tx not in any block: submit failed loudly above it, or node0's proposals aren't landing | check the `✗ submit FAILED` line + node0 log |
 | Node exits at startup: `vk PIN MISMATCH … refusing to start` | circuit/guests changed after genesis was pinned | §3: rebuild+restart serve, then `./devnet.sh --fresh --prover-url …` (re-pins) |
 | Demo says `hk-prove not reachable` | serve died (terminal closed) | restart A, then B (`--fresh`), then C |
-| Node startup "hangs" ~40 s after vk fetch | `sp1_sdk::cpu: initializing cpu prover` | normal, one-time |
+| Node startup "hangs" ~40 s after vk fetch | HISTORIC (retired at v0.17.0, R11): `sp1_sdk::cpu: initializing cpu prover` | the node now starts a verify-only client in seconds; if you see this line you are running a pre-R11 binary |
 | `Workspace still starting` style WSL sluggishness on /mnt/c builds | Windows-fs IO | one-time cost; targets are on ~ already |
 | `error deserializing ProofRequest` (bake-off, RISC0) | r0vm version mismatch | `rzup install r0vm <exact version>` |
 | `libcudart.so.12` missing (bake-off) | CUDA toolkit absent in WSL | `cuda-toolkit-12-9` via NVIDIA wsl-ubuntu repo; NEVER install a driver in WSL |

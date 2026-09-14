@@ -1,8 +1,8 @@
 # Mainnet Validator Key Management (SCMS)
 
-**Status:** design + first build (0.9 → 1.0 track)
+**Status (2026-09-14):** design + first build (0.9 → 1.0 track); the design below is dated 2026-08-16 and unchanged. Where the fleet stands today: keys sealed at rest on every founding seat since 2026-09-05 (HKE1, `LoadCredential=`); the genesis treasury cold off-fleet since 2026-09-05; `consensus_state.bin` (the live LMS tree) is not sealed yet and the passphrase file sits on the same disk — the HSM seam (SP 800-208) is the mainnet fix; R15 (v0.18.2) signing session: 179 µs per signature.
 **Answers:** *"What happens after root exhaustion? What is the plan for mainnet?"*
-**Date:** 2026-08-16
+**Date:** 2026-08-16 (status line re-stamped 2026-09-14)
 
 ---
 

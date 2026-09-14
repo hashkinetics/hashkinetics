@@ -1,4 +1,6 @@
-# Faucet runbook — hot/cold, low-watermark, sealed keys (K3, node v0.16.0)
+# Faucet runbook — hot/cold, low-watermark, sealed keys (K3, node v0.16.0 → v0.19.2)
+
+> **Status 2026-09-14:** the faucet runs hk-node v0.19.2 (2026-09-13): `--drip-asset ID:MICRO` drips an issued asset next to the native one, `/health` reports per-asset floats (§5b); the USDC.sep float is funded by a bridged founder lock, never minted.
 
 The public faucet (`hk-node faucet-serve`, https://faucet.hashkinetics.org) is the front
 door of the chain: it turns an auth commitment into a funded account. Until v0.15.x it
@@ -82,8 +84,8 @@ caps: scale the float so the watermark is ≥ 7 days of the cap.
 ## 5 · Refill (from the cold machine, any time, no faucet restart)
 
 ```bash
-HK_WALLET_PASSPHRASE_FILE=~/.hk-treasury-pass \
-hk-node account-send ~/hk-treasury https://rpc.hashkinetics.org <HOT-ACCOUNT-ID-hex> 4000000000
+HK_WALLET_KEYFILE=~/.hk-treasury.key HK_WALLET_PASSPHRASE_FILE=~/.hk-treasury-pass \
+hk-node account-send ~/hk-treasury https://rpc.hashkinetics.org <HOT-ACCOUNT-ID-hex> 4000000000   # the key file (§2) is the second factor — without it the passphrase opens nothing
 curl -s https://faucet.hashkinetics.org/health | grep -o '"low":[a-z]*'
 ```
 Post the txid in `#receipts` — a refill is a public event on a public chain anyway.

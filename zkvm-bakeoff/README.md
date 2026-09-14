@@ -120,7 +120,25 @@ SP1    prove=1840ms  verify=6ms   size=210KB   [G2: PASS prove, PASS verify, PAS
 
 ---
 
-## Status (2026-08-16)
+## Status — the verdict (2026-08-17) and what lives here now (2026-09-14)
+
+- **G2 verdict (2026-08-17; the full record is `RESULTS.md`): PROVE BAR PASSED — 1,236 ms** for the full
+  statement on SP1-CUDA (RTX 5090; circuit v2 with in-circuit WOTS spend authority, 604,993 cycles — down
+  from the 26-minute, 3.43 M-cycle run #1). Verify and size are met per spend at the **aggregation tier,
+  unwrapped** (pairing wraps are banned by finding F1): OpenVM's stark aggregate 523 KB, RISC0's succinct
+  receipt 219 KB / 16 ms. **Stack locked: SP1 as the client prover.** RISC0-CUDA parked (upstream rc /
+  CUDA-13); the Poseidon2 "doctrine tax" pass remains the pass-2 backlog.
+- **Since then this folder is production code, not only a bench:** circuit **v3** (spend-tree ownership,
+  secret-nk nullifier, two outputs — the statement testnet-1 verifies), the **mint** guest and the **`agg`**
+  aggregation guest (N compressed proofs verified in-zkVM → ONE STARK per block: **1,242 KB constant,
+  2.8–2.9 s**; T_agg(N) ≈ 2.66 s + 0.2882 s·N over N = 4…256), and **`hk-prove`** (`sp1/script`,
+  `cargo run --release --bin serve`) — the GPU proving service behind `prover.hashkinetics.org`. The three
+  verifying keys are pinned in the testnet-1 genesis and ship in `networks/testnet-1/vks.json`; the node
+  verifies with a verify-only client (v0.17.0). Measured on the live network: spend proof 1.19–1.38 s,
+  mint ≈ 1.05–1.19 s (1,056 ms for the first shielded `USDC.sep` on the public prover, 2026-09-09).
+  Nothing here is audited yet.
+
+## Status (2026-08-16) — the record of pass 1
 
 - **`circuit/`** — done, `cargo test` 6/6 green in WSL2. The full statement incl. in-circuit
   hash-based spend auth.

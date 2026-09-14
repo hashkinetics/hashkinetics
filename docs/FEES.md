@@ -1,4 +1,6 @@
-# The protocol fee — normative reference (v0.15.0 · testnet-1)
+# The protocol fee — normative reference (testnet-1 · stamped 2026-09-14, node v0.19.3)
+
+> **Status 2026-09-14:** unchanged since testnet-1 genesis: 100 micro burned per envelope from block 1; the fee asset for bridged assets (X6) is an open decision — fees are paid in the native asset only.
 
 **One flat fee per transaction envelope, bound into the genesis, burned.** On testnet-1: **100 micro** (0.000100 test units) from **height 1**. This page is what a wallet, an exchange integration, an agent framework or an auditor needs; the consensus rule itself is `YELLOWPAPER.md` §19.2–19.3 and `chain/crates/hk-state/src/lib.rs` (`apply_signed`).
 

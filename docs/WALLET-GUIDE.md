@@ -6,9 +6,9 @@
 
 ## 0 · Before you start
 
-1. Download `HashKinetics-Wallet.exe` from the **v0.16.1 release** (`github.com/hashkinetics/hashkinetics/releases/tag/v0.16.1` — wallet v0.14.1, 6.6 MB). Screenshots below are from v0.13.x; v0.14.0 added *Protect with a passphrase* (§5a), v0.14.1 the incremental scan (§8) — the screens are otherwise the same.
+1. Download `HashKinetics-Wallet.exe` from the **v0.19.2 release** (`github.com/hashkinetics/hashkinetics/releases/tag/v0.19.2` — wallet v0.15.0, 2026-09-13, a shell over hk-wallet-core v0.2.0; the sha256 row is in `networks/testnet-1/CHECKSUMS`). Screenshots below are from v0.13.x; v0.14.0 added *Protect with a passphrase* (§5a), v0.14.1 the incremental scan (§8), v0.15.0 the ASSET dropdown and *Get test USDC* (§3a) — the screens are otherwise the same.
 2. Verify it — the only trust step: in PowerShell, `Get-FileHash .\HashKinetics-Wallet.exe` must print
-   `17566A9E5CC258814F06924C65334631F62205358823414F4ABAF587E5F8308E` (v0.14.1; the v0.13.1 build was `FB330C29…`).
+   `6120771FBEDB03100A300ADE9993636E2689565A285FBF9ABB673471D0E94F87` (v0.15.0; the v0.14.1 build was `17566A9E…`, the v0.13.1 build `FB330C29…`).
 3. Windows SmartScreen will warn on first run (unsigned build): *More info → Run anyway*. Do not trust the popup either way — trust the hash.
 4. The wallet talks to `https://rpc.hashkinetics.org` (chain), `https://faucet.hashkinetics.org` (test funds) and `https://prover.hashkinetics.org` (proofs). No installer, no registry, no admin rights.
 

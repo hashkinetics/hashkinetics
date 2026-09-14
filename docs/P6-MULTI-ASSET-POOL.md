@@ -1,5 +1,7 @@
 # P6 — the multi-asset shielded pool: one pool per asset, no circuit change
 
+> **Status 2026-09-14:** SHIPPED as hk-node v0.19.0 (gate-p6 48/48), activated on testnet-1 at height 190,000 on 2026-09-09; the second pool (USDC.sep) opened at height 214,097; wallets pick the asset since P6.2 (docs/P6.2-WALLET-ASSETS.md).
+
 **Written 2026-09-09 (Yadu: "build multi-asset pool (P6)").** Why now: the bridge (B1, `docs/BRIDGE-SEPOLIA-USDC-PLAN.md`) brings `USDC.sep` onto testnet-1 and the demo that matters is *shielded* USDC; the v1 pool is single-asset and testnet-1's is pinned to the test asset. Every issuer conversation (`docs/STABLECOIN-RAILS-AND-ORACLE-PLAN.md` X5) also ends at "can my asset be shielded?". P6 answers it before the audit freeze, as a consensus change with an activation height, rolled like X1 and G1.
 
 ## 0 · The decision: pools per asset, not assets per note

@@ -23,14 +23,27 @@ same `HKE1` envelope (phone-sized Argon2id profile) when a passphrase is set.
    Without the IDE (WSL): `sdkmanager "platforms;android-35" "build-tools;35.0.0"` from the command-line tools,
    then `gradle wrapper && ./gradlew assembleDebug` → `app/build/outputs/apk/debug/app-debug.apk` (sideload).
 
-## What it does (v0.2)
+## Current release — v0.3.0 (2026-09-13)
+
+`wallet-android-v0.3.0` (immutable, pre-release): `HashKinetics-Wallet-android-0.3.0.apk`, sha256
+`59f518ce514c298a7d539e0fae9387e4d395e001038d2f61df872cd8dbc41c90`, signed by the same release key as v0.2.0
+(certificate SHA-256 `b296799ed6bea902f6a30ed3bcd497adce7374eb15ec9f8d587ef0575902d6d3`), so it upgrades
+v0.2.0 in place; built by the tag's own CI run; row in `networks/testnet-1/CHECKSUMS`. Verify a download with
+`sha256sum` / `Get-FileHash` and the signer with `apksigner verify --print-certs HashKinetics-Wallet-android-0.3.0.apk`.
+What v0.3.0 adds (P6.2, over `hk-wallet-core` v0.2.0): **asset chips** in the balance card — `HKN`, `USDC.sep`,
+every asset the chain registers — with the balance, send and the whole shielded side following the chosen asset in
+its own pool; **Get test USDC** (a faucet drip of `USDC.sep`); **Bridge from Sepolia**. The in-app footer text
+"Unaudited testnet software · test units only" ships with the next APK build (v0.3.1), together with the
+regenerated core bindings. Sideload only until the Play listing.
+
+## What it does (v0.3.0)
 
 Four sections behind a bottom bar, in the brand theme (`app/src/main/java/org/hashkinetics/wallet/ui/Theme.kt` —
 the site's engineering-dark palette; the launcher icon is the brand mark drawn as vector paths):
 
-- **Wallet** — balance + fee + height, faucet, receive (account id with a QR + copy), transparent send.
-- **Shielded** — hidden balance, stealth address (QR + copy), scan (incremental, cached in `shield.json`), notes,
-  shield / unshield / pay with a memo / disclose one payment.
+- **Wallet** — balance + fee + height, asset chips (v0.3.0), faucet + Get test USDC, receive (account id with a QR + copy), transparent send in the chosen asset.
+- **Shielded** — hidden balance, stealth address (QR + copy), scan (incremental, cached in `shield.json`; one cursor per pool since v0.3.0), notes,
+  shield / unshield / pay with a memo / disclose one payment — per asset, in that asset's own pool.
 - **Backup** — seed once, passphrase (Argon2id 256 MiB, sealed files), optional device lock (a 32-byte key file
   wrapped by the Android Keystore — the sealed files then need this device or the exported key file; off by default
   so a phone backup restores on a PC with the passphrase alone).
@@ -41,8 +54,8 @@ Before a wallet exists: Welcome (create / restore). While the files are sealed: 
 ## What it does NOT do (yet)
 
 No in-app proving (proofs are made on the public prover; a shielded operation takes a minute or two), no
-QR *scanning* of addresses (the camera; v0.3), no biometric release of the key file (v0.3: `setUserAuthenticationRequired`),
-no push notifications, no iOS. Unaudited testnet software.
+QR *scanning* of addresses (the camera; a later build), no biometric release of the key file (a later build: `setUserAuthenticationRequired`),
+no push notifications, no iOS. Unaudited testnet software — test units only.
 
 ## Release signing (WA3)
 

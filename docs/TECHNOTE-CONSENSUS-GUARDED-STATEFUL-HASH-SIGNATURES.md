@@ -62,3 +62,15 @@ The same architecture is arriving from multiple directions — Ethereum's leanSi
 | Equivocation fraud-proof + slashing path | [SPEC] |
 
 *Companion documents: `HASHKINETICS-IMPLEMENTATION-PLAN.md` (architecture), `HASHSIG-CONSENSUS-SWAP.md` (swap detail), research reports 01–03 (sourced market/crypto landscape). Reproduction: `chain/devnet.ps1`, then the `hk-node demo` and `hk-facilitator demo` drivers.*
+
+---
+
+## 7 · Status addendum (2026-09-14)
+
+The note above is dated 2026-08-16 and is left as written; its labels describe the devnet of that day. What has changed since, in the same three labels:
+
+- **Rule 1 for consensus votes — [SPEC] → [LIVE].** Every prevote, precommit and proposal on the public testnet-1 (`hashkinetics-1-4e4ea68d`, live since 2026-09-02) is an LMS/HSS signature whose leaf index is enforced by the persisted reserve-then-sign signer: the state is durably advanced before a signature leaves the process, and a failed write blocks the signature rather than risk reuse. Eleven validator seats run it today, seven of them external operators on their own machines; each seat's permanent identity is a stateless SLH-DSA-192s root, and seats are admitted on the running chain by root-signed certificates.
+- **Rotation — [LIVE], unattended.** Automatic threshold rotation of the operational tree under the root has run without a human since 2026-08-29 (per-seat jitter on the threshold since 2026-09-03), and the same certificate path revived three fully exhausted seats on the staging network by root-signed certificates carried through a peer. Exhaustion stayed a liveness fault every time — on 2026-08-28 the staging chain chose to halt rather than reuse a leaf, as designed.
+- **Signing cost.** The signing-session fix of 2026-09-08 (v0.18.2) brought a consensus signature from ~450 ms to 179 µs — the vendored signer's aux cache had never validated, so the top tree's authentication path was regenerated on every signature; signatures are byte-identical and the on-disk state format is unchanged.
+- **Still [SPEC].** Rule 2 — equivocation evidence and the slashing path; delegated count caps (§3.3's cert-carried leaf budgets). The mainnet answer to KB-scale commit certificates — one STARK proof of consensus per block — is designed, not built.
+- **Write-ups.** The formal treatment is the 2026-09 paper *Consensus-Guarded Stateful Signatures* (prepared for ePrint) and the SCMS v2 paper. Nothing is audited yet.

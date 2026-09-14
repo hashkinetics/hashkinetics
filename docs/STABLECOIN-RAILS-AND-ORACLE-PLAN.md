@@ -1,5 +1,7 @@
 # Stablecoin rails and the cross-chain oracle — what exists, what an issuer needs, the plan
 
+> **Status 2026-09-14:** X1 issued assets shipped (v0.15.0); the Sepolia USDC bridge (B1) is live as the exhibit; attested reserve-backed minting (X2/B2) is designed, not built.
+
 **Written 2026-09-04 (morning after K4).** Question asked: *if Circle (USDC) or Tether (USDT) wanted to deploy on HashKinetics today, what do we have — and if not enough, what is the implementation plan?* Short answer: **not enough, and the gap is well-defined.** The ledger is multi-asset by construction, but there is no way to *create* an asset after genesis, no issuer controls, no way to verify an issuer's attestation, and no bridge. This document is the inventory (with file references), the issuers' actual on-ramp as of today (researched, linked at the end), the design, and the sequence. Public-safe: nothing here is an offer of anything.
 
 ## 0 · The answer in one table

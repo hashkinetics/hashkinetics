@@ -4,6 +4,8 @@
 
 Trust label (say it everywhere): the Ethereum side is exactly as safe as the attestor keys and the hk-attest code — ECDSA because Ethereum verifies nothing else. On the HashKinetics side every balance moves under hash-based authority.
 
+**Deployed on Sepolia (chain id 11155111) since 2026-09-09 — live both ways on the testnets:** `HKVault` `0x989Cb35485d16c7b19Dff890b617984EeD9970aF` · `HKWrapped` (`wHKT.sep`, wraps the issued `HKT`) `0x24159bE1577f3016AD64beA7D1430e5F2313DB26` · token = Circle Sepolia USDC `0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238` · **1-of-1 attestor** (a founder-run `hk-attest` service — the label on every surface), cap 1,000 USDC per UTC day, minimum lock 0.01 USDC, owner = the deployer, not the attestor. The first loop (lock 20 USDC → mint 20 `USDC.sep` → burn 5 → unlock 5), the reverse leg and every later receipt are in `docs/BRIDGE-GUIDE.md`; `forge test` 28/28 on 2026-09-09 (HKVaultTest 23 incl. a 256-run fuzz, HKWrappedTest 5). What the vault backs is `USDC.sep` — never called "USDC".
+
 ## 1 · Test (WSL; one-time toolchain + libs, then `forge test`)
 
 ```bash
@@ -43,7 +45,7 @@ export VAULT_OWNER=0x…                                # NOT the attestor key; 
 forge script script/Deploy.s.sol:Deploy --rpc-url "$SEPOLIA_RPC_URL" --account hk-deployer --broadcast --verify --etherscan-api-key "$ETHERSCAN_API_KEY" -vv
 ```
 
-The script prints `HKVault: 0x…` — record it in `ops/B1-FACTS.md` (vault address, deploy tx, verified-source link, attestor addresses, cap). Reverse leg later: add `WRAPPED=1 HK_ASSET=0x<USDC.sep or test-asset id>`.
+The script prints `HKVault: 0x…` — record it (vault address, deploy tx, verified-source link, attestor addresses, cap); the addresses of the 2026-09-09 deployment are above and in `docs/BRIDGE-GUIDE.md`. The reverse leg (`HKWrapped`, deployed the same day): add `WRAPPED=1 HK_ASSET=0x<the wrapped asset's id>`.
 
 ## 3 · The first lock by hand (the B1.0 receipt)
 

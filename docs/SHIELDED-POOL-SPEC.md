@@ -1,5 +1,7 @@
 # HashKinetics Shielded Pool — Protocol Specification
 
+> **Status 2026-09-14:** the pool is multi-asset since v0.19.0 (P6, active on testnet-1 from height 190,000): one pool per pool-eligible asset, routing by asset on shield and by anchor on spend, the note and spend statements unchanged — normative text in docs/P6-MULTI-ASSET-POOL.md until it is folded in here. Binary wire (bincode) and genesis vk pins are live since 0.9.11; the durable store since 0.10.0.
+
 **Status: v0.9.7 (2026-08-17) · everything in this document is BUILT and LIVE — on the public
 testnet since 2026-08-27 (staging-1) and on testnet-1 since 2026-09-02 — unless marked otherwise.
 Since this revision: the consensus wire is bincode (0.9.11), verifying keys are pinned in the
@@ -8,7 +10,8 @@ fee applies to every transaction including pool ones (0.12.2; genesis-bound 0.13
 `FEES.md`), the Windows wallet drives every operation here (0.13.0), and since 0.15.0 a
 REGISTERED asset enters the pool only if its issuer set `pool_eligible` at registration —
 a note is unreachable by an issuer freeze by design, so the issuer decides up front
-(`X1-ISSUED-ASSETS.md`; the pool still pins one asset, and a paused asset's unshield
+(`X1-ISSUED-ASSETS.md`; since v0.19.0 each pool-eligible asset has its own pool — P6,
+`P6-MULTI-ASSET-POOL.md` — and a paused asset's unshield
 credit is refused like any other movement while fully shielded transfers continue).** This is the single source of truth for the pool as implemented —
 the reference for auditors (P3), integrating partners, wallet implementers, and the future
 public protocol spec. Code is authoritative where they disagree; file an issue in
@@ -144,7 +147,7 @@ Both are verified against public inputs **the chain derives itself** — never a
 transaction's claim of them.
 
 **MintToPool { asset, value, commitment, proof, stealth_ct }** — shield.
-Rules: value > 0 and ≤ u64::MAX; single-asset pool v1 — the FIRST mint pins `pool.asset`;
+Rules: value > 0 and ≤ u64::MAX; before v0.19.0 a single-asset pool — the FIRST mint pinned `pool.asset`; since P6 (v0.19.0) the mint routes to the pool of its `asset` (`P6-MULTI-ASSET-POOL.md`);
 tree capacity ≥ 1; the mint proof must verify for `MintPublic { commitment, value }`
 (the **inflation guard**: the commitment provably opens to exactly the debited value while
 owner/rho/rcm never touch the chain). Effects: debit sender, append commitment,
@@ -251,15 +254,14 @@ verifier config is node-local; replays must apply the same config timeline).
 - Any vk change (v2→v3 happened 2026-08-17) requires: prover restart, node vk refetch
   (devnet) / genesis pin update (mainnet), fresh witness shapes in wallets.
 
-## 13 · Known v1 limits (deliberate, dated)
+## 13 · Known limits (deliberate, dated 2026-09-14)
 
-Single-asset pool (first mint pins) · stealth randomness is caller-supplied (demo
-deterministic; production = CSPRNG) · wallet `ots_index`/note tracking in-memory
-(persist reserve-then-sign before value) · node note index in-memory, fresh per run ·
-JSON wire codec double-hexes proofs (~2.7 MB → ~11 MB; devnet gossip caps at 32 MiB;
-binary codec WS8 + aggregation P2.3 are the fixes) · per-proof in-node verify (~10² ms/
-validator; ONE aggregate per block is P2.3) · viewing keys / disclosure = P2.2 · nothing
-audited (see `docs/AUDIT-SCOPE.md`).
+Whole-state hash commitment (no Merkleized state yet) · node-level indexes partly in
+memory · delegated proving exposes the witness to the prover (local proving is the
+deployment posture) · trial-decap scanning is O(outputs) (OMR later) · stealth randomness
+is caller-supplied (demo deterministic; production = CSPRNG) · vk pins optional on devnets,
+mandatory on a pinned genesis (`networks/testnet-1/vks.json`) · nothing audited (see
+`docs/AUDIT-SCOPE.md`).
 
 ## 14 · Measured (live devnet, 2026-08-17, RTX 5090 / WSL2)
 

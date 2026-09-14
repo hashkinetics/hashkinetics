@@ -1,6 +1,6 @@
 # HashKinetics testnet-1 — join as a full node
 
-> **Current release: v0.19.0 (2026-09-09) — P6: one shielded pool per asset, a CONSENSUS CHANGE with an activation by height: every node must run v0.19.0 before height 190,000** (nothing changes at the height itself; the first second-asset shield after it — the bridged `USDC.sep` — is the block an older node rejects and islands on). v0.18.2 (2026-09-08, client-only) made every consensus signature ~2,500× cheaper and paces blocks to a 1 s floor. Minimum for the tip until 190,000: v0.18.1 — every node must run ≥ v0.18.1 since height 110,000 (the G1 activation; a node still on ≤ v0.17 — or on the withdrawn v0.18.0, which named 200,000 — stopped following there).** (Since v0.17.0 the node verifies with a verify-only STARK client — a restart costs seconds and the resident set is tens of MiB; since v0.15.1 the kit carries the verifying keys, `vks.json`, and the node's client speaks https; since v0.15.2 your node advertises its version to its peers and shows up on [hashkinetics.org/network#live](https://www.hashkinetics.org/network#live) the moment it connects to the gateway). Minimum to sync: v0.13.0 — testnet-1 launched 2026-09-02 from a fresh
+> **Current release: v0.19.3 (2026-09-13, client-only — N2: a restarted validator always learns its peers' gossipsub subscriptions; operators restart with a gap: stop, wait 45 s, start, never a rolling restart). Consensus rules: v0.19.0 (2026-09-09) — P6: one shielded pool per asset, a CONSENSUS CHANGE that activated at height 190,000 on 2026-09-09: every node must run ≥ v0.19.0 to follow the chain past it** (nothing changed at the height itself; the first second-asset shield after it — the bridged `USDC.sep`, at height 214,097 — is the block an older node rejects and islands on). Between them, client-only and with no deadline: v0.19.1 (2026-09-09) carries the bridge subcommands and a CLI wallet bound to a real account; v0.19.2 (2026-09-13) lets the faucet drip issued assets (P6.2 — test USDC in the wallets). v0.18.2 (2026-09-08, client-only) made every consensus signature ~2,500× cheaper and paces blocks to a 1 s floor. Before P6, v0.18.1 was the minimum from height 110,000 (the G1 activation; a node still on ≤ v0.17 — or on the withdrawn v0.18.0, which named 200,000 — stopped following there). `CHECKSUMS` in this directory carries the sha256 rows for the release assets — hk-node v0.13.0 through v0.19.3 (the client-only v0.19.1 tag's digests are recorded in `CHANGELOG.md`), the desktop wallet builds up to v0.15.0, the Linux zip v0.14.1, and the Android APKs v0.2.0 and v0.3.0 — verify before you run anything. (Since v0.17.0 the node verifies with a verify-only STARK client — a restart costs seconds and the resident set is tens of MiB; since v0.15.1 the kit carries the verifying keys, `vks.json`, and the node's client speaks https; since v0.15.2 your node advertises its version to its peers and shows up on [hashkinetics.org/network#live](https://www.hashkinetics.org/network#live) the moment it connects to the gateway). Minimum to sync: v0.13.0 — testnet-1 launched 2026-09-02 from a fresh
 > genesis with the protocol fee (100 micro per envelope, burned) **bound in the genesis
 > from height 1** and the faucet treasury allocated at genesis — no activation heights,
 > no coordinated rolls for the fee. Appended transaction kinds activate by height instead:
@@ -9,20 +9,24 @@
 > 2026-08-27 → 2026-09-02, stopped at height 107,182 and is archived — see `../staging-1/`.)
 
 The public testnet (the chain behind [hashkinetics.org/explorer](https://www.hashkinetics.org/explorer)
-and `https://rpc.hashkinetics.org`). Four founder-operated validators run it; anyone
+and `https://rpc.hashkinetics.org`). Eleven validators run it — the four founding seats
+and seven external operators admitted on the running chain between 2026-09-05 and
+2026-09-12 (≈ 462,000 blocks at ~1.3 s/block on 2026-09-14); anyone
 can run a **full node** that syncs it, verifies every block, and serves its own RPC
 and explorer. External operators start as **observers**; since v0.14.0 a voting seat
 is admitted on the RUNNING chain by a certificate approved by more than ⅔ of the
 current seats' root keys — no new genesis (`docs/V1-VALIDATOR-SET-CHANGES.md`)
 (`docs/VALIDATOR-ONBOARDING.md`). From height 110,000 (v0.18.1, bootstrap governance)
 the four genesis seats weigh 4 each by a published rule, so the founding seats hold more
-than ⅔ on their own while the network is this young; the weight returns to external
-seats by certificate on a dated milestone (`docs/V1-VALIDATOR-SET-CHANGES.md` §6).
-**Every node must run ≥ v0.18.1 before height 110,000.** Since v0.15.0 the chain carries **issued assets**:
+than ⅔ on their own while the network is this young (16 of 23 with 11 seats, quorum 16;
+seat #11 on 2026-09-12 was the last the founding seats can admit alone — the twelfth
+needs an external co-signature or the handover); the weight returns to external
+seats by `SetPower` certificate on a dated milestone (`docs/V1-VALIDATOR-SET-CHANGES.md` §6).
+**Every node must run ≥ v0.19.0 (the consensus rules since height 190,000); run the current release, v0.19.3.** Since v0.15.0 the chain carries **issued assets**:
 an issuer registers an asset, mints, burns, freezes and pauses under a policy fixed at
 registration, with supply in the state commitment (`docs/X1-ISSUED-ASSETS.md`;
 `hk-node asset …`, `hk_getAssets`). Just want to use it? `https://www.hashkinetics.org/faucet`
-and the wallets — Windows and Android (`docs/WALLET-GUIDE.md`); every transaction pays 100 micro.
+and the wallets — Windows v0.15.0 and Android v0.3.0, both carrying test `USDC.sep` beside `HKN` since 2026-09-13 (`docs/WALLET-GUIDE.md`); every transaction pays 100 micro. Bridged `USDC.sep` comes from Sepolia USDC through the B1 bridge (`docs/BRIDGE-GUIDE.md`; 1-of-1 founder-run attestor, labelled as such).
 
 **Identity, not topology, defines the network.** The `genesis.json` here — chain id,
 validator roots, vk pins — IS the network. A node on this genesis with these peers is

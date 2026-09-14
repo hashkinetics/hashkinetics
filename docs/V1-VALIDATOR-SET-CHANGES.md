@@ -24,7 +24,7 @@ No coordinator key, no new genesis field. The seats that hold the chain today vo
 
 ## 3 · Operator runbook (testnet-1)
 
-The founder seats are `hk-val-0/1/2` and `hk-gateway`; approvals from any three (3·3 = 9 > 2·4 = 8) admit a seat. Every step below is offline except the last.
+The founder seats are `hk-val-0/1/2` and `hk-gateway`. Before G1 (four seats at power 1) approvals from any three admitted a seat (3·3 = 9 > 2·4 = 8); since G1 (height 110,000, founding seats at power 4 — §6) the four founding approvals carried every admission up to seat #11 (2026-09-12) — the last the founders can make alone. Seven external seats were admitted this way between 2026-09-05 and 2026-09-12 (#5–#11). From the eighth external seat the founding fleet no longer holds more than ⅔ on its own (16 of 24), so every admission from #12 on carries at least one external seat's approval — the first external co-signer accepted the role on 2026-09-11; the founders never raise their own weight by certificate. Every step below is offline except the last.
 
 ```bash
 # 0 · the candidate ran `hk-node keygen` and sent validator.json (public halves only)
@@ -74,14 +74,14 @@ Voting power was 1 per seat until v0.18.0; from testnet-1 height 110,000 the fou
 | external seats | total | quorum | founders alone decide? | founders can pass a set change alone? | max absent power |
 |---|---|---|---|---|---|
 | 0 | 16 | 11 | yes (3 of 4 suffice) | yes | 5 |
-| 2 (today) | 18 | 13 | yes — all four; 3 founders + 1 external also | yes (16 > 12) | 5 |
-| 3 (after seat #7) | 19 | 13 | yes — all four; 3 + 1 also | yes | 6 |
-| 7 | 23 | 16 | yes — all four | yes (3·16 = 48 > 46) | 7 |
+| 2 (2026-09-06, when this was written) | 18 | 13 | yes — all four; 3 founders + 1 external also | yes (16 > 12) | 5 |
+| 3 (2026-09-07, after seat #7) | 19 | 13 | yes — all four; 3 + 1 also | yes | 6 |
+| 7 (**today, 2026-09-14** — seats #5–#11) | 23 | 16 | yes — all four | yes (3·16 = 48 > 46) | 7 |
 | 8 | 24 | 17 | **no** (16 < 17) | **no** (48 = 48) | 7 |
 
 So weight 4 holds strict > ⅔ up to **seven** external seats of power 1; the eighth seat, or any earlier handover, is a `SetPower` certificate, never a binary. What the founders give up: one founding seat absent **and** every external seat absent still halts the chain (12 of 18 is not > ⅔) — the founding fleet keeps its four seats up as it always has; what nobody can do any more: stall the chain or block a change by switching off external machines.
 
-**`SetPower` — the handover tool.** `SetChange::SetPower { root_pk, voting_power }` (signing tag `0x03`, power ≥ 1 — use `Remove` to unseat) re-weights one seated root in place under the same approval rule (> ⅔ of the current power, window, chain id). A `SetPower` to the power the seat already has is treated as *already applied*: `apply_set_change` returns `None`, the proposer drops it from its queue without a log line, and it never reaches a block — so a no-op body cannot be used as a rehearsal that leaves a receipt (learned 2026-09-12: 1XP's first co-signature verified at `assemble` and at `hk_submitSetChange`, then the no-op was dropped as designed). `hk-node set-change propose <HOME> --set-power <root_pk hex> --power N …`, then approve / assemble / submit exactly as §3. The handover schedule is a dated milestone in `docs/MASTER-BUILD-PLAN.md`: founding weight lowered by certificate (4 → 1, one seat per change) once external seats have proved a soak — never silently, always with a receipt in `CHANGELOG.md`.
+**`SetPower` — the handover tool.** `SetChange::SetPower { root_pk, voting_power }` (signing tag `0x03`, power ≥ 1 — use `Remove` to unseat) re-weights one seated root in place under the same approval rule (> ⅔ of the current power, window, chain id). A `SetPower` to the power the seat already has is treated as *already applied*: `apply_set_change` returns `None`, the proposer drops it from its queue without a log line, and it never reaches a block — so a no-op body cannot be used as a rehearsal that leaves a receipt (learned 2026-09-12: 1XP's first co-signature verified at `assemble` and at `hk_submitSetChange`, then the no-op was dropped as designed). `hk-node set-change propose <HOME> --set-power <root_pk hex> --power N …`, then approve / assemble / submit exactly as §3. The handover is a dated milestone: the G3 soak clock starts at the SetPower handover — the founding seats' weight lowered from 4 to 1 by certificate, one seat per change with a receipt — with at least four external seats live; 30 days incident-free from then. Never silently, always with a receipt in `CHANGELOG.md`.
 
 **Read it back.** `hk_getValidators` now answers `total_power, founding_power, external_power, quorum_power, max_absent_power, founders_alone_decide, bootstrap {height, founding_power, active}` and marks each validator `genesis: true|false` (`docs/RPC.md`). The activation logs `G1 BOOTSTRAP GOVERNANCE ACTIVATED — genesis seats re-weighted` on every node at the same height; a `SetPower` commit logs `Validator RE-WEIGHTED (G1 set-power)` and `hk_getBlock.set_changes[].change` reads `set_power`.
 

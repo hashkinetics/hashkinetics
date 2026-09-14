@@ -1,6 +1,6 @@
 # HashKinetics — Validator Onboarding (public testnet)
 
-**v0.19.0 · testnet-1.** Run **v0.19.0** (the current release, 2026-09-09 — **a consensus change with an activation by height: every node must run v0.19.0 before testnet-1 height 190,000** — P6, one shielded pool per asset, `docs/P6-MULTI-ASSET-POOL.md`; a node still on ≤ v0.18.2 follows the chain past the height and islands at the first second-asset shield, §8b) — v0.18.2 (2026-09-08, client-only) made every consensus signature cost 179 µs instead of ~450 ms and paces blocks to a 1 s floor — **every node must run ≥ v0.18.1 since testnet-1 height 110,000** (v0.18.0, which named height 200,000, is withdrawn — never run it), the G1 bootstrap-governance activation: at that height the four genesis seats are re-weighted to voting power 4 by rule (§8a); a node still on ≤ v0.17 stops following there, loudly; since v0.17.0 the node verifies STARKs with a verify-only client — no proving engine at start-up, so a restart costs seconds, not minutes, and the resident set is tens of MiB (measured on the founding seats 2026-09-06: 54–59 MiB, start → RPC 6–16 s; any node reports its own in `hk_chainInfo.process`); the kit ships the verifying keys, so your node never depends on our prover; since v0.15.2 your node advertises its version to its peers and appears on the public roll call, `hk_getPeers` / [hashkinetics.org/network#live](https://www.hashkinetics.org/network#live), the moment it connects). Minimum to *sync* **testnet-1** (`hashkinetics-1-4e4ea68d`) is v0.13.0 — the fee policy lives in its genesis, so older nodes cannot decode it — but the network activates appended transaction kinds by height: the first validator-set change (v0.14.0), the first issued-asset transaction (v0.15.0) and the G1 activation at height 110,000 (v0.18.1) each make their release the minimum for every node from that block on (an older node halts there, loudly, by design). A node that wants a seat must run the current release before it is admitted. (staging-1 is retired and archived: `networks/staging-1/`.) How an external operator joins a HashKinetics network: generate a key,
+**v0.19.3 · testnet-1.** Run **v0.19.3** (the current release, 2026-09-13, client-only: the gossipsub subscription re-announce — a restarted seat always learns its peers' topic subscriptions, `docs/INCIDENTS.md` #12; `hk_getPeers` shows `reconnects` and `last_connection_secs`; no activation height) — **v0.19.0 remains the consensus minimum since height 190,000** (2026-09-09 — **a consensus change with an activation by height: every node must run ≥ v0.19.0 from testnet-1 height 190,000** — P6, one shielded pool per asset, `docs/P6-MULTI-ASSET-POOL.md`; a node still on ≤ v0.18.2 follows the chain past the height and islands at the first second-asset shield, §8b) — v0.18.2 (2026-09-08, client-only) made every consensus signature cost 179 µs instead of ~450 ms and paces blocks to a 1 s floor — **every node must run ≥ v0.18.1 since testnet-1 height 110,000** (v0.18.0, which named height 200,000, is withdrawn — never run it), the G1 bootstrap-governance activation: at that height the four genesis seats are re-weighted to voting power 4 by rule (§8a); a node still on ≤ v0.17 stops following there, loudly; since v0.17.0 the node verifies STARKs with a verify-only client — no proving engine at start-up, so a restart costs seconds, not minutes, and the resident set is tens of MiB (measured on the founding seats 2026-09-06: 54–59 MiB, start → RPC 6–16 s; any node reports its own in `hk_chainInfo.process`); the kit ships the verifying keys, so your node never depends on our prover; since v0.15.2 your node advertises its version to its peers and appears on the public roll call, `hk_getPeers` / [hashkinetics.org/network#live](https://www.hashkinetics.org/network#live), the moment it connects). Minimum to *sync* **testnet-1** (`hashkinetics-1-4e4ea68d`) is v0.13.0 — the fee policy lives in its genesis, so older nodes cannot decode it — but the network activates appended transaction kinds by height: the first validator-set change (v0.14.0), the first issued-asset transaction (v0.15.0) and the G1 activation at height 110,000 (v0.18.1) each make their release the minimum for every node from that block on (an older node halts there, loudly, by design). A node that wants a seat must run the current release before it is admitted. (staging-1 is retired and archived: `networks/staging-1/`.) How an external operator joins a HashKinetics network: generate a key,
 send one public JSON blob, receive genesis, start. Every consensus signature you will ever
 produce is hash-based (LMS/HSS over SHAKE-256 under a stateless SLH-DSA-192s root) — you are
 operating post-quantum BFT.
@@ -62,10 +62,11 @@ height 1:
 sha256sum genesis.json      # compare to the published digest
 cp genesis.json ~/hk-validator/
 ```
-The genesis carries **vk pins**: hashes of the exact proof system this chain accepts. Your
-node fetches the verifying-key bytes from the coordinator's prover URL at startup and
-**refuses to start unless they match the pins** — so fetching from someone else's server is
-trustless.
+The genesis carries **vk pins**: hashes of the exact proof system this chain accepts. The
+kit ships the verifying-key bytes (`networks/testnet-1/vks.json`, genesis-pinned — copy it
+into your home, §5) and your node **refuses to start unless they match the pins**. Fetching
+them instead (`hk-node vks-fetch <PROVER_URL>`, or `HK_PROVER_URL` at startup) is the
+fallback — trustless for the same reason: the pins decide, not the server.
 
 ## 4 · Write your config
 
@@ -91,7 +92,7 @@ Skipping gossip is safe: your node still validates everything; only tx relay is 
 ```bash
 cp networks/testnet-1/vks.json ~/hk-validator/vks.json   # since v0.15.1: the verifying keys ship in the kit — no prover needed
 hk-node start ~/hk-validator
-# (pre-v0.15.1 alternative, still supported: HK_PROVER_URL=https://prover.hashkinetics.org — fetches the same pinned keys at startup)
+# (fallback, still supported: `hk-node vks-fetch https://prover.hashkinetics.org` or HK_PROVER_URL=https://prover.hashkinetics.org — fetches the same pinned keys)
 ```
 As a service, `/etc/systemd/system/hk-node.service`:
 ```ini
@@ -249,7 +250,7 @@ matches other validators'. On restarts you'll also see
   certificate you sign; `hk_getValidators.external_power`), your node still proposes in its
   round-robin turn, and the handover of weight to external seats is a dated milestone done by
   `SetPower` certificate with a receipt — `docs/V1-VALIDATOR-SET-CHANGES.md` §6,
-  `docs/MASTER-BUILD-PLAN.md`. Read the line yourself: `hk_getValidators` →
+  `CHANGELOG.md`. Read the line yourself: `hk_getValidators` →
   `quorum_power`, `max_absent_power`, `founders_alone_decide`, `bootstrap.active`.
 - Your key exhausting or your node dying is a **liveness** fault only — the chain continues;
   key rotation under your SLH-DSA root brings you back (SCMS; cert flow is live —
@@ -278,8 +279,10 @@ sha256sum genesis.json                                      # publish this diges
 The full procedure, the rules behind each step, and the testnet-1 record live in
 `docs/CEREMONY-TESTNET-1.md`; `chain/rehearsal.sh` runs the whole ceremony locally first.
 Coordinator also runs: the seed node (stable public multiaddr), the hosted prover (vk
-endpoint + proving for demo traffic), and the public explorer. **G3 soak clock**: starts
-when ≥4 external validators hold ≥⅓ of voting power; 30 days incident-free.
+endpoint + proving for demo traffic), and the public explorer. **G3 soak clock**: the G3 soak
+clock starts at the SetPower handover — the founding seats' weight lowered from 4 to 1 by
+certificate, one seat per change with a receipt — with at least four external seats live;
+30 days incident-free from then.
 
 ## 8 · From observer to seat (v0.14.0; run the current release)
 
@@ -289,7 +292,7 @@ A seat is admitted on the running chain by a `SetChangeCert` approved by more th
 
 ### 8a · Bootstrap governance — the activation at height 110,000 (v0.18.0 → v0.18.1)
 
-Six seats at power 1 meant two things nobody had signed up for: a set change needed an external co-signature (4 of 6 is not > ⅔) and the chain's liveness depended on two external VPSs staying up. **v0.18.1 fixes that at the protocol level:** at height **110,000** every node re-weights the four genesis seats to power **4**, effective 110,001 — a rule in the binary (hard-wired by chain id), not a certificate, so a node syncing from genesis derives the same set. From then on an admitted seat is seated on **founding approvals alone** (four of them while two external seats are seated: 16 > ⅔ of 18), and the founders' weight comes back down by `SetPower` certificate on the dated schedule — never silently. **Upgrade before the height**: `hk-node --version` → v0.18.1 (v0.18.0 named height 200,000 and is withdrawn); a ≤ v0.17 node keeps counting power 1 per seat, refuses the first commit certificate it cannot make a quorum of, and islands. The gate for this release is `chain/gate-g1.sh`; the announcement with the day of the height is in #testnet.
+Six seats at power 1 meant two things nobody had signed up for: a set change needed an external co-signature (4 of 6 is not > ⅔) and the chain's liveness depended on two external VPSs staying up. **v0.18.1 fixes that at the protocol level:** at height **110,000** every node re-weights the four genesis seats to power **4**, effective 110,001 — a rule in the binary (hard-wired by chain id), not a certificate, so a node syncing from genesis derives the same set. From then on an admitted seat is seated on **founding approvals alone** (four of them while two external seats are seated: 16 > ⅔ of 18), and the founders' weight comes back down by `SetPower` certificate on the dated schedule — never silently. **Upgrade before the height**: `hk-node --version` → v0.18.1 (v0.18.0 named height 200,000 and is withdrawn); a ≤ v0.17 node keeps counting power 1 per seat, refuses the first commit certificate it cannot make a quorum of, and islands. The gate for this release is `chain/gate-g1.sh`; the announcement with the day of the height is in #testnet. Seven external seats were admitted this way between 2026-09-05 and 2026-09-12 (#5–#11). From the eighth external seat the founding fleet no longer holds more than ⅔ on its own (16 of 24), so every admission from #12 on carries at least one external seat's approval — the first external co-signer accepted the role on 2026-09-11; the founders never raise their own weight by certificate.
 
 ### 8b · One shielded pool per asset — the activation at height 190,000 (v0.19.0, P6)
 

@@ -1,6 +1,6 @@
-# HashKinetics JSON-RPC — the complete reference (node v0.17.0)
+# HashKinetics JSON-RPC — the complete reference (node v0.19.3 — 26 methods)
 
-**Every method the node answers, with parameters, result shapes, limits and the errors you can get.** The public endpoint is `https://rpc.hashkinetics.org` (testnet-1, `hashkinetics-1-4e4ea68d`); a local node answers on `http://127.0.0.1:26000`. This is the same API the website, the explorer, the faucet and the Windows wallet use — there is no second, private one. Source of truth: `chain/crates/hk-node/src/rpc.rs` (one `dispatch` match; if this page and the code disagree, the code wins and this page has a bug).
+**Every method the node answers (26 as of v0.19.3, 2026-09-14), with parameters, result shapes, limits and the errors you can get.** The public endpoint is `https://rpc.hashkinetics.org` (testnet-1, `hashkinetics-1-4e4ea68d`); a local node answers on `http://127.0.0.1:26000`. This is the same API the website, the explorer, the faucet and the Windows wallet use — there is no second, private one. Source of truth: `chain/crates/hk-node/src/rpc.rs` (one `dispatch` match; if this page and the code disagree, the code wins and this page has a bug).
 
 ## Transport
 

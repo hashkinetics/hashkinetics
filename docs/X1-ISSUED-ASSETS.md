@@ -1,5 +1,7 @@
 # X1 — issued assets: registry + issuer controls (mint · burn · freeze · pause)
 
+> **Status 2026-09-14:** SHIPPED as hk-node v0.15.0 (gate-x1 40/40); the first registered assets are the bridge's USDC.sep and HKT (height 170,698, 2026-09-09); X2 attested minting (B2) is the next consensus change.
+
 **Status: implemented 2026-09-04 (v0.15.0); hk-state tests 21/21; devnet gate `chain/gate-x1.sh` 40/40 GREEN; released and rolled to every testnet-1 seat (R7, state-compatible — the registry enters the commitment only once non-empty). Activation on testnet-1 is the first asset transaction: from that block every node must be ≥ v0.15.0. Must land before the audit-scope freeze (A1) and before the soak clock starts — P3.2 §X.** Companion: `docs/STABLECOIN-RAILS-AND-ORACLE-PLAN.md` (why an issuer needs exactly these five verbs on day one; X2 attested mint builds on this).
 
 ## 1 · What changes
