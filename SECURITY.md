@@ -19,7 +19,8 @@ Do not open public issues for security-relevant findings.
 Everything in this repository, with special interest in: the state machine and its
 commitment (`hk-state`), consensus signing and rotation (`hk-consensus`, `hk-crypto::hashsig`
 — stateful signatures: leaf reuse is catastrophic by design and defended by
-reserve-then-sign), the spend/mint circuits and aggregation digests (`zkvm-bakeoff/circuit`),
+reserve-then-sign with a directory-fsynced state write; R16, 2026-09-22, closed a
+durability gap here after an external report), the spend/mint circuits and aggregation digests (`zkvm-bakeoff/circuit`),
 the durable store and replay path (`hk-node/src/store.rs`, `state.rs`), and the disclosure
 machinery (`hk-wallet`). The ten consensus-critical invariants an attacker should try to
 break are enumerated in `docs/AUDIT-SCOPE.md` and the yellowpaper — consider that a map.

@@ -134,6 +134,16 @@ wait 45 s, start**; deploy validators with a stop-then-start strategy, not a rol
 proposer slots keep committing in round 1 (`hk_getBlock.certificate.round` on the public RPC at
 your heights) while `hk_chainInfo` looks healthy, that is the symptom.
 
+**After every restart, read your leaf counter (2026-09-23, v0.19.4).** `hk_chainInfo.signer.remaining`
+right after the start must be **equal or lower** than it was just before the stop, within the same
+`signer.epoch`. Your signing key is stateful: every signature spends one leaf, and the spent position is
+written to disk before the signature leaves the process. v0.19.4 made that write durable across power
+loss and kernel panics (the directory entry is fsynced, not just the file). If `remaining` ever comes
+back *higher* than before, the state file on disk is older than the signatures you released — stop the
+node and tell us on Discord before it signs again. Keep the state file on the same disk as the block
+log, on storage that honours fsync (a cloud persistent disk, a real SSD — not a VM with write-back
+caching that ignores flushes), and never restore it from a backup or snapshot.
+
 ### 5a · Keys at rest (v0.16.0, optional but recommended)
 
 `priv_validator_key.json` is the SLH-DSA root seed — everything (votes, rotations,

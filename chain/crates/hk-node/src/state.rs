@@ -108,8 +108,10 @@ pub(crate) fn set_verifier_init_ms(ms: u64) {
     let _ = VERIFIER_INIT_MS.set(ms);
 }
 
-/// This process's resident set in bytes — Linux only (`/proc/self/statm`, field 2 in pages);
-/// None where the kernel does not say. Cheap enough to read on every `hk_chainInfo`.
+/// This process's resident set in bytes — Linux (`/proc/self/statm`, field 2 in pages) and,
+/// since v0.19.4, macOS (`proc_pidinfo(PROC_PIDTASKINFO).pti_resident_size` — the first
+/// native macOS/arm64 seat reported `null` here); None where the kernel does not say.
+/// Cheap enough to read on every `hk_chainInfo`.
 pub(crate) fn rss_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -118,8 +120,46 @@ pub(crate) fn rss_bytes() -> Option<u64> {
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as i64;
         rss_from_statm(&statm, page)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
+        // SAFETY: proc_pidinfo writes at most `buffersize` bytes into a zeroed, correctly
+        // sized `proc_taskinfo`; a return value shorter than the struct means "no data".
+        let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+        let got = unsafe {
+            libc::proc_pidinfo(
+                std::process::id() as libc::c_int,
+                libc::PROC_PIDTASKINFO,
+                0,
+                &mut info as *mut libc::proc_taskinfo as *mut libc::c_void,
+                size,
+            )
+        };
+        (got == size).then_some(info.pti_resident_size)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// Free bytes on the filesystem that holds `path` (what an unprivileged writer may still
+/// use: `f_bavail × f_frsize`). v0.19.4, after incident #13 (2026-09-14: the block log
+/// filled the disk and consensus halted 54 min) — `hk_chainInfo.process.disk_free_bytes`
+/// is the number a watcher pages on. None on non-Unix targets or if statvfs fails.
+pub(crate) fn disk_free_bytes(path: &std::path::Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+        // SAFETY: statvfs fills the zeroed struct we hand it and reads only the C string.
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::statvfs(c.as_ptr(), &mut st) };
+        (rc == 0).then(|| (st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
         None
     }
 }
@@ -2180,6 +2220,17 @@ mod rotation_trigger_tests {
 #[cfg(test)]
 mod r11_process_tests {
     use super::{rss_from_statm, set_verifier_init_ms, verifier_init_ms};
+
+    #[test]
+    #[cfg(unix)]
+    #[test]
+    fn v0_19_4_disk_free_bytes_answers_for_a_real_dir_and_not_for_a_missing_one() {
+        let here = std::env::temp_dir();
+        let free = super::disk_free_bytes(&here).expect("temp dir has a filesystem");
+        assert!(free > 0, "a writable temp dir must report free space");
+        let missing = here.join(format!("hk_no_such_dir_{}", std::process::id()));
+        assert_eq!(super::disk_free_bytes(&missing), None);
+    }
 
     #[test]
     fn r11_rss_is_read_from_statm_pages() {

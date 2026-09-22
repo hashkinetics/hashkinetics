@@ -363,6 +363,11 @@ impl NodeStore {
     }
 
     /// 0 = unknown (persistence just opened, or nothing servable yet).
+    /// Where the block log lives — the filesystem whose free space matters (v0.19.4).
+    pub fn blocks_dir(&self) -> &Path {
+        &self.blocks_dir
+    }
+
     pub fn disk_min(&self) -> u64 {
         self.disk_min.load(std::sync::atomic::Ordering::Relaxed)
     }

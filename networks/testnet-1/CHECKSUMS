@@ -65,3 +65,7 @@ a6a4a56ffc0d8339564ccd6392140e4890316cd001f2e04e22bedd168eaaf22d  hk-node-v0.19.
 # v0.19.3 release (2026-09-13) — N2: a restarted validator always learns its peers' gossipsub subscriptions (vendored libp2p-gossipsub 0.49.5 + the HK re-announce patch); hk_getPeers reconnects / last_connection_secs; client-only, no deadline — https://github.com/hashkinetics/hashkinetics/releases/tag/v0.19.3 (immutable)
 290c1aea24c123bec5ade3133353510487dafa50d98301a1fd79d6fdb59d46cb  hk-node-v0.19.3.gz
 900b7e292ec49354ab1759a722f8a00edaca3736f4268e016a0f7e55b550c7b2  hk-node-v0.19.3
+
+# v0.19.4 release (2026-09-23) — R16: the consensus signer's state write is durable (directory fsync after the rename; upward resume on load) + macOS rss_bytes + hk_chainInfo.process.disk_free_bytes; security, client-only, every validator should restart on it once — https://github.com/hashkinetics/hashkinetics/releases/tag/v0.19.4 (immutable)
+5b5a3e4bbf1a1da01c290ce8f00419b2d617521ba39d4cc225b86040cddf43d1  hk-node-v0.19.4.gz
+e072d4aa19a66252554321cabbee006f4c1d4fdbd0ebcf04cb648cdee788d5dc  hk-node-v0.19.4
