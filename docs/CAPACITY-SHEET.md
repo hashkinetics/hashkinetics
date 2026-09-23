@@ -68,7 +68,7 @@ Quote rule: "N seats measured at X blocks/s on one machine" — never "the chain
 - Memory is a non-issue: 32 → 203 MiB resident from 4 to 64 seats.
 - Round changes: 0/20 at every size — no seat missed a proposal on one box; on a WAN it was **signing CPU** that made a seat miss (~0.45 s per signature on v0.18.1 — VALIDATOR-ONBOARDING §0; the storage-latency reading first written here was wrong), fixed in v0.18.2 (R15: 179 µs per signature).
 - **All five rows above are v0.18.1 numbers.** With R15 the per-signature cost on this box fell from ~18 ms to ~0.18 ms, so the table is conservative for v0.18.2: the seat budget (N = 32) stands until re-measured, and is expected to widen, not shrink. The certificate size per signature (≈ 9.2 KB) does not change — the bytes are the signatures themselves.
-- **What this buys the Genesis Validator Program (the mainnet seat program; its terms live in the private data room): a genesis set of 32 seats is inside the measured envelope** (16 flat, 64 at 2× on one box) once the 32-seat row confirms it; the honest costs to state are ~5 GB/day of certificate growth at 3.3 s blocks (~13 GB/day at today's 1.3 s) and a WAN cadence at 32 seats still to be measured; seats beyond 32 wait for P2.
+- **What this buys the Genesis Validator Program (the mainnet seat program): a genesis set of 32 seats is inside the measured envelope** (16 flat, 64 at 2× on one box) once the 32-seat row confirms it; the honest costs to state are ~5 GB/day of certificate growth at 3.3 s blocks (~13 GB/day at today's 1.3 s) and a WAN cadence at 32 seats still to be measured; seats beyond 32 wait for P2.
 
 ## g · Node resident set and restart time (added 2026-09-06 with R11 / v0.17.0)
 

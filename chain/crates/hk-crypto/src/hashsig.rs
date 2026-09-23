@@ -8,8 +8,9 @@
 //! exposes exactly the right shape — signing takes the key bytes plus a callback
 //! that hands back the NEW key bytes, so state advancement is explicit and
 //! persistable. HashKinetics' consensus rule (leaf index = nonce, equivocation =
-//! slashable fraud proof) turns the classic stateful-HBS hazard into a detectable,
-//! punishable event (plan §3.3).
+//! slashable fraud proof) is designed to turn the classic stateful-HBS hazard into a
+//! detectable, punishable event (a reused leaf is visible on-chain today; the slashing
+//! path is specified, not built).
 //!
 //! Parameter set here: LM-OTS W2 + LMS H5 (32 signatures/tree) over SHAKE-256 — a
 //! small tree suitable for KATs and short-lived session keys. Consensus validators
@@ -24,8 +25,9 @@
 //! entry are fsynced (`write_atomic`). What that guarantees: after any crash, power loss
 //! or reset the file holds a position ≥ every signature ever released. What it cannot
 //! guarantee: storage that acknowledges fsync without honouring it, or a state file
-//! restored from an older snapshot/backup — those are operational failures, and the
-//! consensus rule (leaf index = nonce, equivocation = slashable) is the backstop.
+//! restored from an older snapshot/backup — those are operational failures, and a
+//! reused leaf is visible on-chain (the slashing path is specified, not built); a floor
+//! from the node's own evidence and a reservation window are the follow-ups.
 //! `attach_persistence_with_floor` lets the node add its own evidence of spent leaves.
 
 use std::path::PathBuf;
@@ -64,7 +66,8 @@ pub const AUX_CACHE_SIZE: usize = 256 * 1024;
 /// every `sign`); `aux` is the hbs-lms authentication-path cache (empty ⇒ no cache);
 /// `capacity` is the total signatures the tree can ever produce; `persist`, when set,
 /// is the file the monotone state is durably written to BEFORE each signature is
-/// released (reserve-then-sign — a restart never reuses a leaf).
+/// released (reserve-then-sign — no reuse under any failure that preserves the last
+/// durable write).
 pub struct HashSigner {
     state: Vec<u8>,
     aux: Vec<u8>,
@@ -124,7 +127,8 @@ fn encode_blob(used: u64, state: &[u8]) -> Vec<u8> {
 /// journal commit can bring the machine back with the OLD file still in place. For a
 /// stateful signer that is the one failure that must never happen: the old file carries a
 /// lower leaf counter, `attach_persistence` would resume there, and a leaf would be signed
-/// twice (LM-OTS key material leaks → forgery). So after the rename the parent directory is
+/// twice (LM-OTS key material leaks; repeated reuse of one leaf — a crash-looping node —
+/// makes forgery cheap). So after the rename the parent directory is
 /// opened and `fsync`ed, which is what makes the rename durable (same discipline as SQLite
 /// and Postgres). `write_atomic` returns only once BOTH the bytes and the directory entry
 /// are on stable storage; the signature that depends on this write is released after that.
@@ -208,7 +212,8 @@ impl HashSigner {
     }
 
     /// Current private-key state bytes — persist these (atomically) after every sign
-    /// so a restart never reuses a leaf. This IS the monotone signer state.
+    /// so a restart does not reuse a leaf (directory-fsynced write; see the module header
+    /// for what that covers). This IS the monotone signer state.
     pub fn state_bytes(&self) -> &[u8] {
         &self.state
     }

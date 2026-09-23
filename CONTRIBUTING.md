@@ -2,6 +2,8 @@
 
 Thanks for being here. This is consensus software for money — the bar is honest and high.
 
+**Policy (2026-09-23): We accept reports, not code: security findings and reproductions are credited; every fix and its tests are written in-house. External pull requests are closed with a pointer to this paragraph and to `SECURITY.md`; the finding inside them is handled like any report.**
+
 ## The three house rules
 
 1. **Demo-gated or test-gated.** Nothing merges on assertion. A consensus-visible change
@@ -34,9 +36,9 @@ Thanks for being here. This is consensus software for money — the bar is hones
 
 ## Security findings
 
-Never as public issues — see `SECURITY.md` (coordinated disclosure, credited).
+Never as public issues — see `SECURITY.md` (coordinated disclosure, credited); we write the fix and its tests in-house (R16, v0.19.4, is the precedent).
 
 ## Licensing of contributions
 
-By contributing you agree your contribution is licensed under the repository's dual
-license (MIT OR Apache-2.0), without additional terms.
+Material you send in a report (text, reproduction snippets) may be used under the repository's dual
+license (MIT OR Apache-2.0); no external code is merged.

@@ -85,7 +85,7 @@ Same files as before: `shield.json` grows a `pools` map on the first asset scan 
 Open **Backup & advanced**. Your keys live in `%USERPROFILE%\.hashkinetics\`:
 
 - `account.json` — the transparent seed and your ratchet counter. `copy seed` puts the 64-hex seed on the clipboard; store it offline.
-- `shield.json` — created the first time you shield. It holds the **shielded master** and two counters that must never run backwards (the one-time spend key index and the note tag). **Back it up too, and never restore an older copy over a newer one** — a reused one-time key would leak spend authority. Restoring the shielded side from the account seed alone is deliberately not offered.
+- `shield.json` — created the first time you shield. It holds the **shielded master** and two counters that must never run backwards (the one-time spend key index and the note tag). **Back it up too, and never restore an older copy over a newer one** — a reused one-time key leaks key material and weakens that note's spend authority. Restoring the shielded side from the account seed alone is deliberately not offered.
 
 ### 5a · Protect with a passphrase (wallet v0.14.0)
 

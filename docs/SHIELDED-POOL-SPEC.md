@@ -101,7 +101,7 @@ tag     = SHA-256( DOM_ADDR ‖ spend_root ‖ SHA-256(DOM_NK ‖ nk) )
 
 **One-time discipline:** every spend consumes one WOTS leaf (`ots_index`); wallets MUST
 persist the next index reserve-then-sign — same rule as the consensus signer. Leaf reuse
-hands the leaf key to anyone who sees both signatures (including a delegated prover).
+leaks one-time key material to anyone who sees both signatures (including a delegated prover); each further reuse makes forgery cheaper.
 Addresses are cheap to rotate (address #k from the same master); the sender-facing tag
 changes, unlinkably.
 
@@ -228,8 +228,8 @@ authority never touches the KEM.
   committed public values must BYTE-MATCH the chain-derived expectation (guests commit
   bincode), then the raw STARK verifies under the pinned vk. **Secure default:** without a
   wired verifier the state machine's `RejectAllVerifier` refuses all pool traffic.
-- **vk provenance:** devnet fetches vks from hk-prove at node startup (`HK_PROVER_URL`);
-  **mainnet pins vk hashes in genesis** (WS8 hardening item).
+- **vk provenance:** devnets fetch vks from hk-prove at node startup (`HK_PROVER_URL`);
+  **testnet-1 pins vk hashes in genesis and ships `vks.json` (K6, v0.15.1); mainnet does the same** (WS8 hardening item).
 - Node RPCs: `hk_getPoolInfo` (root, latest anchor, sizes, ledger) ·
   `hk_getPoolLeaves` · `hk_getPoolNotes` (the scanner feed: index + commitment +
   stealth_ct, built from committed txs — a node-level index, derivable by any replayer).

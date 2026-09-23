@@ -1,4 +1,4 @@
-# The protocol fee — normative reference (testnet-1 · stamped 2026-09-14, node v0.19.3)
+# The protocol fee — normative reference (testnet-1 · stamped 2026-09-23, node v0.19.4)
 
 > **Status 2026-09-14:** unchanged since testnet-1 genesis: 100 micro burned per envelope from block 1; the fee asset for bridged assets (X6) is an open decision — fees are paid in the native asset only.
 

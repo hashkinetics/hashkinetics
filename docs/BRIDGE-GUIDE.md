@@ -51,7 +51,7 @@ The burn's txid is the `burnId`; the vault keeps `processed[burnId]`, so a burn 
 
 ## The reverse leg (`HKT` → `wHKT.sep` → `HKT`)
 
-The same machinery wraps an HK-issued asset as an ERC-20 on Sepolia: burn `HKT` on testnet-1 naming a Sepolia address → the bridge mints `wHKT.sep` there (no finality wait: a HashKinetics commit is final); `HKWrapped.burn(amount, hkAccount)` on Sepolia → after Ethereum finality the issuer mints `HKT` back to that account. `HKT` is a test asset the bridge issuer mints as a float; wrapping the real HKN after TGE is a policy decision for counsel, not a build question.
+The same machinery wraps an HK-issued asset as an ERC-20 on Sepolia: burn `HKT` on testnet-1 naming a Sepolia address → the bridge mints `wHKT.sep` there (no finality wait: a HashKinetics commit is final); `HKWrapped.burn(amount, hkAccount)` on Sepolia → after Ethereum finality the issuer mints `HKT` back to that account. `HKT` is a test asset the bridge issuer mints as a float; wrapping a mainnet asset later is a policy decision that has not been made — test value only; the network has no token.
 
 ```bash
 hk-node asset burn ~/my-account https://rpc.hashkinetics.org f2b88facb835a9e331b51772cf98cbcb95d6c86233324d252fd4c9edd8fbbcea 4000000 <40 hex chars of your Sepolia address>

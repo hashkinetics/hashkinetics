@@ -1,6 +1,6 @@
 # HashKinetics — The Lawful-Access Model
 
-**One page for regulators, law enforcement, and diligence. Decision D8 (2026-08-26, constitutional): there is no master view key, and one can never be added — the commitment scheme has no slot for it. What exists instead is stronger for lawful process. ⚠ DRAFT — counsel review in progress; not to be used with any official until it lands.**
+**One page for regulators, law enforcement, and diligence. Decision D8 (2026-08-26, constitutional): there is no master view key, and one can never be added — the commitment scheme has no slot for it. What exists instead is stronger for lawful process. ⚠ DRAFT — under review; not to be used with any official until the review lands.**
 
 ## The principle
 
@@ -23,11 +23,11 @@ Disclosure on HashKinetics is **selective, process-bound, and cryptographically 
 
 1. **It would be the highest-value theft target in the system's history.** One leak, one coerced insider, one hostile state, and every user's privacy is destroyed *retroactively* — adversaries already harvest ciphertexts today to decrypt later. A master key converts one bad day into total, permanent compromise.
 2. **Capability creates obligation — to every jurisdiction at once.** Whoever *can* decrypt *must* answer compulsion from any government that can reach them (incl. key-disclosure statutes abroad). Structural inability to perform bulk decryption is what keeps the operator answerable to *process* rather than to *pressure* — from anyone.
-3. **It answers the question badly.** There are no account balances in the shielded pool to look up — only notes. "This person's finances" is correctly and completely reconstructed by process against the person and their counterparties (the instruments above), which also produces *court-grade evidence*: every disclosed fact re-verifies offline from hashes, versus the probabilistic clustering heuristics transparent-chain forensics rely on and defense counsel increasingly defeat.
+3. **It answers the question badly.** There are no account balances in the shielded pool to look up — only notes. "This person's finances" is correctly and completely reconstructed by process against the person and their counterparties (the instruments above), which also produces *court-grade evidence*: every disclosed fact re-verifies offline from hashes, versus the probabilistic clustering heuristics transparent-chain forensics rely on and defense lawyers increasingly defeat.
 4. **It would end the institutional use case** — treasuries will not transact where an operator (or its compromiser) sees everything — and with it the network the compliance regime is supposed to oversee.
 
 ## What law enforcement gains here vs. transparent chains
 
 Deterministic, self-verifying evidence instead of heuristics · mandatory, consensus-enforced travel-rule data at ramps instead of best-effort VASP compliance · bonded truthfulness of compelled disclosures · regulator-required standing visibility over regulated entities' agent fleets · and a clean legal theory: the subpoena target is always an identifiable person or licensed entity, exactly as in banking.
 
-*Public draft (published with the source; summarized on the front page at hashkinetics.org/#lawful-access) · not legal advice · counsel review in progress (the questions are with counsel, September 2026) — nothing here is to be represented to an official as settled until that review lands · provenance: LIVE items are demo-gated on the running chain (the one-payment disclosure receipt: 1 opened, 0 of the other 21; epoch viewing keys in the wallet); P3/P4 items carry their build-plan references.*
+*Public draft (published with the source; summarized on the front page at hashkinetics.org/#lawful-access) · not legal advice · under review (September 2026) — nothing here is to be represented to an official as settled until that review lands · provenance: LIVE items are demo-gated on the running chain (the one-payment disclosure receipt: 1 opened, 0 of the other 21; epoch viewing keys in the wallet); P3/P4 items carry their build-plan references.*

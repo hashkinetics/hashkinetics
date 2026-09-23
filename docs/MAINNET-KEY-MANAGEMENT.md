@@ -1,6 +1,6 @@
 # Mainnet Validator Key Management (SCMS)
 
-**Status (2026-09-14):** design + first build (0.9 → 1.0 track); the design below is dated 2026-08-16 and unchanged. Where the fleet stands today: keys sealed at rest on every founding seat since 2026-09-05 (HKE1, `LoadCredential=`); the genesis treasury cold off-fleet since 2026-09-05; `consensus_state.bin` (the live LMS tree) is not sealed yet and the passphrase file sits on the same disk — the HSM seam (SP 800-208) is the mainnet fix; R15 (v0.18.2) signing session: 179 µs per signature.
+**Status (2026-09-14):** design + first build (0.9 → 1.0 track); the design below is dated 2026-08-16 and unchanged. Where the fleet stands today: keys sealed at rest on every founding seat since 2026-09-05 (HKE1, `LoadCredential=`); the genesis treasury cold off-fleet since 2026-09-05; `consensus_state.bin` (the live LMS tree) is not sealed yet and the passphrase file sits on the same disk — the HSM seam (SP 800-208) is the mainnet fix; R15 (v0.18.2) signing session: 179 µs per signature; R16 (v0.19.4, 2026-09-22): the state write fsyncs its directory, restart resumes at the highest known position.
 **Answers:** *"What happens after root exhaustion? What is the plan for mainnet?"*
 **Date:** 2026-08-16 (status line re-stamped 2026-09-14)
 
@@ -105,19 +105,18 @@ restart that means the advancing private state has to be **durable before the
 signature is released**:
 
 1. hbs-lms computes the signature and the *advanced* key bytes.
-2. We atomically write `used ‖ advanced_state` to disk and `fsync` — **the reserve**.
+2. We write `used ‖ advanced_state` tmp → fsync → rename → fsync the directory (R16, v0.19.4) — **the reserve**.
 3. Only *then* do we commit the advance in memory and release the signature.
 
 If the write fails we release nothing and don't advance — the same leaf is retried.
 On restart we reload the persisted state (same seed → same tree/pubkey; the state
 bytes carry the true leaf index) and continue **past** the last durably-used leaf.
-The one forbidden operation is restoring an **older** snapshot — that reuses leaves.
+Forbidden: restoring an **older** snapshot, and storage that acknowledges fsync without honouring it — both reuse leaves.
 Backups of this file are therefore poison; only forward motion is legal.
 
 **Built in this pass:** `HashSigner` persists `used ‖ state` atomically inside
 `sign()` before returning; the node's consensus signer loads it from
-`<home>/consensus_state.bin` on start. A restarted validator no longer risks leaf
-reuse.
+`<home>/consensus_state.bin` on start. A restarted validator has no reuse under any failure that preserves the last durable write (the directory entry is fsynced too since v0.19.4 — R16); a floor from the node's own evidence and a reservation window are the follow-ups.
 
 ---
 
@@ -171,7 +170,7 @@ spend circuit) are the same ones gate 2 is already benchmarking.
   (certifying epoch keys) while epoch keys certify operational keys *hourly* — the
   root then touches key material a handful of times a year.
 
-### Where the software stands today (v0.16.0) and the seam an HSM plugs into
+### Where the software stands today (v0.19.4) and the seam an HSM plugs into
 
 - **Keys at rest — shipped.** `priv_validator_key.json` (root seed), `account.json`,
   `wallet.json` and the GUI's `shield.json` can be sealed on disk: the `HKE1` envelope
@@ -219,7 +218,7 @@ spend circuit) are the same ones gate 2 is already benchmarking.
 |---|---|---|
 | Operational tree nears empty | — | Proactive rotation at threshold |
 | Operational tree fully exhausts before rotating | Validator can't sign → **liveness** fault (not safety); it stalls, quorum continues without it | Rotate; rejoin. Threshold + overlap prevents it |
-| Node crash / restart | Risk of leaf reuse | Reload persisted `used ‖ state`; continue past last durable leaf |
+| Node crash / restart | Risk of leaf reuse | Directory-fsynced write (v0.19.4); resume at the highest of file / key state / floor |
 | Root key lost | Validator can't rotate → eventually stalls | Exit + re-stake new root (governance) |
 | Root key compromised | Attacker could certify a rogue op key | Detectable (unexpected epoch bump on-chain); slash + re-stake |
 | Equivocation (two sigs, one leaf/height) | — | On-chain fraud proof → **slashable**; the stateful design makes reuse *detectable*, not just forbidden |
@@ -235,7 +234,7 @@ block). That is the property to preserve.
 **Done (0.9.1):**
 - Single consensus signer (leaf-reuse bug fixed).
 - Monotone persisted operational state (reserve-then-sign to
-  `consensus_state.bin`, restart-safe).
+  `consensus_state.bin`; power-loss durable since v0.19.4 on storage that honours fsync).
 - `provider`/`node` wiring so only the engine's signer advances, and it persists.
 
 **Done (0.9.2 — rotation, increment 1):**
@@ -262,7 +261,7 @@ block). That is the property to preserve.
 - Per-epoch operational seeds via `op_seed(master, epoch)` (epoch 0 = genesis key).
 - Demo trigger `HK_ROTATE_EVERY=N` issues a self-rotation every N heights.
 
-**Hardening status — R-series SHIPPED AND PRODUCTION-PROVEN (v0.10.5 → v0.15.0):**
+**Hardening status — R-series SHIPPED AND PRODUCTION-PROVEN (v0.10.5 → v0.19.4; R15 v0.18.2 signing session; R16 v0.19.4 durable state write; open: node-evidence floor, reservation window):**
 Staging incident #1 (2026-08-28) field-proved the urgency: no rotation trigger armed,
 val-0's tree exhausted at height 10,848 and the chain halted 6 h rather than reuse a
 leaf. The design held; the R-series closed the ops gap (C-PROGRAM-PLAN.md §R):
