@@ -11,7 +11,7 @@
 The public testnet (the chain behind [hashkinetics.org/explorer](https://www.hashkinetics.org/explorer)
 and `https://rpc.hashkinetics.org`). Eleven validators run it — the four founding seats
 and seven external operators admitted on the running chain between 2026-09-05 and
-2026-09-12 (≈ 462,000 blocks at ~1.3 s/block on 2026-09-14); anyone
+2026-09-12 (≈ 1,104,500 blocks at ~1.3 s/block on 2026-09-23); anyone
 can run a **full node** that syncs it, verifies every block, and serves its own RPC
 and explorer. External operators start as **observers**; since v0.14.0 a voting seat
 is admitted on the RUNNING chain by a certificate approved by more than ⅔ of the
@@ -19,8 +19,9 @@ current seats' root keys — no new genesis (`docs/V1-VALIDATOR-SET-CHANGES.md`)
 (`docs/VALIDATOR-ONBOARDING.md`). From height 110,000 (v0.18.1, bootstrap governance)
 the four genesis seats weigh 4 each by a published rule, so the founding seats hold more
 than ⅔ on their own while the network is this young (16 of 23 with 11 seats, quorum 16;
-seat #11 on 2026-09-12 was the last the founding seats can admit alone — the twelfth
-needs an external co-signature or the handover); the weight returns to external
+seat #11 on 2026-09-12 was the last admitted on founding approvals alone — from the twelfth
+every certificate carries an external co-signature by policy (the rule, checked against the
+current set, would still pass #12 on 16 of 23 and first forces it at #13) — or the handover); the weight returns to external
 seats by `SetPower` certificate on a dated milestone (`docs/V1-VALIDATOR-SET-CHANGES.md` §6).
 **Every node must run ≥ v0.19.0 (the consensus rules since height 190,000); run the current release, v0.19.4 (security).** Since v0.15.0 the chain carries **issued assets**:
 an issuer registers an asset, mints, burns, freezes and pauses under a policy fixed at
