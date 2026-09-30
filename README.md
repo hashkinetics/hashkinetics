@@ -2,7 +2,7 @@
 
 **A post-quantum L1 that enforces AI-agent spending limits it cannot see.**
 
-[**hashkinetics.org**](https://www.hashkinetics.org) · [**Live explorer**](https://www.hashkinetics.org/explorer) · [**Public RPC**](https://rpc.hashkinetics.org) · [**X @hashkinetics**](https://x.com/hashkinetics) · [**Discord**](https://discord.gg/RsSfb9gn3) · [**Telegram**](https://t.me/+tnRXX8KOCWA3YjE1) · validators@hashkinetics.org · [**Node Keys**](https://nodes.hashkinetics.org)
+[**hashkinetics.org**](https://www.hashkinetics.org) · [**Live explorer**](https://www.hashkinetics.org/explorer) · [**Public RPC**](https://rpc.hashkinetics.org) · [**X @hashkinetics**](https://x.com/hashkinetics) · [**Discord**](https://discord.gg/Q7qF87Bzbh) · [**Telegram**](https://t.me/+tnRXX8KOCWA3YjE1) · validators@hashkinetics.org · [**Node Keys**](https://nodes.hashkinetics.org)
 
 `testnet-1: LIVE since 2026-09-02` · `node v0.19.4 (client-only, security) · consensus v0.19.0 · wallet v0.15.0 (test USDC) · Android wallet v0.3.0 (test USDC)` · `11 seats, 7 external` · `seats change on the running chain (v0.14.0)` · `bootstrap governance: genesis seats weigh 4 from height 110,000 (v0.18.1)` · `issued assets with issuer controls (v0.15.0)` · `spend proof: 1.24 s (GPU)` · `274 tx/s storm-measured` · `testnet only`
 
