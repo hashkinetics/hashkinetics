@@ -54,7 +54,14 @@ impl MandateTree {
         Self::default()
     }
 
-    /// Insert a node. Enforces Biscuit-style attenuation: a child may only narrow.
+    /// Insert a node. Enforces Biscuit-style attenuation: a child may only narrow
+    /// (`expiry`, `per_tx_max`). The asset rule — `asset(child) = asset(parent)`, the
+    /// tree is single-asset by construction — lives in [`insert_asset_bound`]: this
+    /// entry point is the PRE-R17 rule and MUST stay byte-identical, because every
+    /// node replays the mandates testnet-1 accepted before the R17 height through it.
+    /// New callers use `insert_asset_bound`.
+    ///
+    /// [`insert_asset_bound`]: MandateTree::insert_asset_bound
     pub fn insert(&mut self, node: MandateNode) -> Result<(), SpendError> {
         if let Some(pid) = node.parent {
             let parent = self.nodes.get(&pid).ok_or(SpendError::NotFound)?;
@@ -69,6 +76,38 @@ impl MandateTree {
         }
         self.nodes.insert(node.id, node);
         Ok(())
+    }
+
+    /// R17 (reported 2026-10-06): the asset is part of what a mandate authorizes, so a
+    /// child MUST carry its parent's asset — `asset(child) = asset(parent)`, hence by
+    /// induction `asset(leaf) = asset(root)` for every node of a tree inserted through
+    /// this entry point: **the tree is single-asset by construction**. Without the rule
+    /// a child holder could hang a leaf in ANY asset under an envelope the org funded
+    /// in one asset, and every spend sink debits the ROOT's funding account in the
+    /// LEAF's asset — a USDC mandate became a licence on the org's whole HKT balance,
+    /// with the caps accounted in the wrong unit. Read-only; the tree is untouched on
+    /// refusal (consensus determinism, as `check`/`spend`).
+    pub fn check_asset_bound(&self, node: &MandateNode) -> Result<(), SpendError> {
+        if let Some(pid) = node.parent {
+            let parent = self.nodes.get(&pid).ok_or(SpendError::NotFound)?;
+            if node.asset != parent.asset {
+                return Err(SpendError::Attenuation("child asset differs from parent"));
+            }
+        }
+        Ok(())
+    }
+
+    /// [`insert`] under the R17 asset rule: a child may only narrow, and only in its
+    /// parent's asset ([`check_asset_bound`] first, then the attenuation of `insert`).
+    /// The state machine switches from `insert` to this at its activation height, so
+    /// the two entry points are deliberately separate functions rather than one with a
+    /// flag: pre-activation replay never executes a byte of the new rule.
+    ///
+    /// [`insert`]: MandateTree::insert
+    /// [`check_asset_bound`]: MandateTree::check_asset_bound
+    pub fn insert_asset_bound(&mut self, node: MandateNode) -> Result<(), SpendError> {
+        self.check_asset_bound(&node)?;
+        self.insert(node)
     }
 
     pub fn get(&self, id: &MandateId) -> Option<&MandateNode> {
@@ -266,6 +305,42 @@ mod tests {
         // Child may not outlive parent:
         let bad = node(9, Some(2), 1, 1, 1, 2_000_000);
         assert!(matches!(t.insert(bad), Err(SpendError::Attenuation(_))));
+    }
+
+    /// R17: a child in a different asset is refused by the asset-bound entry point
+    /// and still accepted by the legacy `insert` (the pre-activation replay path).
+    #[test]
+    fn child_asset_must_match_parent() {
+        let mut t = demo_tree();
+        let mut foreign = node(9, Some(2), 1, 1, 1, 1_000_000);
+        foreign.asset = id(0xBB);
+        // Read-only verdict first: refused, and nothing was inserted.
+        assert_eq!(
+            t.check_asset_bound(&foreign),
+            Err(SpendError::Attenuation("child asset differs from parent"))
+        );
+        assert_eq!(
+            t.insert_asset_bound(foreign.clone()),
+            Err(SpendError::Attenuation("child asset differs from parent"))
+        );
+        assert!(t.get(&id(9)).is_none(), "a refused insert mutates nothing");
+        // Same asset as the parent: the asset-bound path still narrows as `insert` does.
+        let same = node(10, Some(2), 1, 1, 1, 1_000_000);
+        t.insert_asset_bound(same).unwrap();
+        assert_eq!(t.get(&id(10)).unwrap().asset, id(0xAA));
+        let outlives = node(11, Some(2), 1, 1, 1, 2_000_000);
+        assert_eq!(t.insert_asset_bound(outlives), Err(SpendError::Attenuation("child expiry outlives parent")));
+        // A root has no parent to match — both entry points accept it in any asset.
+        let mut root = node(12, None, 1, 1, 1, 1_000_000);
+        root.asset = id(0xCC);
+        t.insert_asset_bound(root).unwrap();
+        // The legacy entry point is byte-identical to pre-R17: it does NOT know the rule.
+        t.insert(foreign).unwrap();
+        assert_eq!(t.get(&id(9)).unwrap().asset, id(0xBB));
+        // An unknown parent is NotFound on both paths.
+        let orphan = node(13, Some(0x7F), 1, 1, 1, 1_000_000);
+        assert_eq!(t.check_asset_bound(&orphan), Err(SpendError::NotFound));
+        assert_eq!(t.insert_asset_bound(orphan), Err(SpendError::NotFound));
     }
 
     #[test]

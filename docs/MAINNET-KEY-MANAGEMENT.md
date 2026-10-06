@@ -64,19 +64,46 @@ RotationCert {
     root_pk:            SLH-DSA-192s public key (48 B)   // permanent validator identity
     new_op_pk:          HSS operational public key        // root of the fresh tree
     epoch:              u64                               // strictly increasing rotation counter
-    valid_from_height:  u64                               // activation height
-    root_sig:           SLH-DSA signature (~16 KB)        // root signs (new_op_pk ‖ epoch ‖ valid_from_height)
+    valid_from_height:  u64                               // the issuer's tip + 1 — the freshness anchor (v2)
+    root_sig:           SLH-DSA signature (~16 KB)        // root signs the domain-separated body (below)
 }
 ```
 
-**Verification (every validator, stateless):**
-1. `SLH-DSA.verify(root_pk, new_op_pk ‖ epoch ‖ valid_from_height, root_sig)` ✓
-2. `root_pk ∈ active staking set` ✓
-3. `epoch > last accepted epoch for this validator` ✓ (monotone — no rollback)
+**Signing domains (as built; L-2 of the 2026-10-06 audit intake, v0.19.6).** The certificate
+carries no version field: the **commit height** of the block that carries it decides which
+domain it must verify under (`hk_consensus::rotation::RotationRules`), and a chain names the
+switch height by chain id (`genesis::rotation_v2_from_for` — testnet-1 hard-wired, *never*
+until a later patch names it once every seat is on v0.19.6; other chains `HK_ROTATION_V2_HEIGHT`,
+unset = from genesis). `⟨x⟩` = `u64ᴸᴱ(|x|) ‖ x`.
 
-On accept, the validator-set entry's *current operational pubkey* becomes
-`new_op_pk`, effective at `valid_from_height`. From that height the validator signs
-votes with the new tree; peers verify against `new_op_pk`. The old tree is retired.
+- **v1** `hk/v1/rotation-cert ‖ 0x00 ‖ ⟨root_pk⟩ ‖ ⟨new_op_pk⟩ ‖ u64ᴸᴱ(epoch) ‖ u64ᴸᴱ(valid_from_height)` —
+  every certificate testnet-1 has committed to date. No chain id; `valid_from_height` signed but
+  never read by a verifier.
+- **v2** `hk/v2/rotation-cert ‖ 0x00 ‖ ⟨chain_id⟩ ‖ ⟨root_pk⟩ ‖ ⟨new_op_pk⟩ ‖ u64ᴸᴱ(epoch) ‖ u64ᴸᴱ(valid_from_height)` —
+  the chain id is signed, exactly as `hk/v1/set-change` signs it, so a certificate for one chain
+  means nothing on another (the testnet-1 and staging-1 roots were disjoint by ceremony rule,
+  so this closes a class, not a live hole).
+
+**Verification (every validator, stateless; `HkValidatorSet::apply_rotation(cert, rules)` with
+`rules = { height: the commit height h, chain_id, v2_from }`):**
+1. `root_pk ∈ the validator set` ✓ (the seat whose registered root it is)
+2. `epoch > last accepted epoch for this validator` ✓ (monotone — no rollback or replay)
+3. *v2 only (`h ≥ v2_from`):* `valid_from_height ≤ h + 1` ✓ (the certificate cannot name a future
+   height) **and** `h + 1 ≤ valid_from_height + 100,000` ✓ (`ROTATION_FRESHNESS_HORIZON`: a
+   certificate that never landed cannot be carried in days later; ≈ 1.5 days at 1.3 s/block, sized
+   for the human revival path)
+4. `SLH-DSA.verify(root_pk, body under the domain the height demands, root_sig)` ✓ — before
+   `v2_from` only v1 verifies; from it only v2 (a v1 certificate is refused and *named* as v1 in the
+   reason, so the operator re-issues instead of suspecting a forgery)
+
+On accept, the validator-set entry's *current operational pubkey* becomes `new_op_pk` and its
+epoch advances, **effective at `h + 1`** — the height after the commit, recorded in the per-height
+set history (R6) — and the owning node swaps its live signer in the same commit. **Staged
+activation is not implemented:** the design once read "effective at `valid_from_height`, the old
+tree signs until then"; no verifier ever staged anything, every rotation since 0.9.3 took effect at
+commit + 1, and v2 gives the signed field the one meaning it can carry without new snapshot state —
+the freshness window above. Issuers (the commit-path trigger, the R1.b tick, `issue-rotation`) write
+`valid_from_height = tip + 1`.
 
 Cost: one ~16 KB cert per rotation. At 2¹⁵ sigs/tree and a few sigs/sec that's a
 cert every several hours per validator — negligible bandwidth.
@@ -86,14 +113,18 @@ cert every several hours per validator — negligible bandwidth.
 ## Rotation flow (seamless, no missed blocks)
 
 1. Node watches `operational.remaining()`.
-2. At a threshold (e.g. 20 % left) it generates a **fresh** operational tree from a
-   new random seed — off the hot path, on a big-stack worker.
-3. It asks the **root** to sign the `RotationCert` for the new pubkey
-   (root lives in an HSM in prod; on devnet the root seed is local).
-4. The cert is published as a consensus-visible message / transaction.
-5. Peers verify (3 checks above) and stage `new_op_pk` at `valid_from_height`.
-6. The **old** tree keeps signing until `valid_from_height`; the **new** tree takes
-   over exactly there. Overlap means zero missed blocks.
+2. At a threshold (15–25 % left, per-seat jitter — R12) it generates a **fresh** operational
+   tree from `op_seed(master, epoch + 1)` — off the hot path, on a big-stack worker.
+3. It asks the **root** to sign the `RotationCert` for the new pubkey, `valid_from_height =
+   tip + 1`, under the domain the chain demands there (root lives in an HSM in prod; on devnet
+   the root seed is local).
+4. The cert rides the node's next proposal (`Batch.rotations`) and is pushed to its gossip peers
+   (`hk_submitRotation`), who carry it in theirs.
+5. Peers verify (4 checks above) at the commit height and swap `new_op_pk` in the set,
+   effective at commit + 1.
+6. The **old** tree signs through the commit; the **new** tree signs from the next height. The
+   swap and the set update happen in the same commit on the owning node, so no vote is ever
+   signed with a key its peers do not hold. Zero missed blocks (production-proven, R1).
 7. Old tree retired; its remaining leaves are never touched again.
 
 ---
@@ -170,7 +201,7 @@ spend circuit) are the same ones gate 2 is already benchmarking.
   (certifying epoch keys) while epoch keys certify operational keys *hourly* — the
   root then touches key material a handful of times a year.
 
-### Where the software stands today (v0.19.4) and the seam an HSM plugs into
+### Where the software stands today (v0.19.6) and the seam an HSM plugs into
 
 - **Keys at rest — shipped.** `priv_validator_key.json` (root seed), `account.json`,
   `wallet.json` and the GUI's `shield.json` can be sealed on disk: the `HKE1` envelope
@@ -261,7 +292,7 @@ block). That is the property to preserve.
 - Per-epoch operational seeds via `op_seed(master, epoch)` (epoch 0 = genesis key).
 - Demo trigger `HK_ROTATE_EVERY=N` issues a self-rotation every N heights.
 
-**Hardening status — R-series SHIPPED AND PRODUCTION-PROVEN (v0.10.5 → v0.19.4; R15 v0.18.2 signing session; R16 v0.19.4 durable state write; open: node-evidence floor, reservation window):**
+**Hardening status — R-series SHIPPED AND PRODUCTION-PROVEN (v0.10.5 → v0.19.6; R15 v0.18.2 signing session; R16 v0.19.4 durable state write; open: node-evidence floor, reservation window):**
 Staging incident #1 (2026-08-28) field-proved the urgency: no rotation trigger armed,
 val-0's tree exhausted at height 10,848 and the chain halted 6 h rather than reuse a
 leaf. The design held; the R-series closed the ops gap (C-PROGRAM-PLAN.md §R):
@@ -310,6 +341,16 @@ leaf. The design held; the R-series closed the ops gap (C-PROGRAM-PLAN.md §R):
   signature and a rate limit.
 - R11 CLOSED in v0.17.0 (the node verifies with a verify-only client; the memory floor is
   now the node itself, not a proving engine) · Open: STARK-aggregated commit certificates (below).
+- **L-2 ✅ (v0.19.6, R17 audit intake reported 2026-10-06; gated)** — the rotation certificate's
+  `valid_from_height` was signed but never enforced and its domain bound no chain id. Fixed as a
+  second signing domain (`hk/v2/rotation-cert`, chain id signed as in `set-change`) with the
+  field enforced as a freshness window (not past commit + 1, not more than 100,000 blocks before
+  it); the commit height decides the domain, so before a chain's `rotation_v2_from` the v1 rule
+  applies byte for byte and from it only v2 is accepted. testnet-1's height is *never* in
+  v0.19.6 — seats rotate every few hours, so an un-upgraded seat would be refused (and would
+  island on an upgraded seat's certificate) within hours of any height; it is named by a later
+  patch once `hk_getPeers` and `hk_chainInfo.activations` show every seat on the release.
+  `issue-rotation <HOME> <EPOCH> <TIP+1> <CHAIN_ID>` mints the v2 form for the revival path.
 - Operator hygiene learned in recovery: `consensus_state.bin` is the signer's spent-leaf
   state — never copy it between nodes; chain-data restores take `blocks/` + `snapshot.bin`
   only, and transplant tars must pack `snapshot.bin` FIRST (ordering skew wedges the engine).

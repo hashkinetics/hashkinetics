@@ -12,6 +12,11 @@
 //! ⚠ Honesty guard: nothing in this crate is audited. KAT cross-checks against
 //! the vendored SLH-DSA C references are REQUIRED before any key holds value.
 
+/// Durable atomic file writes (tmp → fsync → rename → fsync(dir)) — the one routine behind
+/// every counter file: signer state, the node's secrets, the wallets' account/shield files,
+/// the block log (R16 in `hashsig`, hoisted here by R17 — reported 2026-10-06). Not
+/// feature-gated: every crate that persists a reserve-then-advance counter uses it.
+pub mod fsutil;
 pub mod hash;
 pub mod lamport;
 /// SHAKE-256 authenticated encryption for note ciphertexts (P2.1) — pure hash, no AES dep.

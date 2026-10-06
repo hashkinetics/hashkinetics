@@ -1381,3 +1381,272 @@ fn p6_before_the_activation_height_a_second_asset_is_refused_exactly_as_v1() {
     assert_eq!(x1_apply(&mut st, 101, org.sign(s3)).unwrap_err(), "asset is not pool-eligible");
     org.rollback();
 }
+
+// ---------------------------------------------------------------------------------
+// R17 (H-1, reported 2026-10-06) — MandateTree authorization is asset-bound
+// ---------------------------------------------------------------------------------
+//
+// The reporter's attack: the org funds a USDC root and delegates a USDC child to an
+// agent; the agent (holder of the child) hangs a GRANDCHILD in HKT under it — the tree
+// never compared assets — and every sink then debits the ROOT's funding account in the
+// LEAF's asset: the org's HKT leaves through a mandate it only ever granted in USDC.
+// The tests pin BOTH sides of the activation: byte-identical acceptance before
+// `mandate_asset_from` (what testnet-1 replays), refusal from it.
+
+const MICRO: Amount = 1_000_000;
+
+/// A zero-rate mandate with `cap` as buffer, per-tx cap and initial buffer.
+fn r17_mandate(id: H256, parent: Option<H256>, holder: H256, asset: H256, cap: Amount) -> Tx {
+    Tx::MandateCreate {
+        id, parent, holder, asset, rate_per_sec: 0, buffer_max: cap, per_tx_max: cap,
+        initial_buffer: cap, expiry: 1_000_000, tier: 0,
+    }
+}
+
+/// org holds 50 USDC and 50 HKT; agent and merchant hold nothing.
+fn r17_genesis(org: &Keychain, agent: &Keychain, merchant: &Keychain, usdc: H256, hkt: H256) -> Genesis {
+    Genesis {
+        time: 1_000,
+        accounts: vec![org.genesis(), agent.genesis(), merchant.genesis()],
+        alloc: vec![(org.id, usdc, 50 * MICRO), (org.id, hkt, 50 * MICRO)],
+        fee: None,
+        assets: vec![],
+    }
+}
+
+#[test]
+fn r17_before_the_height_a_cross_asset_grandchild_drains_the_root_funder_exactly_as_before() {
+    let (usdc, hkt) = (h(9), h(7));
+    let mut org = Keychain::new(b"r17a-org");
+    let mut agent = Keychain::new(b"r17a-agent");
+    let merchant = Keychain::new(b"r17a-merchant");
+    let genesis = r17_genesis(&org, &agent, &merchant, usdc, hkt);
+    let mut st = State::from_genesis(&genesis).unwrap();
+    assert_eq!(st.mandate_asset_from, u64::MAX, "never, unless the node injects a height");
+    let (m0, m1, m2) = (h(0xE0), h(0xE1), h(0xE2));
+
+    // Block 1: org funds a USDC root and delegates a USDC child to the agent.
+    let b1 = vec![
+        org.sign(r17_mandate(m0, None, org.id, usdc, 20 * MICRO)),
+        org.sign(r17_mandate(m1, Some(m0), agent.id, usdc, 20 * MICRO)),
+    ];
+    // Block 2: the agent, holder of the child, hangs an HKT grandchild under it — the
+    // pre-R17 tree only narrows expiry and per_tx_max, so this is ACCEPTED.
+    let b2 = vec![agent.sign(r17_mandate(m2, Some(m1), agent.id, hkt, 20 * MICRO))];
+    // Block 3: the sinks debit the root's funder in the LEAF's asset — HKT the org
+    // never delegated — through MandateSpend and through a channel's escrow.
+    let chain = PaywordChain::mint(b"r17a-seed", b"r17a", 1_000);
+    let tip = H256(chain.tip());
+    let ch_id = State::derive_channel_id(&agent.id, &merchant.id, &tip, 2); // agent's nonce after b2 + spend
+    let b3 = vec![
+        agent.sign(Tx::MandateSpend { leaf: m2, to: merchant.id, amount: 10 * MICRO }),
+        agent.sign(Tx::ChannelOpen {
+            id: ch_id, mandate: m2, payee: merchant.id, asset: hkt, tip,
+            unit_price: 10_000, max_steps: 1_000, expiry: 900_000, // escrow 10 HKT
+        }),
+    ];
+    for (hgt, blk) in [(1u64, &b1), (2, &b2), (3, &b3)] {
+        let r = st.apply_block(hgt, 1_000 + hgt, blk).unwrap();
+        assert!(r.iter().all(|r| r.result.is_ok()), "block {hgt}: {r:?}");
+    }
+    assert_eq!(st.balance(&org.id, &hkt), 30 * MICRO, "the org's HKT left through a USDC mandate");
+    assert_eq!(st.balance(&merchant.id, &hkt), 10 * MICRO);
+    assert_eq!(st.channels[&ch_id].escrow_remaining, 10 * MICRO);
+    assert_eq!(st.channels[&ch_id].state.asset, hkt);
+    assert_eq!(st.balance(&org.id, &usdc), 50 * MICRO, "the delegated asset never moved");
+
+    // Byte-identical: a node with the activation AHEAD of it replays the same blocks to
+    // the same commitment as one that never activates — the new rule ran nowhere.
+    let mut ahead = State::from_genesis(&genesis).unwrap();
+    ahead.mandate_asset_from = 1_000_000;
+    for (hgt, blk) in [(1u64, &b1), (2, &b2), (3, &b3)] {
+        let r = ahead.apply_block(hgt, 1_000 + hgt, blk).unwrap();
+        assert!(r.iter().all(|r| r.result.is_ok()), "block {hgt}: {r:?}");
+    }
+    assert_eq!(ahead.state_commitment(), st.state_commitment());
+}
+
+#[test]
+fn r17_from_the_height_a_cross_asset_child_is_refused_and_a_same_asset_tree_works_end_to_end() {
+    let (usdc, hkt) = (h(9), h(7));
+    let mut org = Keychain::new(b"r17b-org");
+    let mut agent = Keychain::new(b"r17b-agent");
+    let mut merchant = Keychain::new(b"r17b-merchant");
+    let genesis = r17_genesis(&org, &agent, &merchant, usdc, hkt);
+    let mut st = State::from_genesis(&genesis).unwrap();
+    st.mandate_asset_from = 0; // a devnet: active from genesis
+    let (m0, m1, m2, m3, mh) = (h(0xE3), h(0xE4), h(0xE5), h(0xE6), h(0xE7));
+
+    let b1 = vec![
+        org.sign(r17_mandate(m0, None, org.id, usdc, 20 * MICRO)),
+        org.sign(r17_mandate(m1, Some(m0), agent.id, usdc, 20 * MICRO)),
+    ];
+    let r1 = st.apply_block(1, 1_001, &b1).unwrap();
+    assert!(r1.iter().all(|r| r.result.is_ok()), "{r1:?}");
+
+    // The attack at creation: refused, tree untouched, nonce not consumed.
+    let err = x1_apply(&mut st, 2, agent.sign(r17_mandate(m2, Some(m1), agent.id, hkt, 20 * MICRO))).unwrap_err();
+    assert!(err.contains("mandate asset mismatch"), "got: {err}");
+    agent.rollback();
+    assert!(st.mandates.get(&m2).is_none());
+    assert_eq!(st.mandates.iter().count(), 2, "the tree is exactly the two USDC nodes");
+    assert_eq!(st.accounts[&agent.id].nonce, 0, "a refused tx does not ratchet");
+    // The same refusal is not holder-dependent: the ROOT holder cannot do it either.
+    let err = x1_apply(&mut st, 3, org.sign(r17_mandate(m2, Some(m0), org.id, hkt, 20 * MICRO))).unwrap_err();
+    assert!(err.contains("mandate asset mismatch"), "got: {err}");
+    org.rollback();
+
+    // Same asset: the grandchild is accepted and the whole storyline still runs —
+    // spend, channel open, settle — with the funder debited in the delegated asset.
+    assert!(x1_apply(&mut st, 4, agent.sign(r17_mandate(m3, Some(m1), agent.id, usdc, 20 * MICRO))).is_ok());
+    assert!(x1_apply(&mut st, 5, agent.sign(Tx::MandateSpend { leaf: m3, to: merchant.id, amount: 5 * MICRO })).is_ok());
+    let chain = PaywordChain::mint(b"r17b-seed", b"r17b", 100);
+    let tip = H256(chain.tip());
+    let ch_id = State::derive_channel_id(&agent.id, &merchant.id, &tip, 2);
+    assert!(x1_apply(&mut st, 6, agent.sign(Tx::ChannelOpen {
+        id: ch_id, mandate: m3, payee: merchant.id, asset: usdc, tip,
+        unit_price: 50_000, max_steps: 100, expiry: 900_000, // escrow 5 USDC
+    })).is_ok());
+    assert!(x1_apply(&mut st, 7, merchant.sign(Tx::ChannelSettle { id: ch_id, word: H256(chain.pay(100).unwrap()), step: 100 })).is_ok());
+    assert_eq!(st.balance(&org.id, &usdc), 40 * MICRO);
+    assert_eq!(st.balance(&merchant.id, &usdc), 10 * MICRO);
+    assert_eq!(st.balance(&org.id, &hkt), 50 * MICRO, "HKT never moved");
+    assert_eq!(st.mandates.get(&m0).unwrap().buffer, 10 * MICRO, "the root envelope drew down in its own unit");
+
+    // A ROOT has no parent to match: the org may still open an HKT tree, and it works.
+    assert!(x1_apply(&mut st, 8, org.sign(r17_mandate(mh, None, agent.id, hkt, 5 * MICRO))).is_ok());
+    assert!(x1_apply(&mut st, 9, agent.sign(Tx::MandateSpend { leaf: mh, to: merchant.id, amount: 5 * MICRO })).is_ok());
+    assert_eq!(st.balance(&org.id, &hkt), 45 * MICRO);
+    assert_eq!(st.balance(&merchant.id, &hkt), 5 * MICRO);
+}
+
+#[test]
+fn r17_from_the_height_the_sinks_refuse_a_cross_asset_tree_built_before_it() {
+    let (usdc, hkt) = (h(9), h(7));
+    let mut org = Keychain::new(b"r17c-org");
+    let mut agent = Keychain::new(b"r17c-agent");
+    let merchant = Keychain::new(b"r17c-merchant");
+    let genesis = r17_genesis(&org, &agent, &merchant, usdc, hkt);
+    let mut st = State::from_genesis(&genesis).unwrap();
+    st.mandate_asset_from = 10; // the activation is ahead
+    let (m0, m1, m2) = (h(0xE8), h(0xE9), h(0xEA));
+
+    // Before the height the cross-asset grandchild is accepted (the replayed past).
+    let b1 = vec![
+        org.sign(r17_mandate(m0, None, org.id, usdc, 20 * MICRO)),
+        org.sign(r17_mandate(m1, Some(m0), agent.id, usdc, 20 * MICRO)),
+    ];
+    assert!(st.apply_block(1, 1_001, &b1).unwrap().iter().all(|r| r.result.is_ok()));
+    assert!(x1_apply(&mut st, 2, agent.sign(r17_mandate(m2, Some(m1), agent.id, hkt, 20 * MICRO))).is_ok());
+    let mut hgt = 2;
+    while hgt < 9 {
+        hgt += 1;
+        st.apply_block(hgt, 1_000 + hgt, &[]).unwrap();
+    }
+
+    // At the height: both sinks refuse the HKT leaf under the USDC root, nothing moves.
+    let err = x1_apply(&mut st, 10, agent.sign(Tx::MandateSpend { leaf: m2, to: merchant.id, amount: 10 * MICRO })).unwrap_err();
+    assert!(err.contains("mandate asset mismatch"), "got: {err}");
+    agent.rollback();
+    let chain = PaywordChain::mint(b"r17c-seed", b"r17c", 1_000);
+    let tip = H256(chain.tip());
+    let ch_id = State::derive_channel_id(&agent.id, &merchant.id, &tip, 1);
+    let err = x1_apply(&mut st, 11, agent.sign(Tx::ChannelOpen {
+        id: ch_id, mandate: m2, payee: merchant.id, asset: hkt, tip,
+        unit_price: 10_000, max_steps: 1_000, expiry: 900_000,
+    })).unwrap_err();
+    assert!(err.contains("mandate asset mismatch"), "got: {err}");
+    agent.rollback();
+    assert_eq!(st.balance(&org.id, &hkt), 50 * MICRO, "the funder's HKT is untouched");
+    assert_eq!(st.balance(&merchant.id, &hkt), 0);
+    assert!(st.channels.is_empty());
+    assert_eq!(st.mandates.get(&m0).unwrap().buffer, 20 * MICRO, "no envelope drew down");
+    assert_eq!(st.mandates.get(&m2).unwrap().buffer, 20 * MICRO);
+    assert_eq!(st.accounts[&agent.id].nonce, 1, "a refused tx does not ratchet");
+
+    // The USDC child under the USDC root is still a working mandate.
+    assert!(x1_apply(&mut st, 12, agent.sign(Tx::MandateSpend { leaf: m1, to: merchant.id, amount: 10 * MICRO })).is_ok());
+    assert_eq!(st.balance(&org.id, &usdc), 40 * MICRO);
+    assert_eq!(st.balance(&merchant.id, &usdc), 10 * MICRO);
+}
+
+/// The shielded storyline on one side of the activation: a USDC root → USDC child
+/// (agent) and an HKT root held by the agent; two HKT notes in the legacy pool; an
+/// unshield under the USDC child (block 3), then one under the HKT root (block 4).
+/// Returns the state, the two receipts, the two leaf ids and block 3's nullifier.
+type R17Receipt = Result<Vec<crate::Event>, String>;
+fn r17_shielded_storyline(mandate_asset_from: u64) -> (State, R17Receipt, R17Receipt, H256, H256, [u8; 32]) {
+    let (usdc, hkt) = (h(9), h(7));
+    let mut org = Keychain::new(b"r17d-org");
+    let mut agent = Keychain::new(b"r17d-agent");
+    let merchant = Keychain::new(b"r17d-merchant");
+    let genesis = r17_genesis(&org, &agent, &merchant, usdc, hkt);
+    let mut st = State::from_genesis(&genesis).unwrap();
+    st.verifier = Arc::new(JsonEchoVerifier);
+    st.mandate_asset_from = mandate_asset_from;
+    let (m0, m1, mh) = (h(0xEB), h(0xEC), h(0xED));
+
+    let b1 = vec![
+        org.sign(r17_mandate(m0, None, org.id, usdc, 20 * MICRO)),
+        org.sign(r17_mandate(m1, Some(m0), agent.id, usdc, 20 * MICRO)),
+        org.sign(r17_mandate(mh, None, agent.id, hkt, 20 * MICRO)),
+    ];
+    assert!(st.apply_block(1, 1_001, &b1).unwrap().iter().all(|r| r.result.is_ok()));
+    // The org shields two HKT notes — the legacy pool pins HKT (the first asset shielded).
+    let (n1, cm1, s1) = p6_shield(hkt, 10 * MICRO, b"r17d-note-1", 0x61);
+    let (n2, cm2, s2) = p6_shield(hkt, 10 * MICRO, b"r17d-note-2", 0x71);
+    assert!(st.apply_block(2, 1_002, &[org.sign(s1), org.sign(s2)]).unwrap().iter().all(|r| r.result.is_ok()));
+    assert_eq!(st.pool.asset, Some(hkt));
+    assert_eq!(st.balance(&org.id, &hkt), 30 * MICRO);
+
+    // Block 3: unshield 5 HKT to the merchant under the USDC child.
+    let (_, pub1, mut sp1) = p6_spend(&n1, &[cm1, cm2], 0, b"r17d-note-1", 0, 5 * MICRO, &merchant.id, 0x81);
+    if let Tx::ShieldedSpend { mandate, .. } = &mut sp1 {
+        *mandate = Some(m1);
+    }
+    let r_usdc = x1_apply(&mut st, 3, agent.sign(sp1));
+    if r_usdc.is_err() {
+        agent.rollback();
+    }
+    // Block 4: unshield 5 HKT under the HKT root — the right asset on either side.
+    let (_, _, mut sp2) = p6_spend(&n2, &[cm1, cm2], 1, b"r17d-note-2", 0, 5 * MICRO, &merchant.id, 0x91);
+    if let Tx::ShieldedSpend { mandate, .. } = &mut sp2 {
+        *mandate = Some(mh);
+    }
+    let r_hkt = x1_apply(&mut st, 4, agent.sign(sp2));
+    (st, r_usdc, r_hkt, m1, mh, pub1.nullifier)
+}
+
+/// The shielded sink: a mandated unshield draws the mandate down by the public fee, so
+/// the mandate's asset MUST be the pool's. A USDC leaf capping an HKT-pool unshield is
+/// accepted before the height (the caps accounted in the wrong unit — no funder debit
+/// here, so this is the whole of the harm) and refused from it; an HKT mandate on the
+/// same pool works on both sides.
+#[test]
+fn r17_a_mandated_unshield_must_match_the_pool_asset_from_the_height() {
+    let (usdc, hkt) = (h(9), h(7));
+    let merchant = Keychain::new(b"r17d-merchant");
+
+    // Before the height: accepted — the USDC envelope was drawn down by an HKT fee.
+    let (st, r_usdc, r_hkt, m1, mh, nf) = r17_shielded_storyline(u64::MAX);
+    assert!(r_usdc.is_ok(), "{r_usdc:?}");
+    assert!(r_hkt.is_ok(), "{r_hkt:?}");
+    assert_eq!(st.balance(&merchant.id, &hkt), 10 * MICRO);
+    assert_eq!(st.mandates.get(&m1).unwrap().buffer, 15 * MICRO, "USDC cap drawn in HKT units");
+    assert_eq!(st.mandates.get(&mh).unwrap().buffer, 15 * MICRO);
+    assert!(st.pool.nullifiers.contains(&nf));
+    assert_eq!(st.pool.total_shielded, 10 * MICRO);
+
+    // From the height: the USDC mandate is refused on the HKT pool, nothing half-applied;
+    // the HKT mandate still caps the HKT unshield.
+    let (st, r_usdc, r_hkt, m1, mh, nf) = r17_shielded_storyline(0);
+    let err = r_usdc.unwrap_err();
+    assert!(err.contains("mandate asset mismatch"), "got: {err}");
+    assert!(!st.pool.nullifiers.contains(&nf), "the refused note is not burned");
+    assert_eq!(st.mandates.get(&m1).unwrap().buffer, 20 * MICRO, "the USDC envelope is untouched");
+    assert!(r_hkt.is_ok(), "{r_hkt:?}");
+    assert_eq!(st.balance(&merchant.id, &hkt), 5 * MICRO);
+    assert_eq!(st.balance(&merchant.id, &usdc), 0);
+    assert_eq!(st.mandates.get(&mh).unwrap().buffer, 15 * MICRO);
+    assert_eq!(st.pool.total_shielded, 15 * MICRO);
+}

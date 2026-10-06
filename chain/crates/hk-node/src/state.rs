@@ -20,6 +20,7 @@ use malachitebft_app_channel::app::types::sync::RawDecidedValue;
 use malachitebft_app_channel::app::types::{LocallyProposedValue, PeerId, ProposedValue};
 use malachitebft_core_types::Height as _;
 
+use hk_consensus::rotation::RotationRules;
 use hk_consensus::{
     op_seed, HkAddress, HkContext, HkHeight, HkPriv, HkProposalFin, HkProposalInit, HkProposalPart,
     HkValidatorSet, HkValue, RootSecret, RotationCert, SetChange, SetChangeCert,
@@ -233,6 +234,10 @@ pub struct SharedHandles {
     /// R2: foreign rotation certs queued by `hk_submitRotation` — an exhausted validator
     /// can't propose its own revival cert, so any peer accepts + carries it.
     pub foreign_rotations: Arc<Mutex<Vec<RotationCert>>>,
+    /// L-2 (R17, reported 2026-10-06): the height from which only chain-bound v2 rotation
+    /// certificates are accepted (`HkApp::rotation_v2_from`) — `hk_submitRotation` judges a
+    /// cert by the same rule commit will, and `hk_chainInfo.activations` publishes it.
+    pub rotation_v2_from: u64,
     /// V1: validator-set change certificates queued by `hk_submitSetChange` — they ride
     /// this node's next proposal (re-validated against the live set at propose + commit).
     pub pending_set_changes: Arc<Mutex<Vec<SetChangeCert>>>,
@@ -372,6 +377,16 @@ pub struct HkApp {
     /// Genesis-gate: SHA-256(genesis.json). `set_genesis_digest` binds chain_id to it.
     genesis_digest: [u8; 32],
     chain_start_time: u64,
+    /// L-2 (R17, reported 2026-10-06): the first height at which rotation certificates
+    /// must be signed under the chain-bound v2 domain, with `valid_from_height` enforced
+    /// as a freshness window (`hk_consensus::rotation`). A chain-id fact like P6 / R17
+    /// (`genesis::rotation_v2_from_for`, set by `set_genesis_digest`), but node-side
+    /// rather than on `hk_state::State`: the validator set is not part of Σ and every
+    /// site that judges a certificate (propose, commit, replay, `hk_submitRotation`)
+    /// lives here. `u64::MAX` (never) until the genesis digest binds the chain id —
+    /// restore never touches it, so replay after a restart applies the same rule as the
+    /// live commit did.
+    rotation_v2_from: u64,
 
     pub current_height: HkHeight,
     pub current_round: Round,
@@ -555,6 +570,7 @@ impl HkApp {
             chain_id: "hashkinetics-devnet-1".to_string(),
             genesis_digest: [0u8; 32],
             chain_start_time: genesis.chain_start_time,
+            rotation_v2_from: u64::MAX, // L-2: never, until set_genesis_digest names the chain
             current_height: HkHeight::INITIAL,
             current_round: Round::Nil,
             current_proposer: None,
@@ -605,6 +621,27 @@ impl HkApp {
         let from = crate::genesis::multi_pool_from_for(&self.chain_id);
         self.chain.lock().unwrap().multi_pool_from = from;
         info!(chain_id = %self.chain_id, multi_pool_from = from, "P6 multi-asset pool activation");
+        // R17: the asset-bound-mandate activation, the same way (chain-id fact, config).
+        let r17 = crate::genesis::mandate_asset_from_for(&self.chain_id);
+        self.chain.lock().unwrap().mandate_asset_from = r17;
+        info!(chain_id = %self.chain_id, mandate_asset_from = r17, "R17 asset-bound mandate activation");
+        // L-2: the rotation-v2 (chain-bound certificate) activation — its OWN height, never
+        // R17's: the trigger here is the fleet's rotation cadence, so it is named only once
+        // every seat is on the release (genesis.rs). Node-side, before restore (node.rs
+        // calls this first), so replay judges every certificate by the same rule.
+        self.rotation_v2_from = crate::genesis::rotation_v2_from_for(&self.chain_id);
+        info!(
+            chain_id = %self.chain_id,
+            rotation_v2_from = self.rotation_v2_from,
+            never = self.rotation_v2_from == u64::MAX,
+            "L-2 chain-bound rotation certificate (v2) activation"
+        );
+    }
+
+    /// L-2: the rotation rule at `height` — the commit height of the block whose
+    /// certificates are being judged (the proposal height at propose; `tip + 1` at the RPC).
+    fn rotation_rules(&self, height: u64) -> RotationRules<'_> {
+        RotationRules::new(height, &self.chain_id, self.rotation_v2_from)
     }
 
     /// Clonable handles for the RPC server (call before moving self into the loop).
@@ -624,6 +661,7 @@ impl HkApp {
             chain_start_time: self.chain_start_time,
             gossip: None,
             foreign_rotations: self.foreign_rotations.clone(),
+            rotation_v2_from: self.rotation_v2_from,
             pending_set_changes: self.pending_set_changes.clone(),
             signer_gauge: self.signer_gauge.clone(),
             tx_index: self.tx_index.clone(),
@@ -673,6 +711,11 @@ impl HkApp {
         let my_root_pk = self.my_root_pk.clone();
         let master_seed = self.master_seed;
         let mut highest_issued = self.highest_issued_epoch;
+        // L-2: the tick issues like the commit path — `valid_from_height = tip + 1` under
+        // the domain the chain demands there (v0.19.4 wrote 0 here; v2 reads the field).
+        let chain = self.chain.clone();
+        let chain_id = self.chain_id.clone();
+        let v2_from = self.rotation_v2_from;
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -722,7 +765,11 @@ impl HkApp {
                 let root = RootSecret::from_seed(&master_seed);
                 let seed = op_seed(&master_seed, next_epoch);
                 let new_op_pk = HkPriv::from_seed(seed).public();
-                let cert = RotationCert::issue(&root, new_op_pk, next_epoch, 0);
+                // This node's tip: a parked seat names a height the network is past, which
+                // the window allows for ROTATION_FRESHNESS_HORIZON blocks (≈ 1.5 days) —
+                // and R9 re-issues at a fresher tip if the cert never lands.
+                let tip = chain.lock().unwrap_or_else(|e| e.into_inner()).height;
+                let cert = RotationCert::issue_for(&root, &chain_id, v2_from, new_op_pk, next_epoch, tip + 1);
                 highest_issued = highest_issued.max(next_epoch);
                 last_issue = Some(std::time::Instant::now());
                 {
@@ -826,12 +873,16 @@ impl HkApp {
         // foreign certs peers submitted via `hk_submitRotation` (R2: an exhausted
         // validator can't propose its own revival; we carry it). Foreign certs are
         // re-validated against the CURRENT set here (they were checked at submit time,
-        // but the set may have advanced); stale ones are dropped in place.
+        // but the set may have advanced) and — L-2 — against the rotation rule at THIS
+        // height (domain, freshness window); stale ones are dropped in place. Our own
+        // pending certs ride as issued: one that straddled the v2 boundary is refused at
+        // commit, logged, and replaced by the R9 re-issue 600 s later.
         let mut rotations = self.pending_rotations.clone();
         {
             let validators = self.validators.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let rules = self.rotation_rules(height);
             let mut foreign = self.foreign_rotations.lock().unwrap();
-            foreign.retain(|c| validators.apply_rotation(c).is_ok());
+            foreign.retain(|c| validators.apply_rotation(c, &rules).is_ok());
             for cert in foreign.iter() {
                 if !rotations
                     .iter()
@@ -1260,7 +1311,12 @@ impl HkApp {
         let mut any_applied = false;
         if let Some(b) = &batch {
             for cert in &b.rotations {
-                let applied = { self.validators.lock().unwrap_or_else(|e| e.into_inner()).apply_rotation(cert) };
+                // L-2: the rule at the COMMIT height — the same answer on a live commit and
+                // on replay (restore_from_store), so the set history never forks on restart.
+                let applied = {
+                    let rules = self.rotation_rules(height);
+                    self.validators.lock().unwrap_or_else(|e| e.into_inner()).apply_rotation(cert, &rules)
+                };
                 match applied {
                     Ok(new_set) => {
                         *self.validators.lock().unwrap_or_else(|e| e.into_inner()) = new_set;
@@ -1297,7 +1353,7 @@ impl HkApp {
                             .unwrap()
                             .retain(|c| !(c.root_pk == cert.root_pk && c.epoch <= cert.epoch));
                     }
-                    Err(e) => error!(%e, "Rejected rotation cert"),
+                    Err(e) => error!(%e, height, epoch = cert.epoch, "Rejected rotation cert"),
                 }
             }
         }
@@ -1552,7 +1608,17 @@ impl HkApp {
             if due {
                 let seed = op_seed(&self.master_seed, next_epoch);
                 let new_op_pk = HkPriv::from_seed(seed).public();
-                let cert = RotationCert::issue(&self.root, new_op_pk, next_epoch, height + 1);
+                // L-2: `valid_from_height = height + 1` (as since 0.9.3), now READ by v2
+                // verifiers as the freshness anchor; the domain follows the chain's rule
+                // where this cert will commit (`issue_for`: v2 iff height + 1 ≥ v2_from).
+                let cert = RotationCert::issue_for(
+                    &self.root,
+                    &self.chain_id,
+                    self.rotation_v2_from,
+                    new_op_pk,
+                    next_epoch,
+                    height + 1,
+                );
                 self.highest_issued_epoch = self.highest_issued_epoch.max(next_epoch);
                 // R9: a re-issue replaces any stale same-or-older own cert instead of
                 // stacking beside it.
@@ -1729,9 +1795,9 @@ impl HkApp {
             // Config survives the image swap (a snapshot must not smuggle in policy):
             // the verifier AND the U4 fee parameters are re-injected from the running
             // configuration, exactly as `HkApp::new` set them.
-            let (verifier, fee_micro, fee_from, fee_asset, multi_pool_from) = {
+            let (verifier, fee_micro, fee_from, fee_asset, multi_pool_from, mandate_asset_from) = {
                 let c = self.chain.lock().unwrap();
-                (c.verifier.clone(), c.fee_micro, c.fee_from, c.fee_asset, c.multi_pool_from)
+                (c.verifier.clone(), c.fee_micro, c.fee_from, c.fee_asset, c.multi_pool_from, c.mandate_asset_from)
             };
             let mut st = hk_state::State::from_snapshot(snap.state);
             st.verifier = verifier;
@@ -1739,6 +1805,9 @@ impl HkApp {
             st.fee_from = fee_from;
             st.fee_asset = fee_asset; // X1: genesis fact, config-like on restore
             st.multi_pool_from = multi_pool_from; // P6: chain-id fact, config-like on restore
+            st.mandate_asset_from = mandate_asset_from; // R17: chain-id fact, config-like on restore
+            // L-2: `self.rotation_v2_from` is node-side (set by `set_genesis_digest`, which
+            // node.rs calls before this), so the image swap cannot smuggle a rotation rule in.
             let got = st.state_commitment().0;
             if got != snap.app_hash {
                 return Err(eyre!(

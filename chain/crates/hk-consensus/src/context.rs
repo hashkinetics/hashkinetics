@@ -529,8 +529,25 @@ impl HkValidatorSet {
         self.validators.iter()
     }
 
+    /// Sum of every seat's power. M-1 (audit intake, reported 2026-10-06): SATURATING, never
+    /// wrapping. The release profile has no overflow checks, so a plain `sum()` over powers
+    /// that exceed u64 would wrap to a SMALL total that a minority passes "> ⅔" of — a
+    /// safety break. The fold removes that break and nothing more: a saturated total is
+    /// NOT survivable — HK's own `verify_against` (setchange.rs, saturating arithmetic)
+    /// fails closed on it, but the engine's quorum test (vendored
+    /// `core-types/src/threshold.rs` `is_met`, `checked_mul(..).expect(..)`, run on every
+    /// vote tally) still panics, exactly as it would on a wrapped one. The control is
+    /// therefore the BOUND, `setchange::MAX_VOTING_POWER`, enforced on every certificate at
+    /// shape time (`check_shape`: submit, propose, commit) and on the genesis set at load
+    /// (`hk-node` `HkGenesis::validator_set`, landed 2026-10-06 with the R17 review) — the
+    /// two ways a power enters a running set. A snapshot image restores powers this node
+    /// itself accepted through one of those two paths; a corrupt image with an absurd power
+    /// halts the node that restores it (its own image, never a certificate) — no bound
+    /// there, by design: a snapshot is not an input.
     pub fn total_voting_power(&self) -> VotingPower {
-        self.validators.iter().map(|v| v.voting_power).sum()
+        self.validators
+            .iter()
+            .fold(0, |acc: VotingPower, v| acc.saturating_add(v.voting_power))
     }
 
     pub fn get_by_address(&self, address: &HkAddress) -> Option<&HkValidator> {
@@ -569,24 +586,23 @@ impl HkValidatorSet {
     }
 
     /// Apply a root-signed `RotationCert`: find the validator whose registered root matches,
-    /// verify the certificate (signature + identity + strictly newer epoch), and return a new
-    /// set with that validator's operational key + epoch advanced. `Err` if no validator owns
-    /// the cert's root or the cert is invalid/stale — the caller (commit) then ignores it.
+    /// verify the certificate (signature + identity + strictly newer epoch, and — L-2 (R17,
+    /// reported 2026-10-06) — the domain and freshness window the chain's rule demands at
+    /// `rules.height`, the commit height of the block carrying it), and return a new set
+    /// with that validator's operational key + epoch advanced. `Err` (with the reason
+    /// `hk_submitRotation` answers and commit logs) if no validator owns the cert's root or
+    /// the cert is invalid/stale — the caller (commit) then ignores it.
     pub fn apply_rotation(
         &self,
         cert: &crate::rotation::RotationCert,
+        rules: &crate::rotation::RotationRules<'_>,
     ) -> Result<HkValidatorSet, String> {
         let target = self
             .validators
             .iter()
             .find(|v| v.root_pk == cert.root_pk)
             .ok_or_else(|| "rotation cert: no validator with that root identity".to_string())?;
-        if !cert.verify_against(&target.root_pk, Some(target.epoch)) {
-            return Err(format!(
-                "rotation cert: invalid or stale (cert epoch {}, current {})",
-                cert.epoch, target.epoch
-            ));
-        }
+        cert.verify_against(&target.root_pk, Some(target.epoch), rules)?;
         let addr = target.address;
         let validators = self
             .validators

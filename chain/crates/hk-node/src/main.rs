@@ -13,7 +13,7 @@
 
 /// The release label this binary reports (`hk-node --version`, the usage banner).
 /// Bump with every node release; the crate version is workspace-wide and not it.
-pub const NODE_VERSION: &str = "v0.19.4";
+pub const NODE_VERSION: &str = "v0.19.6";
 
 mod account;
 mod app;
@@ -165,12 +165,15 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
             // R2: mint a root-signed RotationCert OFFLINE (the stateless SLH-DSA root
             // never exhausts — this works even when the operational tree is at zero).
             // Submit the output to ANY live peer: it rides that peer's next proposal.
+            // L-2 (R17): from a chain's rotation-v2 height the cert must be chain-bound —
+            // pass CHAIN_ID (`hk_chainInfo.chain_id`) and VALID_FROM_HEIGHT = the tip + 1.
             let home = PathBuf::from(args.get(2).cloned().ok_or_else(|| {
-                eyre::eyre!("usage: hk-node issue-rotation <HOME> [EPOCH] [VALID_FROM_HEIGHT]")
+                eyre::eyre!("usage: hk-node issue-rotation <HOME> [EPOCH] [VALID_FROM_HEIGHT] [CHAIN_ID]")
             })?);
             let epoch = args.get(3).and_then(|s| s.parse().ok());
             let valid_from = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
-            cmd_issue_rotation(&home, epoch, valid_from)
+            let chain_id = args.get(5).cloned();
+            cmd_issue_rotation(&home, epoch, valid_from, chain_id.as_deref())
         }
         Some("set-change") => {
             // V1: validator-set changes on a running chain — propose (build the body) →
@@ -764,7 +767,24 @@ fn cmd_keygen(home: &PathBuf, moniker: &str) -> eyre::Result<()> {
 /// that peer's next proposal → on commit every node swaps this validator's key in the
 /// set → restart the exhausted node: `adopt_epoch_signer` builds the fresh epoch tree
 /// (never-signed ⇒ starts at leaf 0) and it rejoins consensus.
-fn cmd_issue_rotation(home: &PathBuf, epoch: Option<u64>, valid_from: u64) -> eyre::Result<()> {
+///
+/// L-2 (R17, reported 2026-10-06): the certificate's signing domain follows the chain's
+/// rule where it will commit (`hk_consensus::rotation`). Without `chain_id` this mints the
+/// v1 certificate every release to v0.19.4 minted (and `chain/gate-s.sh` still exercises);
+/// a chain past its rotation-v2 height refuses it with "signed under the v1 domain". With
+/// `chain_id` (`hk_chainInfo.chain_id` on any live peer) the domain is chosen exactly as a
+/// running node chooses it (`RotationCert::issue_for` against `genesis::rotation_v2_from_for`,
+/// testnet-1 hard-wired, other chains `HK_ROTATION_V2_HEIGHT`), and `valid_from` must then
+/// be the tip + 1 (`hk_chainInfo.height` + 1): a v2 verifier refuses a certificate that
+/// names a height past its commit or more than `ROTATION_FRESHNESS_HORIZON` blocks before it.
+/// Read the tip on the node you will SUBMIT to (R17 review, 2026-10-06): `hk_submitRotation`
+/// judges the window at its own tip + 2, so a node that lags the peer the tip was read from
+/// by two or more blocks refuses the certificate as "past its activation height" even
+/// though commit would take it later — submit to the node the tip came from, or to one at
+/// least as far along.
+fn cmd_issue_rotation(home: &PathBuf, epoch: Option<u64>, valid_from: u64, chain_id: Option<&str>) -> eyre::Result<()> {
+    use hk_consensus::rotation::{RotationDomain, ROTATION_FRESHNESS_HORIZON};
+
     let key_path = home.join("priv_validator_key.json");
     let raw = keys::read_secret(&key_path, keys::Secret::ValidatorKey)
         .map_err(|e| eyre::eyre!("{e} (run on the VALIDATOR's machine)"))?;
@@ -774,15 +794,43 @@ fn cmd_issue_rotation(home: &PathBuf, epoch: Option<u64>, valid_from: u64) -> ey
     if epoch == 0 {
         eyre::bail!("epoch must be ≥ 1 (0 is the genesis key; certs are strictly monotone)");
     }
+    let (domain, chain) = match chain_id {
+        Some(id) if !id.trim().is_empty() => {
+            let id = id.trim();
+            let v2_from = crate::genesis::rotation_v2_from_for(id);
+            if valid_from >= v2_from {
+                if valid_from == 0 {
+                    eyre::bail!(
+                        "chain {id} accepts only chain-bound (v2) rotation certs from height {v2_from}: pass \
+                         VALID_FROM_HEIGHT = the tip + 1 (`hk_chainInfo.height` + 1 on any live peer) — a v2 \
+                         verifier reads it as the freshness anchor"
+                    );
+                }
+                (RotationDomain::V2, id.to_string())
+            } else {
+                println!("chain {id} switches to chain-bound (v2) rotation certs at height {v2_from}; {valid_from} is before it — minting v1");
+                (RotationDomain::V1, String::new())
+            }
+        }
+        _ => (RotationDomain::V1, String::new()),
+    };
     println!("deriving epoch-{epoch} operational tree (LMS/HSS keygen — a moment)...");
     let new_op_pk = HkPriv::from_seed(op_seed(&seed, epoch)).public();
     println!("signing the rotation cert with the SLH-DSA root (stateless — never exhausts)...");
-    let cert = RotationCert::issue(&root, new_op_pk, epoch, valid_from);
+    let cert = RotationCert::issue(&root, domain, &chain, new_op_pk, epoch, valid_from);
     let out = home.join(format!("rotation_e{epoch}.json"));
     std::fs::write(&out, serde_json::to_string(&serde_json::json!({ "cert": cert }))?)?;
     println!("✓ rotation cert written: {}", out.display());
     println!("  root identity : SLH-DSA-192s {}…", hex::encode(&cert.root_pk[..8]));
     println!("  new epoch     : {epoch}   (must be strictly greater than the on-chain epoch)");
+    match domain {
+        RotationDomain::V2 => println!(
+            "  domain        : v2, bound to chain {chain}; valid_from_height {valid_from} — commit it within {ROTATION_FRESHNESS_HORIZON} blocks (re-issue at the tip otherwise)"
+        ),
+        RotationDomain::V1 => println!(
+            "  domain        : v1 (no chain binding) — refused by a chain past its rotation-v2 height: pass CHAIN_ID + the tip + 1 there"
+        ),
+    }
     println!("\nsubmit it through ANY live peer (the cert rides that peer's next proposal):");
     println!(
         "  printf '{{\"method\":\"hk_submitRotation\",\"params\":%s}}' \"$(cat {})\" | \\",

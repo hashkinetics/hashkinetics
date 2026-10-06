@@ -116,3 +116,59 @@ Sealed `account.json` protects a copied disk, a leaked backup, a stray `cat`. It
 protect a running service: the seed is in memory while it signs. That is why the float is
 small and the treasury is elsewhere — the blast radius of a hot-host compromise is one
 float, not the treasury.
+
+## 8 · nginx in front (R17 L-4, 2026-10-06; node v0.19.6)
+
+The per-IP cooldown is only as strong as the proxy that tells the faucet who called. Since
+v0.19.6 `faucet-serve` keys a drip, when the TCP peer is loopback/private (nginx on the same
+box or LAN — the H9 gate), on the RIGHTMOST entry of the last `X-Forwarded-For` line first,
+on `X-Real-IP` second, on the peer address third — never on a value the client typed
+(before v0.19.6 it keyed on the LEFTMOST entry, which is the client's own string, and cut
+IPv6 at the first colon). Both headers must therefore be written by nginx, not passed
+through. In the faucet vhost's proxied `location` (the one that proxies to the faucet's
+loopback port):
+
+```nginx
+# http { } block — edge throttling, so a flood never reaches the faucet process
+limit_req_zone $binary_remote_addr zone=faucet:1m rate=6r/m;
+
+# the faucet vhost
+location / {
+    proxy_pass         http://127.0.0.1:<faucet-port>;
+    proxy_set_header   Host             $host;
+    proxy_set_header   X-Real-IP        $remote_addr;   # OVERWRITES anything the client sent
+    proxy_set_header   X-Forwarded-For  $remote_addr;   # overwrite — NOT $proxy_add_x_forwarded_for
+}
+location = /drip {
+    limit_req          zone=faucet burst=5 nodelay;
+    limit_req_status   429;
+    proxy_pass         http://127.0.0.1:<faucet-port>;
+    proxy_set_header   Host             $host;
+    proxy_set_header   X-Real-IP        $remote_addr;
+    proxy_set_header   X-Forwarded-For  $remote_addr;
+}
+```
+
+`$proxy_add_x_forwarded_for` also works with the v0.19.6 code (it APPENDS `$remote_addr`,
+and the faucet reads the rightmost entry), but overwriting removes every client-supplied
+entry and is what the review asked for. What each misconfiguration does, so the symptom
+names the fix:
+
+| vhost sets | key the faucet uses | verdict |
+|---|---|---|
+| both lines (above) | the caller's real address | correct |
+| only `X-Forwarded-For` (the gateway's state before this section) | the rightmost XFF entry = `$remote_addr` | correct — the client's `X-Real-IP`, passed through untouched, is never read first |
+| only `X-Real-IP` | the client's own XFF rightmost if it sent one, else `X-Real-IP` | **open** — a client that sends `X-Forwarded-For` picks its own key; add the XFF line |
+| neither | whatever the client sent, else the proxy's own address | **open** (no worse than pre-R17); the faucet logs `⚠ faucet: local peer … sent no parseable X-Real-IP / X-Forwarded-For` once per process when a proxied request carries neither |
+
+Verify on the host before calling L-4 closed (`ops/ROLL-v0.19.5-R17-2026-10-06.md` §5):
+
+```bash
+sudo grep -n proxy_set_header /etc/nginx/sites-enabled/faucet*     # both lines, inside the proxied location
+sudo nginx -t && sudo systemctl reload nginx
+curl -s -o /dev/null -w '%{http_code}\n' https://faucet.hashkinetics.org/health   # 200
+```
+
+Then one drip from a client that sends a forged `X-Forwarded-For: 203.0.113.9` and a second
+drip from the same client without it must share ONE cooldown (the second is refused with
+the cooldown message) — that is the receipt.

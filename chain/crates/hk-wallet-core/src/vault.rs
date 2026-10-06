@@ -184,14 +184,17 @@ impl Vault {
     }
 }
 
-/// Write → fsync → rename. Both key files are reserve-then-advance counters; a crash right
-/// after a reservation must never roll a counter back (a reused one-time key leaks spend
-/// authority), so the bytes have to be on disk before the rename makes them the live file.
+/// Write → fsync → rename → fsync(directory). Both key files are reserve-then-advance
+/// counters; a crash right after a reservation must never roll a counter back (a reused
+/// one-time key leaks spend authority), so the bytes have to be on disk before the rename
+/// makes them the live file — AND the directory entry has to be on disk before the write is
+/// reported done: on POSIX the rename alone sits in cached directory metadata, and a power
+/// loss before the next journal commit brings the OLD file back (R16, 2026-09-22, found
+/// for the consensus signer). `shield.json` is the file that matters here — its WOTS leaf
+/// counter has no on-chain nonce to override it, so a rolled-back file IS a reused leaf.
+/// The routine is `hk_crypto::fsutil` since R17 (reported 2026-10-06): this copy had
+/// stopped at the rename. The caller names the temp file (`account.json.tmp`, beside the
+/// live file) and creates the directory; errors stay `WalletError::msg`.
 pub fn write_atomic(path: &Path, tmp: &Path, bytes: &[u8]) -> Result<(), WalletError> {
-    use std::io::Write;
-    let mut f = std::fs::File::create(tmp).map_err(|e| WalletError::msg(e.to_string()))?;
-    f.write_all(bytes).map_err(|e| WalletError::msg(e.to_string()))?;
-    f.sync_all().map_err(|e| WalletError::msg(e.to_string()))?;
-    drop(f);
-    std::fs::rename(tmp, path).map_err(|e| WalletError::msg(e.to_string()))
+    hk_crypto::fsutil::write_atomic_with(path, tmp, bytes, None).map_err(|e| WalletError::msg(e.to_string()))
 }

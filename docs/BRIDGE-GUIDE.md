@@ -11,8 +11,8 @@
 | What | Where |
 |---|---|
 | USDC (Circle, Sepolia) | `0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238` — get 20 per address per 2 h at [faucet.circle.com](https://faucet.circle.com) |
-| HKVault (the lock/unlock vault) | `0x989Cb35485d16c7b19Dff890b617984EeD9970aF` — `bridge/contracts/src/HKVault.sol`, deployed 2026-09-09 (block ≈ 11,666,5xx) |
-| HKWrapped `wHKT.sep` (reverse leg, ERC-20) | `0x24159bE1577f3016AD64beA7D1430e5F2313DB26` — `bridge/contracts/src/HKWrapped.sol` |
+| HKVault (the lock/unlock vault) | `0x989Cb35485d16c7b19Dff890b617984EeD9970aF` — `bridge/contracts/src/HKVault.sol`, deployed 2026-09-09 (block 11,666,550) · source verified 2026-09-25 on [Etherscan](https://sepolia.etherscan.io/address/0x989Cb35485d16c7b19Dff890b617984EeD9970aF#code) and [Sourcify](https://repo.sourcify.dev/11155111/0x989Cb35485d16c7b19Dff890b617984EeD9970aF) (exact match) |
+| HKWrapped `wHKT.sep` (reverse leg, ERC-20) | `0x24159bE1577f3016AD64beA7D1430e5F2313DB26` — `bridge/contracts/src/HKWrapped.sol`, deployed 2026-09-09 (block 11,666,550) · source verified 2026-09-25 on [Etherscan](https://sepolia.etherscan.io/address/0x24159bE1577f3016AD64beA7D1430e5F2313DB26#code) and [Sourcify](https://repo.sourcify.dev/11155111/0x24159bE1577f3016AD64beA7D1430e5F2313DB26) (exact match) |
 | Attestor (signs unlocks and wrapped mints) | `0x1d1d8e13792b318cdd593eb778fbb173bb3447d1` · threshold 1 |
 | `USDC.sep` on testnet-1 | asset id `0c3c3f40884ef40aee41d2ae2b823c8cc1e2c0859172ef20ff899f015442c0f1` · 6 decimals · policy `mfps` (mintable, freezable, pausable, pool-eligible) · issuer `c58cf9224f21130eb2e0b67b2d64be1168f20e4dcdace75435e171f89be77a73` · registered at height 170,698 |
 | `HKT` on testnet-1 (the asset the reverse leg wraps) | asset id `f2b88facb835a9e331b51772cf98cbcb95d6c86233324d252fd4c9edd8fbbcea` · 6 decimals · `mfps` · same issuer |

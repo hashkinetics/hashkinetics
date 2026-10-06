@@ -69,3 +69,7 @@ a6a4a56ffc0d8339564ccd6392140e4890316cd001f2e04e22bedd168eaaf22d  hk-node-v0.19.
 # v0.19.4 release (2026-09-23) — R16: the consensus signer's state write is durable (directory fsync after the rename; upward resume on load) + macOS rss_bytes + hk_chainInfo.process.disk_free_bytes; security, client-only, every validator should restart on it once — https://github.com/hashkinetics/hashkinetics/releases/tag/v0.19.4 (immutable)
 5b5a3e4bbf1a1da01c290ce8f00419b2d617521ba39d4cc225b86040cddf43d1  hk-node-v0.19.4.gz
 e072d4aa19a66252554321cabbee006f4c1d4fdbd0ebcf04cb648cdee788d5dc  hk-node-v0.19.4
+
+# v0.19.6 release (2026-10-06) — R17: asset-bound mandates (CONSENSUS CHANGE, activation at height 1,872,500 — every seat on v0.19.6 before it; v0.19.5 was built and never released — its number, 1,844,000, passed unrolled and was renamed by patch) + mempool envelope verification + voting-power bound + durable atomic writes + faucet IP key + RPC lock fixes; rotation v2 in code, inactive — https://github.com/hashkinetics/hashkinetics/releases/tag/v0.19.6 (immutable)
+2ca5719fccab7b70893727c4bc26e4650a009cd2b7d814134a37a09ffcec0628  hk-node-v0.19.6.gz
+1a32dec3096a214dcab10b9e8e676914a1ed76d093897a2efa57f1a15db6d775  hk-node-v0.19.6

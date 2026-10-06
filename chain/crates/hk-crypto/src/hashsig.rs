@@ -22,7 +22,8 @@
 //! real validators.
 //!
 //! Durability model (R16, 2026-09-22): "persisted" means the bytes AND the directory
-//! entry are fsynced (`write_atomic`). What that guarantees: after any crash, power loss
+//! entry are fsynced (`crate::fsutil::write_atomic`, shared with every other counter file
+//! since R17). What that guarantees: after any crash, power loss
 //! or reset the file holds a position ≥ every signature ever released. What it cannot
 //! guarantee: storage that acknowledges fsync without honouring it, or a state file
 //! restored from an older snapshot/backup — those are operational failures, and a
@@ -37,6 +38,7 @@ use hbs_lms::{
     Seed, Shake256_256,
 };
 
+use crate::fsutil::write_atomic;
 use crate::hash::shake256_n;
 
 type H = Shake256_256;
@@ -117,50 +119,13 @@ fn encode_blob(used: u64, state: &[u8]) -> Vec<u8> {
     v
 }
 
-/// Atomically AND durably write `bytes` to `path`: tmp + fsync(file) + rename +
-/// **fsync(directory)**. Rename replaces the destination on both Unix and Windows, so a
-/// crash leaves either the old or the new file — never a torn one.
-///
-/// R16 (external report, 2026-09-22): the rename alone is NOT durable on POSIX. The new
-/// directory entry lives in the directory's metadata, which the kernel may still hold in
-/// memory after `rename` returns; a power loss / kernel panic / host reset before the next
-/// journal commit can bring the machine back with the OLD file still in place. For a
-/// stateful signer that is the one failure that must never happen: the old file carries a
-/// lower leaf counter, `attach_persistence` would resume there, and a leaf would be signed
-/// twice (LM-OTS key material leaks; repeated reuse of one leaf — a crash-looping node —
-/// makes forgery cheap). So after the rename the parent directory is
-/// opened and `fsync`ed, which is what makes the rename durable (same discipline as SQLite
-/// and Postgres). `write_atomic` returns only once BOTH the bytes and the directory entry
-/// are on stable storage; the signature that depends on this write is released after that.
-///
-/// Windows has no directory fsync; NTFS journals directory metadata itself and validators
-/// run on Linux. On non-Unix targets only the file is synced.
-fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let tmp = path.with_extension("tmp");
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    sync_parent_dir(path)
-}
-
-/// fsync the directory that holds `path` (Unix). Makes a preceding create/rename durable.
-#[cfg(unix)]
-fn sync_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
-    let dir = match path.parent() {
-        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
-        _ => std::path::PathBuf::from("."),
-    };
-    std::fs::File::open(&dir)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_parent_dir(_path: &std::path::Path) -> std::io::Result<()> {
-    Ok(())
-}
+// The state file is written by `crate::fsutil::write_atomic` (imported above): tmp +
+// fsync(file) + rename + fsync(directory). The routine and its rationale (R16, external
+// report 2026-09-22: the rename alone is not durable on POSIX, and a rolled-back state file
+// means a reused leaf) lived here until R17 (reported 2026-10-06) found three sibling copies
+// across the tree that had never received the directory fsync; it is now the one shared
+// helper in `fsutil`, and the signature that depends on the write is still released only
+// after it returns.
 
 /// The leaf counter hbs-lms keeps inside the compressed private key (first 8 bytes, big
 /// endian: `CompressedUsedLeafsIndexes::count`). It is the ground truth of the position;

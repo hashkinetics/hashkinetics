@@ -21,7 +21,9 @@ commitment (`hk-state`), consensus signing and rotation (`hk-consensus`, `hk-cry
 — stateful signatures: leaf reuse leaks one-time key material (repeated reuse of one leaf
 makes forgery cheap) and is defended by reserve-then-sign with a directory-fsynced state
 write — R16, reported 2026-09-22, fixed in v0.19.4 (released the same day); follow-ups: a
-floor from the node's own evidence and a reservation window), the spend/mint circuits and aggregation digests (`zkvm-bakeoff/circuit`),
+floor from the node's own evidence and a reservation window; R17, reported 2026-10-06, nine
+findings fixed in v0.19.6 the same day (the asset-bound mandate rule activates at testnet-1
+height 1,872,500)), the spend/mint circuits and aggregation digests (`zkvm-bakeoff/circuit`),
 the durable store and replay path (`hk-node/src/store.rs`, `state.rs`), the disclosure
 machinery (`hk-wallet`), and the Node Key sale contract `HKNodeKey` (Ethereum mainnet
 `0x36edb45c4610AE2A7FE6334343D9D958Fb81EC84`, source verified on Etherscan and Sourcify;
@@ -33,14 +35,14 @@ break are enumerated in `docs/AUDIT-SCOPE.md` and the yellowpaper — consider t
 ## Honest status
 
 **Nothing here is audited yet.** This code runs a public testnet with valueless test units (the network has no token);
-professional audits and a public audit competition are scheduled ahead of any
-value-bearing mainnet, and mainnet launches guarded (value caps that lift as findings
-close). Do not deploy this to hold real value in the meantime. The full list of open
+professional audits and a public bug bounty on the audit-freeze code are scheduled ahead of any
+value-bearing mainnet, and mainnet launches with value caps enforced by consensus (plan); each
+lift is published with its reason. Do not deploy this to hold real value in the meantime. The full list of open
 caveats lives in the README's honesty ledger — we keep it current on purpose.
 
 ## Bounties
 
-The Node Key sale contract (`HKNodeKey`) carries a bug bounty of up to 1 ETH today. A funded bug-bounty / audit-competition program is planned alongside the audit campaign;
+The Node Key sale contract (`HKNodeKey`) carries a bug bounty of up to 1 ETH today. A funded bug bounty for the chain, on the audit-freeze code, is planned alongside the audit campaign;
 until it opens, exceptional reports will be recognized retroactively when the program
 launches.
 

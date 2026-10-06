@@ -13,6 +13,9 @@
 //!   * `body.chain_id` must be this chain's id — no cross-network replay.
 //!   * every approval's root must be a DISTINCT member of the current set, its signature
 //!     valid; approving power must be strictly more than ⅔ of the set's total power.
+//!   * a seat's power lies in `1..=MAX_VOTING_POWER` (M-1, 2026-10-06): the engine's
+//!     quorum arithmetic is checked-and-panicking, so an unbounded power would be a
+//!     deterministic all-node halt the moment the total nears u64::MAX/3.
 //!   * the commit height must lie in `[not_before, not_after]` — a stale certificate
 //!     (approved months ago, found later) cannot be committed.
 //!   * application is idempotent: admitting a root already seated, or removing one not
@@ -34,6 +37,33 @@ use crate::context::{HkValidator, HkValidatorSet};
 use crate::hashsig_scheme::HkPub;
 
 const DOM_SET_CHANGE: &str = "hk/v1/set-change";
+
+/// M-1 (audit intake, reported 2026-10-06, fixed 2026-10-06): the ceiling on ONE seat's
+/// voting power, enforced on every `Admit` / `SetPower` body by [`SetChangeBody::check_shape`]
+/// — so at submit, at propose and at commit, every node, deterministically — and on the
+/// genesis set at load (`hk-node` genesis.rs `HkGenesis::validator_set`, landed 2026-10-06
+/// with the R17 review; until then the comment here claimed it ahead of the code).
+///
+/// Why a bound at all: `HkValidatorSet::total_voting_power` sums u64 powers, and the
+/// engine's quorum test (vendored malachite `core-types/src/threshold.rs`, `is_met`)
+/// computes `weight·3` and `total·2` with `checked_mul(..).expect(..)`. A total anywhere
+/// near u64::MAX/3 therefore panics EVERY node at once on the next vote tally — a
+/// certificate-induced, deterministic, all-node halt. Before this bound a single > ⅔
+/// root-signed certificate could carry any u64, and the (unchecked, release-profile) sum
+/// could even wrap to a small number a minority passes. The saturating total in
+/// `context.rs` removes the wrapped-small-total break only; the engine still panics on a
+/// saturated total, so the bound — at shape time and at genesis load — is the control.
+///
+/// Why 2^32: testnet-1 weighs seats 1 and 4 and mainnet weights are planned in the same
+/// order, so four billion is beyond any seat a handover will ever grant — yet with any
+/// conceivable seat count (≤ 2^16; a BFT set is not that large) the total stays < 2^48,
+/// 3× of it < 2^50, and the engine's checked arithmetic can never trip.
+///
+/// Unconditional — no activation height: no historical or legitimate certificate carries
+/// a power above it (testnet-1's are 1 and 4), so replay is byte-identical, and a
+/// certificate this refuses would need > ⅔ of the roots to sign an on-its-face absurd
+/// handover.
+pub const MAX_VOTING_POWER: u64 = 1 << 32;
 
 /// What changes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,7 +150,9 @@ impl SetChangeBody {
         }
     }
 
-    /// Structural sanity that needs no set: window ordered, key sizes right, power > 0.
+    /// Structural sanity that needs no set: window ordered, key sizes right, power in
+    /// `1..=MAX_VOTING_POWER` (M-1: the upper bound is what keeps the engine's checked
+    /// quorum arithmetic from ever panicking — see [`MAX_VOTING_POWER`]).
     pub fn check_shape(&self) -> Result<(), String> {
         if self.chain_id.is_empty() {
             return Err("set change: empty chain_id".into());
@@ -139,6 +171,11 @@ impl SetChangeBody {
                 if *voting_power == 0 {
                     return Err("set change: voting_power must be ≥ 1".into());
                 }
+                if *voting_power > MAX_VOTING_POWER {
+                    return Err(format!(
+                        "set change: voting_power {voting_power} exceeds MAX_VOTING_POWER {MAX_VOTING_POWER} (M-1)"
+                    ));
+                }
             }
             SetChange::Remove { root_pk } => {
                 if root_pk.len() != ROOT_PK_LEN {
@@ -151,6 +188,11 @@ impl SetChangeBody {
                 }
                 if *voting_power == 0 {
                     return Err("set change: voting_power must be ≥ 1 (remove the seat instead)".into());
+                }
+                if *voting_power > MAX_VOTING_POWER {
+                    return Err(format!(
+                        "set change: voting_power {voting_power} exceeds MAX_VOTING_POWER {MAX_VOTING_POWER} (M-1)"
+                    ));
                 }
             }
         }
@@ -540,6 +582,75 @@ mod tests {
             // The signing bytes distinguish SetPower from Admit/Remove on the same root.
             let rm = SetChangeBody { change: SetChange::Remove { root_pk: v3.root_pk.clone() }, ..body.clone() };
             assert_ne!(body.signing_bytes(), rm.signing_bytes());
+        });
+    }
+
+    #[test]
+    fn m1_voting_power_above_the_bound_fails_shape() {
+        // M-1 (2026-10-06): a > ⅔ root-signed certificate could carry ANY u64 power, and the
+        // engine's quorum arithmetic is `checked_mul(..).expect(..)` — a total near u64::MAX/3
+        // panics every node at once. The shape check (run at submit, propose and commit)
+        // now refuses anything above MAX_VOTING_POWER. No signatures needed: shape is
+        // checked before a single approval is looked at.
+        let root = vec![1u8; ROOT_PK_LEN];
+        let admit = |p: u64| SetChangeBody {
+            chain_id: CHAIN.into(),
+            change: SetChange::Admit { root_pk: root.clone(), public_key: HkPub(vec![1u8; 60]), voting_power: p },
+            not_before: 0,
+            not_after: 10,
+        };
+        let set_power = |p: u64| SetChangeBody {
+            chain_id: CHAIN.into(),
+            change: SetChange::SetPower { root_pk: root.clone(), voting_power: p },
+            not_before: 0,
+            not_after: 10,
+        };
+        for p in [u64::MAX, u64::MAX / 3, MAX_VOTING_POWER + 1] {
+            let e = admit(p).check_shape().expect_err("admit above the bound must fail shape");
+            assert!(e.contains("MAX_VOTING_POWER"), "admit at {p}: {e}");
+            let e = set_power(p).check_shape().expect_err("set-power above the bound must fail shape");
+            assert!(e.contains("MAX_VOTING_POWER"), "set-power at {p}: {e}");
+        }
+        // The bound itself and everything below it is in shape; 0 stays refused as before.
+        for p in [1, 4, MAX_VOTING_POWER] {
+            assert!(admit(p).check_shape().is_ok(), "admit at {p} must be in shape");
+            assert!(set_power(p).check_shape().is_ok(), "set-power at {p} must be in shape");
+        }
+        assert!(admit(0).check_shape().is_err());
+        assert!(set_power(0).check_shape().is_err());
+        // The full acceptance path refuses the body first, before any approval is read.
+        let (_r1, v1) = seat(1, 1);
+        let set = HkValidatorSet::new(vec![v1]);
+        let e = cert(&admit(u64::MAX), &[]).verify_against(&set, CHAIN).expect_err("refused");
+        assert!(e.contains("MAX_VOTING_POWER"), "{e}");
+    }
+
+    #[test]
+    fn m1_total_voting_power_saturates_instead_of_wrapping() {
+        on_big_stack(|| {
+            // M-1 defense in depth: a set assembled OUTSIDE the certificate path (a snapshot,
+            // a test) with powers that overflow u64 must report a SATURATED total, never a
+            // wrapped one. Wrapped: u64::MAX + 2 + 1 = 2, and the power-2 seat alone would
+            // be "> ⅔ of 2" (3·2 = 6 > 2·2 = 4) — a safety break. Saturated: every ⅔ test
+            // is unreachable — a liveness halt, the fail-closed outcome.
+            let (ra, a) = seat(1, u64::MAX);
+            let (_rb, b) = seat(2, 2);
+            let (_rc, c) = seat(3, 1);
+            let set = HkValidatorSet::new(vec![a.clone(), b, c]);
+            assert_eq!(set.total_voting_power(), u64::MAX);
+            // Fail closed: even the seat that holds "all" the power cannot pass a change —
+            // 3·approving saturates to u64::MAX, which is not > 2·total saturated to u64::MAX.
+            let body = admit_body(RootSecret::from_seed(&[9u8; 32]).public_bytes().to_vec(), 9);
+            let aa = Approval::sign(&ra, &body);
+            let e = cert(&body, &[&aa]).verify_against(&set, CHAIN).expect_err("refused");
+            assert!(e.contains("not > 2/3"), "{e}");
+            // The quorum helper over a saturated total does not panic either.
+            let _ = quorum_power(u64::MAX);
+            // The sane case is unchanged: testnet-1's 4 + 4 + 1 = 9.
+            let (_, f1) = seat(1, 4);
+            let (_, f2) = seat(2, 4);
+            let (_, ext) = seat(3, 1);
+            assert_eq!(HkValidatorSet::new(vec![f1, f2, ext]).total_voting_power(), 9);
         });
     }
 }

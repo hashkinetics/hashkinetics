@@ -163,6 +163,13 @@ pub enum StateError {
     DuplicateMandate,
     #[error("sender is not the required mandate holder")]
     NotHolder,
+    /// R17 (reported 2026-10-06): a mandate authorizes spending in ITS asset only —
+    /// `asset(child) = asset(parent)` at creation, and every sink re-checks the leaf
+    /// against the root (and, shielded, against the pool). Gated by
+    /// `State::mandate_asset_from`; one receipt string for every site so wallets and
+    /// the explorer key on it.
+    #[error("mandate asset mismatch: a mandate authorizes only its own asset (the tree is single-asset)")]
+    MandateAssetMismatch,
     #[error("unknown channel")]
     UnknownChannel,
     #[error("duplicate channel id")]
@@ -287,6 +294,15 @@ pub struct State {
     /// boundary, CONFIG like `fee_from` — injected by the node from the chain-id
     /// table / `HK_P6_HEIGHT`, never snapshotted). u64::MAX = never (v1 behaviour).
     pub multi_pool_from: u64,
+    /// R17 (reported 2026-10-06): first height from which MandateTree authorization is
+    /// asset-bound — a child must carry its parent's asset, and `MandateSpend`,
+    /// `ChannelOpen` and a mandated `ShieldedSpend` refuse a leaf whose asset differs
+    /// from its root's (or the pool's). Before it, the pre-R17 rule byte for byte: a
+    /// child holder could hang a leaf in ANY asset under the org's envelope and every
+    /// sink debited the ROOT's funder in the LEAF's asset. CONFIG like `fee_from` /
+    /// `multi_pool_from` — injected by the node from the chain-id table /
+    /// `HK_R17_HEIGHT`, never snapshotted. u64::MAX = never.
+    pub mandate_asset_from: u64,
 }
 
 /// P6: which pool a shielded operation acts on.
@@ -346,6 +362,7 @@ impl Default for State {
             assets: BTreeMap::new(),
             pools: BTreeMap::new(),
             multi_pool_from: u64::MAX,
+            mandate_asset_from: u64::MAX,
         }
     }
 }
@@ -860,6 +877,22 @@ impl State {
         Ok(H256(bytes))
     }
 
+    /// R17 (reported 2026-10-06): the sink-side half of the asset rule — `leaf` MUST
+    /// denominate the same asset as `root`, the node whose holder funds the tree
+    /// (`root_funding`). The create rule makes this true by construction from the
+    /// activation height on; the sinks re-check it so a cross-asset tree built BEFORE
+    /// the height (accepted then, replayed forever) can no longer draw on the funder.
+    /// Read-only, ungated: every caller tests `self.height >= self.mandate_asset_from`
+    /// in the open, as the other activation reads do.
+    fn check_mandate_asset_bound(&self, leaf: &MandateId, root: &MandateId) -> Result<(), StateError> {
+        let leaf_asset = self.mandates.get(leaf).ok_or(StateError::UnknownMandate)?.asset;
+        let root_asset = self.mandates.get(root).ok_or(StateError::UnknownMandate)?.asset;
+        if leaf_asset != root_asset {
+            return Err(StateError::MandateAssetMismatch);
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn do_mandate_create(
         &mut self, sender: &AccountId, id: MandateId, parent: Option<MandateId>, holder: AccountId,
@@ -869,10 +902,20 @@ impl State {
         if self.mandates.get(&id).is_some() {
             return Err(StateError::DuplicateMandate);
         }
+        // R17: from `mandate_asset_from` the tree is single-asset by construction.
+        // `self.height` is the block being applied (as `fee_from` reads it).
+        let asset_bound = self.height >= self.mandate_asset_from;
         if let Some(p) = parent {
             // Child creation is a PARENT-holder act (delegation, plan §5.1).
             if self.holder_of(&p)? != *sender {
                 return Err(StateError::NotHolder);
+            }
+            // R17 (reported 2026-10-06): the child MUST carry the parent's asset. The
+            // typed refusal is decided HERE so the receipt is `MandateAssetMismatch`;
+            // `insert_asset_bound` below re-states the same rule as the tree crate's
+            // reference semantics (it cannot newly fail after this check).
+            if asset_bound && self.mandates.get(&p).ok_or(StateError::UnknownMandate)?.asset != asset {
+                return Err(StateError::MandateAssetMismatch);
             }
         }
         let node = MandateNode {
@@ -890,7 +933,13 @@ impl State {
             last_accrual: self.time,
             tier,
         };
-        self.mandates.insert(node)?; // enforces attenuation (expiry/per_tx narrowing)
+        // Attenuation (expiry/per_tx narrowing); from the R17 height also the asset rule.
+        // Two entry points, not a flag: pre-activation replay runs the pre-R17 bytes.
+        if asset_bound {
+            self.mandates.insert_asset_bound(node)?;
+        } else {
+            self.mandates.insert(node)?;
+        }
         if parent.is_none() {
             // Root: the creator is the funding account for the whole tree.
             self.root_funding.insert(id, *sender);
@@ -908,6 +957,13 @@ impl State {
         let asset = self.mandates.get(leaf).ok_or(StateError::UnknownMandate)?.asset;
         let root = self.mandates.root_of(leaf)?;
         let funder = *self.root_funding.get(&root).ok_or(StateError::UnknownMandate)?;
+        // R17 (reported 2026-10-06), belt and braces at the sink: the funder is debited
+        // in the LEAF's asset, so the leaf's asset MUST be the root's — the one the
+        // funder actually delegated. Catches a cross-asset tree built before the
+        // activation height, which the create rule above never saw.
+        if self.height >= self.mandate_asset_from {
+            self.check_mandate_asset_bound(leaf, &root)?;
+        }
         // Ordering: mandate AUTHORIZATION verdict first (read-only check), then the
         // settlement-layer checks (X1 asset gate — the ROOT funder is the payer —
         // then balance), then the mutating spend + fund movement.
@@ -967,6 +1023,12 @@ impl State {
         }
         let root = self.mandates.root_of(&mandate)?;
         let funder = *self.root_funding.get(&root).ok_or(StateError::UnknownMandate)?;
+        // R17: the escrow leaves the ROOT's funder in the channel's asset (= the leaf's,
+        // checked just above), so the leaf's asset MUST be the root's — same sink rule
+        // as MandateSpend.
+        if self.height >= self.mandate_asset_from {
+            self.check_mandate_asset_bound(&mandate, &root)?;
+        }
         // Same ordering as MandateSpend: authorization before settlement.
         self.mandates.check(&mandate, deposit, self.time)?;
         self.asset_gate(&asset, Some(&funder), None)?; // X1: escrow leaves the funder
@@ -1218,6 +1280,21 @@ impl State {
             (true, None) => return Err(StateError::PoolAssetMismatch),
             (_, a) => a,
         };
+        // R17 (reported 2026-10-06): the mandate caps the fee in ITS asset, so the
+        // leaf, its root and the pool the note lives in MUST all denominate the same
+        // asset — otherwise a USDC envelope was being drawn down in HKT units (no
+        // funder debit here: this sink is cap accounting only, and it still has to be
+        // in the right unit). Checked BEFORE the proof: a refusal is cheap and read-only.
+        if let Some(m) = mandate {
+            if self.height >= self.mandate_asset_from {
+                let root = self.mandates.root_of(m)?;
+                self.check_mandate_asset_bound(m, &root)?;
+                let m_asset = self.mandates.get(m).ok_or(StateError::UnknownMandate)?.asset;
+                if asset != Some(m_asset) {
+                    return Err(StateError::MandateAssetMismatch);
+                }
+            }
+        }
         // X1: the unshield credit is a transparent movement of the pool's asset —
         // gated like any other (a fully shielded transfer, fee = 0, is not).
         if fee > 0 {
@@ -1320,6 +1397,7 @@ impl State {
             assets: s.assets,
             pools: s.pools,
             multi_pool_from: u64::MAX, // config-like: the node re-injects the activation
+            mandate_asset_from: u64::MAX, // R17: likewise re-injected, never from the image
         }
     }
 

@@ -8,10 +8,16 @@
 //!                                                 signer: {epoch, remaining, capacity},  (R4)
 //!                                                 process: {rss_bytes, uptime_secs,
 //!                                                           verifier_init_ms,   (R11, v0.17.0)
-//!                                                           disk_free_bytes}}   (v0.19.4: free
+//!                                                           disk_free_bytes},   (v0.19.4: free
 //!                                                 bytes on the block log's filesystem; null off-Unix)
+//!                                                 activations: {mandate_asset_from,   (R17, v0.19.6:
+//!                                                               rotation_v2_from}}    the heights THIS
+//!                                                 node will switch rules at — null = never; the roll
+//!                                                 call reads them off every seat before a height is named)
 //!   hk_submitRotation {cert}                   -> {accepted, epoch, queued}  (R2: peer-carried
-//!                                                 revival — cert from `hk-node issue-rotation`)
+//!                                                 revival — cert from `hk-node issue-rotation`;
+//!                                                 L-2: judged by the rule at tip + 1 — domain +
+//!                                                 valid_from_height window — exactly as commit will)
 //!   hk_getAccount   {id}                      -> {found, nonce, auth_commit, balances[]}
 //!   hk_getAsset     {asset | issuer+symbol}   -> {found, asset: {symbol, issuer, policy,
 //!                                                 supply, burned, circulating, held, conserved,
@@ -53,9 +59,35 @@
 //! amounts or parties. The explorer built on this is itself a privacy demo.
 //!
 //! All 32-byte ids are lowercase hex (64 chars).
+//!
+//! R17 (reported 2026-10-06; L-5 + L-6 — client-side only, no consensus impact, no gate):
+//!   * L-5: the pool feed is paged UNDER its lock and only the page leaves the lock
+//!     (`with_pool_feed`). v0.16.1 (H3) paged this way; the P6 refactor (v0.19.0) cloned
+//!     the ENTIRE feed — stealth ciphertexts included — per call, and the commit path takes
+//!     the same lock while holding the chain lock, so one scanner on a big pool stalled
+//!     commit on every node it polled. `hk_getPoolPath` now copies the 32-byte leaves only,
+//!     and (R17 review, 2026-10-06) at most `POOL_PATH_SLOTS` of those full-leaf copies +
+//!     O(n) tree builds run at once — past that, "busy — retry", the feed lock untouched.
+//!     Response shapes are unchanged byte for byte.
+//!   * L-6: `hk_submitRotation` / `hk_submitSetChange` are unauthenticated (Origin check
+//!     only) with no per-IP limit, and ran the ≈1.7 ms SLH-DSA-192s verify (a 16,224-byte
+//!     signature) FIRST, under the validator-set mutex, for any blob a stranger posted.
+//!     Now every free refusal — shape, membership, epoch / window, queue dedup — comes
+//!     first (`rotation_preflight`, `set_change_preflight`), the verify runs on a snapshot
+//!     with no lock held, the free checks are re-run under the lock before anything is
+//!     queued, and at most `CERT_VERIFY_SLOTS` verifies run at once across both methods:
+//!     callers past that get a "busy — retry" error instead of pinning every worker thread.
+//!   * L-2 (consensus, gated — `genesis::rotation_v2_from_for`): a rotation certificate is
+//!     judged here by `hk_consensus::rotation::RotationRules` at `tip + 1` (the earliest
+//!     height it can commit at): before the chain's v2 height the v1 rule, byte for byte;
+//!     from it only the chain-bound v2 domain, with `valid_from_height` enforced as a
+//!     freshness window (not from the future, not more than `ROTATION_FRESHNESS_HORIZON`
+//!     blocks old). The window is a free check and runs in the preflight; the domain is the
+//!     signature itself. `hk_chainInfo.activations` publishes the heights.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -63,10 +95,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
-use hk_primitives::H256;
+use hk_consensus::rotation::RotationRules;
+use hk_consensus::{HkAddress, HkValidatorSet, RotationCert, SetChange, SetChangeCert};
+use hk_crypto::slhdsa_adapter::{ROOT_PK_LEN, ROOT_SIG_LEN};
+use hk_primitives::{AssetId, H256};
 use hk_state::tx::SignedTx;
+use hk_state::PoolKey;
 
 use crate::batch::{txid, Batch};
+use crate::mempool::Mempool;
 use crate::state::SharedHandles;
 
 /// H1 (v0.13.2): a request must arrive within this window, headers and body — a
@@ -75,6 +112,33 @@ const RPC_CONN_TIMEOUT: Duration = Duration::from_secs(10);
 /// H1: at most this many connections are served concurrently; the rest get a fast
 /// 503 instead of queueing behind a slowloris.
 const RPC_MAX_CONNS: usize = 256;
+
+/// L-6 (R17, reported 2026-10-06): at most this many SLH-DSA-192s root-signature verifies
+/// (≈1.7 ms of CPU each; one per approval for a set change) run at once across
+/// `hk_submitRotation` + `hk_submitSetChange`. Both are unauthenticated with no per-IP
+/// limit, so without a bound a flood of well-shaped garbage certs could occupy all
+/// RPC_MAX_CONNS worker slots in verifies. Legitimate traffic is a handful of certs per
+/// epoch — two slots are plenty; the rest answer "busy — retry" (`busy_error`).
+const CERT_VERIFY_SLOTS: usize = 2;
+static CERT_VERIFY: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(CERT_VERIFY_SLOTS);
+
+/// L-5 residual (R17 review, 2026-10-06): `hk_getPoolPath` still copies 32 B × every leaf
+/// of a pool UNDER the feed lock (32 MB at a million notes) and then hashes the whole tree
+/// (`full_tree_path`, O(n) SHAKEs) per call — the page-sized copy of L-5 bounds the two
+/// scanner methods, not this one, and the commit path takes the feed lock with the chain
+/// lock held. Until the per-pool tree is cached (a separate item, MBP §7), at most this
+/// many path builds run at once across every pool, `try_acquire` like `CERT_VERIFY`: one
+/// unauthenticated scanner can no longer serialize commit behind 256 full-feed copies. A
+/// wallet needs one path per spend; two slots are plenty.
+const POOL_PATH_SLOTS: usize = 2;
+static POOL_PATH: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(POOL_PATH_SLOTS);
+
+/// L-6: `hk_submitSetChange` refuses, before verifying, a certificate whose window opens
+/// more than this many blocks past the tip. A queued cert sits in RAM until its window
+/// opens (propose keeps it while `not_before > height`), so this bounds how long an
+/// accepted cert can park: ≈18 days at testnet-1's 1.6 s cadence. A certificate for a
+/// later window is assembled closer to it, not parked on a node.
+const SET_CHANGE_HORIZON: u64 = 1_000_000;
 
 pub async fn serve(addr: SocketAddr, h: SharedHandles) -> eyre::Result<()> {
     let listener = TcpListener::bind(addr).await?;
@@ -121,11 +185,21 @@ fn browser_ops_allowed() -> bool {
 /// Lock order: chain BEFORE mempool (the commit path's order — no deadlocks).
 /// WAL on success only: the WAL replays through this same gate at restart, so
 /// what was never admissible is never persisted.
+///
+/// R17 review (2026-10-06): the two M-2 hashes — `pk_commit` over the 16 KiB key and the
+/// 256-SHAKE Lamport verify, ≈ 0.3 ms — are state-free, so they run HERE, before either
+/// lock, and only the state-dependent binding runs under the locks
+/// (`Mempool::try_admit_verified`). The first cut verified inside `try_admit`, i.e. with
+/// the chain lock held: a flood of right-length junk on these two unauthenticated methods
+/// held the lock the commit path needs for a verify per request, 256 workers deep (the
+/// L-6 shape). Verdicts and their precedence are unchanged (mempool.rs
+/// `hoisted_verdict_and_try_admit_agree`).
 fn admit_one(h: &SharedHandles, tx: &SignedTx) -> Result<[u8; 32], String> {
+    let verdict = Mempool::envelope_verdict(tx);
     let admitted = {
         let chain = h.chain.lock().unwrap_or_else(|e| e.into_inner());
         let mut mp = h.mempool.lock().unwrap_or_else(|e| e.into_inner());
-        mp.try_admit(tx.clone(), &chain)
+        mp.try_admit_verified(tx.clone(), &chain, &verdict)
     };
     match admitted {
         Ok(id) => {
@@ -255,34 +329,30 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
                     "verifier_init_ms": crate::state::verifier_init_ms(),
                     "disk_free_bytes": h.store.as_ref().and_then(|s| crate::state::disk_free_bytes(s.blocks_dir())),
                 },
+                // R17 (v0.19.6): the activation heights THIS binary holds for this chain —
+                // null = never (`u64::MAX`). The roll call reads them off every seat: a
+                // height is named for testnet-1 only once each seat answers the same number,
+                // and a node that answers differently is the one that will island.
+                "activations": {
+                    "mandate_asset_from": activation_height(chain.mandate_asset_from),
+                    "rotation_v2_from": activation_height(h.rotation_v2_from),
+                },
             }})
         }
         // R2: accept a root-signed RotationCert on behalf of ANOTHER validator (an
         // exhausted signer can't propose its own revival — peers carry it). Validated
         // against the live set here AND re-validated at propose + commit; the root
         // signature makes this trustless (nothing to spoof, replay is epoch-monotone).
+        // L-6 (R17): the body lives in `submit_rotation` — free refusals first, the verify
+        // on a snapshot with no lock held, bounded by CERT_VERIFY_SLOTS. L-2: judged by the
+        // rule at tip + 1, the earliest height the cert can commit at (chain lock taken for
+        // the tip only, released before the validator-set lock — the commit path's order).
         "hk_submitRotation" => match params.get("cert") {
-            Some(c) => match serde_json::from_value::<hk_consensus::RotationCert>(c.clone()) {
+            Some(c) => match serde_json::from_value::<RotationCert>(c.clone()) {
                 Ok(cert) => {
-                    let check = { h.validators.lock().unwrap_or_else(|e| e.into_inner()).apply_rotation(&cert) };
-                    match check {
-                        Ok(_) => {
-                            let mut q = h.foreign_rotations.lock().unwrap_or_else(|e| e.into_inner());
-                            let dup = q
-                                .iter()
-                                .any(|x| x.root_pk == cert.root_pk && x.epoch >= cert.epoch);
-                            if !dup {
-                                q.retain(|x| {
-                                    !(x.root_pk == cert.root_pk && x.epoch < cert.epoch)
-                                });
-                                q.push(cert.clone());
-                            }
-                            json!({"result": {"accepted": true, "epoch": cert.epoch,
-                                "queued": !dup,
-                                "note": "cert rides this node's next proposal"}})
-                        }
-                        Err(e) => json!({"result": {"accepted": false, "reason": e}}),
-                    }
+                    let tip = h.chain.lock().unwrap_or_else(|e| e.into_inner()).height;
+                    let rules = RotationRules::new(tip.saturating_add(1), &h.chain_id, h.rotation_v2_from);
+                    submit_rotation(&h.validators, &h.foreign_rotations, &CERT_VERIFY, &rules, cert)
                 }
                 Err(e) => json!({"error": format!("bad cert: {e}")}),
             },
@@ -479,42 +549,43 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
         // (null when the page reached the end). A wallet keeps `next` as its scan cursor and
         // asks only for what it has not seen; a spender asks `hk_getPoolPath` for one
         // authentication path instead of downloading every commitment.
+        // L-5 (R17): each arm hands `with_pool_feed` a closure that copies exactly what the
+        // answer needs — a page of leaves, a page of notes, or the bare 32-byte leaves — and
+        // nothing else leaves the lock. The JSON shapes are the v0.19.0 ones, byte for byte.
         "hk_getPoolLeaves" => {
             // P6: `asset` (optional) selects the per-asset feed; absent = the legacy pool.
-            match pool_feed(h, params) {
+            match with_pool_feed(&h.chain, &h.pool_notes, &h.pool_notes_by_asset, params, |feed| {
+                page_of(feed, params, |(l, _)| l.0)
+            }) {
                 Err(e) => json!({"error": e}),
-                Ok((notes, asset)) => {
-                    let (from, to, next) = pool_page(params, notes.len());
-                    json!({"result": {
-                        "asset": asset,
-                        "leaves": notes[from..to].iter().map(|(l, _)| hex::encode(l.0)).collect::<Vec<_>>(),
-                        "from": from,
-                        "count": to - from,
-                        "total": notes.len(),
-                        "next": next,
-                    }})
-                }
+                Ok((page, asset)) => json!({"result": {
+                    "asset": asset,
+                    "leaves": page.items.iter().map(hex::encode).collect::<Vec<_>>(),
+                    "from": page.from,
+                    "count": page.to - page.from,
+                    "total": page.total,
+                    "next": page.next,
+                }}),
             }
         }
         "hk_getPoolNotes" => {
             // For scanners: (leaf index, commitment, stealth payload). P6: per pool.
-            match pool_feed(h, params) {
+            match with_pool_feed(&h.chain, &h.pool_notes, &h.pool_notes_by_asset, params, |feed| {
+                page_of(feed, params, |(l, ct)| (l.0, ct.clone()))
+            }) {
                 Err(e) => json!({"error": e}),
-                Ok((notes, asset)) => {
-                    let (from, to, next) = pool_page(params, notes.len());
-                    json!({"result": {
-                        "asset": asset,
-                        "notes": notes[from..to].iter().enumerate().map(|(i, (l, ct))| json!({
-                            "index": from + i,
-                            "commitment": hex::encode(l.0),
-                            "stealth_ct": hex::encode(ct),
-                        })).collect::<Vec<_>>(),
-                        "from": from,
-                        "count": to - from,
-                        "total": notes.len(),
-                        "next": next,
-                    }})
-                }
+                Ok((page, asset)) => json!({"result": {
+                    "asset": asset,
+                    "notes": page.items.iter().enumerate().map(|(i, (l, ct))| json!({
+                        "index": page.from + i,
+                        "commitment": hex::encode(l),
+                        "stealth_ct": hex::encode(ct),
+                    })).collect::<Vec<_>>(),
+                    "from": page.from,
+                    "count": page.to - page.from,
+                    "total": page.total,
+                    "next": page.next,
+                }}),
             }
         }
         "hk_getPoolPath" => {
@@ -522,28 +593,11 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
             // computed from the node's full leaf list. The proof binds the root; the chain
             // accepts it only while that root is a recent anchor — a wrong path can only
             // cost the spender a rejected tx, never a coin. P6: per pool (`asset`).
-            match params.get("index").and_then(|v| v.as_u64()) {
-                Some(index) => match pool_feed(h, params) {
-                    Err(e) => json!({"error": e}),
-                    Ok((notes, asset)) => {
-                        if (index as usize) >= notes.len() {
-                            json!({"error": format!("index {index} out of range (pool has {} commitments)", notes.len())})
-                        } else {
-                            let leaves: Vec<[u8; 32]> = notes.iter().map(|(l, _)| l.0).collect();
-                            let (siblings, root) = hk_state::pool::full_tree_path(&leaves, index);
-                            json!({"result": {
-                                "asset": asset,
-                                "index": index,
-                                "commitment": hex::encode(leaves[index as usize]),
-                                "siblings": siblings.iter().map(hex::encode).collect::<Vec<_>>(),
-                                "root": hex::encode(root),
-                                "total": leaves.len(),
-                            }})
-                        }
-                    }
-                },
-                None => json!({"error": "index (leaf index, integer) required"}),
-            }
+            // L-5: the tree is still rebuilt per call (O(n) hashing — caching it is a
+            // separate item), but only the 32-byte leaves are copied out of the lock, never
+            // the ≈1.2 KB stealth ciphertext beside each one; the copy + the build are
+            // bounded by POOL_PATH_SLOTS (`pool_path`).
+            pool_path(&h.chain, &h.pool_notes, &h.pool_notes_by_asset, &POOL_PATH, params)
         }
         "hk_getReceipt" => match param_h256(params, "txid") {
             Some(id) => {
@@ -752,32 +806,14 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
         // here (chain id, supermajority of CURRENT seats, window not yet closed) and
         // re-checked at propose + commit by every node; the root signatures make it
         // trustless to carry — anyone may relay a valid certificate.
+        // L-6 (R17): the body lives in `submit_set_change` — free refusals first (shape,
+        // chain id, window, membership, power, subject, queue dedup), then the per-approval
+        // verify on a snapshot with no lock held, bounded by CERT_VERIFY_SLOTS.
         "hk_submitSetChange" => match params.get("cert") {
-            Some(c) => match serde_json::from_value::<hk_consensus::SetChangeCert>(c.clone()) {
+            Some(c) => match serde_json::from_value::<SetChangeCert>(c.clone()) {
                 Ok(cert) => {
                     let tip = h.chain.lock().unwrap_or_else(|e| e.into_inner()).height;
-                    let check = {
-                        let vs = h.validators.lock().unwrap_or_else(|e| e.into_inner());
-                        cert.verify_against(&vs, &h.chain_id)
-                    };
-                    match check {
-                        Ok(()) if cert.body.not_after < tip => json!({"result": {
-                            "accepted": false,
-                            "reason": format!("window closed: not_after {} < tip {tip}", cert.body.not_after)
-                        }}),
-                        Ok(()) => {
-                            let mut q = h.pending_set_changes.lock().unwrap_or_else(|e| e.into_inner());
-                            let dup = q.iter().any(|x| x.body == cert.body);
-                            if !dup {
-                                q.push(cert.clone());
-                            }
-                            json!({"result": {"accepted": true, "queued": !dup,
-                                "approvals": cert.approvals.len(),
-                                "window": [cert.body.not_before, cert.body.not_after],
-                                "note": "cert rides this node's next proposal inside its window"}})
-                        }
-                        Err(e) => json!({"result": {"accepted": false, "reason": e}}),
-                    }
+                    submit_set_change(&h.validators, &h.pending_set_changes, &CERT_VERIFY, &h.chain_id, tip, cert)
                 }
                 Err(e) => json!({"error": format!("bad cert: {e}")}),
             },
@@ -1047,24 +1083,101 @@ fn pool_json(key: hk_state::PoolKey, p: &hk_state::pool::PoolState) -> Value {
     })
 }
 
-/// P6: the leaf feed an RPC call addresses (cloned out of its lock) + the asset label.
+/// One pool's note feed as the node indexes it: (commitment, stealth ciphertext) in leaf
+/// order (`SharedHandles::pool_notes` / `pool_notes_by_asset`).
+type PoolFeed = Vec<(H256, Vec<u8>)>;
+
+/// L-5 (R17, reported 2026-10-06): run `f` over the leaf feed an RPC call addresses, UNDER
+/// that feed's lock, and return what it produced + the asset label (`None` = the legacy
+/// pool; the answer's `asset`). `f` decides what gets copied out — a page, or the bare
+/// 32-byte leaves — so the lock is held for one bounded copy, never for a clone of the
+/// whole feed (what v0.19.0's `pool_feed` did, ciphertexts included: ≈1.2 KB × every note,
+/// per call, while the commit path waits on this lock with the chain lock held).
 /// An `asset` that is the legacy pool's pinned asset reads the legacy feed; an asset
 /// without a pool yet reads an empty feed (a scanner sees `total: 0`).
-fn pool_feed(h: &SharedHandles, params: &Value) -> Result<(Vec<(H256, Vec<u8>)>, Option<String>), String> {
+/// Lock order: chain (released) → the one feed lock; never both at once.
+fn with_pool_feed<R>(
+    chain: &Mutex<hk_state::State>,
+    legacy: &Mutex<PoolFeed>,
+    by_asset: &Mutex<BTreeMap<AssetId, PoolFeed>>,
+    params: &Value,
+    f: impl FnOnce(&[(H256, Vec<u8>)]) -> R,
+) -> Result<(R, Option<String>), String> {
     let key = {
-        let chain = h.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let chain = chain.lock().unwrap_or_else(|e| e.into_inner());
         pool_key_param(params, &chain)?
     };
     match key {
-        hk_state::PoolKey::Legacy => {
-            let notes = h.pool_notes.lock().unwrap_or_else(|e| e.into_inner());
-            Ok((notes.clone(), None))
+        PoolKey::Legacy => {
+            let notes = legacy.lock().unwrap_or_else(|e| e.into_inner());
+            Ok((f(notes.as_slice()), None))
         }
-        hk_state::PoolKey::Asset(a) => {
-            let by = h.pool_notes_by_asset.lock().unwrap_or_else(|e| e.into_inner());
-            Ok((by.get(&a).cloned().unwrap_or_default(), Some(hex::encode(a.0))))
+        PoolKey::Asset(a) => {
+            let by = by_asset.lock().unwrap_or_else(|e| e.into_inner());
+            let feed = by.get(&a).map(Vec::as_slice).unwrap_or(&[]);
+            Ok((f(feed), Some(hex::encode(a.0))))
         }
     }
+}
+
+/// `hk_getPoolPath` (H3 + L-5): one leaf's authentication path (siblings bottom → top) and
+/// the root it folds to, from the pool's full leaf list. The 32-byte leaves are copied
+/// under the feed lock, the tree is built outside it, and the whole call holds one of
+/// `slots` (`POOL_PATH_SLOTS`) — `try_acquire`, so a caller past the bound gets a "busy —
+/// retry" error and never queues on the lock the commit path needs. Takes the handles it
+/// touches so `r17_tests` can drive it without a node; `dispatch` only routes to it.
+fn pool_path(
+    chain: &Mutex<hk_state::State>,
+    legacy: &Mutex<PoolFeed>,
+    by_asset: &Mutex<BTreeMap<AssetId, PoolFeed>>,
+    slots: &tokio::sync::Semaphore,
+    params: &Value,
+) -> Value {
+    let Some(index) = params.get("index").and_then(|v| v.as_u64()) else {
+        return json!({"error": "index (leaf index, integer) required"});
+    };
+    let Ok(_permit) = slots.try_acquire() else {
+        return json!({"error": format!(
+            "busy: {POOL_PATH_SLOTS} pool-path builds already in flight — retry in a moment"
+        )});
+    };
+    match with_pool_feed(chain, legacy, by_asset, params, |feed| feed.iter().map(|(l, _)| l.0).collect::<Vec<[u8; 32]>>()) {
+        Err(e) => json!({"error": e}),
+        Ok((leaves, asset)) => {
+            if (index as usize) >= leaves.len() {
+                json!({"error": format!("index {index} out of range (pool has {} commitments)", leaves.len())})
+            } else {
+                let (siblings, root) = hk_state::pool::full_tree_path(&leaves, index);
+                json!({"result": {
+                    "asset": asset,
+                    "index": index,
+                    "commitment": hex::encode(leaves[index as usize]),
+                    "siblings": siblings.iter().map(hex::encode).collect::<Vec<_>>(),
+                    "root": hex::encode(root),
+                    "total": leaves.len(),
+                }})
+            }
+        }
+    }
+}
+
+/// One page of a pool feed, cut under the lock (L-5): `items` is `feed[from..to]` through
+/// the arm's projection, `total` the feed's length, `next` the following page's `from`
+/// (`None` once this page reached the end) — the H3 paging contract, unchanged.
+#[derive(Debug)]
+struct PoolPage<T> {
+    from: usize,
+    to: usize,
+    total: usize,
+    next: Option<usize>,
+    items: Vec<T>,
+}
+
+/// `params`'s page of `feed` (`pool_page` arithmetic), each item through `project` — the
+/// only copy a paged pool read makes.
+fn page_of<T>(feed: &[(H256, Vec<u8>)], params: &Value, project: impl Fn(&(H256, Vec<u8>)) -> T) -> PoolPage<T> {
+    let (from, to, next) = pool_page(params, feed.len());
+    PoolPage { from, to, total: feed.len(), next, items: feed[from..to].iter().map(project).collect() }
 }
 
 fn param_h256(params: &Value, key: &str) -> Option<H256> {
@@ -1092,6 +1205,274 @@ fn pool_page(params: &Value, total: usize) -> (usize, usize, Option<usize>) {
     let to = from.saturating_add(limit).min(total);
     let next = (to < total).then_some(to);
     (from, to, next)
+}
+
+// ---- L-6 (R17, reported 2026-10-06): the operator submits ------------------------------
+//
+// Both handlers follow one shape: (1) snapshot the validator set — an `Arc` clone — and
+// DROP its lock; (2) every free refusal, under the queue's lock only, via a `*_preflight`
+// that also answers "already queued"; (3) one of CERT_VERIFY_SLOTS or `busy_error`;
+// (4) the SLH-DSA verify on the snapshot, no lock held; (5) re-lock, re-run the free
+// checks (the set or the queue may have moved under the verify), then queue. The bodies
+// take the handles they touch rather than `SharedHandles` so `r17_tests` can drive them
+// without a node; `dispatch` only parses `params.cert` around them.
+
+/// What a free pre-check says about a submitted certificate.
+enum Preflight {
+    /// Every free check passed — spend a verify slot on it.
+    Verify,
+    /// An equivalent certificate is already queued; that copy was verified when it was
+    /// queued and already rides the next proposal, so the submitted bytes change nothing
+    /// and are not verified (a flood of re-submits costs the node a few compares).
+    AlreadyQueued,
+}
+
+fn busy_error() -> Value {
+    json!({"error": format!(
+        "busy: {CERT_VERIFY_SLOTS} root-signature verifications already in flight — retry in a moment"
+    )})
+}
+
+fn refused(reason: String) -> Value {
+    json!({"result": {"accepted": false, "reason": reason}})
+}
+
+/// R17: an activation height as `hk_chainInfo` reports it — `null` for never (`u64::MAX`).
+fn activation_height(h: u64) -> Option<u64> {
+    (h != u64::MAX).then_some(h)
+}
+
+/// The free checks of `hk_submitRotation`, in the order they refuse: the cert's root must
+/// be a seated validator's; its epoch must be strictly newer than that seat's (epochs are
+/// monotone — a replay or rollback is stale); L-2: under the v2 rule its
+/// `valid_from_height` must sit inside the freshness window (`RotationCert::check_window`
+/// — a u64 compare, nothing signed); the signature must be the one size SLH-DSA-192s
+/// produces (anything else cannot verify, so it never reaches the verifier); and no cert
+/// for that root at this epoch or newer may already be queued. Nothing here costs more than
+/// a 48-byte compare per seat. `apply_rotation` repeats the first three (cheaply) in front
+/// of the signature — this is the gate in front of it. The chain-id binding of L-2 is the
+/// v2 signature domain itself (the cert carries no chain-id field), so it is the verify.
+fn rotation_preflight(
+    set: &HkValidatorSet,
+    queue: &[RotationCert],
+    rules: &RotationRules<'_>,
+    cert: &RotationCert,
+) -> Result<Preflight, String> {
+    let seat = set
+        .iter()
+        .find(|v| v.root_pk == cert.root_pk)
+        .ok_or_else(|| "rotation cert: no validator with that root identity".to_string())?;
+    if cert.epoch <= seat.epoch {
+        return Err(format!("rotation cert: stale (cert epoch {}, current {})", cert.epoch, seat.epoch));
+    }
+    cert.check_window(rules)?;
+    if cert.root_sig.len() != ROOT_SIG_LEN {
+        return Err(format!(
+            "rotation cert: root_sig must be {ROOT_SIG_LEN} bytes (SLH-DSA-192s), got {}",
+            cert.root_sig.len()
+        ));
+    }
+    if queue.iter().any(|x| x.root_pk == cert.root_pk && x.epoch >= cert.epoch) {
+        return Ok(Preflight::AlreadyQueued);
+    }
+    Ok(Preflight::Verify)
+}
+
+fn rotation_accepted(cert: &RotationCert, queued: bool) -> Value {
+    json!({"result": {"accepted": true, "epoch": cert.epoch, "queued": queued,
+        "note": if queued {
+            "cert rides this node's next proposal"
+        } else {
+            "a cert for that root at this epoch or newer is already queued — it rides this node's next proposal"
+        }}})
+}
+
+/// `hk_submitRotation` (R2 + L-6 + L-2): queue a foreign validator's root-signed rotation
+/// cert for this node's next proposal, judged by `rules` (the chain's rotation rule at
+/// tip + 1). Responses: `{accepted: true, epoch, queued, note}` for a verified or
+/// already-queued cert (the v0.19.4 shape), `{accepted: false, reason}` for a refused one,
+/// `{error}` when every verify slot is busy.
+fn submit_rotation(
+    validators: &Mutex<HkValidatorSet>,
+    queue: &Mutex<Vec<RotationCert>>,
+    slots: &tokio::sync::Semaphore,
+    rules: &RotationRules<'_>,
+    cert: RotationCert,
+) -> Value {
+    let set = validators.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let gate = {
+        let q = queue.lock().unwrap_or_else(|e| e.into_inner());
+        rotation_preflight(&set, &q, rules, &cert)
+    };
+    match gate {
+        Err(reason) => return refused(reason),
+        Ok(Preflight::AlreadyQueued) => return rotation_accepted(&cert, false),
+        Ok(Preflight::Verify) => {}
+    }
+    let Ok(permit) = slots.try_acquire() else {
+        return busy_error();
+    };
+    // The expensive part — on the snapshot, no lock held. `apply_rotation` is the exact
+    // check propose and commit run; its `Err` text is what callers saw before R17.
+    if let Err(reason) = set.apply_rotation(&cert, rules) {
+        return refused(reason);
+    }
+    drop(permit);
+    let set = validators.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+    match rotation_preflight(&set, &q, rules, &cert) {
+        Err(reason) => refused(reason),
+        Ok(Preflight::AlreadyQueued) => rotation_accepted(&cert, false),
+        Ok(Preflight::Verify) => {
+            // A newer cert for the same root retires any older queued copy (R9: never
+            // stack beside the entry that wedged us).
+            q.retain(|x| !(x.root_pk == cert.root_pk && x.epoch < cert.epoch));
+            q.push(cert.clone());
+            rotation_accepted(&cert, true)
+        }
+    }
+}
+
+/// The free checks of `hk_submitSetChange`, in the order they refuse: body shape (window
+/// ordered, key sizes, power ≥ 1), chain id, window against the tip (closed, or opening
+/// past SET_CHANGE_HORIZON), approvals present / well-sized / distinct / from seated roots
+/// / strictly more than ⅔ of the current power (exactly as `verify_against` counts, minus
+/// the signatures), the subject as commit would judge it against the set as it stands (a
+/// change that is already applied would only be queued and dropped at the next propose —
+/// refuse it here with the reason instead), and the pending-queue dedup. The reason texts
+/// match `verify_against` / `apply_set_change` where the check is the same one.
+fn set_change_preflight(
+    set: &HkValidatorSet,
+    queue: &[SetChangeCert],
+    chain_id: &str,
+    tip: u64,
+    cert: &SetChangeCert,
+) -> Result<Preflight, String> {
+    let body = &cert.body;
+    body.check_shape()?;
+    if body.chain_id != chain_id {
+        return Err(format!("set change: for chain {} — this is {chain_id}", body.chain_id));
+    }
+    if body.not_after < tip {
+        return Err(format!("window closed: not_after {} < tip {tip}", body.not_after));
+    }
+    if body.not_before > tip.saturating_add(SET_CHANGE_HORIZON) {
+        return Err(format!(
+            "window too far ahead: not_before {} > tip {tip} + {SET_CHANGE_HORIZON} — assemble it closer to its window",
+            body.not_before
+        ));
+    }
+    if cert.approvals.is_empty() {
+        return Err("set change: no approvals".into());
+    }
+    let total = set.total_voting_power();
+    let mut approving: u64 = 0;
+    let mut seen: Vec<&[u8]> = Vec::with_capacity(cert.approvals.len());
+    for a in &cert.approvals {
+        if a.root_pk.len() != ROOT_PK_LEN || a.root_sig.len() != ROOT_SIG_LEN {
+            return Err(format!(
+                "set change: an approval must be a {ROOT_PK_LEN}-byte root + {ROOT_SIG_LEN}-byte SLH-DSA-192s signature"
+            ));
+        }
+        if seen.iter().any(|s| *s == a.root_pk.as_slice()) {
+            return Err("set change: duplicate approval from one root".into());
+        }
+        let seat = set
+            .iter()
+            .find(|v| v.root_pk == a.root_pk)
+            .ok_or_else(|| "set change: approval from a root that is not seated".to_string())?;
+        seen.push(&a.root_pk);
+        approving = approving.saturating_add(seat.voting_power);
+    }
+    if approving.saturating_mul(3) <= total.saturating_mul(2) {
+        return Err(format!("set change: approving power {approving} is not > 2/3 of {total}"));
+    }
+    let seated = |root: &[u8]| set.iter().find(|v| v.root_pk == root);
+    match &body.change {
+        SetChange::Admit { root_pk, public_key, .. } => {
+            if seated(root_pk).is_some() {
+                return Err("set change: already applied — that root is seated".into());
+            }
+            let addr = HkAddress::from_public_key(public_key);
+            if set.iter().any(|v| v.address == addr) {
+                return Err("set change: operational key collides with a seated address".into());
+            }
+        }
+        SetChange::Remove { root_pk } => {
+            if seated(root_pk).is_none() {
+                return Err("set change: already applied — that root is not seated".into());
+            }
+            if set.len() == 1 {
+                return Err("set change: refusing to remove the last seat".into());
+            }
+        }
+        SetChange::SetPower { root_pk, voting_power } => match seated(root_pk) {
+            None => return Err("set change: set-power for a root that is not seated".into()),
+            Some(v) if v.voting_power == *voting_power => {
+                return Err(format!("set change: already applied — that seat already weighs {voting_power}"));
+            }
+            Some(_) => {}
+        },
+    }
+    if queue.iter().any(|x| x.body == *body) {
+        return Ok(Preflight::AlreadyQueued);
+    }
+    Ok(Preflight::Verify)
+}
+
+fn set_change_accepted(cert: &SetChangeCert, queued: bool) -> Value {
+    json!({"result": {"accepted": true, "queued": queued,
+        "approvals": cert.approvals.len(),
+        "window": [cert.body.not_before, cert.body.not_after],
+        "note": if queued {
+            "cert rides this node's next proposal inside its window"
+        } else {
+            "an identical cert is already queued — it rides this node's next proposal inside its window"
+        }}})
+}
+
+/// `hk_submitSetChange` (V1 + L-6): queue a validator-set change certificate for this
+/// node's next proposal. `tip` is the chain height the window is judged against.
+/// Responses: `{accepted: true, queued, approvals, window, note}` for a verified or
+/// already-queued cert (the v0.19.4 shape), `{accepted: false, reason}` for a refused
+/// one, `{error}` when every verify slot is busy.
+fn submit_set_change(
+    validators: &Mutex<HkValidatorSet>,
+    queue: &Mutex<Vec<SetChangeCert>>,
+    slots: &tokio::sync::Semaphore,
+    chain_id: &str,
+    tip: u64,
+    cert: SetChangeCert,
+) -> Value {
+    let set = validators.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let gate = {
+        let q = queue.lock().unwrap_or_else(|e| e.into_inner());
+        set_change_preflight(&set, &q, chain_id, tip, &cert)
+    };
+    match gate {
+        Err(reason) => return refused(reason),
+        Ok(Preflight::AlreadyQueued) => return set_change_accepted(&cert, false),
+        Ok(Preflight::Verify) => {}
+    }
+    let Ok(permit) = slots.try_acquire() else {
+        return busy_error();
+    };
+    // The expensive part — every approval's root signature, on the snapshot, no lock
+    // held. `verify_against` is the exact check propose and commit run.
+    if let Err(reason) = cert.verify_against(&set, chain_id) {
+        return refused(reason);
+    }
+    drop(permit);
+    let set = validators.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+    match set_change_preflight(&set, &q, chain_id, tip, &cert) {
+        Err(reason) => refused(reason),
+        Ok(Preflight::AlreadyQueued) => set_change_accepted(&cert, false),
+        Ok(Preflight::Verify) => {
+            q.push(cert.clone());
+            set_change_accepted(&cert, true)
+        }
+    }
 }
 
 fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -1238,5 +1619,437 @@ mod h3_tests {
         // limit is capped, never zero
         assert_eq!(pool_page(&json!({"limit": 0}), 7), (0, 1, Some(1)));
         assert_eq!(pool_page(&json!({"limit": 1_000_000}), 3 * POOL_PAGE_MAX), (0, POOL_PAGE_MAX, Some(POOL_PAGE_MAX)));
+    }
+}
+
+/// R17 (reported 2026-10-06): L-5 — the pool feed is paged under its lock and a page is a
+/// slice of the feed; L-6 — the operator submits refuse for free before the SLH-DSA verify,
+/// verify with no lock held, and answer "busy" past the verify slots. `SharedHandles` needs
+/// a genesis and a signer (`HkApp::new`), so the handler bodies are driven here over the
+/// handles they take; `dispatch`'s `params.cert` plumbing around them is unchanged and is
+/// exercised by gate-h3 / gate-v1 / gate-g1 against a live devnet.
+#[cfg(test)]
+mod r17_tests {
+    use super::*;
+    use hk_consensus::rotation::RotationDomain;
+    use hk_consensus::{Approval, HkPub, HkValidator, RootSecret, SetChangeBody};
+    use tokio::sync::Semaphore;
+
+    const CHAIN: &str = "hashkinetics-test";
+
+    /// SLH-DSA operations allocate large fixed arrays — anything that reaches the verifier
+    /// runs on the stack the node gives its workers (main.rs: 32 MiB).
+    fn on_big_stack<F: FnOnce() + Send + 'static>(f: F) {
+        std::thread::Builder::new().stack_size(32 * 1024 * 1024).spawn(f).unwrap().join().unwrap();
+    }
+
+    fn feed_of(tag: u8, n: u8) -> PoolFeed {
+        (0..n).map(|i| (H256([tag ^ i; 32]), vec![tag, i, i, i, i])).collect()
+    }
+
+    fn accepted(v: &Value) -> Option<bool> {
+        v.get("result")?.get("accepted")?.as_bool()
+    }
+    fn queued(v: &Value) -> Option<bool> {
+        v.get("result")?.get("queued")?.as_bool()
+    }
+    fn reason(v: &Value) -> String {
+        v.get("result").and_then(|r| r.get("reason")).and_then(|r| r.as_str()).unwrap_or("").to_string()
+    }
+    fn error(v: &Value) -> String {
+        v.get("error").and_then(|e| e.as_str()).unwrap_or("").to_string()
+    }
+
+    #[test]
+    fn l5_pool_pages_are_slices_of_the_feed_and_chain_to_the_end() {
+        let chain = Mutex::new(hk_state::State::default());
+        let legacy_feed = feed_of(0x10, 7);
+        let asset = H256([0xaa; 32]);
+        let asset_feed = feed_of(0x20, 5);
+        let legacy = Mutex::new(legacy_feed.clone());
+        let by_asset = Mutex::new(BTreeMap::from([(asset, asset_feed.clone())]));
+        let notes = |params: &Value| {
+            with_pool_feed(&chain, &legacy, &by_asset, params, |feed| page_of(feed, params, |(l, ct)| (*l, ct.clone())))
+        };
+
+        // legacy pool: a page is exactly feed[from..to], with the H3 cursor arithmetic
+        let (p, asset_label) = notes(&json!({"limit": 3})).unwrap();
+        assert_eq!(asset_label, None);
+        assert_eq!((p.from, p.to, p.total, p.next), (0, 3, 7, Some(3)));
+        assert_eq!(p.items, legacy_feed[0..3].to_vec());
+        let (p, _) = notes(&json!({"from": 3, "limit": 3})).unwrap();
+        assert_eq!((p.from, p.to, p.next), (3, 6, Some(6)));
+        assert_eq!(p.items, legacy_feed[3..6].to_vec());
+        let (p, _) = notes(&json!({"from": 6, "limit": 3})).unwrap();
+        assert_eq!((p.from, p.to, p.next), (6, 7, None));
+        assert_eq!(p.items, legacy_feed[6..7].to_vec());
+        // past the end: an empty page, no next (a wallet whose cursor == total asks this)
+        let (p, _) = notes(&json!({"from": 99})).unwrap();
+        assert_eq!((p.from, p.to, p.total, p.next), (7, 7, 7, None));
+        assert!(p.items.is_empty());
+        // pages concatenate to the whole feed
+        let (mut cursor, mut all) = (Some(0usize), Vec::new());
+        while let Some(from) = cursor {
+            let (p, _) = notes(&json!({"from": from, "limit": 2})).unwrap();
+            all.extend(p.items);
+            cursor = p.next;
+        }
+        assert_eq!(all, legacy_feed);
+
+        // by-asset arm: its own feed, labelled; an asset without a pool is an empty feed
+        let (p, asset_label) = notes(&json!({"asset": hex::encode(asset.0), "from": 2, "limit": 2})).unwrap();
+        assert_eq!(asset_label, Some(hex::encode(asset.0)));
+        assert_eq!((p.from, p.to, p.total, p.next), (2, 4, 5, Some(4)));
+        assert_eq!(p.items, asset_feed[2..4].to_vec());
+        let other = H256([0xbb; 32]);
+        let (p, asset_label) = notes(&json!({"asset": hex::encode(other.0)})).unwrap();
+        assert_eq!(asset_label, Some(hex::encode(other.0)));
+        assert_eq!((p.from, p.to, p.total, p.next), (0, 0, 0, None));
+        assert_eq!(notes(&json!({"asset": "zz"})).unwrap_err(), "asset must be 64-char hex");
+
+        // the leaves-only copy hk_getPoolPath makes: every commitment, nothing else
+        let (leaves, _) = with_pool_feed(&chain, &legacy, &by_asset, &json!({}), |feed| {
+            feed.iter().map(|(l, _)| l.0).collect::<Vec<[u8; 32]>>()
+        })
+        .unwrap();
+        assert_eq!(leaves, legacy_feed.iter().map(|(l, _)| l.0).collect::<Vec<_>>());
+        // and the leaves page projects the same commitments
+        let (p, _) = with_pool_feed(&chain, &legacy, &by_asset, &json!({"from": 1, "limit": 4}), |feed| {
+            page_of(feed, &json!({"from": 1, "limit": 4}), |(l, _)| l.0)
+        })
+        .unwrap();
+        assert_eq!(p.items, leaves[1..5].to_vec());
+    }
+
+    #[test]
+    fn l5_pool_path_is_bounded_by_its_slots_and_folds_to_the_root() {
+        // R17 review (2026-10-06): the full-feed leaf copy + O(n) tree build of
+        // hk_getPoolPath hold one of POOL_PATH_SLOTS; past the bound the caller is told to
+        // retry and the feed lock is never taken.
+        let chain = Mutex::new(hk_state::State::default());
+        let legacy_feed = feed_of(0x10, 5);
+        let legacy = Mutex::new(legacy_feed.clone());
+        let by_asset = Mutex::new(BTreeMap::new());
+        let no_slots = Semaphore::new(0);
+        let r = pool_path(&chain, &legacy, &by_asset, &no_slots, &json!({"index": 0}));
+        assert!(error(&r).contains("busy: 2 pool-path builds"), "{r}");
+        // a missing index is refused before a slot is needed
+        let r = pool_path(&chain, &legacy, &by_asset, &no_slots, &json!({}));
+        assert!(error(&r).contains("index (leaf index, integer) required"), "{r}");
+
+        // with slots: the answer is `full_tree_path` over the bare leaves, shape unchanged,
+        // and the slot comes back
+        let slots = Semaphore::new(POOL_PATH_SLOTS);
+        let leaves: Vec<[u8; 32]> = legacy_feed.iter().map(|(l, _)| l.0).collect();
+        let (siblings, root) = hk_state::pool::full_tree_path(&leaves, 3);
+        let r = pool_path(&chain, &legacy, &by_asset, &slots, &json!({"index": 3}));
+        assert_eq!(r["result"]["index"], json!(3), "{r}");
+        assert_eq!(r["result"]["commitment"], json!(hex::encode(leaves[3])));
+        assert_eq!(r["result"]["root"], json!(hex::encode(root)));
+        assert_eq!(r["result"]["total"], json!(5));
+        assert_eq!(r["result"]["asset"], Value::Null);
+        let got: Vec<String> =
+            r["result"]["siblings"].as_array().unwrap().iter().map(|s| s.as_str().unwrap().to_string()).collect();
+        assert_eq!(got, siblings.iter().map(hex::encode).collect::<Vec<_>>());
+        assert_eq!(slots.available_permits(), POOL_PATH_SLOTS);
+        // out of range: refused, and the slot still comes back
+        let r = pool_path(&chain, &legacy, &by_asset, &slots, &json!({"index": 5}));
+        assert!(error(&r).contains("out of range (pool has 5 commitments)"), "{r}");
+        assert_eq!(slots.available_permits(), POOL_PATH_SLOTS);
+        // an asset without a pool is an empty feed: every index is out of range
+        let r = pool_path(&chain, &legacy, &by_asset, &slots, &json!({"asset": hex::encode([0xbb; 32]), "index": 0}));
+        assert!(error(&r).contains("pool has 0 commitments"), "{r}");
+        assert_eq!(slots.available_permits(), POOL_PATH_SLOTS);
+    }
+
+    fn one_seat(seed: u8, epoch: u64) -> (RootSecret, HkValidator) {
+        let root = RootSecret::from_seed(&[seed; 32]);
+        let mut v = HkValidator::new(root.public_bytes().to_vec(), HkPub(vec![seed; 60]), 1);
+        v.epoch = epoch;
+        (root, v)
+    }
+
+    fn garbage_rotation(root_pk: Vec<u8>, epoch: u64, sig_len: usize) -> RotationCert {
+        RotationCert { root_pk, new_op_pk: HkPub(vec![7u8; 60]), epoch, valid_from_height: 0, root_sig: vec![0u8; sig_len] }
+    }
+
+    /// The v0.19.4 rule: a chain that never activates v2, judged at tip + 1 = 101.
+    const V1_RULES: RotationRules<'static> = RotationRules { height: 101, chain_id: CHAIN, v2_from: u64::MAX };
+    /// The devnet rule: v2 from genesis, judged at tip + 1.
+    fn v2_rules(tip: u64) -> RotationRules<'static> {
+        RotationRules::new(tip + 1, CHAIN, 0)
+    }
+
+    #[test]
+    fn l6_rotation_free_refusals_come_before_the_verify_and_the_slot() {
+        let (_, seat) = one_seat(1, 3);
+        let root = seat.root_pk.clone();
+        let validators = Mutex::new(HkValidatorSet::new([seat]));
+        let queue = Mutex::new(Vec::new());
+        // zero permits: anything that reaches the verifier answers "busy" — so every
+        // refusal below provably happened before the slot (and the verify) was needed
+        let no_slots = Semaphore::new(0);
+
+        let r = submit_rotation(&validators, &queue, &no_slots, &V1_RULES, garbage_rotation(vec![9u8; ROOT_PK_LEN], 4, ROOT_SIG_LEN));
+        assert_eq!(accepted(&r), Some(false));
+        assert!(reason(&r).contains("no validator with that root identity"), "{r}");
+        for stale in [0, 2, 3] {
+            let r = submit_rotation(&validators, &queue, &no_slots, &V1_RULES, garbage_rotation(root.clone(), stale, ROOT_SIG_LEN));
+            assert_eq!(accepted(&r), Some(false));
+            assert!(reason(&r).contains("stale (cert epoch"), "{r}");
+        }
+        let r = submit_rotation(&validators, &queue, &no_slots, &V1_RULES, garbage_rotation(root.clone(), 4, 10));
+        assert_eq!(accepted(&r), Some(false));
+        assert!(reason(&r).contains("root_sig must be"), "{r}");
+        assert!(queue.lock().unwrap().is_empty());
+
+        // a well-shaped cert that passes every free check needs a slot: none → busy, nothing queued
+        let r = submit_rotation(&validators, &queue, &no_slots, &V1_RULES, garbage_rotation(root.clone(), 4, ROOT_SIG_LEN));
+        assert!(error(&r).contains("busy"), "{r}");
+        assert!(queue.lock().unwrap().is_empty());
+
+        // L-2: under v2 the valid_from_height window is a free refusal too — from the
+        // future, or older than the horizon, never reaches the verifier. At the RPC the
+        // rule sits at tip + 1 (the earliest block the cert can commit in), so the
+        // activation it is judged against is tip + 2: naming that height is fine, one
+        // past it is "from the future".
+        let tip = 500_000u64;
+        let mut future = garbage_rotation(root.clone(), 4, ROOT_SIG_LEN);
+        future.valid_from_height = tip + 3;
+        let r = submit_rotation(&validators, &queue, &no_slots, &v2_rules(tip), future);
+        assert_eq!(accepted(&r), Some(false));
+        assert!(reason(&r).contains("valid_from_height 500003 is past its activation height 500002"), "{r}");
+        let mut edge = garbage_rotation(root.clone(), 4, ROOT_SIG_LEN);
+        edge.valid_from_height = tip + 2;
+        let r = submit_rotation(&validators, &queue, &no_slots, &v2_rules(tip), edge);
+        assert!(error(&r).contains("busy"), "{r}"); // inside the window → the verify's turn
+        let mut old = garbage_rotation(root.clone(), 4, ROOT_SIG_LEN);
+        old.valid_from_height = tip + 1 - hk_consensus::rotation::ROTATION_FRESHNESS_HORIZON - 1;
+        let r = submit_rotation(&validators, &queue, &no_slots, &v2_rules(tip), old);
+        assert_eq!(accepted(&r), Some(false));
+        assert!(reason(&r).contains("stale — valid_from_height"), "{r}");
+        // the same values under the v1 rule are not read at all (v0.19.4 behaviour): busy
+        let mut legacy = garbage_rotation(root.clone(), 4, ROOT_SIG_LEN);
+        legacy.valid_from_height = tip + 2;
+        let r = submit_rotation(&validators, &queue, &no_slots, &V1_RULES, legacy);
+        assert!(error(&r).contains("busy"), "{r}");
+        // inside the window it is the verify's turn: busy
+        let mut fresh = garbage_rotation(root.clone(), 4, ROOT_SIG_LEN);
+        fresh.valid_from_height = tip + 1;
+        let r = submit_rotation(&validators, &queue, &no_slots, &v2_rules(tip), fresh);
+        assert!(error(&r).contains("busy"), "{r}");
+        assert!(queue.lock().unwrap().is_empty());
+
+        // dedup precedes the verify: with a cert for this root at epoch 4 already queued, a
+        // garbage epoch-4 copy is "already queued" — never verified, never a slot
+        queue.lock().unwrap().push(garbage_rotation(root.clone(), 4, ROOT_SIG_LEN));
+        let r = submit_rotation(&validators, &queue, &no_slots, &V1_RULES, garbage_rotation(root.clone(), 4, ROOT_SIG_LEN));
+        assert_eq!((accepted(&r), queued(&r)), (Some(true), Some(false)));
+        assert_eq!(queue.lock().unwrap().len(), 1);
+        // but a NEWER epoch is not a duplicate — it needs the slot
+        let r = submit_rotation(&validators, &queue, &no_slots, &V1_RULES, garbage_rotation(root, 5, ROOT_SIG_LEN));
+        assert!(error(&r).contains("busy"), "{r}");
+        assert_eq!(queue.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn l6_rotation_verify_runs_outside_the_lock_and_returns_its_slot() {
+        on_big_stack(|| {
+            let (root, seat) = one_seat(1, 3);
+            let root_pk = seat.root_pk.clone();
+            let validators = Mutex::new(HkValidatorSet::new([seat]));
+            let queue = Mutex::new(Vec::new());
+            let slots = Semaphore::new(CERT_VERIFY_SLOTS);
+
+            // garbage signature of the right size: the verify runs, fails, the slot comes back
+            let r = submit_rotation(&validators, &queue, &slots, &V1_RULES, garbage_rotation(root_pk.clone(), 4, ROOT_SIG_LEN));
+            assert_eq!(accepted(&r), Some(false));
+            assert!(reason(&r).contains("invalid or stale"), "{r}");
+            assert!(queue.lock().unwrap().is_empty());
+            assert_eq!(slots.available_permits(), CERT_VERIFY_SLOTS);
+
+            // a real cert: verified and queued once; a re-submit is "already queued"
+            let c4 = RotationCert::issue(&root, RotationDomain::V1, "", HkPub(vec![4u8; 60]), 4, 0);
+            let r = submit_rotation(&validators, &queue, &slots, &V1_RULES, c4.clone());
+            assert_eq!((accepted(&r), queued(&r)), (Some(true), Some(true)));
+            assert_eq!(r["result"]["epoch"], json!(4));
+            let r = submit_rotation(&validators, &queue, &slots, &V1_RULES, c4.clone());
+            assert_eq!((accepted(&r), queued(&r)), (Some(true), Some(false)));
+            assert_eq!(queue.lock().unwrap().len(), 1);
+            // a newer real cert retires the older queued copy
+            let c5 = RotationCert::issue(&root, RotationDomain::V1, "", HkPub(vec![5u8; 60]), 5, 0);
+            let r = submit_rotation(&validators, &queue, &slots, &V1_RULES, c5);
+            assert_eq!((accepted(&r), queued(&r)), (Some(true), Some(true)));
+            {
+                let q = queue.lock().unwrap();
+                assert_eq!(q.len(), 1);
+                assert_eq!(q[0].epoch, 5);
+            }
+            assert_eq!(slots.available_permits(), CERT_VERIFY_SLOTS);
+        });
+    }
+
+    #[test]
+    fn l2_rotation_rpc_demands_v2_from_the_height_and_names_a_v1_cert() {
+        on_big_stack(|| {
+            let (root, seat) = one_seat(1, 3);
+            let validators = Mutex::new(HkValidatorSet::new([seat]));
+            let queue = Mutex::new(Vec::new());
+            let slots = Semaphore::new(CERT_VERIFY_SLOTS);
+            let tip = 1_000u64;
+
+            // a v1 cert (a ≤ v0.19.4 issuer, or `issue-rotation` without the chain id) on a
+            // chain past its v2 height: the verify ran (slot taken and returned), the reason
+            // says v1 so the operator re-issues instead of suspecting a forgery
+            let v1 = RotationCert::issue(&root, RotationDomain::V1, "", HkPub(vec![4u8; 60]), 4, tip + 1);
+            let r = submit_rotation(&validators, &queue, &slots, &v2_rules(tip), v1.clone());
+            assert_eq!(accepted(&r), Some(false));
+            assert!(reason(&r).contains("signed under the v1 domain"), "{r}");
+            assert!(reason(&r).contains("issue-rotation <HOME> 4 <TIP+1> hashkinetics-test"), "{r}");
+            assert!(queue.lock().unwrap().is_empty());
+            assert_eq!(slots.available_permits(), CERT_VERIFY_SLOTS);
+
+            // a v2 cert for ANOTHER chain: refused (the chain id is in the signed bytes)
+            let elsewhere = RotationCert::issue(&root, RotationDomain::V2, "hashkinetics-1-deadbeef", HkPub(vec![4u8; 60]), 4, tip + 1);
+            let r = submit_rotation(&validators, &queue, &slots, &v2_rules(tip), elsewhere);
+            assert_eq!(accepted(&r), Some(false));
+            assert!(reason(&r).contains("v2 domain, chain hashkinetics-test"), "{r}");
+            assert!(queue.lock().unwrap().is_empty());
+
+            // the same seat's v2 cert for this chain, issued at the tip: queued
+            let v2 = RotationCert::issue_for(&root, CHAIN, 0, HkPub(vec![4u8; 60]), 4, tip + 1);
+            let r = submit_rotation(&validators, &queue, &slots, &v2_rules(tip), v2.clone());
+            assert_eq!((accepted(&r), queued(&r)), (Some(true), Some(true)));
+            assert_eq!(queue.lock().unwrap().len(), 1);
+            // and the v1 copy is refused on a chain BEFORE its height only as "not v1" would
+            // be — i.e. the v2 cert is refused there, the v1 one is what that chain takes
+            let before = RotationRules::new(tip + 1, CHAIN, u64::MAX);
+            let queue2 = Mutex::new(Vec::new());
+            let r = submit_rotation(&validators, &queue2, &slots, &before, v2);
+            assert_eq!(accepted(&r), Some(false));
+            assert!(reason(&r).contains("invalid or stale (cert epoch 4, current 3)"), "{r}");
+            let r = submit_rotation(&validators, &queue2, &slots, &before, v1);
+            assert_eq!((accepted(&r), queued(&r)), (Some(true), Some(true)));
+            assert_eq!(slots.available_permits(), CERT_VERIFY_SLOTS);
+        });
+    }
+
+    fn admit_body(root_pk: Vec<u8>, key: u8, not_before: u64, not_after: u64) -> SetChangeBody {
+        SetChangeBody {
+            chain_id: CHAIN.into(),
+            change: SetChange::Admit { root_pk, public_key: HkPub(vec![key; 60]), voting_power: 1 },
+            not_before,
+            not_after,
+        }
+    }
+
+    fn garbage_approvals(seats: &[&HkValidator]) -> Vec<Approval> {
+        seats.iter().map(|v| Approval { root_pk: v.root_pk.clone(), root_sig: vec![0u8; ROOT_SIG_LEN] }).collect()
+    }
+
+    #[test]
+    fn l6_set_change_free_refusals_come_before_the_verify_and_the_slot() {
+        let tip = 100u64;
+        let (_, s1) = one_seat(1, 0);
+        let (_, s2) = one_seat(2, 0);
+        let (_, s3) = one_seat(3, 0);
+        let validators = Mutex::new(HkValidatorSet::new([s1.clone(), s2.clone(), s3.clone()]));
+        let queue = Mutex::new(Vec::new());
+        let no_slots = Semaphore::new(0);
+        let newcomer = RootSecret::from_seed(&[9u8; 32]).public_bytes().to_vec();
+        let all3 = garbage_approvals(&[&s1, &s2, &s3]);
+        let submit = |body: SetChangeBody, approvals: Vec<Approval>| {
+            submit_set_change(&validators, &queue, &no_slots, CHAIN, tip, SetChangeCert { body, approvals })
+        };
+        let refuses = |body: SetChangeBody, approvals: Vec<Approval>, needle: &str| {
+            let r = submit(body, approvals);
+            assert_eq!(accepted(&r), Some(false), "{r}");
+            assert!(reason(&r).contains(needle), "wanted {needle:?} in {r}");
+        };
+
+        // shape, chain id, window — none of them looks at the set
+        refuses(admit_body(newcomer.clone(), 9, 150, 140), all3.clone(), "not_after < not_before");
+        let mut wrong = admit_body(newcomer.clone(), 9, 101, 500);
+        wrong.chain_id = "hashkinetics-1-deadbeef".into();
+        refuses(wrong, all3.clone(), "for chain hashkinetics-1-deadbeef — this is hashkinetics-test");
+        refuses(admit_body(newcomer.clone(), 9, 1, 99), all3.clone(), "window closed: not_after 99 < tip 100");
+        refuses(
+            admit_body(newcomer.clone(), 9, tip + SET_CHANGE_HORIZON + 1, u64::MAX),
+            all3.clone(),
+            "window too far ahead",
+        );
+        // approvals: present, well-sized, distinct, seated, > 2/3
+        refuses(admit_body(newcomer.clone(), 9, 101, 500), vec![], "no approvals");
+        refuses(
+            admit_body(newcomer.clone(), 9, 101, 500),
+            vec![Approval { root_pk: s1.root_pk.clone(), root_sig: vec![0u8; 5] }],
+            "SLH-DSA-192s signature",
+        );
+        refuses(admit_body(newcomer.clone(), 9, 101, 500), garbage_approvals(&[&s1, &s1, &s2]), "duplicate approval");
+        let (_, stranger) = one_seat(8, 0);
+        refuses(admit_body(newcomer.clone(), 9, 101, 500), garbage_approvals(&[&s1, &s2, &stranger]), "not seated");
+        refuses(admit_body(newcomer.clone(), 9, 101, 500), garbage_approvals(&[&s1, &s2]), "approving power 2 is not > 2/3 of 3");
+        // the subject, as commit would judge it
+        refuses(admit_body(s1.root_pk.clone(), 1, 101, 500), all3.clone(), "already applied — that root is seated");
+        refuses(admit_body(newcomer.clone(), 1, 101, 500), all3.clone(), "operational key collides");
+        let mut rm = admit_body(newcomer.clone(), 9, 101, 500);
+        rm.change = SetChange::Remove { root_pk: newcomer.clone() };
+        refuses(rm, all3.clone(), "already applied — that root is not seated");
+        let mut sp = admit_body(newcomer.clone(), 9, 101, 500);
+        sp.change = SetChange::SetPower { root_pk: newcomer.clone(), voting_power: 2 };
+        refuses(sp, all3.clone(), "set-power for a root that is not seated");
+        let mut same = admit_body(newcomer.clone(), 9, 101, 500);
+        same.change = SetChange::SetPower { root_pk: s1.root_pk.clone(), voting_power: 1 };
+        refuses(same, all3.clone(), "already applied — that seat already weighs 1");
+        assert!(queue.lock().unwrap().is_empty());
+
+        // every free check passes → a slot is needed: none → busy, nothing queued
+        let good = admit_body(newcomer.clone(), 9, 101, 500);
+        let r = submit(good.clone(), all3.clone());
+        assert!(error(&r).contains("busy"), "{r}");
+        assert!(queue.lock().unwrap().is_empty());
+
+        // dedup precedes the verify: an identical body already queued → "already queued",
+        // the garbage approvals are never verified and no slot is taken
+        queue.lock().unwrap().push(SetChangeCert { body: good.clone(), approvals: all3.clone() });
+        let r = submit(good, all3);
+        assert_eq!((accepted(&r), queued(&r)), (Some(true), Some(false)));
+        assert_eq!(r["result"]["approvals"], json!(3));
+        assert_eq!(r["result"]["window"], json!([101, 500]));
+        assert_eq!(queue.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn l6_set_change_verify_runs_outside_the_lock_and_returns_its_slot() {
+        on_big_stack(|| {
+            let tip = 10u64;
+            let (root1, s1) = one_seat(1, 0);
+            let validators = Mutex::new(HkValidatorSet::new([s1.clone()]));
+            let queue = Mutex::new(Vec::new());
+            let slots = Semaphore::new(CERT_VERIFY_SLOTS);
+            let newcomer = RootSecret::from_seed(&[2u8; 32]).public_bytes().to_vec();
+            let body = admit_body(newcomer, 2, tip + 1, tip + 400);
+
+            // a garbage signature of the right size: the verify runs, fails, the slot comes back
+            let r = submit_set_change(&validators, &queue, &slots, CHAIN, tip, SetChangeCert {
+                body: body.clone(),
+                approvals: garbage_approvals(&[&s1]),
+            });
+            assert_eq!(accepted(&r), Some(false));
+            assert!(reason(&r).contains("invalid approval signature"), "{r}");
+            assert!(queue.lock().unwrap().is_empty());
+            assert_eq!(slots.available_permits(), CERT_VERIFY_SLOTS);
+
+            // a real 1-of-1 approval: verified and queued once; a re-submit is "already queued"
+            let cert = SetChangeCert { body: body.clone(), approvals: vec![Approval::sign(&root1, &body)] };
+            let r = submit_set_change(&validators, &queue, &slots, CHAIN, tip, cert.clone());
+            assert_eq!((accepted(&r), queued(&r)), (Some(true), Some(true)));
+            assert_eq!(r["result"]["approvals"], json!(1));
+            assert_eq!(r["result"]["window"], json!([11, 410]));
+            let r = submit_set_change(&validators, &queue, &slots, CHAIN, tip, cert);
+            assert_eq!((accepted(&r), queued(&r)), (Some(true), Some(false)));
+            assert_eq!(queue.lock().unwrap().len(), 1);
+            assert_eq!(slots.available_permits(), CERT_VERIFY_SLOTS);
+        });
     }
 }

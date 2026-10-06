@@ -206,27 +206,21 @@ pub(crate) fn write_secret(path: &Path, plaintext: &str, which: Secret) -> eyre:
     write_atomic(path, body.as_bytes())
 }
 
-/// tmp → fsync → rename. Counters in these files are reserve-then-advance; the bytes must
-/// be on disk before the rename makes them the live file (the v0.13.1 wallet rule).
+/// tmp → fsync → rename → fsync(directory), mode 0600 on Unix. Counters in these files are
+/// reserve-then-advance; the bytes must be on disk before the rename makes them the live
+/// file (the v0.13.1 wallet rule), AND the directory entry must be on disk before the write
+/// is reported done — on POSIX the rename alone sits in cached directory metadata and a
+/// power loss can bring the OLD file (a lower counter) back (R16, 2026-09-22). The routine
+/// is `hk_crypto::fsutil` since R17 (reported 2026-10-06): this copy had stopped at the
+/// rename. The missing parent directory is still created here (first write of a fresh
+/// home); the helper itself refuses a missing parent.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> eyre::Result<()> {
-    use std::io::Write;
     if let Some(dir) = path.parent() {
         if !dir.as_os_str().is_empty() {
             std::fs::create_dir_all(dir)?;
         }
     }
-    let tmp = path.with_extension("tmp");
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-    }
-    std::fs::rename(&tmp, path)?;
+    hk_crypto::fsutil::write_atomic_with(path, &path.with_extension("tmp"), bytes, Some(0o600))?;
     Ok(())
 }
 

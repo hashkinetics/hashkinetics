@@ -21,8 +21,11 @@
 //! `snapshot_roundtrip_identical_commitment_and_keeps_running`; proven at the
 //! process layer by the crash-kill devnet demo).
 //!
-//! Durability notes (honest): block/snapshot writes are atomic (tmp+fsync+rename,
-//! same discipline as the signer state); WAL appends are fsynced per admission
+//! Durability notes (honest): block/segment/snapshot/index writes go through
+//! `hk_crypto::fsutil::write_atomic` (tmp + fsync + rename + directory fsync — the same
+//! routine as the signer state since R17, reported 2026-10-06; until then this file's own
+//! copy stopped at the rename, so a power loss right after a write could bring the previous
+//! file back — R16 had fixed the signer only); WAL appends are fsynced per admission
 //! since H6 (v0.13.2, `HK_WAL_FSYNC=0` to trade that for throughput on benches).
 //!
 //! **C2.8 (v0.16.0) — segmented block log + retention.** One file per height forever
@@ -57,6 +60,9 @@ use eyre::{Result, WrapErr as _};
 use serde::{Deserialize, Serialize};
 
 use hk_consensus::{HkAddress, HkPub};
+// R17 (reported 2026-10-06): the durable atomic write (tmp + fsync + rename + fsync(dir))
+// is the one shared helper; this file's own copy had never received R16's directory fsync.
+use hk_crypto::fsutil::write_atomic;
 use hk_primitives::H256;
 use hk_state::tx::SignedTx;
 use hk_state::StateSnapshot;
@@ -749,18 +755,6 @@ impl NodeStore {
         }
         write_atomic(&self.wal_path, &buf).wrap_err("resetting mempool WAL")
     }
-}
-
-/// Atomic write: tmp + fsync + rename (same discipline as the signer state file —
-/// a crash leaves the old or the new file, never a torn one).
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)
 }
 
 #[cfg(test)]

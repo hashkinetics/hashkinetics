@@ -16,8 +16,16 @@
 //! - Reserve-then-sign: the faucet wallet's nonce persists BEFORE submit; rollback
 //!   (persisted) only on refusal — a crash can never re-sign a spent L-ratchet index.
 //! - Rate limiting is the anti-spam floor alongside the U4 fee: per-IP cooldown +
-//!   a global daily cap. X-Forwarded-For is honored ONLY from a loopback/private peer
-//!   (the nginx in front of us) — a direct caller cannot forge its own address (H9).
+//!   a global daily cap. X-Real-IP / X-Forwarded-For are honored ONLY from a loopback/private
+//!   peer (the nginx in front of us) — a direct caller cannot forge its own address (H9).
+//! - R17 L-4 (reported 2026-10-06, fixed the same day; precedence corrected by the review
+//!   the same day): of a forwarded chain we key on the entry OUR proxy wrote — the
+//!   RIGHTMOST `X-Forwarded-For` entry, else `X-Real-IP` — never
+//!   the leftmost, which is whatever the client typed. Values are parsed as `IpAddr` (the old
+//!   `split(':')` cut `2001:db8::1` down to `2001`), IPv6 is keyed on its /64, and an absent
+//!   or unparseable header falls back to the peer address, never to a client string. The
+//!   rule only holds if nginx OVERWRITES both headers (`proxy_set_header X-Real-IP
+//!   $remote_addr; proxy_set_header X-Forwarded-For $remote_addr;`) — see `client_ip`.
 //! - Cooldowns persist (`faucet-cooldowns.json` next to the wallet) and the map is
 //!   bounded: a restart no longer hands everyone a fresh drip, and a scan of a
 //!   million addresses no longer grows memory without limit (H9, v0.13.2).
@@ -37,8 +45,10 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv6Addr, TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -96,7 +106,10 @@ pub(crate) fn serve(cfg: FaucetCfg) -> eyre::Result<()> {
     let wallet = Wallet::from_seed(file.seed_bytes()?, id, chain_nonce);
     let bal = demo::balance(&cfg.node_rpc, &id);
     println!("🚰 faucet up: account {} · balance {bal} micro · drip {} micro", file.id, cfg.drip);
-    println!("   listening on {} (put nginx in front; X-Forwarded-For honored)", cfg.listen);
+    println!(
+        "   listening on {} (put nginx in front; rightmost X-Forwarded-For, else X-Real-IP, honored from a local peer — R17 L-4)",
+        cfg.listen
+    );
     println!(
         "   K3 hot/cold: low watermark {} micro ({} drips) · reserve floor {} micro — top up from the cold account",
         cfg.low_micro,
@@ -223,19 +236,18 @@ fn handle(st: std::sync::Arc<FaucetState>, mut stream: TcpStream) -> eyre::Resul
     }
 
     // ---- rate limits ------------------------------------------------------
-    // H9: X-Forwarded-For is trusted only when the TCP peer is the local reverse
+    // H9: forwarding headers are trusted only when the TCP peer is the local reverse
     // proxy; anyone reaching us directly is rated by the address they came from.
+    // R17 L-4: WHICH forwarded entry, and how it is parsed, lives in `client_ip`; the
+    // map key is the canonical form from `cooldown_key`. Only the header block is
+    // searched — a JSON body cannot smuggle a header line in.
     let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
-    let peer_is_proxy = peer_ip.map(|ip| ip.is_loopback() || is_private(ip)).unwrap_or(false);
-    let forwarded = text
-        .lines()
-        .find(|l| l.to_ascii_lowercase().starts_with("x-forwarded-for:"))
-        .and_then(|l| l.split(':').nth(1))
-        .map(|v| v.split(',').next().unwrap_or("").trim().to_string())
-        .filter(|s| !s.is_empty());
-    let ip = match (peer_is_proxy, forwarded) {
-        (true, Some(f)) => f,
-        _ => peer_ip.map(|a| a.to_string()).unwrap_or_else(|| "?".into()),
+    let head = text.split("\r\n\r\n").next().unwrap_or("");
+    let ip = match client_ip(peer_ip, head) {
+        Some(ip) => cooldown_key(ip),
+        // peer_addr() failed on an accepted socket: nothing to key on, and nothing a
+        // client can choose either. Pre-R17 behaviour, kept.
+        None => "?".into(),
     };
     // ---- P6.2: which asset? ----------------------------------------------------------
     // Absent = the native drip (the only one that can CREATE an account). An issued asset must
@@ -455,10 +467,128 @@ fn unix_now() -> u64 {
 }
 
 /// RFC 1918 / link-local / unique-local — "the proxy is on this box or this LAN".
-fn is_private(ip: std::net::IpAddr) -> bool {
+fn is_private(ip: IpAddr) -> bool {
     match ip {
-        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
-        std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0xfc00 || (v6.segments()[0] & 0xffc0) == 0xfe80,
+        IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0xfc00 || (v6.segments()[0] & 0xffc0) == 0xfe80,
+    }
+}
+
+/// R17 L-4 (reported 2026-10-06): the address a drip is rate-limited by.
+///
+/// Before R17 the key was the LEFTMOST `X-Forwarded-For` entry, cut at the first ':' of
+/// the header LINE. Two defects: (1) nginx's `$proxy_add_x_forwarded_for` APPENDS the real
+/// peer to whatever the client sent, so the leftmost entry is the client's own string — a
+/// caller sending a fresh `X-Forwarded-For` per request never met the cooldown and only
+/// the global daily cap (`--daily-cap`, default 200) stood between it and the float;
+/// (2) `split(':').nth(1)` on the line turned `X-Forwarded-For: 2001:db8::1` into the key
+/// "2001", folding every v6 caller with that first hextet into one bucket — one honest
+/// drip locked out an entire provider's v6 range for the window.
+///
+/// Now, and only when the peer is the loopback/private proxy (the H9 gate, unchanged):
+///   1. the RIGHTMOST entry of the LAST `X-Forwarded-For` line — the entry the trusted
+///      proxy wrote, the only one a client cannot choose under EITHER standard nginx form
+///      (`$proxy_add_x_forwarded_for` appends `$remote_addr`; `$remote_addr` leaves exactly
+///      one);
+///   2. else `X-Real-IP` — single-valued, written by nginx only where the vhost carries
+///      `proxy_set_header X-Real-IP $remote_addr;`;
+///   3. else the peer address itself.
+/// Why XFF before X-Real-IP (R17 review, 2026-10-06 — the first cut of this fix read
+/// X-Real-IP first): nginx forwards a client-supplied `X-Real-IP` UNTOUCHED unless the
+/// vhost overrides it, and the gateway's faucet vhost is not in this repo. Its
+/// X-Forwarded-For line is the one the faucet has relied on since H9 (v0.13.2); the
+/// X-Real-IP line is the one still owed (`ops/ROLL-v0.19.6-R17-2026-10-06.md` §5). On a
+/// vhost that sets only X-Forwarded-For, X-Real-IP-first handed the cooldown key back to
+/// the client — through a header the pre-R17 code never read, i.e. a regression under the
+/// one config the tree cannot rule out — while XFF-rightmost-first is never worse than
+/// pre-R17 under either form. The reverse mistake (an X-Real-IP line but XFF passed
+/// through) is what the runbook's `grep proxy_set_header` check exists to catch before
+/// L-4 is called closed.
+/// A header is used only if `IpAddr::from_str` accepts it: an absent, empty or garbage
+/// value lands on the PROXY's own address, which collapses every proxied caller into one
+/// cooldown. That is the strict failure (the faucet gets stingy, not open) and
+/// `warn_proxy_header_once` names the nginx lines that fix it. A direct peer (public
+/// address) is always keyed on itself; its headers are ignored.
+///
+/// The one thing this cannot defend: an nginx that passes the client's headers through
+/// UNTOUCHED (no `proxy_set_header` for either name). Then the rightmost entry and
+/// X-Real-IP are both the client's again — no worse than pre-R17, but the fix is only real
+/// once the gateway's nginx site config (not in this repo) overwrites both headers.
+fn client_ip(peer: Option<IpAddr>, head: &str) -> Option<IpAddr> {
+    let peer_is_proxy = peer.map(|ip| ip.is_loopback() || is_private(ip)).unwrap_or(false);
+    if !peer_is_proxy {
+        return peer;
+    }
+    if let Some(ip) = header_value(head, "x-forwarded-for")
+        .and_then(|v| v.rsplit(',').next())
+        .and_then(parse_ip)
+    {
+        return Some(ip);
+    }
+    if let Some(ip) = header_value(head, "x-real-ip").and_then(parse_ip) {
+        return Some(ip);
+    }
+    if let Some(p) = peer {
+        warn_proxy_header_once(p);
+    }
+    peer
+}
+
+/// The LAST `name:` header line in `head` (name compared case-insensitively), split at
+/// the FIRST ':' only and trimmed. HTTP treats repeated same-name lines as one
+/// comma-joined value in order, so "last line" keeps the proxy-appended entry rightmost.
+/// The pre-R17 `split(':').nth(1)` cut IPv6 values at their own first colon.
+fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines()
+        .filter_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim().eq_ignore_ascii_case(name).then(|| v.trim())
+        })
+        .last()
+}
+
+/// `IpAddr::from_str` with the one tolerance a forwarded value needs: an IPv6 literal
+/// written `[2001:db8::1]` (RFC 7239 style) is accepted. Anything else that fails to parse
+/// — a port suffix, a hostname, a shell payload — is `None`, and the caller keys on the peer.
+fn parse_ip(s: &str) -> Option<IpAddr> {
+    let s = s.trim();
+    let s = s.strip_prefix('[').and_then(|r| r.strip_suffix(']')).unwrap_or(s);
+    IpAddr::from_str(s).ok()
+}
+
+/// Canonical cooldown-map key for an address. The map persists (`faucet-cooldowns.json`),
+/// so the spelling matters across restarts and upgrades:
+/// - IPv4: the dotted quad — byte-identical to the pre-R17 keys, so v4 cooldowns written
+///   by v0.19.x survive the roll; an IPv4-mapped v6 (`::ffff:a.b.c.d`, what a dual-stack
+///   listener reports for a v4 client) keys as that v4, one client = one key either way.
+/// - IPv6: the /64 the address sits in, written `2001:db8:1:2::/64`. DECISION (R17): key on
+///   the /64, not the address. A residential allocation is at least a /64 and SLAAC privacy
+///   extensions rotate the low 64 bits at will, so a per-address key would hand a v6 caller
+///   2^64 fresh identities per window; the /64 is the smallest unit a subscriber cannot
+///   cheaply escape. Pre-R17 v6 keys ("2001"-style truncations) simply age out of the map.
+fn cooldown_key(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let prefix = Ipv6Addr::from(u128::from(v6) & !((1u128 << 64) - 1));
+                format!("{prefix}/64")
+            }
+        },
+    }
+}
+
+static PROXY_HEADER_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Once per process: a loopback/private peer POSTed /drip without a usable forwarding
+/// header. If that peer is nginx, every proxied caller now shares ONE cooldown and the
+/// site config is missing its `proxy_set_header` lines — say so, once, not per request.
+fn warn_proxy_header_once(peer: IpAddr) {
+    if !PROXY_HEADER_WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "⚠ faucet: local peer {peer} sent no parseable X-Real-IP / X-Forwarded-For — if that is nginx, every proxied caller shares one cooldown; add `proxy_set_header X-Real-IP $remote_addr;` and `proxy_set_header X-Forwarded-For $remote_addr;` to the site config (R17 L-4)"
+        );
     }
 }
 
@@ -481,5 +611,137 @@ fn save_cooldowns(path: &std::path::Path, map: &HashMap<String, u64>) {
         .and_then(|_| std::fs::rename(&tmp, path).map_err(|e| e.to_string()));
     if let Err(e) = res {
         eprintln!("faucet: could not persist cooldowns: {e}");
+    }
+}
+
+#[cfg(test)]
+mod r17_tests {
+    //! R17 L-4 (reported 2026-10-06): the rate-limit key must be the address OUR proxy
+    //! wrote, parsed as an address, and never a string the client chose.
+    use super::{client_ip, cooldown_key, header_value};
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+    /// The TCP peer as nginx on the same box presents it (the H9 gate opens).
+    fn proxy() -> Option<IpAddr> {
+        Some(ip("127.0.0.1"))
+    }
+    /// A request head as `handle` sees it: request line + header lines, CRLF, no body.
+    fn head(lines: &[&str]) -> String {
+        format!("POST /drip HTTP/1.1\r\nHost: faucet.hashkinetics.org\r\n{}\r\n", lines.join("\r\n"))
+    }
+
+    #[test]
+    fn ipv4_xff_chain_keys_on_rightmost_entry() {
+        // Client typed 203.0.113.9; nginx ($proxy_add_x_forwarded_for) appended the real peer.
+        let h = head(&["X-Forwarded-For: 203.0.113.9, 198.51.100.7"]);
+        assert_eq!(client_ip(proxy(), &h), Some(ip("198.51.100.7")));
+        // Three hops, odd spacing: still the rightmost.
+        let h = head(&["X-Forwarded-For:  203.0.113.9 ,10.0.0.1,   198.51.100.7  "]);
+        assert_eq!(client_ip(proxy(), &h), Some(ip("198.51.100.7")));
+        // Repeated header lines are one comma-joined value in order: the LAST line's
+        // rightmost entry is the proxy's.
+        let h = head(&["X-Forwarded-For: 203.0.113.9", "X-Forwarded-For: 203.0.113.10, 198.51.100.7"]);
+        assert_eq!(client_ip(proxy(), &h), Some(ip("198.51.100.7")));
+        // `proxy_set_header X-Forwarded-For $remote_addr` leaves exactly one entry.
+        let h = head(&["x-forwarded-for:198.51.100.7"]);
+        assert_eq!(client_ip(proxy(), &h), Some(ip("198.51.100.7")));
+        assert_eq!(cooldown_key(ip("198.51.100.7")), "198.51.100.7");
+    }
+
+    #[test]
+    fn xff_rightmost_wins_over_x_real_ip() {
+        // The review case (2026-10-06): a vhost that sets only X-Forwarded-For passes a
+        // client-typed X-Real-IP through untouched — it must never be the key.
+        let h = head(&["X-Forwarded-For: 203.0.113.9, 198.51.100.7", "X-Real-IP: 192.0.2.44"]);
+        assert_eq!(client_ip(proxy(), &h), Some(ip("198.51.100.7")));
+        // Order of the two headers is irrelevant; the name match is case-insensitive.
+        let h = head(&["x-real-ip: 192.0.2.44", "X-FORWARDED-FOR: 198.51.100.7"]);
+        assert_eq!(client_ip(proxy(), &h), Some(ip("198.51.100.7")));
+        // No XFF at all (a vhost that sets only X-Real-IP): X-Real-IP is the key.
+        let h = head(&["X-Real-IP: 192.0.2.44"]);
+        assert_eq!(client_ip(proxy(), &h), Some(ip("192.0.2.44")));
+        // A garbage XFF rightmost does not poison the key: fall through to X-Real-IP.
+        let h = head(&["X-Forwarded-For: 203.0.113.9, garbage", "X-Real-IP: 192.0.2.44"]);
+        assert_eq!(client_ip(proxy(), &h), Some(ip("192.0.2.44")));
+        // A garbage X-Real-IP beside a good XFF never matters.
+        let h = head(&["X-Real-IP: not-an-ip", "X-Forwarded-For: 203.0.113.9, 198.51.100.7"]);
+        assert_eq!(client_ip(proxy(), &h), Some(ip("198.51.100.7")));
+    }
+
+    #[test]
+    fn ipv6_literal_round_trips() {
+        // Pre-R17 this became the key "2001" (split on the line's first ':').
+        let h = head(&["X-Forwarded-For: 2001:db8::1"]);
+        assert_eq!(client_ip(proxy(), &h), Some(ip("2001:db8::1")));
+        assert_eq!(header_value(&h, "x-forwarded-for"), Some("2001:db8::1"));
+        // No space after the colon, mixed case, a v6 chain: the whole literal survives.
+        let h = head(&["x-forwarded-for:2001:DB8::1, 2001:db8:1:2:3:4:5:6"]);
+        assert_eq!(client_ip(proxy(), &h), Some(ip("2001:db8:1:2:3:4:5:6")));
+        // X-Real-IP in RFC 7239 bracket style.
+        let h = head(&["X-Real-IP: [2001:db8::1]"]);
+        assert_eq!(client_ip(proxy(), &h), Some(ip("2001:db8::1")));
+        // The key is the /64 (see `cooldown_key`): one subscriber, one bucket.
+        assert_eq!(cooldown_key(ip("2001:db8::1")), "2001:db8::/64");
+        assert_eq!(cooldown_key(ip("2001:db8:1:2:3:4:5:6")), "2001:db8:1:2::/64");
+        assert_eq!(cooldown_key(ip("2001:db8::1")), cooldown_key(ip("2001:db8::ffff:ffff:ffff:ffff")));
+        assert_ne!(cooldown_key(ip("2001:db8::1")), cooldown_key(ip("2001:db8:0:1::1")));
+        // IPv4-mapped v6 (dual-stack listener) keys as the v4 — same client, same key.
+        assert_eq!(cooldown_key(ip("::ffff:198.51.100.7")), "198.51.100.7");
+    }
+
+    #[test]
+    fn garbage_header_falls_back_to_peer() {
+        for h in [
+            head(&["X-Forwarded-For: not-an-ip"]),
+            head(&["X-Forwarded-For:"]),
+            head(&["X-Forwarded-For: 203.0.113.9, garbage"]), // rightmost is junk: NOT the leftmost
+            head(&["X-Forwarded-For: 198.51.100.7:4321"]),    // a port is not an address
+            head(&["X-Forwarded-For: 2001"]),                 // the pre-R17 truncation, verbatim
+            head(&["X-Real-IP: faucet.hashkinetics.org"]),
+            head(&["X-Real-IP: $remote_addr"]), // an un-expanded nginx variable
+            head(&["X-Real-IP:", "X-Forwarded-For: ,"]),
+        ] {
+            assert_eq!(client_ip(proxy(), &h), proxy(), "head: {h:?}");
+        }
+    }
+
+    #[test]
+    fn header_absent_keys_on_peer() {
+        let h = head(&["Content-Type: application/json"]);
+        assert_eq!(client_ip(proxy(), &h), proxy());
+        assert_eq!(client_ip(Some(ip("10.0.0.5")), &h), Some(ip("10.0.0.5")));
+        assert_eq!(client_ip(Some(ip("203.0.113.9")), &h), Some(ip("203.0.113.9")));
+        // No peer address at all: nothing to key on, and no header can supply one.
+        assert_eq!(client_ip(None, &head(&["X-Real-IP: 192.0.2.44"])), None);
+        assert_eq!(client_ip(None, &h), None);
+    }
+
+    #[test]
+    fn direct_public_peer_ignores_forwarding_headers() {
+        // H9: a caller that reaches the socket directly is rated by its own address,
+        // whatever it claims.
+        let h = head(&["X-Real-IP: 192.0.2.44", "X-Forwarded-For: 203.0.113.9, 198.51.100.7"]);
+        assert_eq!(client_ip(Some(ip("203.0.113.77")), &h), Some(ip("203.0.113.77")));
+        assert_eq!(client_ip(Some(ip("2a02:c207:2355:1558::1")), &h), Some(ip("2a02:c207:2355:1558::1")));
+        // Loopback, RFC 1918, ULA and link-local peers are "the proxy" and open the gate
+        // (to the proxy-written XFF entry first).
+        for p in ["::1", "10.42.7.9", "192.168.1.2", "172.16.0.3", "fd00:1::5", "fe80::1"] {
+            assert_eq!(client_ip(Some(ip(p)), &h), Some(ip("198.51.100.7")), "peer {p}");
+        }
+    }
+
+    #[test]
+    fn header_value_splits_on_first_colon_only_and_ignores_the_body() {
+        let h = head(&["Content-Length: 12"]) + "\r\n" + "x-real-ip: 192.0.2.44";
+        // `handle` passes only the head; a header-shaped line in the body is never seen.
+        let only_head = h.split("\r\n\r\n").next().unwrap();
+        assert_eq!(header_value(only_head, "x-real-ip"), None);
+        assert_eq!(header_value(only_head, "content-length"), Some("12"));
+        assert_eq!(header_value("X-Real-IP: a:b:c", "x-real-ip"), Some("a:b:c"));
+        assert_eq!(header_value("X-Real-IP-Extra: 1.2.3.4", "x-real-ip"), None);
+        assert_eq!(header_value("no colon here", "x-real-ip"), None);
     }
 }
