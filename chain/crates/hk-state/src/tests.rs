@@ -1650,3 +1650,196 @@ fn r17_a_mandated_unshield_must_match_the_pool_asset_from_the_height() {
     assert_eq!(st.mandates.get(&mh).unwrap().buffer, 15 * MICRO);
     assert_eq!(st.pool.total_shielded, 15 * MICRO);
 }
+
+// ---------------------------------------------------------------------------------------
+// R18 (reported 2026-10-04 by 'secwatch-hunt'; confirmed 2026-10-08 against v0.19.6): the
+// PayWord settlement caps. `verify_settlement` hashes `step` links from the revealed word
+// back to the tip with no early exit, inside apply, under the chain lock; a settle with
+// `step = u32::MAX` on a channel opened with `max_steps = u32::MAX` was ≈ 4.29 × 10⁹
+// hashes per validator per block — free (fee refunded, nonce not ratcheted) and so
+// replayable every block. From `payword_cap_from`: `max_steps ≤ MAX_CHANNEL_STEPS` at
+// open and `step − highest_step_settled ≤ MAX_SETTLE_DELTA` at settle, both refused BEFORE
+// a link is hashed. The tests pin BOTH sides of the activation: byte-identical acceptance
+// before the height (what testnet-1 replays), refusal from it, the refusal preceding the
+// hashing, and the receipt strings wallets and the explorer key on.
+
+use crate::{MAX_CHANNEL_STEPS, MAX_SETTLE_DELTA};
+
+/// org holds 50 USDC and funds a root mandate it holds itself (cap 50 USDC), so one
+/// keychain opens the channels and one is paid.
+fn r18_genesis(org: &Keychain, merchant: &Keychain, usdc: H256) -> Genesis {
+    Genesis {
+        time: 1_000,
+        accounts: vec![org.genesis(), merchant.genesis()],
+        alloc: vec![(org.id, usdc, 50 * MICRO)],
+        fee: None,
+        assets: vec![],
+    }
+}
+
+#[test]
+fn r18_before_the_height_a_long_channel_and_a_wide_settle_apply_exactly_as_before() {
+    let usdc = h(9);
+    let mut org = Keychain::new(b"r18a-org");
+    let mut merchant = Keychain::new(b"r18a-merchant");
+    let genesis = r18_genesis(&org, &merchant, usdc);
+    let mut st = State::from_genesis(&genesis).unwrap();
+    assert_eq!(st.payword_cap_from, u64::MAX, "never, unless the node injects a height");
+    let m0 = h(0xF0);
+
+    // The chain the settle reveals from has 65,537 words (2 MiB, a fraction of a second):
+    // the channel is `MAX_CHANNEL_STEPS + 1` steps long, but only the revealed prefix has
+    // to exist — the open never looks past the tip.
+    let chain = PaywordChain::mint(b"r18a-seed", b"r18a", (MAX_SETTLE_DELTA + 1) as u32);
+    let tip = H256(chain.tip());
+    let ch_id = State::derive_channel_id(&org.id, &merchant.id, &tip, 1); // org's nonce after the mandate
+    let b1 = vec![org.sign(r17_mandate(m0, None, org.id, usdc, 50 * MICRO))];
+    // Block 2: a channel one step longer than the cap — escrow 131,073 micro at 1/step.
+    let b2 = vec![org.sign(Tx::ChannelOpen {
+        id: ch_id, mandate: m0, payee: merchant.id, asset: usdc, tip,
+        unit_price: 1, max_steps: (MAX_CHANNEL_STEPS + 1) as u32, expiry: 900_000,
+    })];
+    // Block 3: a settle one link wider than the cap, with the real word — ACCEPTED.
+    let step = (MAX_SETTLE_DELTA + 1) as u32;
+    let b3 = vec![merchant.sign(Tx::ChannelSettle { id: ch_id, word: H256(chain.pay(step).unwrap()), step })];
+    for (hgt, blk) in [(1u64, &b1), (2, &b2), (3, &b3)] {
+        let r = st.apply_block(hgt, 1_000 + hgt, blk).unwrap();
+        assert!(r.iter().all(|r| r.result.is_ok()), "block {hgt}: {r:?}");
+    }
+    let ch = &st.channels[&ch_id];
+    assert_eq!(ch.state.max_steps, MAX_CHANNEL_STEPS + 1, "the pre-R18 open took any u32");
+    assert_eq!(ch.state.highest_step_settled, MAX_SETTLE_DELTA + 1);
+    assert_eq!(ch.escrow_remaining, (MAX_CHANNEL_STEPS - MAX_SETTLE_DELTA) as Amount);
+    assert_eq!(st.balance(&merchant.id, &usdc), (MAX_SETTLE_DELTA + 1) as Amount);
+    assert_eq!(st.balance(&org.id, &usdc), 50 * MICRO - (MAX_CHANNEL_STEPS + 1) as Amount);
+    // The mirrors' helpers answer on this side of the height too (a client refuses by
+    // them everywhere, at once): the delta is what consensus will cap, the links are
+    // what the from-the-tip verifier hashes.
+    assert_eq!(st.settle_delta(&ch_id, step + 1), Some(1));
+    assert_eq!(st.settle_links(&ch_id, step + 1), Some(MAX_SETTLE_DELTA + 2));
+
+    // Byte-identical: a node with the activation AHEAD of it replays the same blocks to
+    // the same commitment as one that never activates — the new rule ran nowhere.
+    let mut ahead = State::from_genesis(&genesis).unwrap();
+    ahead.payword_cap_from = 1_000_000;
+    for (hgt, blk) in [(1u64, &b1), (2, &b2), (3, &b3)] {
+        let r = ahead.apply_block(hgt, 1_000 + hgt, blk).unwrap();
+        assert!(r.iter().all(|r| r.result.is_ok()), "block {hgt}: {r:?}");
+    }
+    assert_eq!(ahead.state_commitment(), st.state_commitment());
+}
+
+#[test]
+fn r18_from_the_height_the_caps_refuse_before_hashing_and_a_long_channel_settles_in_pieces() {
+    let usdc = h(9);
+    let mut org = Keychain::new(b"r18b-org");
+    let mut merchant = Keychain::new(b"r18b-merchant");
+    let genesis = r18_genesis(&org, &merchant, usdc);
+    let mut st = State::from_genesis(&genesis).unwrap();
+    st.payword_cap_from = 0; // a devnet: active from genesis
+    let m0 = h(0xF1);
+    assert!(x1_apply(&mut st, 1, org.sign(r17_mandate(m0, None, org.id, usdc, 50 * MICRO))).is_ok());
+    let org_usdc = st.balance(&org.id, &usdc);
+
+    // A channel at the cap is exactly two full-width pieces (2¹⁷ = 2 · 2¹⁶ — the review
+    // of 2026-10-08 cut the cap from 2²⁴ to the proposer's budget, lib.rs
+    // `MAX_CHANNEL_STEPS`): 131,072 words exist on the payer's side (4 MiB).
+    assert_eq!(MAX_CHANNEL_STEPS, 2 * MAX_SETTLE_DELTA, "the cap is two settle widths");
+    let chain = PaywordChain::mint(b"r18b-seed", b"r18b", MAX_CHANNEL_STEPS as u32);
+    let tip = H256(chain.tip());
+    let ch_id = State::derive_channel_id(&org.id, &merchant.id, &tip, 1);
+
+    // One step past the cap: refused with the pinned receipt, channel absent, escrow and
+    // the envelope untouched, nonce not consumed — decided before the holder/nonce reads.
+    let err = x1_apply(&mut st, 2, org.sign(Tx::ChannelOpen {
+        id: ch_id, mandate: m0, payee: merchant.id, asset: usdc, tip,
+        unit_price: 1, max_steps: (MAX_CHANNEL_STEPS + 1) as u32, expiry: 900_000,
+    })).unwrap_err();
+    assert_eq!(err, "channel too long (131073 steps, max 131072)");
+    org.rollback();
+    assert!(st.channels.is_empty());
+    assert_eq!(st.balance(&org.id, &usdc), org_usdc);
+    assert_eq!(st.mandates.get(&m0).unwrap().buffer, 50 * MICRO, "no envelope drew down");
+    assert_eq!(st.accounts[&org.id].nonce, 1, "a refused tx does not ratchet");
+    // u32::MAX — the reported shape — is the same refusal, with the number it asked for.
+    let err = x1_apply(&mut st, 3, org.sign(Tx::ChannelOpen {
+        id: ch_id, mandate: m0, payee: merchant.id, asset: usdc, tip,
+        unit_price: 1, max_steps: u32::MAX, expiry: 900_000,
+    })).unwrap_err();
+    assert_eq!(err, "channel too long (4294967295 steps, max 131072)");
+    org.rollback();
+
+    // Exactly the cap: accepted (inclusive). Escrow 2¹⁷ micro at 1/step.
+    assert!(x1_apply(&mut st, 4, org.sign(Tx::ChannelOpen {
+        id: ch_id, mandate: m0, payee: merchant.id, asset: usdc, tip,
+        unit_price: 1, max_steps: MAX_CHANNEL_STEPS as u32, expiry: 900_000,
+    })).is_ok());
+    assert_eq!(st.channels[&ch_id].state.max_steps, MAX_CHANNEL_STEPS);
+    assert_eq!(st.balance(&org.id, &usdc), org_usdc - MAX_CHANNEL_STEPS as Amount);
+
+    // THE PROOF THAT THE CAP PRECEDES THE HASHING: a garbage word at the channel's own
+    // max (2¹⁷ links from a fresh channel, in range for `BadStep`) is refused as
+    // `SettleDeltaTooLarge`, not as `BadSettlement` — a garbage word that WAS hashed can
+    // only ever come back "invalid payword settlement proof". (Had it hashed, this test
+    // would also take 2¹⁷ SHAKE-256s before saying so.)
+    let garbage = h(0x5A);
+    let err = x1_apply(&mut st, 5, merchant.sign(Tx::ChannelSettle { id: ch_id, word: garbage, step: MAX_CHANNEL_STEPS as u32 })).unwrap_err();
+    assert_eq!(err, "settle delta too large (131072 links past the highest settled step, max 65536 per settlement)");
+    merchant.rollback();
+    // One link over the cap, the same way (this is the receipt a wallet keys on).
+    let err = x1_apply(&mut st, 6, merchant.sign(Tx::ChannelSettle { id: ch_id, word: garbage, step: (MAX_SETTLE_DELTA + 1) as u32 })).unwrap_err();
+    assert_eq!(err, "settle delta too large (65537 links past the highest settled step, max 65536 per settlement)");
+    merchant.rollback();
+    assert_eq!(st.channels[&ch_id].state.highest_step_settled, 0, "nothing settled");
+    assert_eq!(st.balance(&merchant.id, &usdc), 0);
+    assert_eq!(st.accounts[&merchant.id].nonce, 0, "a refused tx does not ratchet");
+    // The pre-R18 refusals keep their precedence: beyond `max_steps` is `BadStep`, not
+    // the cap (the cap is read AFTER the range check, on the same `prev`).
+    let err = x1_apply(&mut st, 7, merchant.sign(Tx::ChannelSettle { id: ch_id, word: garbage, step: (MAX_CHANNEL_STEPS + 1) as u32 })).unwrap_err();
+    assert_eq!(err, "settle step invalid (stale, zero, or beyond max)");
+    merchant.rollback();
+    // The mirrors' helpers agree with the handler's arithmetic on the fresh channel:
+    // the helper REPORTS the over-cap delta the handler just refused, and answers `None`
+    // wherever the handler refuses before hashing.
+    let s1 = MAX_SETTLE_DELTA as u32;
+    assert_eq!(st.settle_delta(&ch_id, s1 + 1), Some(MAX_SETTLE_DELTA + 1), "the helper reports, the handler refuses");
+    assert_eq!(st.settle_delta(&ch_id, 0), None, "zero");
+    assert_eq!(st.settle_delta(&ch_id, (MAX_CHANNEL_STEPS + 1) as u32), None, "beyond max");
+    assert_eq!(st.settle_delta(&h(0xEE), 1), None, "unknown channel");
+
+    // Exactly the cap with the real word: accepted — the first piece of the channel.
+    assert!(x1_apply(&mut st, 8, merchant.sign(Tx::ChannelSettle { id: ch_id, word: H256(chain.pay(s1).unwrap()), step: s1 })).is_ok());
+    assert_eq!(st.channels[&ch_id].state.highest_step_settled, MAX_SETTLE_DELTA);
+    assert_eq!(st.balance(&merchant.id, &usdc), MAX_SETTLE_DELTA as Amount);
+    // From the climbed `highest`: the delta is counted from it, `None` at or below it,
+    // and the links the from-the-tip verifier hashes are `step`, not the delta.
+    let hi = s1;
+    assert_eq!(st.settle_delta(&ch_id, hi + 1), Some(1));
+    assert_eq!(st.settle_delta(&ch_id, hi + s1), Some(MAX_SETTLE_DELTA), "the second piece, exactly the cap");
+    assert_eq!(st.settle_delta(&ch_id, hi + s1 + 1), None, "beyond max precedes the cap, as in the handler");
+    assert_eq!(st.settle_delta(&ch_id, hi), None, "stale");
+    assert_eq!(st.settle_links(&ch_id, hi + 1), Some(MAX_SETTLE_DELTA + 1));
+    assert_eq!(st.settle_links(&ch_id, hi), None);
+    // The cap is the ONLY new refusal: at exactly the cap from the climbed `highest` the
+    // word IS hashed (2¹⁷ links), and a wrong one comes back as it always did.
+    let s2 = MAX_CHANNEL_STEPS as u32;
+    let err = x1_apply(&mut st, 9, merchant.sign(Tx::ChannelSettle { id: ch_id, word: garbage, step: s2 })).unwrap_err();
+    assert_eq!(err, "invalid payword settlement proof");
+    merchant.rollback();
+    assert_eq!(st.channels[&ch_id].state.highest_step_settled, MAX_SETTLE_DELTA);
+    // The second piece with the real word: the channel settles completely in two txs.
+    assert!(x1_apply(&mut st, 10, merchant.sign(Tx::ChannelSettle { id: ch_id, word: H256(chain.pay(s2).unwrap()), step: s2 })).is_ok());
+    assert_eq!(st.channels[&ch_id].state.highest_step_settled, MAX_CHANNEL_STEPS);
+    assert_eq!(st.balance(&merchant.id, &usdc), MAX_CHANNEL_STEPS as Amount);
+    assert_eq!(st.channels[&ch_id].escrow_remaining, 0, "nothing left in escrow: the merchant collected it all");
+    // A fully settled channel refuses in O(1) on both sides of its top: stale at the top,
+    // beyond max past it — never the cap, never a hash.
+    let err = x1_apply(&mut st, 11, merchant.sign(Tx::ChannelSettle { id: ch_id, word: garbage, step: s2 })).unwrap_err();
+    assert_eq!(err, "settle step invalid (stale, zero, or beyond max)");
+    merchant.rollback();
+    let err = x1_apply(&mut st, 12, merchant.sign(Tx::ChannelSettle { id: ch_id, word: garbage, step: s2 + 1 })).unwrap_err();
+    assert_eq!(err, "settle step invalid (stale, zero, or beyond max)");
+    merchant.rollback();
+    assert_eq!(st.settle_delta(&ch_id, s2), None);
+    assert_eq!(st.settle_links(&ch_id, s2 + 1), None);
+}

@@ -73,3 +73,7 @@ e072d4aa19a66252554321cabbee006f4c1d4fdbd0ebcf04cb648cdee788d5dc  hk-node-v0.19.
 # v0.19.6 release (2026-10-06) — R17: asset-bound mandates (CONSENSUS CHANGE, activation at height 1,872,500 — every seat on v0.19.6 before it; v0.19.5 was built and never released — its number, 1,844,000, passed unrolled and was renamed by patch) + mempool envelope verification + voting-power bound + durable atomic writes + faucet IP key + RPC lock fixes; rotation v2 in code, inactive — https://github.com/hashkinetics/hashkinetics/releases/tag/v0.19.6 (immutable)
 2ca5719fccab7b70893727c4bc26e4650a009cd2b7d814134a37a09ffcec0628  hk-node-v0.19.6.gz
 1a32dec3096a214dcab10b9e8e676914a1ed76d093897a2efa57f1a15db6d775  hk-node-v0.19.6
+
+# v0.19.7 release (2026-10-08) — R18: PayWord settlement bounded (CONSENSUS CHANGE, activation at height 2,007,000 — every seat on v0.19.7 before it): a settle may climb at most 2^16 links, a channel opens with at most 2^17 steps; mempool + proposer mirrors; hk_submitBundle shape check — https://github.com/hashkinetics/hashkinetics/releases/tag/v0.19.7 (immutable)
+2a1e3c40d62f79e27243156e41eab01ddafba55b20d120ca06bb794341f35a9d  hk-node-v0.19.7.gz
+c9698e34888f3e98b47772ea84b6fab2915e3391080c24dc2b83f1d56a1d190a  hk-node-v0.19.7

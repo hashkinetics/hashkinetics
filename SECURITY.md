@@ -10,7 +10,7 @@ Do not open public issues for security-relevant findings.
 
 - Acknowledgement within **48 hours**, an assessment within **7 days**.
 - **Coordinated disclosure:** give us **90 days** (or agree a timeline with us) before
-  any public disclosure. We credit reporters in the release notes and the CHANGELOG (as for R15, R16 and R17 — Alboy)
+  any public disclosure. We credit reporters in the release notes and the CHANGELOG (as for R15, R16 and R17 — Alboy; R18 — secwatch-hunt)
   unless you prefer anonymity.
 - Testnet findings are in scope and valued — that is what the testnet is *for*.
 
@@ -23,7 +23,8 @@ makes forgery cheap) and is defended by reserve-then-sign with a directory-fsync
 write — R16, reported 2026-09-22, fixed in v0.19.4 (released the same day); follow-ups: a
 floor from the node's own evidence and a reservation window; R17, reported 2026-10-06 by Alboy, nine
 findings fixed in v0.19.6 the same day (the asset-bound mandate rule activates at testnet-1
-height 1,872,500)), the spend/mint circuits and aggregation digests (`zkvm-bakeoff/circuit`),
+height 1,872,500); R18, reported 2026-10-04 by secwatch-hunt, fixed in v0.19.7 (settlement
+hashing bounded; consensus rule at testnet-1 height 2007000)), the spend/mint circuits and aggregation digests (`zkvm-bakeoff/circuit`),
 the durable store and replay path (`hk-node/src/store.rs`, `state.rs`), the disclosure
 machinery (`hk-wallet`), and the Node Key sale contract `HKNodeKey` (Ethereum mainnet
 `0x36edb45c4610AE2A7FE6334343D9D958Fb81EC84`, source verified on Etherscan and Sourcify;

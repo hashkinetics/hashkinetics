@@ -193,6 +193,43 @@ pub fn mandate_asset_from_from(chain_id: &str, env_height: Option<&str>) -> u64 
     env_height.and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0)
 }
 
+/// R18 (reported 2026-10-04 by 'secwatch-hunt'; confirmed 2026-10-08 against v0.19.6 by a
+/// verifier and three refuters, none refuting): the height from which testnet-1 nodes cap
+/// PayWord settlement — a `ChannelSettle` may advance a channel by at most 2¹⁶ links and a
+/// `ChannelOpen` may name at most 2¹⁷ steps (the same-day review cut it from 2²⁴ to the
+/// proposer's per-block budget — `hk_state::MAX_CHANNEL_STEPS` says why), both refused
+/// BEFORE any link is hashed
+/// (`hk_state::State::payword_cap_from`; `hk_state::{MAX_SETTLE_DELTA, MAX_CHANNEL_STEPS}`).
+/// Before it, a settle with `step = u32::MAX` on a channel opened with
+/// `max_steps = u32::MAX` made every validator hash ≈ 4.29 × 10⁹ SHAKE-256 links at commit
+/// — 30–90 CPU-minutes on an e2-standard-2, synchronously inside the consensus loop under
+/// the chain lock — and the refusal was free (fee refunded, nonce not ratcheted), so the
+/// same bytes could ride every block. Named 2026-10-08 13:38:53 UTC at tip 1,984,849 with
+/// the chain at ≈ 1.31 s/block: 22,151 blocks ≈ 8.06 h out, ≈ 21:42 UTC — the founder
+/// chose ~8 h of notice, more than R17's six: R17's FIRST number (1,844,000) passed before
+/// any seat had rolled, so this one gives the roll room. The client-side mirrors (mempool
+/// admission, the proposer's per-block link budget in `state.rs`) are not gated by it and
+/// protect an upgraded node's own pool and proposals at once; only the consensus refusal
+/// waits for the height. A node that is not on the release at this height accepts the
+/// first over-cap settle or open and forks. The number may move by patch release BEFORE
+/// it is reached; it never moves after a node has applied it (the G1 rule).
+pub const R18_TESTNET1_HEIGHT: u64 = 2_007_000;
+
+/// The PayWord-cap activation this node applies for `chain_id`: testnet-1 hard-wired; any
+/// OTHER chain reads `HK_R18_HEIGHT` (unset ⇒ 0 = active from genesis, so every devnet
+/// gate runs the caps from block 1; set it to exercise the pre-activation acceptance).
+/// Never the public network.
+pub fn payword_cap_from_for(chain_id: &str) -> u64 {
+    payword_cap_from_from(chain_id, std::env::var("HK_R18_HEIGHT").ok().as_deref())
+}
+
+pub fn payword_cap_from_from(chain_id: &str, env_height: Option<&str>) -> u64 {
+    if chain_id == "hashkinetics-1-4e4ea68d" {
+        return R18_TESTNET1_HEIGHT;
+    }
+    env_height.and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0)
+}
+
 /// L-2 (R17, reported 2026-10-06): the height from which testnet-1 nodes accept ONLY
 /// chain-bound v2 rotation certificates (`hk/v2/rotation-cert`: the chain id is signed, and
 /// `valid_from_height` is enforced as a freshness window — `hk_consensus::rotation`). Before
@@ -245,13 +282,55 @@ mod l2_tests {
         if std::env::var_os("HK_ROTATION_V2_HEIGHT").is_none() {
             assert_eq!(rotation_v2_from_for("hashkinetics-devnet-1"), 0);
         }
-        // Its own gate, never R17's: the two activations are independent by construction.
-        // Compared through the readers, not the consts: `u64::MAX >= x` on the consts is a
-        // clippy `absurd_extreme_comparisons` hard error (R17 review, 2026-10-06).
+        // Its own gate, never R17's or R18's: the activations are independent by
+        // construction. Compared through the readers, not the consts: `u64::MAX >= x` on
+        // the consts is a clippy `absurd_extreme_comparisons` hard error (R17 review,
+        // 2026-10-06).
         assert!(
             rotation_v2_from_from("hashkinetics-1-4e4ea68d", None)
                 >= mandate_asset_from_from("hashkinetics-1-4e4ea68d", None)
         );
+        assert!(
+            rotation_v2_from_from("hashkinetics-1-4e4ea68d", None)
+                >= payword_cap_from_from("hashkinetics-1-4e4ea68d", None)
+        );
+    }
+}
+
+#[cfg(test)]
+mod r18_tests {
+    use super::*;
+
+    #[test]
+    fn r18_activation_is_hardwired_for_testnet1_and_env_only_elsewhere() {
+        assert_eq!(payword_cap_from_from("hashkinetics-1-4e4ea68d", Some("5")), R18_TESTNET1_HEIGHT);
+        assert_eq!(payword_cap_from_from("hashkinetics-1-4e4ea68d", None), 2_007_000);
+        assert_eq!(payword_cap_from_from("hashkinetics-devnet-1", None), 0);
+        assert_eq!(payword_cap_from_from("hashkinetics-devnet-1", Some("40")), 40);
+        assert_eq!(payword_cap_from_from("hashkinetics-devnet-1", Some(" 40 ")), 40);
+        assert_eq!(payword_cap_from_from("hashkinetics-devnet-1", Some("junk")), 0);
+        // The real reader: the table for testnet-1 whatever the environment says.
+        assert_eq!(payword_cap_from_for("hashkinetics-1-4e4ea68d"), R18_TESTNET1_HEIGHT);
+        if std::env::var_os("HK_R18_HEIGHT").is_none() {
+            assert_eq!(payword_cap_from_for("hashkinetics-devnet-1"), 0);
+        }
+        // Named after R17 (and R17 after P6) on the same chain: the activations are
+        // ordered as they shipped (through the readers — a comparison of two consts is
+        // clippy's `assertions_on_constants`).
+        assert!(
+            payword_cap_from_from("hashkinetics-1-4e4ea68d", None)
+                > mandate_asset_from_from("hashkinetics-1-4e4ea68d", None)
+        );
+        // The caps the height activates, as the numbers were chosen (R18 review,
+        // 2026-10-08): a channel at the cap settles in two full-width txs, both fit the
+        // wire's u32 `step`, and the cap never exceeds the proposer's per-block budget —
+        // so every consensus-valid settle on a post-height channel is one an upgraded
+        // node proposes (the door refuses only what the proposer would never pick).
+        assert_eq!(hk_state::MAX_CHANNEL_STEPS / hk_state::MAX_SETTLE_DELTA, 2);
+        assert!(hk_state::MAX_CHANNEL_STEPS <= u32::MAX as u64);
+        assert_eq!(hk_state::MAX_SETTLE_DELTA, 65_536);
+        assert_eq!(hk_state::MAX_CHANNEL_STEPS, 131_072);
+        assert!(hk_state::MAX_CHANNEL_STEPS <= crate::state::MAX_SETTLE_LINKS_PER_BLOCK);
     }
 }
 

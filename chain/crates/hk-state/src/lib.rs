@@ -242,11 +242,73 @@ pub enum StateError {
     BadFeeAssetPolicy,
     #[error("duplicate genesis asset")]
     DuplicateAsset,
+    /// R18 (reported 2026-10-04): one `ChannelSettle` may advance a channel by at most
+    /// [`MAX_SETTLE_DELTA`] links (`step − highest_step_settled`). Decided BEFORE
+    /// `verify_settlement` hashes a single link — the whole point: the refusal must be
+    /// cheaper than the work it refuses. Gated by `State::payword_cap_from`; one receipt
+    /// string so wallets and the explorer key on it.
+    #[error("settle delta too large ({delta} links past the highest settled step, max {max} per settlement)")]
+    SettleDeltaTooLarge { delta: u64, max: u64 },
+    /// R18: a channel may be opened with at most [`MAX_CHANNEL_STEPS`] steps — a longer
+    /// run is several channels. Structural (decided with the zero checks, before any
+    /// read of the holder, the nonce or the mandate). Gated by `State::payword_cap_from`.
+    #[error("channel too long ({max_steps} steps, max {max})")]
+    ChannelTooLong { max_steps: u64, max: u64 },
 }
 
 /// U4: the asset the flat protocol fee is charged in (the staging USD test asset).
 /// X1: the DEFAULT — a genesis may name another via `fee.asset` (`State::fee_asset`).
 pub const FEE_ASSET: AssetId = H256([9u8; 32]);
+
+// ---------------------------------------------------------------------------------------
+// R18 (reported 2026-10-04 by 'secwatch-hunt'; confirmed 2026-10-08 against v0.19.6 by a
+// verifier and three refuters, none refuting) — the PayWord settlement caps.
+// `hk_crypto::payword::verify_settlement` hashes `step` SHAKE-256 links from the revealed
+// word back to the channel's tip, with no early exit, inside `apply_block` under the chain
+// lock: a settle with `step = u32::MAX` on a channel opened with `max_steps = u32::MAX`
+// cost every validator ≈ 4.29 × 10⁹ hashes (30–90 CPU-minutes on an e2-standard-2) at
+// commit — and the refusal was free (fee refunded, nonce not ratcheted; U4's "refusals
+// are free" policy), so the identical bytes could ride every block, the mempool admitted
+// them (no payload checks), the proposer copied them blind, and replay and resync paid
+// again. The two caps below bound the work a settle can ask for BEFORE a link is hashed;
+// both are gated by `State::payword_cap_from` (testnet-1: `R18_TESTNET1_HEIGHT`).
+// ---------------------------------------------------------------------------------------
+
+/// R18: the most links one `ChannelSettle` may advance a channel by — `step` minus the
+/// highest step already settled must be ≤ this. 2¹⁶ = 65,536 links ≈ 50 ms of SHAKE-256
+/// on a seat: the bound on what one settlement costs the fleet ONCE verification is
+/// incremental (from the last settled word, hashing only the delta — deferred, because
+/// it adds that word to `ChannelState`, i.e. to the commitment and the snapshot image).
+/// With today's from-the-tip verifier the delta cap bounds how FAST `step` can climb:
+/// every link above 2¹⁶ has to be paid for by an accepted settlement (fee burned, channel
+/// ratcheted) — `MAX_CHANNEL_STEPS` bounds the per-settlement cost itself. The
+/// whitepaper's reference, "1,000 calls settle as one tx", stays true with a 65× margin;
+/// a longer run settles in several txs, each advancing ≤ 2¹⁶ (steps are cumulative:
+/// the merchant reveals intermediate words, nothing is lost) — two of them on a channel
+/// at `MAX_CHANNEL_STEPS`.
+pub const MAX_SETTLE_DELTA: u64 = 1 << 16;
+
+/// R18: the most steps a channel may be opened with. 2¹⁷ = 131,072: since
+/// `step ≤ max_steps`, this is the hard bound on what ONE settlement can make the
+/// from-the-tip verifier hash — 2¹⁷ links ≈ 0.1 s on a seat — and it EQUALS the
+/// proposer's per-block link budget (`hk-node` `MAX_SETTLE_LINKS_PER_BLOCK`, pinned
+/// `≥` this by a compile-time assert there), so every consensus-valid settle on a
+/// channel opened from the height is one an upgraded proposer will carry: nothing a
+/// node admits can be unproposable. The first cut of R18 (2026-10-08 ≈ 14:00 UTC) set
+/// 2²⁴ with a 2²⁰ budget; the same-day review found the two inconsistent — the top
+/// 15/16 of such a channel was escrow no upgraded node would ever settle, refunding to
+/// the payer at expiry — and that 2²⁰ links per block (≈ 0.75 s, 57 % of the 1.31 s block
+/// interval) was the residual a FREE refused settle (fee refunded, nonce not ratcheted;
+/// U4) could make every honest proposer's block cost, sustained. 2¹⁷ sizes both for the
+/// free case: a channel settles completely in two txs of `MAX_SETTLE_DELTA`, the
+/// whitepaper's reference run (1,000 calls) keeps a 131× margin, the payer's word chain
+/// is 4 MiB, and a longer run is several channels. A channel opened before the height
+/// keeps its length: the cap is tested at open, the delta cap governs every settle from
+/// the height, and an upgraded node settles such a channel only up to step
+/// `MAX_SETTLE_LINKS_PER_BLOCK` (the door says so: `settle too costly to propose`).
+/// Both numbers are free to rise with the incremental path (§19.17 (a)), which makes
+/// the delta the whole cost.
+pub const MAX_CHANNEL_STEPS: u64 = 1 << 17;
 
 pub struct State {
     pub height: u64,
@@ -303,6 +365,16 @@ pub struct State {
     /// `multi_pool_from` — injected by the node from the chain-id table /
     /// `HK_R17_HEIGHT`, never snapshotted. u64::MAX = never.
     pub mandate_asset_from: u64,
+    /// R18 (reported 2026-10-04): first height from which the PayWord settlement caps
+    /// apply — `ChannelOpen` refuses `max_steps > MAX_CHANNEL_STEPS` and `ChannelSettle`
+    /// refuses a delta (`step − highest_step_settled`) above `MAX_SETTLE_DELTA`, both
+    /// BEFORE any link is hashed. Before it, the pre-R18 rule byte for byte: any
+    /// `max_steps` in `1..=u32::MAX`, any delta up to it, `verify_settlement` hashing
+    /// every link. CONFIG like `fee_from` / `multi_pool_from` / `mandate_asset_from` —
+    /// injected by the node from the chain-id table / `HK_R18_HEIGHT`, never
+    /// snapshotted. u64::MAX = never. The client-side mirrors (mempool admission, the
+    /// proposer's per-block link budget) do NOT read it: they refuse everywhere, at once.
+    pub payword_cap_from: u64,
 }
 
 /// P6: which pool a shielded operation acts on.
@@ -363,6 +435,7 @@ impl Default for State {
             pools: BTreeMap::new(),
             multi_pool_from: u64::MAX,
             mandate_asset_from: u64::MAX,
+            payword_cap_from: u64::MAX,
         }
     }
 }
@@ -1009,6 +1082,14 @@ impl State {
         if unit_price == 0 || max_steps == 0 {
             return Err(StateError::ZeroAmount);
         }
+        // R18 (reported 2026-10-04): from `payword_cap_from` a channel is at most
+        // `MAX_CHANNEL_STEPS` long. Structural, so it sits with the zero check — before
+        // the holder, nonce and mandate reads, before any money moves. `self.height` is
+        // the block being applied (as `fee_from` reads it); below the height the branch
+        // is never taken and the bytes are v0.19.6's.
+        if self.height >= self.payword_cap_from && max_steps as u64 > MAX_CHANNEL_STEPS {
+            return Err(StateError::ChannelTooLong { max_steps: max_steps as u64, max: MAX_CHANNEL_STEPS });
+        }
         if self.holder_of(&mandate)? != *sender {
             return Err(StateError::NotHolder);
         }
@@ -1070,10 +1151,21 @@ impl State {
             if step as u64 <= prev || step as u64 > ch.state.max_steps {
                 return Err(StateError::BadStep);
             }
+            let newly = step as u64 - prev;
+            // R18 (reported 2026-10-04): from `payword_cap_from` the delta is capped, and
+            // the refusal is decided HERE — before `verify_settlement` hashes a single
+            // link (a garbage word with an over-cap delta is refused as
+            // `SettleDeltaTooLarge`, never as `BadSettlement`: the tests prove the
+            // order). `newly` is the number `State::settle_delta` hands the client-side
+            // mirrors, so admission, proposing and consensus agree on it. Below the
+            // height the branch is never taken; computing `newly` first is pure
+            // arithmetic, so the bytes are v0.19.6's.
+            if self.height >= self.payword_cap_from && newly > MAX_SETTLE_DELTA {
+                return Err(StateError::SettleDeltaTooLarge { delta: newly, max: MAX_SETTLE_DELTA });
+            }
             if !payword::verify_settlement(ch.state.tip.0, word.0, step) {
                 return Err(StateError::BadSettlement);
             }
-            let newly = step as u64 - prev;
             let paid = ch.state.unit_price.checked_mul(newly as Amount).ok_or(StateError::Overflow)?;
             (paid, ch.state.payee, ch.state.asset)
         };
@@ -1084,6 +1176,41 @@ impl State {
         ch.escrow_remaining -= paid;
         self.credit(&payee, &asset, paid);
         Ok(vec![Event::ChannelSettled { id: *id, upto_step: step, paid }])
+    }
+
+    /// R18: the delta a `ChannelSettle { id, step }` would claim if it were applied to
+    /// THIS state — `step − highest_step_settled` when the channel is open and
+    /// `highest < step ≤ max_steps` (the `prev` arithmetic of `do_channel_settle`, the
+    /// number `MAX_SETTLE_DELTA` bounds from `payword_cap_from`); `None` when the handler
+    /// would refuse before hashing anything (unknown or refunded channel, a stale or
+    /// over-max step). The client-side mirror of the CAP reads it — the mempool's
+    /// admission check (`hk-node/src/mempool.rs`) — so it and consensus agree on the
+    /// number; apply itself never consults it. Read-only, ungated: it answers on both
+    /// sides of the height, because a client refuses by it everywhere, at once. For the
+    /// COST of a settle (what the verifier hashes) see [`State::settle_links`].
+    pub fn settle_delta(&self, id: &ChannelId, step: u32) -> Option<u64> {
+        let ch = self.channels.get(id)?;
+        if ch.refunded {
+            return None;
+        }
+        let prev = ch.state.highest_step_settled;
+        if step as u64 <= prev || step as u64 > ch.state.max_steps {
+            return None;
+        }
+        Some(step as u64 - prev)
+    }
+
+    /// R18: the SHAKE-256 links `do_channel_settle` would make the chain hash for a
+    /// `ChannelSettle { id, step }` applied to THIS state — with today's from-the-tip
+    /// verifier that is `step` itself whenever [`settle_delta`](Self::settle_delta) is
+    /// `Some` (a stale, over-max, unknown or refunded settle costs nothing: it is refused
+    /// first; from `payword_cap_from` so is an over-cap delta). The proposer's per-block
+    /// link budget (`hk-node/src/state.rs`) sums this, not the delta: the delta is what
+    /// consensus caps, the links are what the fleet pays. When the incremental path lands
+    /// (verify from the last settled word) this collapses to the delta and the budget
+    /// follows without a client change.
+    pub fn settle_links(&self, id: &ChannelId, step: u32) -> Option<u64> {
+        self.settle_delta(id, step).map(|_| step as u64)
     }
 
     fn do_channel_refund(&mut self, sender: &AccountId, id: &ChannelId) -> Result<Vec<Event>, StateError> {
@@ -1398,6 +1525,7 @@ impl State {
             pools: s.pools,
             multi_pool_from: u64::MAX, // config-like: the node re-injects the activation
             mandate_asset_from: u64::MAX, // R17: likewise re-injected, never from the image
+            payword_cap_from: u64::MAX, // R18: likewise re-injected, never from the image
         }
     }
 

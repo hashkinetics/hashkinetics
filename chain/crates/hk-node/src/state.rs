@@ -354,6 +354,65 @@ pub const FEE_MICRO_DEFAULT: u128 = 100;
 /// (acceptors are epoch-monotone, so a duplicate is refused harmlessly).
 const REISSUE_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// R18 (reported 2026-10-04): the most PayWord links the `ChannelSettle`s in ONE block
+/// this node proposes may make the fleet hash — Σ [`settle_cost`] over them (the bundle
+/// of P2.3 included), read against the chain as it stands when the block is built.
+/// 2¹⁷ ≈ 0.1 s of SHAKE-256 on a seat, ≈ 8 % of the 1.31 s block interval: two full-width
+/// settles under the consensus cap, or 131 of the whitepaper's 1,000-step reference
+/// settles. The links are what `verify_settlement` hashes today (`step`, from the tip),
+/// NOT the delta consensus caps from `payword_cap_from` — the delta bounds how fast a
+/// channel's `step` climbs; a settle at a climbed `step` still costs `step` links until
+/// the incremental path lands, and that is the number a block must be bounded by.
+///
+/// Sized for the FREE case (the same-day review of 2026-10-08): `do_channel_settle` has no
+/// payee check, a garbage word under the delta cap passes the door and the gated cap and
+/// is hashed `step` links before `BadSettlement` refunds the fee and leaves the nonce
+/// alone, and the commit prunes it so the identical bytes re-admit next block — so
+/// whatever this budget is, an attacker with a few faucet-funded accounts and fresh 2¹⁶
+/// channels can make every honest proposer's block cost it, sustained, for nothing. The
+/// first cut's 2²⁰ was ≈ 0.75 s of that per block (57 % of the interval); 2¹⁷ is the
+/// number we accept until (b) — a fee burn on `BadSettlement` — is decided.
+///
+/// `hk_state::MAX_CHANNEL_STEPS` is pinned `≤` this at compile time (below): every
+/// consensus-valid settle on a channel opened from the height fits one block, so what
+/// the door admits the proposer carries. Client-side only: a block built by another node
+/// is judged by consensus alone; this never changes what a block ACCEPTS. Pre-height it
+/// is also the only thing that bounds an upgraded proposer's own blocks.
+pub const MAX_SETTLE_LINKS_PER_BLOCK: u64 = 1 << 17;
+
+// R18 review (2026-10-08): the invariant the door and the proposer rest on — a settle the
+// consensus rule accepts on a post-height channel (`step ≤ max_steps ≤ MAX_CHANNEL_STEPS`)
+// always fits an empty block's budget, so admission (`mempool.rs` `channel_settle_cap`)
+// can refuse exactly what `select_batch_txs` would never pick and nothing admitted parks.
+const _: () = assert!(hk_state::MAX_CHANNEL_STEPS <= MAX_SETTLE_LINKS_PER_BLOCK);
+
+/// R18 review (2026-10-08): THE cost function — the links a `ChannelSettle { id, step }`
+/// would make the fleet hash if it rode the NEXT block this chain builds. One function for
+/// the proposer's budget ([`select_batch_txs`]) and the mempool's door
+/// (`Mempool::channel_settle_cap`), so the two can never disagree on a tx: the door
+/// refuses what this answers above [`MAX_SETTLE_LINKS_PER_BLOCK`], the proposer holds what
+/// would overflow the running total.
+///   * `settle_links` is `Some(step)` — the channel is open and `highest < step ≤ max_steps`
+///     — the from-the-tip verifier hashes `step` links;
+///   * `None` on a KNOWN channel (refunded, or a stale / over-max step): `do_channel_settle`
+///     refuses it in O(1) before a link is hashed, and nothing pending ahead of it in the
+///     block can change that (a channel never re-opens, `highest` never falls, `max_steps`
+///     never moves) — cost 0, exactly;
+///   * `None` on an UNKNOWN channel: its `ChannelOpen` may be pending ahead of it in this
+///     very pool, in which case the delta IS `step` — cost `step` before the height; from
+///     the height the gated delta cap refuses `step > MAX_SETTLE_DELTA` in O(1) once the
+///     open lands (and `UnknownChannel` in O(1) if it never does), so the cost is at most
+///     `min(step, MAX_SETTLE_DELTA)`. The height tested is the NEXT block's
+///     (`apply_block` sets `height` before the gate), the earliest a pending tx can ride.
+pub(crate) fn settle_cost(chain: &hk_state::State, id: &hk_primitives::ChannelId, step: u32) -> u64 {
+    match chain.settle_links(id, step) {
+        Some(links) => links,
+        None if chain.channels.contains_key(id) => 0,
+        None if chain.height.saturating_add(1) >= chain.payword_cap_from => u64::from(step).min(hk_state::MAX_SETTLE_DELTA),
+        None => u64::from(step),
+    }
+}
+
 pub struct HkApp {
     pub address: HkAddress,
     /// Live validator set behind a lock: consensus reads/rotates it here, and the RPC
@@ -625,6 +684,12 @@ impl HkApp {
         let r17 = crate::genesis::mandate_asset_from_for(&self.chain_id);
         self.chain.lock().unwrap().mandate_asset_from = r17;
         info!(chain_id = %self.chain_id, mandate_asset_from = r17, "R17 asset-bound mandate activation");
+        // R18: the PayWord settlement caps, the same way (chain-id fact, config). Only the
+        // CONSENSUS refusal waits for it — the mempool's mirror and `build_batch`'s link
+        // budget are not gated.
+        let r18 = crate::genesis::payword_cap_from_for(&self.chain_id);
+        self.chain.lock().unwrap().payword_cap_from = r18;
+        info!(chain_id = %self.chain_id, payword_cap_from = r18, "R18 PayWord settlement-cap activation");
         // L-2: the rotation-v2 (chain-bound certificate) activation — its OWN height, never
         // R17's: the trigger here is the fleet's rotation cadence, so it is named only once
         // every seat is on the release (genesis.rs). Node-side, before restore (node.rs
@@ -851,7 +916,13 @@ impl HkApp {
 
     /// Build the block payload: parent app_hash (this node's current commitment) +
     /// up to N transactions PEEKED (not removed) from the mempool. Txs are removed
-    /// only on successful commit, so a round change never drops them.
+    /// only on successful commit, so a round change never drops them. R18: the
+    /// `ChannelSettle`s among them are bounded by [`MAX_SETTLE_LINKS_PER_BLOCK`]
+    /// (`select_batch_txs`) — client-side, this node's own proposals only — and the
+    /// P2.3 bundle, which rides ahead of the pool, is costed into the same budget
+    /// (R18 review, 2026-10-08: `hk_submitBundle` now admits only proof-less pool txs,
+    /// so the seed is 0 in practice; counting it here is belt and braces so that NO path
+    /// into a block this node builds is uncosted).
     fn build_batch(&self, height: u64) -> Bytes {
         let parent_app_hash = self.chain.lock().unwrap().state_commitment().0;
         // P2.3: a pending aggregation bundle rides whole (proof-less txs + ONE aggregate).
@@ -866,8 +937,30 @@ impl HkApp {
         };
         let room = MAX_TXS_PER_BLOCK - txs.len();
         {
+            // R18: the per-block settle-link budget needs the chain's channel state.
+            // Lock order: chain BEFORE mempool (the commit path's order; mempool.rs).
+            let chain = self.chain.lock().unwrap();
+            let bundle_links: u64 = txs
+                .iter()
+                .filter_map(|t| match &t.payload {
+                    Tx::ChannelSettle { id, step, .. } => Some(settle_cost(&chain, id, *step)),
+                    _ => None,
+                })
+                .fold(0u64, u64::saturating_add);
+            if bundle_links > 0 {
+                warn!(height, bundle_links, "R18: the pending bundle carries ChannelSettles — costed into this block's settle-link budget");
+            }
             let mp = self.mempool.lock().unwrap();
-            txs.extend(mp.iter().take(room).cloned());
+            let (picked, held) = select_batch_txs(&chain, mp.iter(), room, bundle_links);
+            if held > 0 {
+                info!(
+                    height,
+                    held,
+                    budget_links = MAX_SETTLE_LINKS_PER_BLOCK,
+                    "R18: txs left in the mempool for a later block — this block's settle-link budget is full"
+                );
+            }
+            txs.extend(picked);
         }
         // Include any rotation certs we've issued but not yet seen committed — PLUS
         // foreign certs peers submitted via `hk_submitRotation` (R2: an exhausted
@@ -1795,9 +1888,17 @@ impl HkApp {
             // Config survives the image swap (a snapshot must not smuggle in policy):
             // the verifier AND the U4 fee parameters are re-injected from the running
             // configuration, exactly as `HkApp::new` set them.
-            let (verifier, fee_micro, fee_from, fee_asset, multi_pool_from, mandate_asset_from) = {
+            let (verifier, fee_micro, fee_from, fee_asset, multi_pool_from, mandate_asset_from, payword_cap_from) = {
                 let c = self.chain.lock().unwrap();
-                (c.verifier.clone(), c.fee_micro, c.fee_from, c.fee_asset, c.multi_pool_from, c.mandate_asset_from)
+                (
+                    c.verifier.clone(),
+                    c.fee_micro,
+                    c.fee_from,
+                    c.fee_asset,
+                    c.multi_pool_from,
+                    c.mandate_asset_from,
+                    c.payword_cap_from,
+                )
             };
             let mut st = hk_state::State::from_snapshot(snap.state);
             st.verifier = verifier;
@@ -1806,6 +1907,7 @@ impl HkApp {
             st.fee_asset = fee_asset; // X1: genesis fact, config-like on restore
             st.multi_pool_from = multi_pool_from; // P6: chain-id fact, config-like on restore
             st.mandate_asset_from = mandate_asset_from; // R17: chain-id fact, config-like on restore
+            st.payword_cap_from = payword_cap_from; // R18: chain-id fact, config-like on restore
             // L-2: `self.rotation_v2_from` is node-side (set by `set_genesis_digest`, which
             // node.rs calls before this), so the image swap cannot smuggle a rotation rule in.
             let got = st.state_commitment().0;
@@ -2104,10 +2206,250 @@ mod r10_history_tests {
     }
 }
 
-/// R1: should this validator issue a rotation cert at this commit?
-/// Returns (due, threshold_hit). The PRODUCTION trigger is the leaf budget
-/// (< 20% remaining); the interval is a demo/ops override. Guards: never while our
-/// own cert is pending, never re-issuing an epoch at-or-below the highest issued.
+/// R18: pick up to `room` txs from the mempool's FIFO view for the block being built,
+/// holding back every `ChannelSettle` whose links would push the block's running total
+/// (starting at `links_so_far` — the P2.3 bundle that rides ahead of the pool, 0 when
+/// there is none) over [`MAX_SETTLE_LINKS_PER_BLOCK`]; a held tx rides a later block, in
+/// order. The links are [`settle_cost`] against the chain as it stands now — the SAME
+/// function the mempool's door refuses by, so the two never disagree on a tx: a settle the
+/// chain would refuse free on a known channel costs 0 (it rides, is refused in O(1) and
+/// pruned at commit), an unknown channel's settle costs what a fresh channel would (its
+/// open may be pending ahead of it). Once one of a sender's txs is held back, every later
+/// tx of that sender is held with it: the pool is in nonce order per sender, and a
+/// successor proposed without its predecessor would only burn a slot on `bad nonce` and be
+/// pruned from the pool at commit, costing the sender a resubmit. A settle whose links
+/// alone exceed the budget is refused at admission (`settle too costly to propose`) and
+/// never reaches this pool through the door; one that does (a channel opened before the
+/// height, restored from a pre-review snapshot) is simply never picked. Returns the picked
+/// txs (pool order) and how many were held back.
+pub(crate) fn select_batch_txs<'a>(
+    chain: &hk_state::State,
+    pending: impl Iterator<Item = &'a SignedTx>,
+    room: usize,
+    links_so_far: u64,
+) -> (Vec<SignedTx>, usize) {
+    let mut picked: Vec<SignedTx> = Vec::new();
+    let mut held = 0usize;
+    let mut links: u64 = links_so_far;
+    let mut held_senders: std::collections::BTreeSet<hk_primitives::AccountId> = Default::default();
+    for tx in pending {
+        if picked.len() >= room {
+            break;
+        }
+        if held_senders.contains(&tx.sender) {
+            held += 1;
+            continue;
+        }
+        if let Tx::ChannelSettle { id, step, .. } = &tx.payload {
+            let cost = settle_cost(chain, id, *step);
+            if links.saturating_add(cost) > MAX_SETTLE_LINKS_PER_BLOCK {
+                held += 1;
+                held_senders.insert(tx.sender);
+                continue;
+            }
+            links = links.saturating_add(cost);
+        }
+        picked.push(tx.clone());
+    }
+    (picked, held)
+}
+
+#[cfg(test)]
+mod r18_batch_tests {
+    use super::{select_batch_txs, settle_cost, MAX_SETTLE_LINKS_PER_BLOCK};
+    use hk_primitives::{ChannelState, H256};
+    use hk_state::tx::{SignedTx, Tx};
+    use hk_state::{Channel, State, MAX_CHANNEL_STEPS, MAX_SETTLE_DELTA};
+
+    fn h(b: u8) -> H256 {
+        H256([b; 32])
+    }
+
+    /// A bare state with `n` open channels (ids 1..=n, `max_steps` each, nothing
+    /// settled) — `settle_links` reads only the channel map, so no genesis or signatures
+    /// are needed. `max_steps > MAX_CHANNEL_STEPS` is the shape of a channel opened
+    /// BEFORE the height (the cap is tested at open only).
+    fn chain_with_channels_of(n: u8, max_steps: u64) -> State {
+        let mut st = State::default();
+        for i in 1..=n {
+            st.channels.insert(
+                h(i),
+                Channel {
+                    state: ChannelState {
+                        id: h(i),
+                        payer: h(0xA0),
+                        payee: h(0xB0),
+                        asset: h(9),
+                        mandate: h(0xC0),
+                        tip: h(0xD0),
+                        unit_price: 1,
+                        max_steps,
+                        highest_step_settled: 0,
+                        expiry: u64::MAX,
+                    },
+                    escrow_remaining: max_steps as u128,
+                    refunded: false,
+                },
+            );
+        }
+        st
+    }
+
+    /// `n` post-height channels: opened at exactly the consensus cap.
+    fn chain_with_channels(n: u8) -> State {
+        chain_with_channels_of(n, MAX_CHANNEL_STEPS)
+    }
+
+    /// Full-width settles that fill one block's budget exactly.
+    const FILL: u64 = MAX_SETTLE_LINKS_PER_BLOCK / MAX_SETTLE_DELTA;
+
+    /// Unsigned frames: the selector never looks at the envelope.
+    fn tx(sender: u8, nonce: u64, payload: Tx) -> SignedTx {
+        SignedTx { sender: h(sender), nonce, payload, next_auth: h(0), lamport_pk: vec![], sig: vec![] }
+    }
+    fn settle(sender: u8, nonce: u64, ch: u8, step: u32) -> SignedTx {
+        tx(sender, nonce, Tx::ChannelSettle { id: h(ch), word: h(0), step })
+    }
+    fn transfer(sender: u8, nonce: u64) -> SignedTx {
+        tx(sender, nonce, Tx::Transfer { to: h(0xB0), asset: h(9), amount: 1 })
+    }
+    fn nonces(txs: &[SignedTx]) -> Vec<(u8, u64)> {
+        txs.iter().map(|t| (t.sender.0[0], t.nonce)).collect()
+    }
+
+    #[test]
+    fn r18_budget_holds_the_third_full_width_settle_and_the_senders_successors() {
+        // Sender 1 queues FILL + 3 full-width settles on fresh channels (2¹⁶ links each —
+        // exactly the consensus cap) and then a transfer; sender 2 a transfer.
+        assert_eq!(FILL, 2, "2¹⁷ / 2¹⁶: two full-width settles fill a block");
+        let n = FILL as u8 + 3;
+        let st = chain_with_channels(n);
+        let mut pool: Vec<SignedTx> = (0..n).map(|i| settle(1, i as u64, i + 1, MAX_SETTLE_DELTA as u32)).collect();
+        pool.push(transfer(1, n as u64));
+        pool.push(transfer(2, 0));
+        let (picked, held) = select_batch_txs(&st, pool.iter(), 1024, 0);
+        // FILL settles fill the budget exactly (2 · 2¹⁶ = 2¹⁷); the next is held, and with
+        // it every later tx of sender 1; sender 2's transfer rides in pool order.
+        let mut want: Vec<(u8, u64)> = (0..FILL).map(|k| (1, k)).collect();
+        want.push((2, 0));
+        assert_eq!(nonces(&picked), want);
+        assert_eq!(held, 4);
+        // The held settles are the next blocks' first picks (same chain state) — nothing
+        // is dropped, only deferred, in order: two more ride, then the last one + the
+        // transfer.
+        let rest = || pool.iter().skip(FILL as usize).filter(|t| t.sender == h(1));
+        let (next, held2) = select_batch_txs(&st, rest(), 1024, 0);
+        assert_eq!(nonces(&next), vec![(1, FILL), (1, FILL + 1)]);
+        assert_eq!(held2, 2);
+        let (last, held3) = select_batch_txs(&st, rest().skip(FILL as usize), 1024, 0);
+        assert_eq!(nonces(&last), vec![(1, FILL + 2), (1, n as u64)]);
+        assert_eq!(held3, 0);
+    }
+
+    #[test]
+    fn r18_budget_counts_the_links_the_verifier_hashes_not_the_delta() {
+        // A channel climbed to 2¹⁷ − 2¹⁶ by an earlier settle: the next full-width settle
+        // has delta 2¹⁶ but costs 2¹⁷ links from the tip — it fills the budget on its own,
+        // and a one-link settle on another channel after it is held.
+        let mut st = chain_with_channels(2);
+        st.channels.get_mut(&h(1)).unwrap().state.highest_step_settled = MAX_SETTLE_LINKS_PER_BLOCK - MAX_SETTLE_DELTA;
+        let pool = [settle(1, 0, 1, MAX_SETTLE_LINKS_PER_BLOCK as u32), settle(2, 0, 2, 1)];
+        assert_eq!(st.settle_delta(&h(1), MAX_SETTLE_LINKS_PER_BLOCK as u32), Some(MAX_SETTLE_DELTA));
+        assert_eq!(st.settle_links(&h(1), MAX_SETTLE_LINKS_PER_BLOCK as u32), Some(MAX_SETTLE_LINKS_PER_BLOCK));
+        assert_eq!(settle_cost(&st, &h(1), MAX_SETTLE_LINKS_PER_BLOCK as u32), MAX_SETTLE_LINKS_PER_BLOCK);
+        let (picked, held) = select_batch_txs(&st, pool.iter(), 1024, 0);
+        assert_eq!(nonces(&picked), vec![(1, 0)]);
+        assert_eq!(held, 1);
+        // In the other order the one-link settle rides and the 2¹⁷ one is held.
+        let pool = [settle(2, 0, 2, 1), settle(1, 0, 1, MAX_SETTLE_LINKS_PER_BLOCK as u32)];
+        let (picked, held) = select_batch_txs(&st, pool.iter(), 1024, 0);
+        assert_eq!(nonces(&picked), vec![(2, 0)]);
+        assert_eq!(held, 1);
+        // One link past the budget can never ride from this node. On a post-height channel
+        // that step is past `max_steps` (the cap equals the budget — the compile-time
+        // assert), i.e. a free O(1) refusal costed 0 and picked; the shape that CAN cost
+        // more than a block is a channel opened before the height, whose `max_steps` the
+        // cap never saw: the door refuses it (`settle too costly to propose`), and here it
+        // is never picked.
+        let pool = [settle(1, 0, 1, MAX_SETTLE_LINKS_PER_BLOCK as u32 + 1)];
+        assert_eq!(settle_cost(&st, &h(1), MAX_SETTLE_LINKS_PER_BLOCK as u32 + 1), 0);
+        assert_eq!(nonces(&select_batch_txs(&st, pool.iter(), 1024, 0).0), vec![(1, 0)]);
+        let mut old = chain_with_channels_of(1, u64::from(u32::MAX));
+        old.channels.get_mut(&h(1)).unwrap().state.highest_step_settled = MAX_SETTLE_LINKS_PER_BLOCK - MAX_SETTLE_DELTA + 1;
+        assert_eq!(settle_cost(&old, &h(1), MAX_SETTLE_LINKS_PER_BLOCK as u32 + 1), MAX_SETTLE_LINKS_PER_BLOCK + 1);
+        assert_eq!(select_batch_txs(&old, pool.iter(), 1024, 0).0.len(), 0);
+    }
+
+    #[test]
+    fn r18_a_settle_the_chain_refuses_free_costs_nothing_and_an_unknown_channel_costs_its_step() {
+        // Unknown channel (its open may be pending ahead of it): `step` links before the
+        // height, the fresh-channel cost. The reported shape — u32::MAX — is never picked
+        // from a pre-height pool; a small one rides.
+        let st = chain_with_channels(1);
+        assert_eq!(st.payword_cap_from, u64::MAX, "a bare state never activates");
+        let pool = [settle(1, 0, 0x77, u32::MAX), settle(2, 0, 0x77, 10), settle(3, 0, 1, 5)];
+        assert_eq!(settle_cost(&st, &h(0x77), u32::MAX), u64::from(u32::MAX));
+        let (picked, held) = select_batch_txs(&st, pool.iter(), 1024, 0);
+        assert_eq!(nonces(&picked), vec![(2, 0), (3, 0)]);
+        assert_eq!(held, 1);
+        // From the height the gated delta cap refuses an unknown channel's settle past
+        // 2¹⁶ in O(1) once its open lands (and `UnknownChannel` in O(1) if it never does),
+        // so the conservative cost is `min(step, MAX_SETTLE_DELTA)`: the same u32::MAX now
+        // rides to its free refusal instead of parking. The height tested is the NEXT
+        // block's — the block being built.
+        let mut at_height = chain_with_channels(1);
+        at_height.payword_cap_from = 1;
+        assert_eq!(at_height.height, 0);
+        assert_eq!(settle_cost(&at_height, &h(0x77), u32::MAX), MAX_SETTLE_DELTA);
+        assert_eq!(settle_cost(&at_height, &h(0x77), 10), 10);
+        let (picked, held) = select_batch_txs(&at_height, pool.iter(), 1024, 0);
+        assert_eq!(nonces(&picked), vec![(1, 0), (2, 0), (3, 0)]);
+        assert_eq!(held, 0);
+        at_height.payword_cap_from = 2;
+        assert_eq!(settle_cost(&at_height, &h(0x77), u32::MAX), u64::from(u32::MAX), "one block short of the height");
+        // A stale, over-max or refunded settle on a KNOWN channel is refused by the chain
+        // in O(1) before any hashing, and nothing ahead of it in the block can change that
+        // — costed 0 (R18 review: the first cut costed it `step` and parked it).
+        let mut st = chain_with_channels(2);
+        st.channels.get_mut(&h(1)).unwrap().state.highest_step_settled = 100;
+        st.channels.get_mut(&h(2)).unwrap().refunded = true;
+        assert_eq!(settle_cost(&st, &h(1), 50), 0, "stale");
+        assert_eq!(settle_cost(&st, &h(1), u32::MAX), 0, "over max");
+        assert_eq!(settle_cost(&st, &h(2), 1), 0, "refunded");
+        assert_eq!(settle_cost(&st, &h(1), 101), 101, "one link past the settled step: hashed");
+        let pool = [settle(1, 0, 1, 50), settle(2, 0, 1, u32::MAX), settle(3, 0, 2, 1), settle(4, 0, 1, 101)];
+        let (picked, held) = select_batch_txs(&st, pool.iter(), 1024, 0);
+        assert_eq!(nonces(&picked), vec![(1, 0), (2, 0), (3, 0), (4, 0)]);
+        assert_eq!(held, 0);
+        // `room` still bounds the batch, and non-settle txs never touch the budget.
+        let pool: Vec<SignedTx> = (0..5u64).map(|n| transfer(9, n)).collect();
+        let (picked, held) = select_batch_txs(&st, pool.iter(), 3, 0);
+        assert_eq!(picked.len(), 3);
+        assert_eq!(held, 0);
+    }
+
+    #[test]
+    fn r18_the_bundle_ahead_of_the_pool_is_costed_into_the_same_budget() {
+        // `build_batch` seeds the running total with the P2.3 bundle's settle links
+        // (`hk_submitBundle` admits only proof-less pool txs now, so the seed is 0 in
+        // practice — belt and braces): with one link of budget left, a one-link settle
+        // rides and a two-link settle is held; with the budget already full, nothing
+        // costed rides but transfers do.
+        let st = chain_with_channels(3);
+        let pool = [settle(1, 0, 1, 2), settle(2, 0, 2, 1), transfer(3, 0)];
+        let (picked, held) = select_batch_txs(&st, pool.iter(), 1024, MAX_SETTLE_LINKS_PER_BLOCK - 1);
+        assert_eq!(nonces(&picked), vec![(2, 0), (3, 0)]);
+        assert_eq!(held, 1);
+        let (picked, held) = select_batch_txs(&st, pool.iter(), 1024, MAX_SETTLE_LINKS_PER_BLOCK);
+        assert_eq!(nonces(&picked), vec![(3, 0)]);
+        assert_eq!(held, 2);
+        // A seed past the budget (a bundle no door should have let through) saturates
+        // rather than wrapping, and still only holds settles.
+        let (picked, _) = select_batch_txs(&st, pool.iter(), 1024, u64::MAX);
+        assert_eq!(nonces(&picked), vec![(3, 0)]);
+    }
+}
+
 /// v0.11.2: the kind tag the explorer shows — matches rpc.rs's tx_summary kinds.
 fn tx_kind(tx: &hk_state::tx::Tx) -> &'static str {
     use hk_state::tx::Tx;
@@ -2292,7 +2634,6 @@ mod r11_process_tests {
 
     #[test]
     #[cfg(unix)]
-    #[test]
     fn v0_19_4_disk_free_bytes_answers_for_a_real_dir_and_not_for_a_missing_one() {
         let here = std::env::temp_dir();
         let free = super::disk_free_bytes(&here).expect("temp dir has a filesystem");

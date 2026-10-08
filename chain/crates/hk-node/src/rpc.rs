@@ -11,9 +11,10 @@
 //!                                                           disk_free_bytes},   (v0.19.4: free
 //!                                                 bytes on the block log's filesystem; null off-Unix)
 //!                                                 activations: {mandate_asset_from,   (R17, v0.19.6:
-//!                                                               rotation_v2_from}}    the heights THIS
-//!                                                 node will switch rules at — null = never; the roll
-//!                                                 call reads them off every seat before a height is named)
+//!                                                               rotation_v2_from,     the heights THIS
+//!                                                               payword_cap_from}}    node will switch rules at — null = never; the roll
+//!                                                 call reads them off every seat before a height is named;
+//!                                                 payword_cap_from = R18, 2026-10-08: the PayWord caps)
 //!   hk_submitRotation {cert}                   -> {accepted, epoch, queued}  (R2: peer-carried
 //!                                                 revival — cert from `hk-node issue-rotation`;
 //!                                                 L-2: judged by the rule at tip + 1 — domain +
@@ -84,6 +85,28 @@
 //!     freshness window (not from the future, not more than `ROTATION_FRESHNESS_HORIZON`
 //!     blocks old). The window is a free check and runs in the preflight; the domain is the
 //!     signature itself. `hk_chainInfo.activations` publishes the heights.
+//!
+//! R18 (reported 2026-10-04, confirmed 2026-10-08; client-side here, no gate): `hk_submitTx`
+//! and `hk_gossipTxs` refuse, through the mempool door (`Mempool::envelope_verdict` /
+//! `try_admit_verified`), a `ChannelOpen` past `hk_state::MAX_CHANNEL_STEPS` and a
+//! `ChannelSettle` more than `hk_state::MAX_SETTLE_DELTA` links past its channel's settled
+//! step — the settle whose apply was ≈ 4.29e9 SHAKE-256 links under the chain mutex, free to
+//! the sender and replayable every block. Reasons: `channel too long (N steps, max M)` /
+//! `settle delta too large (D links past the highest settled step, max M per settlement)` —
+//! hk-state's receipt wording, byte for byte (mempool.rs `AdmitError::as_str`; docs/RPC.md)
+//! — and, since the same-day review, `settle too costly to propose (L links from the tip,
+//! max B per block …)` for a settle no block this node builds could carry (mempool.rs).
+//! The consensus rule behind them is height-gated (`hk_state::State::payword_cap_from`), and
+//! `hk_chainInfo.activations.payword_cap_from` publishes that height exactly as the two R17
+//! ones. R18 review (2026-10-08): `hk_submitBundle` was a sibling path into the SAME hash
+//! loop that bypassed both mirrors and the proposer's budget — `build_batch` places the
+//! bundle's txs ahead of the pool without costing them, and an invalid aggregate only logs
+//! (the block still applies, so its `ChannelSettle`s were hashed by every validator) — so
+//! an unauthenticated caller could put up to `MAX_TXS_PER_BLOCK` over-cap settles into an
+//! UPGRADED proposer's next block, before or after the height. A bundle is now refused
+//! unless every tx is a proof-less `MintToPool` / `ShieldedSpend` — what P2.3 defines a
+//! bundle as, and exactly what `demo_agg` builds (`bundle_shape_verdict`). Nothing else on
+//! this surface changes.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -99,10 +122,10 @@ use hk_consensus::rotation::RotationRules;
 use hk_consensus::{HkAddress, HkValidatorSet, RotationCert, SetChange, SetChangeCert};
 use hk_crypto::slhdsa_adapter::{ROOT_PK_LEN, ROOT_SIG_LEN};
 use hk_primitives::{AssetId, H256};
-use hk_state::tx::SignedTx;
+use hk_state::tx::{SignedTx, Tx};
 use hk_state::PoolKey;
 
-use crate::batch::{txid, Batch};
+use crate::batch::{txid, Batch, MAX_TXS_PER_BLOCK};
 use crate::mempool::Mempool;
 use crate::state::SharedHandles;
 
@@ -194,6 +217,10 @@ fn browser_ops_allowed() -> bool {
 /// held the lock the commit path needs for a verify per request, 256 workers deep (the
 /// L-6 shape). Verdicts and their precedence are unchanged (mempool.rs
 /// `hoisted_verdict_and_try_admit_agree`).
+///
+/// R18 (2026-10-08): an over-cap `ChannelOpen` is refused inside `envelope_verdict`, i.e.
+/// before the hashes; an over-cap `ChannelSettle` under the locks, one channel lookup,
+/// before the account walk (mempool.rs `r18_caps_refuse_the_same_through_both_doors`).
 fn admit_one(h: &SharedHandles, tx: &SignedTx) -> Result<[u8; 32], String> {
     let verdict = Mempool::envelope_verdict(tx);
     let admitted = {
@@ -279,6 +306,34 @@ async fn handle_conn(sock: &mut tokio::net::TcpStream, h: &SharedHandles) -> eyr
 const BUNDLE_QUEUE_MAX: usize = 64;
 const GOSSIP_MAX_TXS: usize = 1_024;
 
+/// R18 review (2026-10-08): what `hk_submitBundle` may queue — P2.3's definition of a
+/// bundle, exactly: proof-less pool txs (`MintToPool` / `ShieldedSpend` with an empty
+/// `proof`) whose truth the ONE aggregate STARK carries, and no more of them than a block
+/// holds (`build_batch` would never pick a longer bundle, and a queued bundle it never
+/// picks sits at the head of the queue until its txs commit some other way). Anything else
+/// — a `ChannelSettle` above all — has no business in a bundle: it rode ahead of the pool,
+/// uncosted by the proposer's settle-link budget and unseen by the mempool's two caps, so
+/// the bundle path was the one door through which an over-cap settle reached an UPGRADED
+/// proposer's own block (the module doc). The verdict reads payloads only; the mempool
+/// never sees bundle txs, so it is judged here, before the queue.
+pub(crate) fn bundle_shape_verdict(txs: &[SignedTx]) -> Result<(), String> {
+    if txs.len() > MAX_TXS_PER_BLOCK {
+        return Err(format!("bad txs: a bundle may carry at most {MAX_TXS_PER_BLOCK} txs (one block)"));
+    }
+    for (i, t) in txs.iter().enumerate() {
+        let proof_less_pool_tx = matches!(
+            &t.payload,
+            Tx::MintToPool { proof, .. } | Tx::ShieldedSpend { proof, .. } if proof.is_empty()
+        );
+        if !proof_less_pool_tx {
+            return Err(format!(
+                "bad txs: a bundle may carry only proof-less MintToPool / ShieldedSpend txs covered by its aggregate (tx {i} is not one — submit it through hk_submitTx)"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
     match method {
         "hk_chainInfo" => {
@@ -329,13 +384,17 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
                     "verifier_init_ms": crate::state::verifier_init_ms(),
                     "disk_free_bytes": h.store.as_ref().and_then(|s| crate::state::disk_free_bytes(s.blocks_dir())),
                 },
-                // R17 (v0.19.6): the activation heights THIS binary holds for this chain —
-                // null = never (`u64::MAX`). The roll call reads them off every seat: a
-                // height is named for testnet-1 only once each seat answers the same number,
-                // and a node that answers differently is the one that will island.
+                // R17 (v0.19.6) + R18 (2026-10-08): the activation heights THIS binary holds
+                // for this chain — null = never (`u64::MAX`). The roll call reads them off
+                // every seat: a height is named for testnet-1 only once each seat answers the
+                // same number, and a node that answers differently is the one that will island.
                 "activations": {
                     "mandate_asset_from": activation_height(chain.mandate_asset_from),
                     "rotation_v2_from": activation_height(h.rotation_v2_from),
+                    // R18: the PayWord caps (MAX_SETTLE_DELTA links per settle,
+                    // MAX_CHANNEL_STEPS per channel) as a consensus rule; the mempool
+                    // mirrors them from the moment this binary runs, gate or no gate.
+                    "payword_cap_from": activation_height(chain.payword_cap_from),
                 },
             }})
         }
@@ -503,6 +562,13 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
             let agg_hex = params.get("agg_proof").and_then(|p| p.as_str()).unwrap_or("");
             match (serde_json::from_value::<Vec<SignedTx>>(txs_val), hex::decode(agg_hex)) {
                 (Ok(txs), Ok(agg)) if !txs.is_empty() && !agg.is_empty() => {
+                    // R18 review (2026-10-08): only proof-less pool txs ride a bundle —
+                    // judged before the queue, so a ChannelSettle can never reach
+                    // `build_batch` through this door (`bundle_shape_verdict`).
+                    if let Err(reason) = bundle_shape_verdict(&txs) {
+                        warn!(txs = txs.len(), "hk_submitBundle refused: {reason}");
+                        return json!({"error": reason});
+                    }
                     // H4 (v0.13.2): the queue is bounded and de-duplicated by the
                     // aggregate bytes — an unauthenticated push can no longer grow
                     // memory or block the proposer's head-of-line behind copies.
@@ -1595,6 +1661,65 @@ mod n1_tests {
         assert_eq!(hk_peer_genesis_digest("hashkinetics/1/genesis/ééééééééééééééééééééééééééééééééé"), None);
         assert_eq!(hk_peer_node_version(&format!("hashkinetics/1/genesis/{digest}/hk-node/")), None);
         assert_eq!(hk_peer_node_version(&format!("hashkinetics/1/genesis/{digest}/hk-node/v0.15.2 <script>")), None);
+    }
+}
+
+/// R18 review (2026-10-08): the bundle door admits P2.3's bundle and nothing else.
+#[cfg(test)]
+mod r18_tests {
+    use super::{bundle_shape_verdict, MAX_TXS_PER_BLOCK};
+    use hk_primitives::H256;
+    use hk_state::tx::{SignedTx, Tx};
+
+    /// Unsigned frames: the verdict reads payloads only (the aggregate is the proof).
+    fn frame(payload: Tx) -> SignedTx {
+        SignedTx { sender: H256([1; 32]), nonce: 0, payload, next_auth: H256([0; 32]), lamport_pk: vec![], sig: vec![] }
+    }
+    fn spend(proof: Vec<u8>) -> SignedTx {
+        frame(Tx::ShieldedSpend {
+            anchor: H256([2; 32]),
+            nullifier: H256([3; 32]),
+            out_commitment: H256([4; 32]),
+            out2_commitment: H256([5; 32]),
+            fee: 0,
+            credit: None,
+            mandate: None,
+            proof,
+            stealth_ct: vec![],
+            stealth_ct2: vec![],
+        })
+    }
+    fn mint(proof: Vec<u8>) -> SignedTx {
+        frame(Tx::MintToPool { asset: H256([9; 32]), value: 1, commitment: H256([6; 32]), proof, stealth_ct: vec![] })
+    }
+
+    #[test]
+    fn r18_a_bundle_carries_only_proof_less_pool_txs() {
+        // exactly what demo_agg builds: proof-less spends (and mints) under one aggregate
+        assert_eq!(bundle_shape_verdict(&[spend(vec![]), spend(vec![]), mint(vec![])]), Ok(()));
+        // the reported bypass: a ChannelSettle (over-cap or not) rode the bundle uncosted
+        let settle = frame(Tx::ChannelSettle { id: H256([7; 32]), word: H256([8; 32]), step: u32::MAX });
+        let err = bundle_shape_verdict(&[spend(vec![]), settle.clone()]).unwrap_err();
+        assert!(err.starts_with("bad txs: a bundle may carry only proof-less MintToPool / ShieldedSpend txs"), "{err}");
+        assert!(err.contains("tx 1 is not one"), "{err}");
+        assert!(bundle_shape_verdict(&[settle]).is_err());
+        // an over-cap ChannelOpen, a transfer: the same refusal — nothing but pool txs
+        let open = frame(Tx::ChannelOpen {
+            id: H256([7; 32]), mandate: H256([1; 32]), payee: H256([2; 32]), asset: H256([9; 32]),
+            tip: H256([3; 32]), unit_price: 1, max_steps: u32::MAX, expiry: 1,
+        });
+        assert!(bundle_shape_verdict(&[open]).is_err());
+        assert!(bundle_shape_verdict(&[frame(Tx::Transfer { to: H256([2; 32]), asset: H256([9; 32]), amount: 1 })]).is_err());
+        // a pool tx that carries its own proof is the classic per-proof path, not a bundle
+        assert!(bundle_shape_verdict(&[spend(vec![1, 2, 3])]).is_err());
+        assert!(bundle_shape_verdict(&[mint(vec![1])]).is_err());
+        // longer than a block: never picked by build_batch, so never queued
+        let too_long: Vec<SignedTx> = (0..=MAX_TXS_PER_BLOCK).map(|_| spend(vec![])).collect();
+        assert_eq!(
+            bundle_shape_verdict(&too_long).unwrap_err(),
+            format!("bad txs: a bundle may carry at most {MAX_TXS_PER_BLOCK} txs (one block)")
+        );
+        assert_eq!(bundle_shape_verdict(&too_long[..MAX_TXS_PER_BLOCK]), Ok(()));
     }
 }
 
