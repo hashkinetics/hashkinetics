@@ -204,16 +204,20 @@ pub fn mandate_asset_from_from(chain_id: &str, env_height: Option<&str>) -> u64 
 /// `max_steps = u32::MAX` made every validator hash ≈ 4.29 × 10⁹ SHAKE-256 links at commit
 /// — 30–90 CPU-minutes on an e2-standard-2, synchronously inside the consensus loop under
 /// the chain lock — and the refusal was free (fee refunded, nonce not ratcheted), so the
-/// same bytes could ride every block. Named 2026-10-08 13:38:53 UTC at tip 1,984,849 with
-/// the chain at ≈ 1.31 s/block: 22,151 blocks ≈ 8.06 h out, ≈ 21:42 UTC — the founder
-/// chose ~8 h of notice, more than R17's six: R17's FIRST number (1,844,000) passed before
-/// any seat had rolled, so this one gives the roll room. The client-side mirrors (mempool
+/// same bytes could ride every block. This is the SECOND number: the first, 2,007,000
+/// (named 2026-10-08 13:38:53 UTC at tip 1,984,849, ≈ 8 h out, carried by v0.19.7 — built
+/// 15:37 UTC, never released), passed at ≈ 21:20 UTC with every seat still on v0.19.6 and
+/// nobody at the keyboard; no node ever applied it, so renaming it is replay-safe (a
+/// v0.19.8 node treats 2,007,000..2,038,500 exactly as v0.19.6 does). Named 2026-10-09
+/// 05:44:34 UTC at tip 2,029,968, ≈ 1.31 s/block: 8,532 blocks ≈ 3.1 h, ≈ 08:51 UTC —
+/// sized for the hour the founder is actually at the keyboard, not for a nominal notice
+/// (R17's and R18's first numbers both passed unrolled). The client-side mirrors (mempool
 /// admission, the proposer's per-block link budget in `state.rs`) are not gated by it and
 /// protect an upgraded node's own pool and proposals at once; only the consensus refusal
 /// waits for the height. A node that is not on the release at this height accepts the
 /// first over-cap settle or open and forks. The number may move by patch release BEFORE
 /// it is reached; it never moves after a node has applied it (the G1 rule).
-pub const R18_TESTNET1_HEIGHT: u64 = 2_007_000;
+pub const R18_TESTNET1_HEIGHT: u64 = 2_038_500;
 
 /// The PayWord-cap activation this node applies for `chain_id`: testnet-1 hard-wired; any
 /// OTHER chain reads `HK_R18_HEIGHT` (unset ⇒ 0 = active from genesis, so every devnet
@@ -304,7 +308,7 @@ mod r18_tests {
     #[test]
     fn r18_activation_is_hardwired_for_testnet1_and_env_only_elsewhere() {
         assert_eq!(payword_cap_from_from("hashkinetics-1-4e4ea68d", Some("5")), R18_TESTNET1_HEIGHT);
-        assert_eq!(payword_cap_from_from("hashkinetics-1-4e4ea68d", None), 2_007_000);
+        assert_eq!(payword_cap_from_from("hashkinetics-1-4e4ea68d", None), 2_038_500);
         assert_eq!(payword_cap_from_from("hashkinetics-devnet-1", None), 0);
         assert_eq!(payword_cap_from_from("hashkinetics-devnet-1", Some("40")), 40);
         assert_eq!(payword_cap_from_from("hashkinetics-devnet-1", Some(" 40 ")), 40);
