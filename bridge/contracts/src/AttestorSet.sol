@@ -15,7 +15,12 @@ import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 ///             across vaults, forks or chains);
 ///           - signers must be strictly ascending, so a signature can never be counted twice;
 ///           - ANY single attestor may pause (the brake is cheap); only the owner unpauses;
-///           - the owner is two-step (Ownable2Step) and never has a path to move funds.
+///           - the owner is two-step (Ownable2Step) and has no withdrawal or mint function of its own, but it
+///             rotates the attestor set and threshold (`setAttestors`, owner only) and unpauses — at threshold 1
+///             a replaced set signs whatever the owner wants, so the owner key is trusted exactly as the
+///             attestors are (on Sepolia both are founder-held). A timelock on the owner, or renouncing
+///             `setAttestors` after bootstrap, is the mainnet-design item. (Wording corrected 2026-10-11,
+///             secwatch-hunt L-2; the deployed bytecode is unchanged.)
 abstract contract AttestorSet is EIP712, Pausable, Ownable2Step {
     /// @dev attestor set + threshold. `attestors` is kept for enumeration; `isAttestor` for O(1) checks.
     address[] private _attestors;

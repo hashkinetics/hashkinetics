@@ -206,12 +206,12 @@ pub fn mandate_asset_from_from(chain_id: &str, env_height: Option<&str>) -> u64 
 /// the chain lock — and the refusal was free (fee refunded, nonce not ratcheted), so the
 /// same bytes could ride every block. This is the SECOND number: the first, 2,007,000
 /// (named 2026-10-08 13:38:53 UTC at tip 1,984,849, ≈ 8 h out, carried by v0.19.7 — built
-/// 15:37 UTC, never released), passed at ≈ 21:20 UTC with every seat still on v0.19.6 and
-/// nobody at the keyboard; no node ever applied it, so renaming it is replay-safe (a
-/// v0.19.8 node treats 2,007,000..2,038,500 exactly as v0.19.6 does). Named 2026-10-09
-/// 05:44:34 UTC at tip 2,029,968, ≈ 1.31 s/block: 8,532 blocks ≈ 3.1 h, ≈ 08:51 UTC —
-/// sized for the hour the founder is actually at the keyboard, not for a nominal notice
-/// (R17's and R18's first numbers both passed unrolled). The client-side mirrors (mempool
+/// 15:37 UTC, never released), passed at ≈ 21:20 UTC with every seat still on v0.19.6;
+/// no node ever applied it, so renaming it is replay-safe (a v0.19.8 node treats
+/// 2,007,000..2,038,500 exactly as v0.19.6 does). Named 2026-10-09 05:44:34 UTC at tip
+/// 2,029,968, ≈ 1.31 s/block: 8,532 blocks ≈ 3.1 h, ≈ 08:51 UTC — sized for a window in
+/// which the fleet is actively watched and the roll is already under way, not for a
+/// nominal notice (R17's and R18's first numbers both passed unrolled). The client-side mirrors (mempool
 /// admission, the proposer's per-block link budget in `state.rs`) are not gated by it and
 /// protect an upgraded node's own pool and proposals at once; only the consensus refusal
 /// waits for the height. A node that is not on the release at this height accepts the

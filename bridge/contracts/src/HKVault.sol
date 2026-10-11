@@ -14,8 +14,13 @@ import {DailyLimit} from "./DailyLimit.sol";
 ///   unlock(to, amount, burnId, sigs[])   — releases USDC for a committed HashKinetics burn (burnId = the HK
 ///                                          txid) under t-of-n attestor signatures; each burnId once; a daily cap;
 ///                                          refused while paused.
-///   No admin path moves funds. No upgradeability on the testnet (redeploy). Trust label: exactly as safe as
-///   the attestor keys and the hk-attest code — said plainly on the site.
+///   The owner has no withdrawal or mint function of its own, but it rotates the attestor set and threshold
+///   (`setAttestors`, inherited), sets `dailyCap` / `minLock` and unpauses — at threshold 1 a replaced set
+///   signs whatever the owner wants, so the owner key is trusted exactly as the attestors are (on Sepolia both
+///   are founder-held; a timelock or renouncing `setAttestors` after bootstrap is the mainnet-design item).
+///   No upgradeability on the testnet (redeploy). Trust label: exactly as safe as the attestor keys, the owner
+///   key and the hk-attest code — said plainly on the site. (Wording corrected 2026-10-11, secwatch-hunt L-2;
+///   the deployed bytecode is unchanged.)
 contract HKVault is AttestorSet, DailyLimit, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -101,7 +106,7 @@ contract HKVault is AttestorSet, DailyLimit, ReentrancyGuard {
         emit Unlocked(burnId, to, amount);
     }
 
-    // ---------------------------------------------------------------- admin (owner; never moves funds)
+    // ------------------------ admin (owner: caps + dust guard here; the attestor rotation it also holds is in AttestorSet)
 
     function setDailyCap(uint256 dailyCap_) external onlyOwner {
         _setDailyCap(dailyCap_);

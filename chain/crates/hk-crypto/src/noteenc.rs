@@ -1,9 +1,20 @@
 //! noteenc — SHAKE-256 authenticated encryption for shielded-note ciphertexts (P2.1/WS4).
 //!
 //! Encrypt-then-MAC, both primitives domain-separated SHAKE-256 (pure hash — the doctrine
-//! holds even here; no AES/ChaCha dependency):
-//!   keystream = SHAKE-256(DOM_NOTE_ENC ‖ key ‖ nonce)   (XOF, XORed over the plaintext)
-//!   tag       = SHAKE-256₃₂(DOM_NOTE_MAC ‖ key ‖ nonce ‖ ciphertext)
+//! holds even here; no AES/ChaCha dependency). Exact absorbed bytes (v1, FROZEN):
+//!   keystream = SHAKE-256-XOF( "hk/v1/note-enc" ‖ 0x00 ‖ key ‖ nonce )
+//!               — the 14-byte tag, one 0x00, then key(32) and nonce(32) RAW: no length prefixes;
+//!               one stream read to |plaintext| bytes (no counter) and XORed over it (`xor_stream`)
+//!   tag       = shake256_32(DOM_NOTE_MAC, [key, nonce, ciphertext])
+//!             = SHAKE-256₃₂( "hk/v1/note-mac" ‖ 0x00 ‖ u64le(32) ‖ key ‖ u64le(32) ‖ nonce
+//!                            ‖ u64le(|ciphertext|) ‖ ciphertext )
+//!               — hash.rs framing: 0x00 after the tag, a u64-LE byte length before EVERY part
+//! The keystream is unprefixed and sound as is: it absorbs two fixed 32-byte arrays under a tag
+//! with exactly one use, so there is no concatenation ambiguity to prevent; the tag goes through
+//! the general helper. Both framings are frozen as v1 for testnet-1 — re-framing in place would
+//! orphan every sealed note on chain. A prefixed keystream, if ever wanted, goes under a NEW tag
+//! (`hk/v2/note-enc`) selected by chain_id from mainnet genesis. (2026-10-11 — reported by
+//! secwatch-hunt, L-3: the framing was under-specified; documented, no wire change.)
 //!
 //! `key` is derived from the ML-KEM shared secret (see `mlkem::note_key`); `nonce` must be
 //! unique per (key, message) — the wallet uses the note COMMITMENT, unique by construction.
@@ -45,7 +56,10 @@ pub fn open(key: &[u8; 32], nonce: &[u8; 32], sealed: &[u8]) -> Option<Vec<u8>> 
 fn xor_stream(key: &[u8; 32], nonce: &[u8; 32], data: &[u8]) -> Vec<u8> {
     let mut h = Shake256::default();
     h.update(DOM_NOTE_ENC.as_bytes());
-    h.update(&[0u8]); // domain terminator, mirrors hash.rs framing
+    // v1 framing, FROZEN for testnet-1: tag ‖ 0x00 ‖ key ‖ nonce, RAW — unlike `hash::shake256_32`
+    // there are NO u64-LE length prefixes on key/nonce (both fixed 32 B, the tag has one use: sound).
+    // Never change this in place; a prefixed keystream is a new tag (`hk/v2/note-enc`, by chain_id).
+    h.update(&[0u8]); // the 0x00 after the tag is the only framing byte
     h.update(key);
     h.update(nonce);
     let mut reader = h.finalize_xof();

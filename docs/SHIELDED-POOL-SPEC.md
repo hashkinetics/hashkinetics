@@ -202,10 +202,12 @@ runs show 1.19–1.31 s. (Formal v3 re-bench = pass-2 backlog.)
 stealth_ct = kem_ct (1088 B, ML-KEM-768) ‖ AEAD_ct ‖ tag (32 B)
 AEAD: SHAKE-256 encrypt-then-MAC (doctrine-pure, no AES):
   key       = SHAKE-256₃₂( "hk/v1/note-key" ‖ shared_secret ‖ cm )   // cm binds position
-  keystream = SHAKE-256-XOF( "hk/v1/note-enc" ‖ key ‖ cm )
+  keystream = SHAKE-256-XOF( "hk/v1/note-enc" ‖ 0x00 ‖ key ‖ cm )     // RAW: 14-byte tag, 0x00, key(32), cm(32) — NO length prefixes
   tag       = SHAKE-256₃₂( "hk/v1/note-mac" ‖ key ‖ cm ‖ ciphertext )
 plaintext  = value_le(8) ‖ rho(32) ‖ rcm(32) ‖ memo(rest)
 ```
+
+Framing, pinned (v1, **frozen** for testnet-1). `SHAKE-256₃₂(tag ‖ a ‖ b ‖ …)` above is `hk-crypto::hash::shake256_32`, which absorbs `tag ‖ 0x00 ‖ u64le(|a|) ‖ a ‖ u64le(|b|) ‖ b ‖ …` — a `0x00` after the tag and a u64-LE byte length before every part — so the tag is exactly `SHAKE-256₃₂("hk/v1/note-mac" ‖ 0x00 ‖ u64le(32) ‖ key ‖ u64le(32) ‖ cm ‖ u64le(|ct|) ‖ ct)`, and the key line is framed the same way. The keystream is the one exception: `noteenc::xor_stream` absorbs `"hk/v1/note-enc" ‖ 0x00 ‖ key ‖ cm` with no length prefixes and reads one XOF stream of `|plaintext|` bytes (no counter). Sound as is — both parts are fixed 32-byte arrays, the two tags are distinct and `hk/v1/note-enc` has exactly one use — and it MUST stay as is: re-framing in place would orphan every sealed note on chain. A prefixed keystream, if ever wanted, is a new tag (`hk/v2/note-enc`) selected by chain_id from mainnet genesis. *2026-10-11 — reported by secwatch-hunt (L-3): the keystream framing was under-specified; documented, no wire change.*
 
 Scanner (per wallet, per entry `(leaf_index, cm, stealth_ct)`): decapsulate (FIPS 203
 implicit rejection always yields 32 bytes — garbage if not ours), derive key, open AEAD
