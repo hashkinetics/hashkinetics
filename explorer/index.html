@@ -16,7 +16,7 @@
   *{box-sizing:border-box;margin:0;padding:0}
   html{scroll-behavior:smooth}
   body{background:var(--bg);color:var(--text);font:15px/1.6 -apple-system,'Segoe UI',Inter,Roboto,sans-serif;min-height:100vh;overflow-x:hidden}
-  /* orbs: radial gradients ARE the blur — cheap, GPU-friendly */
+  /* orbs: radial gradients ARE the blur — no filter cost, GPU-friendly */
   .orbs{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden}
   .orb{position:absolute;border-radius:50%;will-change:transform}
   .orb-a{width:55vw;height:55vw;left:-18vw;top:-22vw;background:radial-gradient(circle,rgba(78,240,208,0.14) 0%,rgba(78,240,208,0.05) 40%,transparent 70%);animation:drift 26s ease-in-out infinite alternate}
@@ -164,7 +164,7 @@
         <h2><span class="spark">⬢</span> Validators</h2>
         <table id="vals"><thead><tr><th>Address</th><th class="right">Power</th><th class="right">Epoch</th></tr></thead><tbody></tbody></table>
         <div class="kv" style="margin-top:8px"><div><span class="muted">External nodes (join kit)</span></div><div class="right"><span class="badge b-rot" id="s-observers">observers welcome — see /network#join</span></div></div>
-        <div class="privnote" style="border-color:var(--cyan)"><b style="color:var(--cyan)">Every vote is hash-based</b> (LMS/HSS over SHAKE-256) under an SLH-DSA root — the consensus itself is post-quantum, not just the wallets. Epoch badges climb when a validator rotates its signing tree — automatic since v0.10.5; on testnet-1 all four seats rotated unattended on 2026-09-03 (heights 11,584–11,595). <b>EXTERNAL</b> marks a seat admitted on the running chain by a certificate from more than ⅔ of the current seats — the first one landed in block 72219 on 2026-09-05. The external-nodes row is the gateway's own live peer table (hk_getPeers, v0.15.2): every kit node bootstraps through it. The four founding seats run on Google Cloud, external seats on their operators' own machines; the prover lives elsewhere entirely. Want a seat? <a href="/network#join" style="color:var(--cyan)">Join as an observer now; seats follow.</a></div>
+        <div class="privnote" style="border-color:var(--cyan)"><b style="color:var(--cyan)">Every vote is hash-based</b> (LMS/HSS over SHAKE-256) under an SLH-DSA root — the consensus itself is post-quantum, not just the wallets. Epoch badges climb when a validator rotates its signing tree — automatic since v0.10.5; on testnet-1 all four seats rotated unattended on 2026-09-03 (heights 11,584–11,595). <b>EXTERNAL</b> marks a seat admitted on the running chain by a certificate from more than ⅔ of the current seats — the first one landed in block 72219 on 2026-09-05. The external-nodes row is the gateway's own live peer table (hk_getPeers, v0.15.2): every kit node bootstraps through it. The four founding seats have run on AWS Lightsail, Frankfurt (eu-central-1), since 2026-10-11; external seats run on their operators' own machines; the prover lives elsewhere entirely. Want a seat? <a href="/network#join" style="color:var(--cyan)">Join as an observer now; seats follow.</a></div>
       </div>
       <div class="card">
         <h2><span class="spark">◈</span> Issued assets</h2>
