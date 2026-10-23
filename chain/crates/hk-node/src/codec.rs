@@ -15,9 +15,27 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-// Hash-based consensus signatures travel as raw bytes (LMS/HSS). `From<Vec<u8>> for
-// HkSig` (in hk-consensus) makes the decode-side `.into()` calls just work.
+// Hash-based consensus signatures travel as raw bytes (LMS/HSS). On the decode side they go
+// through `sig` below (RZ-1); the block store's certificate DTO still uses `From<Vec<u8>>`.
 type RawSig = Vec<u8>;
+
+/// RZ-1 (v0.19.9): a consensus signature is exactly `CONSENSUS_SIG_LEN` = 9,140 bytes — every
+/// consensus key is a `generate_consensus` tree, so no honest vote, proposal or certificate
+/// signature has another length. A gossiped signature of the wrong length is refused HERE, at
+/// decode, before the engine sees the message: a vote for a height above ours is buffered
+/// unverified until that height arrives, and without this gate a wrong-length blob (up to the
+/// pubsub message cap) would sit in that queue. The verifier refuses the same lengths again
+/// (`hk_consensus::hashsig_scheme::verify`), so this is the cheap first refusal, not the only one.
+fn sig(raw: RawSig) -> Result<HkSig, JsonError> {
+    if raw.len() != hk_crypto::hashsig::CONSENSUS_SIG_LEN {
+        return Err(Box::new(bincode::ErrorKind::Custom(format!(
+            "consensus signature must be {} bytes, got {}",
+            hk_crypto::hashsig::CONSENSUS_SIG_LEN,
+            raw.len()
+        ))));
+    }
+    Ok(HkSig(raw))
+}
 
 use malachitebft_codec::{Codec, HasEncodedLen};
 
@@ -33,7 +51,7 @@ use malachitebft_core_consensus::{LivenessMsg, SignedConsensusMsg};
 use malachitebft_sync::{Request, Response, Status, ValueRequest, ValueResponse};
 
 use hk_consensus::{
-    HkAddress, HkContext, HkHeight, HkProposal, HkProposalPart, HkValue, HkValueId, HkVote,
+    HkAddress, HkContext, HkHeight, HkProposal, HkProposalPart, HkSig, HkValue, HkValueId, HkVote,
 };
 
 #[derive(Copy, Clone, Debug)]
@@ -159,13 +177,13 @@ impl Codec<SignedConsensusMsg<HkContext>> for HkCodec {
             RawSignedConsensusMsg::Vote { vote, signature } => {
                 SignedConsensusMsg::Vote(SignedVote {
                     message: vote.into(),
-                    signature: signature.into(),
+                    signature: sig(signature)?,
                 })
             }
             RawSignedConsensusMsg::Proposal { proposal, signature } => {
                 SignedConsensusMsg::Proposal(SignedProposal {
                     message: proposal.into(),
-                    signature: signature.into(),
+                    signature: sig(signature)?,
                 })
             }
         })
@@ -235,7 +253,7 @@ impl Codec<LivenessMsg<HkContext>> for HkCodec {
         Ok(match raw {
             RawLivenessMsg::Vote { vote, signature } => LivenessMsg::Vote(SignedVote {
                 message: vote.into(),
-                signature: signature.into(),
+                signature: sig(signature)?,
             }),
             RawLivenessMsg::PolkaCertificate(c) => {
                 LivenessMsg::PolkaCertificate(PolkaCertificate {
@@ -245,11 +263,10 @@ impl Codec<LivenessMsg<HkContext>> for HkCodec {
                     polka_signatures: c
                         .polka_signatures
                         .into_iter()
-                        .map(|s| PolkaSignature {
-                            address: s.address,
-                            signature: s.signature.into(),
+                        .map(|s| {
+                            Ok(PolkaSignature { address: s.address, signature: sig(s.signature)? })
                         })
-                        .collect(),
+                        .collect::<Result<Vec<_>, JsonError>>()?,
                 })
             }
             RawLivenessMsg::SkipRoundCertificate(c) => {
@@ -260,13 +277,15 @@ impl Codec<LivenessMsg<HkContext>> for HkCodec {
                     round_signatures: c
                         .round_signatures
                         .into_iter()
-                        .map(|s| RoundSignature {
-                            vote_type: s.vote_type,
-                            value_id: s.value_id,
-                            address: s.address,
-                            signature: s.signature.into(),
+                        .map(|s| {
+                            Ok(RoundSignature {
+                                vote_type: s.vote_type,
+                                value_id: s.value_id,
+                                address: s.address,
+                                signature: sig(s.signature)?,
+                            })
                         })
-                        .collect(),
+                        .collect::<Result<Vec<_>, JsonError>>()?,
                 })
             }
         })
@@ -557,5 +576,81 @@ impl Codec<Response<HkContext>> for HkCodec {
 impl HasEncodedLen<Response<HkContext>> for HkCodec {
     fn encoded_len(&self, msg: &Response<HkContext>) -> Result<usize, JsonError> {
         self.encode(msg).map(|b| b.len())
+    }
+}
+
+#[cfg(test)]
+mod rz1_tests {
+    //! RZ-1 (2026-10-22): the wire decoder refuses a consensus signature of the wrong length
+    //! before the engine sees the message, and round-trips the right length untouched.
+    use super::*;
+    use hk_crypto::hashsig::CONSENSUS_SIG_LEN;
+
+    type SCM = SignedConsensusMsg<HkContext>;
+    type LM = LivenessMsg<HkContext>;
+
+    fn addr() -> HkAddress {
+        HkAddress::new([7u8; HkAddress::LENGTH])
+    }
+    fn vote() -> HkVote {
+        HkVote::new_prevote(HkHeight::new(7), Round::new(0), NilOrVal::Nil, addr())
+    }
+    fn proposal() -> HkProposal {
+        HkProposal::new(
+            HkHeight::new(7),
+            Round::new(0),
+            HkValue::new(Bytes::from_static(b"txs")),
+            Round::Nil,
+            addr(),
+        )
+    }
+    const BAD_LENS: [usize; 5] = [0, 10, CONSENSUS_SIG_LEN - 1, CONSENSUS_SIG_LEN + 1, 4 * CONSENSUS_SIG_LEN];
+
+    #[test]
+    fn rz1_consensus_messages_with_a_wrong_length_signature_fail_to_decode() {
+        let codec = HkCodec;
+        // The right length round-trips (the bytes are not verified here; that is the engine's job).
+        let good_sig = HkSig(vec![0xAB; CONSENSUS_SIG_LEN]);
+        let good = SCM::Vote(SignedVote { message: vote(), signature: good_sig.clone() });
+        let bytes = <HkCodec as Codec<SCM>>::encode(&codec, &good).unwrap();
+        let back = <HkCodec as Codec<SCM>>::decode(&codec, bytes.clone()).expect("the right length decodes");
+        assert_eq!(<HkCodec as Codec<SCM>>::encode(&codec, &back).unwrap(), bytes);
+        let good_p = SCM::Proposal(SignedProposal { message: proposal(), signature: good_sig.clone() });
+        let bytes = <HkCodec as Codec<SCM>>::encode(&codec, &good_p).unwrap();
+        assert!(<HkCodec as Codec<SCM>>::decode(&codec, bytes).is_ok());
+        // Every other length is refused — a vote, a proposal, a liveness vote, a polka
+        // certificate with one wrong-length signature among right ones.
+        for len in BAD_LENS {
+            let bad = HkSig(vec![0xAB; len]);
+            let v = SCM::Vote(SignedVote { message: vote(), signature: bad.clone() });
+            let bytes = <HkCodec as Codec<SCM>>::encode(&codec, &v).unwrap();
+            assert!(<HkCodec as Codec<SCM>>::decode(&codec, bytes).is_err(), "vote, {len} bytes");
+            let p = SCM::Proposal(SignedProposal { message: proposal(), signature: bad.clone() });
+            let bytes = <HkCodec as Codec<SCM>>::encode(&codec, &p).unwrap();
+            assert!(<HkCodec as Codec<SCM>>::decode(&codec, bytes).is_err(), "proposal, {len} bytes");
+            let lv = LM::Vote(SignedVote { message: vote(), signature: bad.clone() });
+            let bytes = <HkCodec as Codec<LM>>::encode(&codec, &lv).unwrap();
+            assert!(<HkCodec as Codec<LM>>::decode(&codec, bytes).is_err(), "liveness vote, {len} bytes");
+            let polka = LM::PolkaCertificate(PolkaCertificate {
+                height: HkHeight::new(7),
+                round: Round::new(0),
+                value_id: HkValueId::new([1u8; 32]),
+                polka_signatures: vec![
+                    PolkaSignature { address: addr(), signature: good_sig.clone() },
+                    PolkaSignature { address: HkAddress::new([8u8; HkAddress::LENGTH]), signature: bad.clone() },
+                ],
+            });
+            let bytes = <HkCodec as Codec<LM>>::encode(&codec, &polka).unwrap();
+            assert!(<HkCodec as Codec<LM>>::decode(&codec, bytes).is_err(), "polka certificate, {len} bytes");
+        }
+        // A polka certificate whose signatures all have the right length decodes.
+        let polka = LM::PolkaCertificate(PolkaCertificate {
+            height: HkHeight::new(7),
+            round: Round::new(0),
+            value_id: HkValueId::new([1u8; 32]),
+            polka_signatures: vec![PolkaSignature { address: addr(), signature: good_sig }],
+        });
+        let bytes = <HkCodec as Codec<LM>>::encode(&codec, &polka).unwrap();
+        assert!(<HkCodec as Codec<LM>>::decode(&codec, bytes).is_ok());
     }
 }

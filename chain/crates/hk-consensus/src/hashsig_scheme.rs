@@ -25,7 +25,9 @@ use hk_crypto::hashsig::{self, HashSigPublic, HashSigner};
 use crate::context::DOM_VALIDATOR_ADDR;
 use crate::HkAddress;
 
-/// LMS/HSS signature bytes (~1–2.5 KB). Newtype for the Clone/Eq/Ord bounds.
+/// LMS/HSS signature bytes — a consensus signature is exactly
+/// `hk_crypto::hashsig::CONSENSUS_SIG_LEN` = 9,140 bytes (RZ-1: `verify` refuses any other
+/// length before parsing). Newtype for the Clone/Eq/Ord bounds.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct HkSig(pub Vec<u8>);
 
@@ -129,7 +131,21 @@ impl SigningScheme for HkHashScheme {
     type PublicKey = HkPub;
     type PrivateKey = HkPriv;
 
+    /// RZ-1: a consensus signature has exactly `CONSENSUS_SIG_LEN` bytes (every consensus key is
+    /// a `generate_consensus` tree); any other length is a decoding error here and `false` in
+    /// `verify`. (The wire path builds `HkSig` through `From<Vec<u8>>`, not this method; the
+    /// length is enforced again in `verify`, which every path reaches.)
     fn decode_signature(bytes: &[u8]) -> Result<HkSig, Self::DecodingError> {
+        if bytes.len() != hashsig::CONSENSUS_SIG_LEN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "consensus signature must be {} bytes, got {}",
+                    hashsig::CONSENSUS_SIG_LEN,
+                    bytes.len()
+                ),
+            ));
+        }
         Ok(HkSig(bytes.to_vec()))
     }
 
@@ -138,8 +154,18 @@ impl SigningScheme for HkHashScheme {
     }
 }
 
-/// Verify a vote/proposal signature. Stateless, order-free.
+/// Verify a vote/proposal signature. Stateless, order-free, and total: a malformed signature
+/// is `false`, never a panic (RZ-1, external report 2026-10-14 — before v0.19.9 an empty or
+/// truncated signature on a vote carrying a real validator's address panicked the vendored
+/// parser inside the consensus actor, which then stopped for good while the process stayed up).
+/// Every consensus key is a `generate_consensus` tree, so an honest signature has exactly
+/// `CONSENSUS_SIG_LEN` bytes: any other length is refused here, before a byte is parsed — the
+/// cheapest refusal of a crafted vote. Below that, `hashsig::verify` carries its own window,
+/// the total parser and the panic boundary.
 pub fn verify(msg: &[u8], sig: &HkSig, pk: &HkPub) -> bool {
+    if sig.0.len() != hashsig::CONSENSUS_SIG_LEN {
+        return false;
+    }
     hashsig::verify(msg, &sig.0, &HashSigPublic(pk.0.clone()))
 }
 
@@ -189,6 +215,44 @@ mod tests {
             bad.0[mid] ^= 1;
             assert!(!verify(m1, &bad, &pk));
             assert!(!verify(b"other", &s1, &pk));
+        });
+    }
+
+    /// RZ-1: the consensus verifier refuses a malformed signature — empty, short, one byte
+    /// short, one byte long, a bogus level or type code at full length, a zero blob — as
+    /// `false`, never a panic; the real signature's length is the pinned constant.
+    #[test]
+    fn rz1_malformed_consensus_signatures_are_invalid_not_panics() {
+        on_big_stack(|| {
+            let sk = HkPriv::from_seed([21u8; 32]);
+            let pk = sk.public();
+            let m = b"hk/v1/consensus-vote prevote h=7 r=0";
+            let s = sk.sign(m).expect("sign");
+            assert_eq!(s.0.len(), hashsig::CONSENSUS_SIG_LEN);
+            assert!(verify(m, &s, &pk));
+
+            assert!(!verify(m, &HkSig(vec![]), &pk));
+            assert!(!verify(m, &HkSig(vec![0xAB; 10]), &pk));
+            assert!(!verify(m, &HkSig(s.0[..s.0.len() - 1].to_vec()), &pk));
+            let mut longer = s.0.clone();
+            longer.push(0);
+            assert!(!verify(m, &HkSig(longer), &pk));
+            assert!(!verify(m, &HkSig(vec![0u8; hashsig::CONSENSUS_SIG_LEN]), &pk));
+            for level in [0u32, 7, 8, u32::MAX] {
+                let mut bad = s.clone();
+                bad.0[..4].copy_from_slice(&level.to_be_bytes());
+                assert!(!verify(m, &bad, &pk), "level {level}");
+            }
+            for at in [8usize, 4 + 4 + (4 + 32 + 32 * 133)] {
+                let mut bad = s.clone();
+                bad.0[at..at + 4].copy_from_slice(&99u32.to_be_bytes());
+                assert!(!verify(m, &bad, &pk), "type code at {at}");
+            }
+            // The SigningScheme decoder enforces the same length.
+            assert!(HkHashScheme::decode_signature(&[]).is_err());
+            assert!(HkHashScheme::decode_signature(&s.0[..10]).is_err());
+            assert_eq!(HkHashScheme::decode_signature(&s.0).unwrap(), s);
+            assert!(verify(m, &s, &pk), "the real signature still verifies");
         });
     }
 

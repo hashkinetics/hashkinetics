@@ -1,5 +1,3 @@
-use core::convert::TryInto;
-
 use tinyvec::ArrayVec;
 
 use crate::{
@@ -14,7 +12,7 @@ use crate::{
         generate_key_pair,
         parameters::LmsParameter,
     },
-    util::helper::read_and_advance,
+    util::helper::read_u32_and_advance,
 };
 use crate::{hss::aux::hss_get_aux_data_len, lms::signing::LmsSignature};
 
@@ -205,12 +203,14 @@ impl<H: HashChain> HssPublicKey<H> {
 }
 
 impl<'a, H: HashChain> InMemoryHssPublicKey<'a, H> {
+    /// Parse an HSS public key (RFC 8554 §6.1). Total since HashKinetics RZ-1 — the key is the
+    /// verifier's own, but the same reader was unchecked here as in the signature parsers.
     pub fn new(data: &'a [u8]) -> Option<Self> {
         let mut index = 0;
 
-        let level = u32::from_be_bytes(read_and_advance(data, 4, &mut index).try_into().unwrap());
+        let level = read_u32_and_advance(data, &mut index)?;
 
-        let public_key = InMemoryLmsPublicKey::new(&data[index..])?;
+        let public_key = InMemoryLmsPublicKey::new(data.get(index..)?)?;
 
         Some(Self {
             public_key,

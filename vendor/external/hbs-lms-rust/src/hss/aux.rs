@@ -83,8 +83,10 @@ pub fn hss_expand_aux_data<'a, H: HashChain>(
 
     // REMARK: Reference implementation treats that as u64 and ANDs it with 0x7ffffffffL after its stored in expanded_aux_data
     // However in our opinion that should make no difference, because we only read 4 bytes.
+    // The reader is total since HashKinetics RZ-1: a cache shorter than its own header is
+    // "no cache" (`None`), as a cache with a bad MAC already was.
     expanded_aux_data.level = u32::from_be_bytes(
-        read_and_advance(aux_data, 4, &mut index)
+        read_and_advance(aux_data, 4, &mut index)?
             .try_into()
             .unwrap(),
     );

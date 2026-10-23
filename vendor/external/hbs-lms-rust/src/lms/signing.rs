@@ -10,7 +10,7 @@ use crate::lm_ots::signing::InMemoryLmotsSignature;
 use crate::lm_ots::signing::LmotsSignature;
 use crate::lms::definitions::LmsPrivateKey;
 use crate::lms::parameters::LmsAlgorithm;
-use crate::util::helper::{read, read_and_advance};
+use crate::util::helper::{read, read_and_advance, read_u32_and_advance};
 
 use core::convert::TryInto;
 use tinyvec::ArrayVec;
@@ -160,33 +160,32 @@ impl<H: HashChain> LmsSignature<H> {
 }
 
 impl<'a, H: HashChain> InMemoryLmsSignature<'a, H> {
+    /// Parse an LMS signature (RFC 8554 §5.4.2, Algorithm 6a). Total since HashKinetics RZ-1:
+    /// a short input, an unknown LM-OTS or LMS type code, or a leaf number beyond the tree is
+    /// `None`, never a panic — the three `unwrap`s this held were reachable from the wire.
     pub fn new(data: &'a [u8]) -> Option<Self> {
-        // Parsing like 5.4.2 Algorithm 6a
         let mut index = 0;
 
-        let lms_leaf_identifier =
-            u32::from_be_bytes(read_and_advance(data, 4, &mut index).try_into().unwrap());
+        let lms_leaf_identifier = read_u32_and_advance(data, &mut index)?;
 
         // LMOTS Signature consists of LMOTS parameter, signature randomizer & signature data
         let lmots_parameter = LmotsAlgorithm::get_from_type::<H>(u32::from_be_bytes(
-            read(data, 4, &index).try_into().unwrap(),
-        ))
-        .unwrap();
+            read(data, 4, &index)?.try_into().ok()?,
+        ))?;
         let lmots_signature = lm_ots::signing::InMemoryLmotsSignature::new(read_and_advance(
             data,
             (4 + H::OUTPUT_SIZE * (1 + lmots_parameter.get_num_winternitz_chains())) as usize,
             &mut index,
-        ))
-        .unwrap();
+        )?)?;
 
-        let _type = u32::from_be_bytes(read_and_advance(data, 4, &mut index).try_into().unwrap());
+        let _type = read_u32_and_advance(data, &mut index)?;
 
-        let lms_parameter = LmsAlgorithm::get_from_type(_type).unwrap();
+        let lms_parameter = LmsAlgorithm::get_from_type(_type)?;
         let authentication_path = read_and_advance(
             data,
             (H::OUTPUT_SIZE * lms_parameter.get_tree_height() as u16) as usize,
             &mut index,
-        );
+        )?;
 
         if lms_leaf_identifier >= lms_parameter.number_of_lm_ots_keys() as u32 {
             return None;

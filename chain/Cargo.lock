@@ -3309,6 +3309,7 @@ dependencies = [
  "informalsystems-malachitebft-signing-ed25519",
  "rayon",
  "serde",
+ "tokio",
  "tracing",
 ]
 

@@ -31,11 +31,12 @@
 //! from the node's own evidence and a reservation window are the follow-ups.
 //! `attach_persistence_with_floor` lets the node add its own evidence of spent leaves.
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 
 use hbs_lms::{
     keygen, verify as hss_verify, HssParameter, HssSigningSession, LmotsAlgorithm, LmsAlgorithm,
-    Seed, Shake256_256,
+    Seed, Shake256_256, MAX_HSS_SIGNATURE_LENGTH,
 };
 
 use crate::fsutil::write_atomic;
@@ -45,10 +46,13 @@ type H = Shake256_256;
 
 const DOM_HASHSIG_SEED: &str = "hk/v1/hashsig-seed";
 
-/// Consensus-grade capacity: two-level HSS (W2/H10 over W2/H10) over SHAKE-256 =
-/// 2^20 ≈ 1,048,576 signatures per validator key (~4 days at 3 sigs/s). The top
-/// tree is built at keygen; bottom trees are built lazily (~sub-second, once per
-/// 1,024 signatures). See docs/HASHSIG-CONSENSUS-SWAP.md for the parameter rationale.
+/// Consensus-grade capacity: two-level HSS (W2/H10 over W2/H5) over SHAKE-256 =
+/// 2^15 = 32,768 signatures per validator key (≈ 3 h at 3 sigs/s; validators rotate to
+/// a fresh tree under the SLH-DSA root before exhaustion). The top tree is built at
+/// keygen; bottom trees are built lazily (once per 32 signatures). See
+/// docs/HASHSIG-CONSENSUS-SWAP.md for the parameter rationale, `generate_consensus`
+/// for the parameters themselves, and `CONSENSUS_SIG_LEN` for the signature length
+/// they fix.
 pub const CONSENSUS_CAPACITY: u64 = 1 << 15;
 
 /// Aux-data cache size (bytes). hbs-lms caches upper Merkle-tree nodes here so signing
@@ -63,6 +67,27 @@ pub const CONSENSUS_CAPACITY: u64 = 1 << 15;
 /// alive between signatures (`HssSigningSession`) instead of rebuilding the bottom tree
 /// and re-signing its public key on every call.
 pub const AUX_CACHE_SIZE: usize = 256 * 1024;
+
+/// RZ-1 (external report 2026-10-14, fixed 2026-10-22): the shortest byte string that can be a
+/// well-formed HSS signature over a 32-byte hash — one tree (level 0), LM-OTS W8 (34 chains),
+/// LMS H5: 4 (level) + 4 (leaf) + 4 (LM-OTS type) + 32 (randomizer) + 32·34 (chains) + 4 (LMS
+/// type) + 32·5 (path) = 1,296 bytes. `verify` refuses anything shorter before the parser sees
+/// it. (The parser is total since the same fix; the floor is the cheap first refusal.)
+pub const MIN_SIG_LEN: usize = 4 + 4 + 4 + 32 + 32 * 34 + 4 + 32 * 5;
+
+/// The longest HSS signature the vendored crate can represent (eight levels of the tallest
+/// trees, its own bound). `verify` refuses anything longer before the parser sees it.
+pub const MAX_SIG_LEN: usize = MAX_HSS_SIGNATURE_LENGTH;
+
+/// The exact length of a signature from a `generate_consensus` key — two levels, LM-OTS W2 (133
+/// chains over a 32-byte hash), LMS H10 over H5: 4 (level) + [4 + (4 + 32 + 32·133) + 4 + 32·10
+/// + 56] (the top tree's signature over the bottom public key, and that key) + [4 + (4 + 32 +
+/// 32·133) + 4 + 32·5] (the bottom signature) = 9,140 bytes. Every consensus key is built by
+/// `generate_consensus` (`HkPriv::from_seed` is the only path: genesis, keygen, rotation), so
+/// every honest vote, proposal, part, extension and commit signature has exactly this length —
+/// the consensus verifier refuses any other length before parsing a byte (RZ-1).
+pub const CONSENSUS_SIG_LEN: usize =
+    4 + (4 + (4 + 32 + 32 * 133) + 4 + 32 * 10 + 56) + (4 + (4 + 32 + 32 * 133) + 4 + 32 * 5);
 
 /// A stateful hash-based signer. `state` is the LMS/HSS private key bytes (advances on
 /// every `sign`); `aux` is the hbs-lms authentication-path cache (empty ⇒ no cache);
@@ -324,9 +349,33 @@ impl HashSigner {
     }
 }
 
-/// Verify a signature against a public key. Stateless, order-free.
+/// Verify a signature against a public key. Stateless, order-free. Total: a malformed `sig` is
+/// `false`, never a panic (RZ-1, external report 2026-10-14 — the vendored parser sliced the
+/// caller's bytes unchecked, so an empty, truncated or mis-typed signature unwound through the
+/// consensus actor, which ractor then stopped for good while the node stayed up). Three layers:
+/// the length window here, the parser made total in the vendored crate, and the panic boundary
+/// around the call.
 pub fn verify(msg: &[u8], sig: &[u8], public: &HashSigPublic) -> bool {
-    hss_verify::<H>(msg, sig, &public.0).is_ok()
+    if sig.len() < MIN_SIG_LEN || sig.len() > MAX_SIG_LEN {
+        return false;
+    }
+    verify_guarded(msg, sig, &public.0)
+}
+
+/// The verify call behind a panic boundary. The parser is total since RZ-1 (every read is
+/// bounds-checked, every type lookup is a `?`, the level is bounded), so this boundary should
+/// never fire; it is the last line — a panic anywhere below becomes `false` instead of unwinding
+/// into the caller's actor or rayon worker. `AssertUnwindSafe` is sound: the closure borrows
+/// immutable data only, so nothing is left half-updated if it unwinds. (The default panic hook
+/// still prints a caught panic to stderr; that line is the signal that a parser hole survived.)
+fn verify_guarded(msg: &[u8], sig: &[u8], pk: &[u8]) -> bool {
+    guarded(|| hss_verify::<H>(msg, sig, pk).is_ok())
+}
+
+/// The panic boundary itself: `f`'s verdict, or `false` if `f` unwinds. Kept as its own
+/// function so the test that pins the boundary exercises the code that ships.
+fn guarded(f: impl FnOnce() -> bool) -> bool {
+    catch_unwind(AssertUnwindSafe(f)).unwrap_or(false)
 }
 
 // ⚠ Stack note: hbs-lms keygen/sign allocate large fixed arrays on the stack.
@@ -679,6 +728,172 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(&dir);
         });
+    }
+
+    /// RZ-1 (external report 2026-10-14): a malformed signature is REJECTED, never a panic. The
+    /// vendored parser is exercised directly (no boundary) on every prefix of a real signature,
+    /// bogus levels and type codes, the level-overflow blob and pseudo-random blobs, so this
+    /// pins the parser's totality; then the same inputs go through `verify` (window + boundary).
+    #[test]
+    fn rz1_malformed_signatures_are_rejected_not_panics() {
+        on_big_stack(|| {
+            let (mut signer, pk) = generate(&[21u8; 32]);
+            let msg = b"hk/v1/consensus-vote prevote h=7 r=0";
+            let good = signer.sign(msg).expect("sign");
+            assert!(verify(msg, &good, &pk));
+            // One W2/H5 tree over a 32-byte hash.
+            let lmots_len = 4 + 32 + 32 * 133;
+            let lms_sig_len = 4 + lmots_len + 4 + 32 * 5;
+            assert_eq!(good.len(), 4 + lms_sig_len);
+            assert!(good.len() >= MIN_SIG_LEN && good.len() <= MAX_SIG_LEN);
+
+            let raw = |sig: &[u8]| hss_verify::<H>(msg, sig, &pk.0).is_ok();
+            // The parser itself: every prefix (the reporter's panics were n = 0 and n = 10).
+            for n in 0..good.len() {
+                assert!(!raw(&good[..n]), "prefix of {n} bytes must be refused by the parser");
+            }
+            // Bogus level (bytes 0..4), including the values that overflowed the level array.
+            for level in [1u32, 7, 8, 1_000, u32::MAX] {
+                let mut bad = good.clone();
+                bad[..4].copy_from_slice(&level.to_be_bytes());
+                assert!(!raw(&bad), "level {level} must be refused by the parser");
+                assert!(!verify(msg, &bad, &pk));
+            }
+            // Full length, bogus LM-OTS type (bytes 8..12) and LMS type (after the LM-OTS part).
+            let lms_type_at = 4 + 4 + lmots_len;
+            for at in [8, lms_type_at] {
+                for code in [0u32, 99, u32::MAX] {
+                    let mut bad = good.clone();
+                    bad[at..at + 4].copy_from_slice(&code.to_be_bytes());
+                    assert!(!raw(&bad), "type code {code} at {at} must be refused by the parser");
+                    assert!(!verify(msg, &bad, &pk));
+                }
+            }
+            // A leaf number beyond the H5 tree (bytes 4..8).
+            let mut bad = good.clone();
+            bad[4..8].copy_from_slice(&32u32.to_be_bytes());
+            assert!(!raw(&bad) && !verify(msg, &bad, &pk));
+            // The level-overflow blob: level 8 followed by eight well-formed (signature, public
+            // key) pairs — the bottom signature stands in for each level's signature and a
+            // W2/H5 public key header for each key — then the bottom signature.
+            let mut overflow = 8u32.to_be_bytes().to_vec();
+            let mut pk56 = vec![0u8; 56];
+            pk56[..4].copy_from_slice(&5u32.to_be_bytes()); // LMS H5
+            pk56[4..8].copy_from_slice(&2u32.to_be_bytes()); // LM-OTS W2
+            for _ in 0..8 {
+                overflow.extend_from_slice(&good[4..]);
+                overflow.extend_from_slice(&pk56);
+            }
+            overflow.extend_from_slice(&good[4..]);
+            assert!(!raw(&overflow), "a level-8 blob must be refused, not overflow the array");
+            assert!(!verify(msg, &overflow, &pk));
+
+            // `verify`: the window refuses these before the parser; the parser would too.
+            assert!(!verify(msg, &[], &pk));
+            assert!(!verify(msg, &good[..10], &pk));
+            assert!(!verify(msg, &good[..good.len() - 1], &pk));
+            // One byte appended: inside the window, so the parser's strictness refuses it
+            // (trailing bytes used to be ignored, and this used to verify).
+            let mut longer = good.clone();
+            longer.push(0);
+            assert!(!raw(&longer) && !verify(msg, &longer, &pk));
+            assert!(!verify(msg, &vec![0u8; MIN_SIG_LEN - 1], &pk));
+            assert!(!verify(msg, &vec![0u8; MIN_SIG_LEN], &pk));
+            assert!(!verify(msg, &vec![0u8; CONSENSUS_SIG_LEN], &pk));
+            assert!(!verify(msg, &vec![0u8; MAX_SIG_LEN], &pk));
+            assert!(!verify(msg, &vec![0u8; MAX_SIG_LEN + 1], &pk));
+            assert!(!verify(msg, &vec![0xFFu8; MAX_SIG_LEN], &pk));
+
+            // Pseudo-random blobs (xorshift, fixed seed): never a panic, never a false accept.
+            let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+            let mut next = move || {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x
+            };
+            // (a) Random bytes, random length; two of three get a level the bound admits
+            //     (0..=2), so the readers below the level see random input too.
+            for i in 0..500u32 {
+                let len = (next() % 12_000) as usize;
+                let mut blob: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+                if i % 3 != 0 && blob.len() >= 4 {
+                    blob[..4].copy_from_slice(&(i % 3).to_be_bytes());
+                }
+                assert!(!raw(&blob));
+                assert!(!verify(msg, &blob, &pk));
+            }
+            // (b) Every (LM-OTS, LMS) parameter pair the parser admits, at exactly its own
+            //     length, with valid type codes, a leaf inside the tree and random everything
+            //     else: the parser accepts the shape, the verifier refuses the content. The
+            //     W2/H5 pair matches the key, so that one runs the whole LM-OTS verify on
+            //     random data; the other nineteen are refused at the parameter compare.
+            for (wt, chains) in [(1u32, 265usize), (2, 133), (3, 67), (4, 34)] {
+                for (ht, height) in [(5u32, 5usize), (6, 10), (7, 15), (8, 20), (9, 25)] {
+                    let lmots = 4 + 32 + 32 * chains;
+                    let len = 4 + 4 + lmots + 4 + 32 * height;
+                    for _ in 0..5 {
+                        let mut blob: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+                        blob[..4].copy_from_slice(&0u32.to_be_bytes());
+                        let leaf = (next() % (1u64 << height)) as u32;
+                        blob[4..8].copy_from_slice(&leaf.to_be_bytes());
+                        blob[8..12].copy_from_slice(&wt.to_be_bytes());
+                        let lms_at = 4 + 4 + lmots;
+                        blob[lms_at..lms_at + 4].copy_from_slice(&ht.to_be_bytes());
+                        assert!(!raw(&blob), "W type {wt} / H type {ht} random content must be refused");
+                        assert!(!verify(msg, &blob, &pk));
+                    }
+                }
+            }
+            // (c) The real signature's shape with every non-structural field randomised
+            //     (randomizer, chains, path), the leaf kept inside the tree: the full verify
+            //     path on random data, two hundred times.
+            for _ in 0..200 {
+                let mut blob = good.clone();
+                for i in (12..lms_type_at).chain(lms_type_at + 4..good.len()) {
+                    blob[i] = next() as u8;
+                }
+                blob[4..8].copy_from_slice(&((next() % 32) as u32).to_be_bytes());
+                assert!(!raw(&blob));
+                assert!(!verify(msg, &blob, &pk));
+            }
+            assert!(verify(msg, &good, &pk), "the real signature still verifies");
+        });
+    }
+
+    /// RZ-1: the consensus key's signature length is a protocol constant — the consensus
+    /// verifier refuses every other length before parsing, so this must never drift silently.
+    #[test]
+    fn rz1_consensus_signature_length_is_pinned() {
+        on_big_stack(|| {
+            let (mut signer, pk) = generate_consensus(&[22u8; 32]);
+            let msg = b"hk/v1/consensus-vote precommit h=7 r=0";
+            // Across a bottom-tree rollover (H5 = 32 leaves) the length is unchanged.
+            for i in 0..34u32 {
+                let sig = signer.sign(msg).expect("sign");
+                assert_eq!(sig.len(), CONSENSUS_SIG_LEN, "signature {i} length");
+                assert!(verify(msg, &sig, &pk));
+            }
+            assert_eq!(CONSENSUS_SIG_LEN, 9140);
+            assert_eq!(MIN_SIG_LEN, 1296);
+            assert!(MIN_SIG_LEN < CONSENSUS_SIG_LEN && CONSENSUS_SIG_LEN < MAX_SIG_LEN);
+            // The parser, with no boundary, on every prefix of a two-level signature.
+            let good = signer.sign(msg).expect("sign");
+            for n in (0..good.len()).step_by(7).chain([good.len() - 1]) {
+                assert!(hss_verify::<H>(msg, &good[..n], &pk.0).is_err(), "prefix {n}");
+            }
+        });
+    }
+
+    /// RZ-1: the panic boundary that ships (`guarded`, behind `verify_guarded`) maps an
+    /// unwinding closure to `false` and passes a verdict through. The parser no longer panics
+    /// on any input, so the boundary is exercised with a closure that does. (The default
+    /// panic hook prints the simulated panic to stderr; that line is expected here.)
+    #[test]
+    fn rz1_panic_boundary_maps_a_panic_to_false() {
+        assert!(!guarded(|| -> bool { panic!("simulated parser hole") }));
+        assert!(guarded(|| true));
+        assert!(!guarded(|| false));
     }
 
     /// R16: `write_atomic` fsyncs the parent directory on Unix, so the file is visible and

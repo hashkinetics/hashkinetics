@@ -2,10 +2,12 @@ use crate::{
     constants::{D_MESG, MAX_HASH_SIZE, MAX_LMOTS_SIGNATURE_LENGTH, MAX_NUM_WINTERNITZ_CHAINS},
     hasher::HashChain,
     lm_ots::parameters::LmotsAlgorithm,
-    util::{coef::coef, helper::read_and_advance},
+    util::{
+        coef::coef,
+        helper::{read_and_advance, read_u32_and_advance},
+    },
 };
 
-use core::convert::TryInto;
 use tinyvec::ArrayVec;
 
 #[cfg(feature = "fast_verify")]
@@ -216,21 +218,21 @@ impl<H: HashChain> LmotsSignature<H> {
 }
 
 impl<'a, H: HashChain> InMemoryLmotsSignature<'a, H> {
+    /// Parse an LM-OTS signature (RFC 8554 §4.5). Total since HashKinetics RZ-1: a short input
+    /// or an unknown type code is `None`, never a panic — this is reached with wire bytes.
     pub fn new(data: &'a [u8]) -> Option<Self> {
         let mut index = 0;
 
-        let lmots_parameter = LmotsAlgorithm::get_from_type::<H>(u32::from_be_bytes(
-            read_and_advance(data, 4, &mut index).try_into().unwrap(),
-        ))
-        .unwrap();
+        let lmots_parameter =
+            LmotsAlgorithm::get_from_type::<H>(read_u32_and_advance(data, &mut index)?)?;
 
-        let signature_randomizer = read_and_advance(data, H::OUTPUT_SIZE as usize, &mut index);
+        let signature_randomizer = read_and_advance(data, H::OUTPUT_SIZE as usize, &mut index)?;
 
         let signature_data = read_and_advance(
             data,
             (H::OUTPUT_SIZE * lmots_parameter.get_num_winternitz_chains()) as usize,
             &mut index,
-        );
+        )?;
 
         Some(Self {
             signature_randomizer,

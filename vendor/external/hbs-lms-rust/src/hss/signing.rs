@@ -12,13 +12,12 @@ use crate::{
         definitions::{InMemoryLmsPublicKey, LmsPublicKey},
         signing::{InMemoryLmsSignature, LmsSignature},
     },
-    util::helper::read_and_advance,
+    util::helper::read_u32_and_advance,
     HashChain,
 };
 
 use super::definitions::HssPrivateKey;
 
-use core::convert::TryInto;
 use tinyvec::ArrayVec;
 
 #[derive(PartialEq)]
@@ -142,21 +141,48 @@ impl<'a, H: HashChain> PartialEq<HssSignature<H>> for InMemoryHssSignature<'a, H
 }
 
 impl<'a, H: HashChain> InMemoryHssSignature<'a, H> {
+    /// Parse an HSS signature (RFC 8554 §6.1): the level, that many signed public keys, then
+    /// the bottom-tree signature. Total since HashKinetics RZ-1 (external report 2026-10-14):
+    /// the first read used to be an unchecked slice (an empty input panicked right here), and
+    /// `level` — a field the sender chooses — drove pushes into a fixed array of
+    /// `MAX_ALLOWED_HSS_LEVELS - 1` slots that panics when full, so a blob announcing eight
+    /// well-formed levels panicked too. A level that cannot belong to any key is refused
+    /// before anything is read; every read is bounds-checked.
     pub fn new(data: &'a [u8]) -> Option<Self> {
         let mut index = 0;
 
-        let level =
-            u32::from_be_bytes(read_and_advance(data, 4, &mut index).try_into().unwrap()) as usize;
+        let level = read_u32_and_advance(data, &mut index)? as usize;
+        if level > MAX_ALLOWED_HSS_LEVELS - 1 {
+            return None;
+        }
 
         let mut signed_public_keys = ArrayVec::new();
 
         for _ in 0..level {
-            let signed_public_key = InMemoryHssSignedPublicKey::<'a, H>::new(&data[index..])?;
-            index += signed_public_key.len();
+            let signed_public_key = InMemoryHssSignedPublicKey::<'a, H>::new(data.get(index..)?)?;
+            index = index.checked_add(signed_public_key.len())?;
             signed_public_keys.push(Some(signed_public_key));
         }
 
-        let signature = InMemoryLmsSignature::<'a, H>::new(&data[index..])?;
+        let signature = InMemoryLmsSignature::<'a, H>::new(data.get(index..)?)?;
+
+        // RZ-1, strictness: the signature must END with the bottom-tree signature. Bytes
+        // after it used to be ignored, so one valid signature verified under infinitely many
+        // byte strings; a signature with anything appended is refused now.
+        let bottom_len = lms_signature_length(
+            signature
+                .lmots_signature
+                .lmots_parameter
+                .get_hash_function_output_size(),
+            signature
+                .lmots_signature
+                .lmots_parameter
+                .get_num_winternitz_chains() as usize,
+            signature.lms_parameter.get_tree_height() as usize,
+        );
+        if index.checked_add(bottom_len)? != data.len() {
+            return None;
+        }
 
         Some(Self {
             level,
@@ -203,6 +229,8 @@ impl<H: HashChain> HssSignedPublicKey<H> {
 }
 
 impl<'a, H: HashChain> InMemoryHssSignedPublicKey<'a, H> {
+    /// Parse one HSS level: an LMS signature over the next level's LMS public key, then that
+    /// public key. Total since HashKinetics RZ-1 (every read bounds-checked).
     pub fn new(data: &'a [u8]) -> Option<Self> {
         let sig = InMemoryLmsSignature::new(data)?;
 
@@ -216,7 +244,7 @@ impl<'a, H: HashChain> InMemoryHssSignedPublicKey<'a, H> {
             sig.lms_parameter.get_tree_height() as usize,
         );
 
-        let public_key = InMemoryLmsPublicKey::new(&data[sig_size..])?;
+        let public_key = InMemoryLmsPublicKey::new(data.get(sig_size..)?)?;
 
         Some(Self { sig, public_key })
     }

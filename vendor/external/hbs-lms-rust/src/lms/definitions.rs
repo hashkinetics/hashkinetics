@@ -5,10 +5,9 @@ use crate::lm_ots::parameters::{LmotsAlgorithm, LmotsParameter};
 use crate::lms::helper::get_tree_element;
 use crate::lms::parameters::LmsAlgorithm;
 use crate::lms::MutableExpandedAuxData;
-use crate::util::helper::read_and_advance;
+use crate::util::helper::{read_and_advance, read_u32_and_advance};
 use crate::{lm_ots, Seed};
 
-use core::convert::TryInto;
 use tinyvec::ArrayVec;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -118,29 +117,23 @@ impl<'a, H: HashChain> PartialEq<LmsPublicKey<H>> for InMemoryLmsPublicKey<'a, H
 }
 
 impl<'a, H: HashChain> InMemoryLmsPublicKey<'a, H> {
+    /// Parse an LMS public key (RFC 8554 §5.4.2). Total since HashKinetics RZ-1: the
+    /// intermediate public keys of an HSS signature arrive inside the signature, off the wire.
     pub fn new(data: &'a [u8]) -> Option<Self> {
-        // Parsing like desribed in 5.4.2
         let mut data_index = 0;
 
-        let lms_parameter = LmsAlgorithm::get_from_type(u32::from_be_bytes(
-            read_and_advance(data, 4, &mut data_index)
-                .try_into()
-                .unwrap(),
-        ))?;
-        let lmots_parameter = LmotsAlgorithm::get_from_type(u32::from_be_bytes(
-            read_and_advance(data, 4, &mut data_index)
-                .try_into()
-                .unwrap(),
-        ))?;
-        let lms_tree_identifier = read_and_advance(data, 16, &mut data_index);
-        let key = read_and_advance(data, H::OUTPUT_SIZE.into(), &mut data_index);
+        let lms_parameter = LmsAlgorithm::get_from_type(read_u32_and_advance(data, &mut data_index)?)?;
+        let lmots_parameter =
+            LmotsAlgorithm::get_from_type(read_u32_and_advance(data, &mut data_index)?)?;
+        let lms_tree_identifier = read_and_advance(data, 16, &mut data_index)?;
+        let key = read_and_advance(data, H::OUTPUT_SIZE.into(), &mut data_index)?;
 
         Some(Self {
             lmots_parameter,
             lms_parameter,
             lms_tree_identifier,
             key,
-            complete_data: &data[..data_index],
+            complete_data: data.get(..data_index)?,
         })
     }
 

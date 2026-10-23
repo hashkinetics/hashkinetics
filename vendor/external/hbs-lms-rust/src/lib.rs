@@ -97,6 +97,11 @@ pub use signature::{self};
 
 #[doc(hidden)]
 pub use crate::constants::MAX_HASH_SIZE;
+/// The longest HSS signature this build can represent (eight levels of the tallest trees);
+/// HashKinetics RZ-1 (2026-10-22): the consensus verifier refuses anything longer before
+/// parsing, so the bound is public.
+#[doc(hidden)]
+pub use crate::constants::MAX_HSS_SIGNATURE_LENGTH;
 #[doc(hidden)]
 pub use crate::hss::reference_impl_private_key::Seed;
 
@@ -122,7 +127,6 @@ use core::convert::TryFrom;
 use signature::Error;
 use tinyvec::ArrayVec;
 
-use constants::MAX_HSS_SIGNATURE_LENGTH;
 
 /**
  * Implementation of [`signature::Signature`].

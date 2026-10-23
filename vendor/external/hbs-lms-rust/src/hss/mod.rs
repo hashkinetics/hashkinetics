@@ -596,6 +596,168 @@ mod tests {
         assert!(expanded.is_some(), "the cache must validate from the oversized buffer");
     }
 
+    /// HashKinetics RZ-1 (external report 2026-10-14; fixed 2026-10-22): `hss_verify` is called
+    /// with bytes straight off the consensus wire, so the in-memory parsers must REFUSE a
+    /// malformed signature, never panic. Before the fix an empty input panicked on the first
+    /// read, a 10-byte prefix on the second, a full-length blob with an unknown type code on an
+    /// `unwrap`, and a level of eight well-formed signed public keys on an `ArrayVec::push`.
+    /// This pins the parser itself: every prefix of a real two-level signature, every bogus
+    /// level, bogus type codes in both trees, a leaf number beyond the tree, the overflow
+    /// blob, and five hundred pseudo-random blobs are all `Err` — and the real signature still
+    /// verifies after each of them.
+    #[test]
+    fn rz1_hss_verify_refuses_malformed_signatures_without_panicking() {
+        type H = Shake256_256;
+        let seed = gen_random_seed::<H>();
+        let parameters = [
+            HssParameter::new(LmotsAlgorithm::LmotsW2, LmsAlgorithm::LmsH5),
+            HssParameter::new(LmotsAlgorithm::LmotsW2, LmsAlgorithm::LmsH5),
+        ];
+        let (mut signing_key, verifying_key) =
+            hss_keygen::<H>(&parameters, &seed, None).expect("keygen");
+        let message = b"hk/v1/consensus-vote prevote h=7 r=0";
+        let good: Vec<u8> = signing_key.try_sign(message).expect("sign").as_ref().to_vec();
+        let pk = verifying_key.as_slice();
+        let ok = |sig: &[u8]| hss_verify::<H>(message, sig, pk).is_ok();
+        assert!(ok(&good), "the real signature verifies");
+
+        // Two W2/H5 trees over a 32-byte hash: 4 + (4460 + 56) + 4460 bytes.
+        let lmots_len = 4 + 32 + 32 * 133;
+        let lms_sig_len = 4 + lmots_len + 4 + 32 * 5;
+        let lms_pk_len = 4 + 4 + 16 + 32;
+        assert_eq!(good.len(), 4 + (lms_sig_len + lms_pk_len) + lms_sig_len);
+
+        // Every prefix, the empty one included (the reporter's two panics were n = 0 and n = 10).
+        for n in 0..good.len() {
+            assert!(!ok(&good[..n]), "a {}-byte prefix must be refused", n);
+        }
+        // One byte past the end still refuses (nothing consumes it, but the verdict must hold).
+        let mut longer = good.clone();
+        longer.push(0);
+        assert!(!ok(&longer));
+
+        // The level field (bytes 0..4): anything but the real one is refused, including the
+        // values that used to overflow the signed-public-key array.
+        for level in [0u32, 2, 7, 8, 9, 1_000, u32::MAX] {
+            let mut bad = good.clone();
+            bad[..4].copy_from_slice(&level.to_be_bytes());
+            assert!(!ok(&bad), "level {} must be refused", level);
+        }
+        // Eight well-formed levels: level = 8, eight (signature + public key) pairs that each
+        // parse, then a bottom signature — the push into a 7-slot array that used to panic.
+        let signed_pk = &good[4..4 + lms_sig_len + lms_pk_len];
+        let bottom = &good[4 + lms_sig_len + lms_pk_len..];
+        let mut overflow = 8u32.to_be_bytes().to_vec();
+        for _ in 0..8 {
+            overflow.extend_from_slice(signed_pk);
+        }
+        overflow.extend_from_slice(bottom);
+        assert!(!ok(&overflow), "a level-8 blob must be refused, not overflow the array");
+        // Seven levels parse into the array and are then refused by the level check in verify.
+        let mut seven = 7u32.to_be_bytes().to_vec();
+        for _ in 0..7 {
+            seven.extend_from_slice(signed_pk);
+        }
+        seven.extend_from_slice(bottom);
+        assert!(!ok(&seven));
+
+        // Bogus type codes at full length: the top tree's LM-OTS type (bytes 8..12), its LMS
+        // type (after the LM-OTS signature), and both in the bottom tree.
+        let top_lms_type_at = 4 + 4 + lmots_len;
+        let bottom_at = 4 + lms_sig_len + lms_pk_len;
+        for at in [8, top_lms_type_at, bottom_at + 4, bottom_at + 4 + 4 + lmots_len] {
+            for code in [0u32, 3, 4, 99, u32::MAX] {
+                let mut bad = good.clone();
+                bad[at..at + 4].copy_from_slice(&code.to_be_bytes());
+                assert!(!ok(&bad), "type code {} at {} must be refused", code, at);
+            }
+        }
+        // A leaf number beyond an H5 tree (bytes 4..8 of the top signature; and the bottom one).
+        for at in [4, bottom_at] {
+            let mut bad = good.clone();
+            bad[at..at + 4].copy_from_slice(&32u32.to_be_bytes());
+            assert!(!ok(&bad));
+            bad[at..at + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+            assert!(!ok(&bad));
+        }
+
+        // Pseudo-random blobs (xorshift, fixed seed): never a panic, never a false accept.
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        // (a) Random bytes, random length; two of three get a level the bound admits
+        //     (0..=2), so the readers below the level see random input too.
+        for i in 0..500u32 {
+            let len = (next() % 12_000) as usize;
+            let mut blob: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            if i % 3 != 0 && blob.len() >= 4 {
+                blob[..4].copy_from_slice(&(i % 3).to_be_bytes());
+            }
+            assert!(!ok(&blob));
+        }
+        // (b) Every (LM-OTS, LMS) parameter pair at its own length, valid type codes, a leaf
+        //     inside the tree, random everything else, as a level-0 signature: the parser
+        //     accepts the shape; verify refuses it at the level compare (0 + 1 != 2).
+        for (wt, chains) in [(1u32, 265usize), (2, 133), (3, 67), (4, 34)] {
+            for (ht, height) in [(5u32, 5usize), (6, 10), (7, 15), (8, 20), (9, 25)] {
+                let lmots = 4 + 32 + 32 * chains;
+                let len = 4 + 4 + lmots + 4 + 32 * height;
+                for _ in 0..5 {
+                    let mut blob: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+                    blob[..4].copy_from_slice(&0u32.to_be_bytes());
+                    let leaf = (next() % (1u64 << height)) as u32;
+                    blob[4..8].copy_from_slice(&leaf.to_be_bytes());
+                    blob[8..12].copy_from_slice(&wt.to_be_bytes());
+                    let lms_at = 4 + 4 + lmots;
+                    blob[lms_at..lms_at + 4].copy_from_slice(&ht.to_be_bytes());
+                    assert!(!ok(&blob), "W type {} / H type {} random content must be refused", wt, ht);
+                }
+            }
+        }
+        // (c) The real two-level shape with every non-structural field randomised (both
+        //     randomizers, every chain, both paths, the intermediate key's tree id and root),
+        //     both leaves kept inside their trees: the parser accepts it, the top-tree
+        //     LM-OTS verify runs on random data and refuses it. Two hundred times.
+        let top_leaf_at = 4;
+        let top_lms_type_at = 4 + 4 + lmots_len;
+        let pk_at = 4 + lms_sig_len;
+        let bottom_leaf_at = bottom_at;
+        let bottom_type_at = bottom_at + 4;
+        let bottom_lms_type_at = bottom_at + 4 + 4 + lmots_len;
+        let keep = |i: usize| -> bool {
+            i < 4
+                || (8..12).contains(&i)
+                || (top_lms_type_at..top_lms_type_at + 4).contains(&i)
+                || (pk_at..pk_at + 8).contains(&i)
+                || (bottom_type_at..bottom_type_at + 4).contains(&i)
+                || (bottom_lms_type_at..bottom_lms_type_at + 4).contains(&i)
+        };
+        for _ in 0..200 {
+            let mut blob = good.clone();
+            for i in 0..blob.len() {
+                if !keep(i) {
+                    blob[i] = next() as u8;
+                }
+            }
+            blob[top_leaf_at..top_leaf_at + 4].copy_from_slice(&((next() % 32) as u32).to_be_bytes());
+            blob[bottom_leaf_at..bottom_leaf_at + 4].copy_from_slice(&((next() % 32) as u32).to_be_bytes());
+            assert!(!ok(&blob));
+        }
+        // (d) A real signature with one random byte changed (keeps the length): either
+        //     verdict is fine; it must return.
+        for _ in 0..200 {
+            let mut bad = good.clone();
+            let at = (next() as usize) % bad.len();
+            bad[at] = next() as u8;
+            let _ = ok(&bad);
+        }
+        assert!(ok(&good), "the real signature still verifies");
+    }
+
     #[test]
     fn update_keypair() {
         let message = [
