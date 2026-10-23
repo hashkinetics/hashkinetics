@@ -16,6 +16,9 @@
 //! - spend-tree capacity is 2^h per address (wallet-chosen, ≤ 2^SPEND_TREE_DEPTH); the
 //!   wallet must NEVER reuse an `ots_index` (persist it reserve-then-sign — leaf reuse
 //!   hands the leaf key to anyone who sees both signatures, incl. a delegated prover).
+//! - the spend signature `build_spend_with_path` makes covers `tx_binding = H(credit ‖ fee)` ONLY —
+//!   not the outputs, not the input note — so the `hk-prove` a witness is sent to is trusted with
+//!   the VALUE of the spend until circuit v4 (M-1, reported 2026-10-14).
 
 /// K1/K2 (v0.16.0): keys at rest — the sealed-file envelope shared by the node CLI, the faucet and the GUI wallet.
 pub mod sealed;

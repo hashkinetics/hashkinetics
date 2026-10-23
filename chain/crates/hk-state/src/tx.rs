@@ -70,7 +70,11 @@ pub enum Tx {
     /// the STARK, not the envelope. Publics: a recent `anchor`, the burned `nullifier`,
     /// the new `out_commitment`, and a transparent `fee` paid to `credit` (the unshield
     /// channel; fee = 0 ⇒ fully shielded transfer). The proof's tx_binding must equal
-    /// H(credit ‖ fee), so a relayer cannot redirect the transparent effects.
+    /// H(credit ‖ fee), so a relayer cannot redirect the transparent effects — the
+    /// TRANSPARENT effects only: the binding (and the owner's WOTS signature inside the
+    /// proof) covers neither output commitment nor the input note, so whoever builds the
+    /// proof from the witness — the prover — chooses the outputs, and this state machine
+    /// cannot tell (M-1, reported 2026-10-14; circuit v4, pending, widens the signed statement).
     ShieldedSpend {
         anchor: H256,
         nullifier: H256,

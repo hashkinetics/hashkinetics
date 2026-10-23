@@ -179,7 +179,7 @@ Conservation is tracked publicly in aggregate only: the pool's `total_shielded` 
 
 **ShieldedSpend.** Publishes `(anchor, nf, cm₁, cm₂, fee, credit?, mandate?)` plus a proof (or aggregate coverage, §8.3). Value equation: `v_in = v_out1 + v_out2 + fee` — payment plus change plus an optional public component. `fee > 0` with a `credit` account is the **unshield channel**; `fee = 0` is a fully shielded transfer. Spends are **proof-carrying and relayable**: any account may carry the envelope, because authority lives in the proof, not the envelope signature.
 
-**The binding rule (anti-malleability).** The circuit commits to `tx_binding = H_bind(credit ‖ fee)`, and the chain *derives the expected public statement from the transaction's own fields* before verifying. A relayer that alters where unshielded value lands changes the expectation and the proof no longer verifies. Nothing about the public effects of a spend is malleable in transit.
+**The binding rule (anti-malleability).** The circuit commits to `tx_binding = H_bind(credit ‖ fee)`, and the chain *derives the expected public statement from the transaction's own fields* before verifying. A relayer that alters where unshielded value lands changes the expectation and the proof no longer verifies. Nothing about the public effects of a spend is malleable in transit — by a relayer. The rule says nothing about the prover: the signature inside the proof covers only `credit ‖ fee`, so whoever holds the spend witness (a delegated prover) is trusted with the spend's value until circuit v4 (M-1, reported 2026-10-14; §15.2).
 
 ### 7.4 Addresses and spend authority: the spend tree
 
@@ -191,7 +191,7 @@ tag = H_addr( spend_root ‖ H_nk(nk) )
 
 binding two secrets' fingerprints: the root of the holder's **spend tree** and the hash of the nullifier key. A spend tree is a Merkle tree (protocol depth 10) over WOTS one-time public keys, all derived from the wallet's master seed; wallets choose an actual capacity `2^h ≤ 2^10` and pad with a precomputed empty ladder, making addresses cheap to generate and rotate. Spending note `n` under `tag`:
 
-1. The wallet signs the spend statement digest with the next unused WOTS leaf (reserve-then-sign; the leaf index persists before signing).
+1. The wallet signs the transaction binding `tx_binding = H_bind(credit ‖ fee)` — not the whole statement: the outputs and the input note are bound by the proof, not by this signature, until circuit v4 (M-1) — with the next unused WOTS leaf (reserve-then-sign; the leaf index persists before signing).
 2. **In-circuit**, the WOTS public key is *recovered from the signature itself* (chains completed to their ends; the checksum blocks walk-forward forgery) — no public key travels in the witness, which cut witness size by ~85% during development.
 3. The recovered key is folded up the spend tree along an authentication path to `spend_root`, and the circuit checks `tag = H_addr(spend_root ‖ H_nk(nk))` against the note's owner field.
 
@@ -203,7 +203,7 @@ Public inputs: `(anchor, nf, cm₁, cm₂, fee, tx_binding)`. Witness: input not
 
 ```
 cm_in  = H_note(v ‖ tag ‖ ρ ‖ rcm)          and  Merkle(cm_in, path) = anchor
-wots_pk = Recover(sig, digest)               and  Fold(wots_pk, ots_path) = spend_root
+wots_pk = Recover(sig, tx_binding)           and  Fold(wots_pk, ots_path) = spend_root
 tag    = H_addr(spend_root ‖ H_nk(nk))       (ownership binds to BOTH secrets)
 nf     = H_nf(nk ‖ ρ)                        (secret-key nullifier)
 cm₁    = H_note(out₁),  cm₂ = H_note(out₂)   (two outputs: payment + change)
@@ -383,11 +383,11 @@ Harvest-now-decrypt-later touches only the confidentiality column, and the doctr
 
 ### 15.2 Protocol-level defenses
 
-Double-spends: the forever nullifier set (replays refused, receipt-named). Proof forgery: raw STARK soundness plus byte-exact public-statement derivation — a proof is checked against what the *chain* says the transaction claims, never against prover-supplied statements. Malleability: the binding rule (§7.3). Inflation: the mint proof plus the public conservation ledger. State divergence: consensus-fatal by value-id binding (§5.2). Stateful-signature hazards: inverted into consensus rules and reserve-then-sign persistence (§2 D-6, §5.3). Lying ciphertexts: re-commitment checks at scan. Aggregate smuggling: coverage keys derive from chain-derived statements; kind, key, order, and count are digest-bound. Wire/domain confusion: signing digests are codec-independent; every hash is domain-tagged.
+Double-spends: the forever nullifier set (replays refused, receipt-named). Proof forgery: raw STARK soundness plus byte-exact public-statement derivation — a proof is checked against what the *chain* says the transaction claims, never against prover-supplied statements. Malleability: the binding rule (§7.3) — against a relayer; against the prover that holds the witness, circuit v4 (M-1, 2026-10-14: until then the prover is trusted with the value of every spend it proves). Inflation: the mint proof plus the public conservation ledger. State divergence: consensus-fatal by value-id binding (§5.2). Stateful-signature hazards: inverted into consensus rules and reserve-then-sign persistence (§2 D-6, §5.3). Lying ciphertexts: re-commitment checks at scan. Aggregate smuggling: coverage keys derive from chain-derived statements; kind, key, order, and count are digest-bound. Wire/domain confusion: signing digests are codec-independent; every hash is domain-tagged.
 
 ### 15.3 Assurance
 
-Three independent audit tracks (consensus + state machine; STARK circuits; the stateful-key manager) gate mainnet-critical claims, with trust boundaries, a crypto inventory with KAT status, and eight consensus-critical invariants pre-mapped in the audit scope. Residual disclosures the network maintains in public: GPU-class hardware is assumed for agent-side proving; development numbers are single-machine WSL2 measurements; in-circuit WOTS awaits its full KAT campaign; the disclosure-completeness problem is open and stated as such.
+Three independent audit tracks (consensus + state machine; STARK circuits; the stateful-key manager) gate mainnet-critical claims, with trust boundaries, a crypto inventory with KAT status, and eight consensus-critical invariants pre-mapped in the audit scope. Residual disclosures the network maintains in public: GPU-class hardware is assumed for agent-side proving, and the delegated prover a wallet uses instead is trusted with the value of every spend it proves until circuit v4 (M-1); development numbers are single-machine WSL2 measurements; in-circuit WOTS awaits its full KAT campaign; the disclosure-completeness problem is open and stated as such.
 
 ---
 

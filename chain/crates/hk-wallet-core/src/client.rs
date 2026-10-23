@@ -166,7 +166,9 @@ impl Http {
         }
     }
 
-    /// `prove_mint` / `prove_spend` on the public prover. Core-mode STARKs can take a while —
+    /// `prove_mint` / `prove_spend` on the configured prover, which receives the whole witness and is
+    /// trusted with the value of the spend until circuit v4 (M-1; see `PROVER_DEFAULT`). Core-mode
+    /// STARKs can take a while —
     /// long timeout; the caller runs off the UI thread. Returns (proof bytes, prove_ms).
     pub fn prove(&self, method: &str, witness: Value) -> Result<(Vec<u8>, u64), WalletError> {
         let prover = &self.ep.prover;

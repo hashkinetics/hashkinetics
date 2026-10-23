@@ -4,6 +4,10 @@
 //! proof (hex bincode of `SP1ProofWithPublicValues`) that any hk-node with the matching
 //! verifying key accepts. Every proof is self-verified here before it is returned.
 //!
+//! Trust (M-1, reported 2026-10-14): a spend witness carries nk, both output openings and a WOTS
+//! signature over `credit ‖ fee` only, so this service — its operator, or whoever compromises the
+//! host — is trusted with the VALUE of every spend it proves until circuit v4. Run your own.
+//!
 //! Protocol: POST any path, JSON body {"method": ..., "params": {...}}:
 //!   health                          -> {ok, mode}
 //!   vks                             -> {spend_vk, mint_vk}          (hex bincode SP1VerifyingKey)

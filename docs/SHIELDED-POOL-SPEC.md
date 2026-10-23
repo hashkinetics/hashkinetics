@@ -107,8 +107,18 @@ changes, unlinkably.
 
 Why the sender can't steal or claw back: the sender pays a PUBLIC tag; producing a spend
 requires a WOTS signature whose recovered key folds to `spend_root` — only the master-seed
-holder can do that. The KEM shared secret (which the sender also knows) carries no spend
-authority whatsoever.
+holder can do that (and that signature authorises less than the whole spend — M-1, next
+paragraph). The KEM shared secret (which the sender also knows) carries no spend authority
+whatsoever.
+
+Who CAN redirect a spend today (M-1, reported 2026-10-14 by Tuan Berdasi; wording corrected
+2026-10-23): the **prover**. The WOTS signature in a spend witness signs `credit ‖ fee` only
+(§7), so whoever holds the witness — a delegated prover, or whoever compromises it — can re-point
+both output notes to notes of its own (any split of the same total — conservation constrains only
+the sum), later spend the change note with the same signature (silently so for a fully shielded
+spend, whose binding is a chain-wide constant; an unshield's signature reuses only on a spend that
+repeats its credit and fee), and still produce a proof the chain accepts (§6, §13). Circuit v4 closes it by signing the whole
+statement; until then, trust the prover you point the wallet at, or run your own `hk-prove`.
 
 ## 5 · The commitment tree (consensus state)
 
@@ -136,10 +146,24 @@ nf = SHA-256( DOM_NF ‖ nk ‖ rho )
 The circuit proves nk belongs to the note's address (via the tag binding, §7). Since the
 sender of a note knows rho but never nk, **nobody except the owner can precompute a
 note's nullifier or watch for its spend** (the classic sender-tracking leak, closed —
-review flag 1, 2026-08-17). Residual exposure: a spend WITNESS contains nk + one WOTS
-signature; an untrusted delegated prover therefore sees them. Posture: **local proving**
-(GPU-class agent hardware is the documented G2 requirement); nk sits on the viewing side
-of the P2.2 IVK/OVK split.
+review flag 1, 2026-08-17). **Exposure to the prover (M-1, reported 2026-10-14 by Tuan Berdasi;
+this paragraph corrected 2026-10-23 — it used to say the prover only "sees" nk):** a spend WITNESS
+contains nk, the openings of both output notes and one WOTS signature over `credit ‖ fee` ALONE.
+A delegated prover is therefore trusted with the **value** of every spend it proves, not only with
+its privacy: it can re-point the payment and the change to notes of its own and submit that proof
+first (the victim's own spend then fails as a double-spend), and it can spend the victim's change
+note later with the same signature — for a fully shielded spend (fee 0) the binding is a chain-wide
+constant, so one signature authorises any later note of that address whose opening the holder knows.
+The chain cannot tell a redirected proof from an honest one (§7). Every shipped wallet hands the
+whole witness to a delegated `hk-prove` — the Windows wallet and the Android app by default to the
+issuer-operated public one, the CLI wallet and the demos to one at `127.0.0.1:9911` on your own
+machine — and none proves in-process; running your own `hk-prove` is the only way to keep that trust
+in your own hands. Fix: circuit v4 (sketched in
+`YELLOWPAPER.md` §19.19; §8 below is the v3 statement) — the signature covers the nullifier, both
+output commitments, the credit account and the fee, computed inside the circuit; a new verifying key,
+so on testnet-1 only through the planned verifying-key schedule (v0.20.0) and on mainnet the genesis
+pin. nk sits on the viewing side of the
+P2.2 IVK/OVK split.
 
 ## 7 · Transactions and chain rules
 
@@ -165,9 +189,13 @@ SpendPublic { merkle_root = anchor, nullifier, out_commitment, out2_commitment,
 ```
 
 The **binding rule** puts the transparent effects INSIDE the proof: a relayer cannot
-redirect the unshielded value or alter the fee without breaking the STARK (and the WOTS
-signature signs the same binding — non-malleable end to end). Effects: insert nullifier,
-append BOTH output commitments (in order), credit fee, `total_shielded −= fee`.
+redirect the unshielded value or alter the fee without breaking the STARK. What the binding
+does NOT cover (M-1, corrected 2026-10-23 — this paragraph used to claim "non-malleable end to
+end"): the two output commitments and the input note. The WOTS signature signs `credit ‖ fee`
+only, so the party that builds the proof from the witness — the prover — chooses the outputs; the
+chain derives the expected statement from the transaction's own fields and accepts any genuine
+proof. Non-malleable against a RELAYER, not against the PROVER, until circuit v4 (§6). Effects:
+insert nullifier, append BOTH output commitments (in order), credit fee, `total_shielded −= fee`.
 
 `stealth_ct*` are **advisory**: consensus stores and gossips them, scanners read them, a
 lying blob only hurts its sender (§9). Failed transactions mutate NOTHING (including the
@@ -256,11 +284,15 @@ verifier config is node-local; replays must apply the same config timeline).
 - Any vk change (v2→v3 happened 2026-08-17) requires: prover restart, node vk refetch
   (devnet) / genesis pin update (mainnet), fresh witness shapes in wallets.
 
-## 13 · Known limits (deliberate, dated 2026-09-14)
+## 13 · Known limits (dated 2026-09-14; deliberate unless marked as a reported finding)
 
 Whole-state hash commitment (no Merkleized state yet) · node-level indexes partly in
-memory · delegated proving exposes the witness to the prover (local proving is the
-deployment posture) · trial-decap scanning is O(outputs) (OMR later) · stealth randomness
+memory · delegated proving hands the prover the whole witness and with it the VALUE of the
+spend — a prover can redirect both outputs and spend the change note later, undetectably
+(M-1, reported 2026-10-14 — a finding, not a design choice; circuit v4 closes it); no shipped
+wallet proves in-process — the Windows and Android wallets default to the issuer's public prover,
+the CLI and the demos to an `hk-prove` on your own machine — so until v4 the posture is: trust the
+prover you point the wallet at, or run your own `hk-prove` (§6) · trial-decap scanning is O(outputs) (OMR later) · stealth randomness
 is caller-supplied (demo deterministic; production = CSPRNG) · vk pins optional on devnets,
 mandatory on a pinned genesis (`networks/testnet-1/vks.json`) · nothing audited (see
 `docs/AUDIT-SCOPE.md`).

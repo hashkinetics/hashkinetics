@@ -159,12 +159,16 @@ pub struct SpendWitness {
     /// Output 2 — the change (zero-value dummy when not needed).
     pub out2_note: Note,
     pub fee: u64,
-    /// Message the spend signature authorizes (binds this proof to one transaction).
+    /// Message the spend signature authorizes: `H(credit ‖ fee)` (see `tx_binding_for`) — it binds
+    /// the transparent effects, not the outputs and not this input note; for fee 0 it is a chain-wide
+    /// constant (M-1).
     pub tx_binding: Hash,
 }
 
 /// What the proof reveals (and the chain checks): the anchor it spent under, the nullifier
-/// it burns, the two notes it creates, the fee, and the tx it is bound to.
+/// it burns, the two notes it creates, the fee, and the transparent effects it is bound to
+/// (`tx_binding` — the outputs are bound by the proof, not by the owner's signature, until
+/// circuit v4; M-1).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpendPublic {
     pub merkle_root: Hash,
@@ -458,6 +462,12 @@ pub fn empty_roots() -> [Hash; TREE_DEPTH + 1] {
 /// is the transparent account the public `fee` is paid to (all-zero when the spend is fully
 /// shielded). Because the binding sits INSIDE the proof, the transparent effects are
 /// non-malleable: a relayer cannot redirect the unshielded value without breaking the proof.
+/// What it does NOT cover (M-1, reported 2026-10-14): the output commitments and the input
+/// note — the WOTS signature authorises `credit ‖ fee` only, so a prover holding the witness
+/// can choose the outputs (and reuse the signature against another note of the same address)
+/// and the chain cannot tell. Circuit v4 (pending; `YELLOWPAPER.md` §19.19) will sign a digest over
+/// nullifier ‖ out ‖ out2 ‖ credit ‖ fee computed in-circuit; until then the prover is trusted
+/// with the value it proves.
 pub fn tx_binding_for(credit_account: &Hash, fee: u64) -> Hash {
     sha(&[&[DOM_TXBIND], credit_account, &fee.to_le_bytes()])
 }

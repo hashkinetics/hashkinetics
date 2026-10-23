@@ -10,7 +10,7 @@ Do not open public issues for security-relevant findings.
 
 - Acknowledgement within **48 hours**, an assessment within **7 days**.
 - **Coordinated disclosure:** give us **90 days** (or agree a timeline with us) before
-  any public disclosure. We credit reporters in the release notes and the CHANGELOG (as for R15 — Eddy, an external operator; R16 — an independent researcher, named as soon as they say so; R17 — Alboy, with M-1 and L-1 also reported independently by Mansor; R18 — secwatch-hunt; RZ-1 — Reza)
+  any public disclosure. We credit reporters in the release notes and the CHANGELOG (as for R15 — Eddy, an external operator; R16 — an independent researcher, named as soon as they say so; R17 — Alboy, with its M-1 and L-1 (the voting-power bound, the atomic write) also reported independently by Mansor; R18 — secwatch-hunt; RZ-1 — Reza; M-1, the prover trust model — Tuan Berdasi, the documents corrected 2026-10-23 and the circuit change pending)
   unless you prefer anonymity.
 - Testnet findings are in scope and valued — that is what the testnet is *for*.
 
@@ -27,7 +27,11 @@ height 1,872,500); R18, reported 2026-10-04 by secwatch-hunt, fixed in v0.19.8 (
 hashing bounded; consensus rule at testnet-1 height 2038500); RZ-1, reported 2026-10-14 by Reza,
 fixed in v0.19.9 (a malformed consensus signature is refused, never a
 panic — the vendored parser made total, length gates at decode and before parsing, a panic
-boundary around the verify; client-only, every node restarts on it)), the spend/mint circuits and aggregation digests (`zkvm-bakeoff/circuit`),
+boundary around the verify; client-only, every node restarts on it)), the spend/mint circuits and
+aggregation digests (`zkvm-bakeoff/circuit` — M-1, reported 2026-10-14 by Tuan Berdasi: the spend
+signature covers only `credit ‖ fee`, so until circuit v4 the prover a wallet sends its witness to is
+trusted with the value of every spend it proves — the documents corrected 2026-10-23, the circuit
+change on testnet-1 through the planned verifying-key schedule and on mainnet at the genesis pin),
 the durable store and replay path (`hk-node/src/store.rs`, `state.rs`), the disclosure
 machinery (`hk-wallet`), and the Node Key sale contract `HKNodeKey` (Ethereum mainnet
 `0x36edb45c4610AE2A7FE6334343D9D958Fb81EC84`, source verified on Etherscan and Sourcify;

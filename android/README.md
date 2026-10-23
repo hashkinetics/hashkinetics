@@ -53,7 +53,7 @@ Before a wallet exists: Welcome (create / restore). While the files are sealed: 
 
 ## What it does NOT do (yet)
 
-No in-app proving (proofs are made on the public prover; a shielded operation takes a minute or two), no
+No in-app proving (proofs are made on the public prover — a shielded operation takes a minute or two; until the circuit change that prover is trusted with the value of each spend it proves, and this app has no prover field yet, the URL is a build constant — `docs/WALLET-GUIDE.md` §14), no
 QR *scanning* of addresses (the camera; a later build), no biometric release of the key file (a later build: `setUserAuthenticationRequired`),
 no push notifications, no iOS. Unaudited testnet software — test units only.
 

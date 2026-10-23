@@ -52,6 +52,9 @@ pub const CORE_VERSION: &str = "v0.2.0";
 
 pub const RPC_DEFAULT: &str = "https://rpc.hashkinetics.org";
 pub const FAUCET_DEFAULT: &str = "https://faucet.hashkinetics.org";
+/// The issuer-operated public prover. It receives the whole spend witness and, until circuit v4, is
+/// trusted with the value of every spend it proves (M-1, reported 2026-10-14) — point `Endpoints::prover`
+/// at your own `hk-prove` to keep that trust in your own hands.
 pub const PROVER_DEFAULT: &str = "https://prover.hashkinetics.org";
 pub const EXPLORER_DEFAULT: &str = "https://www.hashkinetics.org/explorer/";
 
@@ -79,7 +82,7 @@ impl WalletError {
 }
 
 /// The four services a wallet talks to. Defaults = the public testnet-1 endpoints; a devnet
-/// or a self-hosted prover just points elsewhere.
+/// or a self-hosted prover just points elsewhere (see `PROVER_DEFAULT` for why you might).
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct Endpoints {
     pub rpc: String,

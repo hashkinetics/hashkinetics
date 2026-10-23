@@ -1372,7 +1372,8 @@ impl State {
     /// SHIELDED SPEND: the envelope's sender is just the RELAYER — authority comes from
     /// the proof (membership under `anchor`, fresh `nullifier`, value conservation) and
     /// the in-proof tx_binding pins the transparent effects (credit, fee) against
-    /// malleability. Verified against the public inputs THE CHAIN derives, never the tx's
+    /// malleability — and only those: see `Tx::ShieldedSpend` for what the owner's signature
+    /// does not cover (M-1). Verified against the public inputs THE CHAIN derives, never the tx's
     /// claim of them.
     #[allow(clippy::too_many_arguments)]
     fn do_shielded_spend(
