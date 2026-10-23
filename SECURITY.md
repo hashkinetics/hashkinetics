@@ -10,7 +10,7 @@ Do not open public issues for security-relevant findings.
 
 - Acknowledgement within **48 hours**, an assessment within **7 days**.
 - **Coordinated disclosure:** give us **90 days** (or agree a timeline with us) before
-  any public disclosure. We credit reporters in the release notes and the CHANGELOG (as for R15 — Eddy, an external operator; R16 — an independent researcher, named as soon as they say so; R17 — Alboy, with M-1 and L-1 also reported independently by Mansor; R18 — secwatch-hunt; RZ-1 — an independent researcher, named as soon as they say so)
+  any public disclosure. We credit reporters in the release notes and the CHANGELOG (as for R15 — Eddy, an external operator; R16 — an independent researcher, named as soon as they say so; R17 — Alboy, with M-1 and L-1 also reported independently by Mansor; R18 — secwatch-hunt; RZ-1 — Reza)
   unless you prefer anonymity.
 - Testnet findings are in scope and valued — that is what the testnet is *for*.
 
@@ -24,8 +24,8 @@ write — R16, reported 2026-09-22, fixed in v0.19.4 (released the same day); fo
 floor from the node's own evidence and a reservation window; R17, reported 2026-10-04 by Alboy (read 10-06), nine
 findings fixed in v0.19.6 the same day (the asset-bound mandate rule activates at testnet-1
 height 1,872,500); R18, reported 2026-10-04 by secwatch-hunt, fixed in v0.19.8 (settlement
-hashing bounded; consensus rule at testnet-1 height 2038500); RZ-1, reported 2026-10-14 by an
-independent researcher, fixed in v0.19.9 (a malformed consensus signature is refused, never a
+hashing bounded; consensus rule at testnet-1 height 2038500); RZ-1, reported 2026-10-14 by Reza,
+fixed in v0.19.9 (a malformed consensus signature is refused, never a
 panic — the vendored parser made total, length gates at decode and before parsing, a panic
 boundary around the verify; client-only, every node restarts on it)), the spend/mint circuits and aggregation digests (`zkvm-bakeoff/circuit`),
 the durable store and replay path (`hk-node/src/store.rs`, `state.rs`), the disclosure
