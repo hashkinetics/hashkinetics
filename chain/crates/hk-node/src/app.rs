@@ -131,18 +131,37 @@ pub async fn run(state: &mut HkApp, channels: &mut Channels<HkContext>) -> eyre:
                 info!(%height, %round, "Processing synced value");
 
                 match HkCodec.decode(value_bytes) {
-                    Ok(value) => {
-                        let proposed = malachitebft_app_channel::app::types::ProposedValue {
-                            height,
-                            round,
-                            valid_round: Round::Nil,
-                            proposer,
-                            value,
-                            validity: malachitebft_app_channel::app::types::core::Validity::Valid,
-                        };
-                        state.store_undecided(proposed.clone());
-                        if reply.send(Some(proposed)).is_err() {
-                            error!("Failed to send ProcessSyncedValue reply");
+                    Ok(decoded) => {
+                        let decoded: hk_consensus::HkValue = decoded;
+                        // v0.19.10 (the VZ-2 review): a synced value's id is the hash of its
+                        // bytes, recomputed HERE — never the id carried inside the wire value.
+                        // The commit certificate signs the id, and the engine compares the
+                        // value's id with the certificate's; until v0.19.10 that comparison
+                        // read the carried field, so a sync peer answering our request could
+                        // bind arbitrary bytes to a valid certificate. Rebuilding the value
+                        // from its bytes makes the certificate bind the bytes.
+                        let value = hk_consensus::HkValue::new(decoded.txs.clone());
+                        if value.id != decoded.id {
+                            error!(
+                                %height, %round, carried = %decoded.id, actual = %value.id,
+                                "synced value carries an id that is not the hash of its bytes — refusing"
+                            );
+                            if reply.send(None).is_err() {
+                                error!("Failed to send ProcessSyncedValue reply");
+                            }
+                        } else {
+                            let proposed = malachitebft_app_channel::app::types::ProposedValue {
+                                height,
+                                round,
+                                valid_round: Round::Nil,
+                                proposer,
+                                value,
+                                validity: malachitebft_app_channel::app::types::core::Validity::Valid,
+                            };
+                            state.store_undecided(proposed.clone());
+                            if reply.send(Some(proposed)).is_err() {
+                                error!("Failed to send ProcessSyncedValue reply");
+                            }
                         }
                     }
                     Err(e) => {

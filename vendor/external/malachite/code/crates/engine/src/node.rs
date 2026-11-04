@@ -110,7 +110,20 @@ where
                 );
             }
             SupervisionEvent::ActorFailed(cell, error) => {
-                error!("Actor {} has failed: {error}", cell.get_id());
+                // HK D-13 (v0.19.10): a child actor that FAILED (a panic caught by
+                // ractor) used to be logged and left dead while the process stayed
+                // up — RZ-1 (2026-10-14) showed what that means for a validator: a
+                // dead consensus actor inside a live process is a silently mute
+                // seat that `Restart=always` never recovers. Exit instead: the
+                // supervisor (systemd on every seat) restarts the whole node, the
+                // WAL replays, and the next unknown panic costs a restart, not a
+                // human. Graceful terminations (`ActorTerminated`) are untouched.
+                error!(
+                    "Actor {} has failed: {error} — exiting the process so the service \
+                     supervisor restarts the node (HK D-13)",
+                    cell.get_id()
+                );
+                std::process::exit(70);
             }
             SupervisionEvent::ProcessGroupChanged(_) => (),
         }

@@ -41,6 +41,21 @@ where
         "Processing value response"
     );
 
+    // v0.19.10 (HK): a commit certificate never carries round Nil, and
+    // `get_proposer` → `select_proposer` asserts a defined round BEFORE the
+    // certificate is verified below — so a sync peer answering our own request
+    // could panic the consensus actor with a Nil-round certificate. Refuse it
+    // here (the request times out and is retried elsewhere); the wire decoder
+    // refuses it too.
+    if value.certificate.round.is_nil() {
+        warn!(
+            certificate.height = %cert_height,
+            peer = %value.peer,
+            "Received value response whose certificate carries round Nil, ignoring"
+        );
+        return Ok(());
+    }
+
     let proposer = state
         .get_proposer(cert_height, value.certificate.round)
         .clone();

@@ -48,10 +48,17 @@ const DISCOVERY_METRICS_PREFIX: &str = "malachitebft_discovery";
 // we advertise it in identify's `agent_version`, and the identify handler
 // disconnects any consensus-protocol peer that advertises a MISMATCHED digest.
 //
-// Migration safety: a peer that advertises NO HK genesis tag (a pre-gate build,
-// or a foreign libp2p node) is GRACED — never disconnected — so a one-at-a-time
-// rolling upgrade of the live validator set can't partition it. `protocol_version`
-// is deliberately left unchanged for the same reason.
+// Until v0.19.10 a peer that advertised NO HK genesis tag (a pre-gate build, or
+// a foreign libp2p node) was GRACED — never disconnected — so the first rolling
+// upgrade onto the gate could not partition the live set. Since v0.19.10 the gate
+// FAILS CLOSED: every live seat has carried the tag since v0.19.1, and an untagged
+// stranger was otherwise admitted to the consensus mesh; a peer on another identify
+// protocol version is dropped too (it escaped the gate and the inbound cap before).
+// So since v0.19.10 the identify `protocol_version` and the `hashkinetics/1/genesis/`
+// tag prefix are compatibility keys: a future release that changes either must roll
+// through a graced transition again. `protocol_version` itself is still left
+// unchanged by every hk-node release, so a rolling upgrade across node versions
+// never partitions the running network.
 // ---------------------------------------------------------------------------
 
 /// Our genesis digest, set once by hk-node before `spawn`. `None` until set
@@ -176,6 +183,15 @@ static HK_PEERS: std::sync::OnceLock<std::sync::Mutex<HashMap<libp2p::PeerId, Hk
 /// Consensus-protocol peers refused by the genesis gate since boot (island chains).
 pub static HK_ISLANDS_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// v0.19.10: peers disconnected because they advertised NO HK genesis tag, or an
+/// identify protocol version other than ours, while our digest was set (the gate
+/// fails closed now; until v0.19.10 both were let through).
+pub static HK_UNTAGGED_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// v0.19.10: non-Sync frames refused from the broadcast (libp2p-scatter) carrier
+/// while consensus runs over gossipsub (see `handle_broadcast_event`).
+pub static HK_BROADCAST_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn hk_peer_table() -> &'static std::sync::Mutex<HashMap<libp2p::PeerId, HkPeer>> {
     HK_PEERS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
@@ -198,6 +214,17 @@ pub fn hk_peers() -> Vec<HkPeer> {
 /// Island chains refused since boot (see `HK_ISLANDS_REFUSED`).
 pub fn hk_islands_refused() -> u64 {
     HK_ISLANDS_REFUSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// v0.19.10: peers dropped for carrying no HK genesis tag or another identify
+/// protocol version (the gate fails closed), since boot.
+pub fn hk_untagged_refused() -> u64 {
+    HK_UNTAGGED_REFUSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// v0.19.10: non-Sync frames refused from the broadcast carrier, since boot.
+pub fn hk_broadcast_refused() -> u64 {
+    HK_BROADCAST_REFUSED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn hk_peer_connected(peer_id: &libp2p::PeerId, direction: &'static str, remote_addr: String, connections: usize) {
@@ -754,22 +781,39 @@ async fn handle_swarm_event(
 
                     // HK genesis-gate: a consensus-protocol peer must be on OUR genesis.
                     // If it advertises a DIFFERENT genesis digest it is an independent
-                    // chain — drop the connection instead of admitting it. Peers with no
-                    // HK genesis tag (pre-gate builds / discovery) are graced (fail open).
-                    if let (Some(ours), Some(theirs)) = (
-                        hk_our_genesis_digest(),
-                        hk_peer_genesis_digest(&info.agent_version),
-                    ) {
-                        if ours != theirs {
-                            warn!(
-                                "HK genesis-gate: peer {peer_id} is on a DIFFERENT genesis \
-                                 (agent={}) — refusing island chain, disconnecting",
-                                info.agent_version
-                            );
-                            HK_ISLANDS_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            hk_peer_closed(&peer_id, 0);
-                            let _ = swarm.disconnect_peer_id(peer_id);
-                            return ControlFlow::Continue(());
+                    // chain — drop the connection instead of admitting it. v0.19.10: the
+                    // gate FAILS CLOSED — a peer that advertises NO HK genesis tag is
+                    // dropped too (every live seat has carried the tag since v0.19.1; the
+                    // grace period for pre-gate builds is over, and an untagged stranger
+                    // was otherwise admitted to the consensus mesh). The gate stays inert
+                    // only while OUR digest is unset.
+                    if let Some(ours) = hk_our_genesis_digest() {
+                        match hk_peer_genesis_digest(&info.agent_version) {
+                            Some(theirs) if theirs == ours => {}
+                            Some(_) => {
+                                warn!(
+                                    "HK genesis-gate: peer {peer_id} is on a DIFFERENT genesis \
+                                     (agent={}) — refusing island chain, disconnecting",
+                                    info.agent_version
+                                );
+                                HK_ISLANDS_REFUSED
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                hk_peer_closed(&peer_id, 0);
+                                let _ = swarm.disconnect_peer_id(peer_id);
+                                return ControlFlow::Continue(());
+                            }
+                            None => {
+                                warn!(
+                                    "HK genesis-gate: peer {peer_id} advertises no HK genesis tag \
+                                     (agent={}) — the gate fails closed since v0.19.10, disconnecting",
+                                    info.agent_version
+                                );
+                                HK_UNTAGGED_REFUSED
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                hk_peer_closed(&peer_id, 0);
+                                let _ = swarm.disconnect_peer_id(peer_id);
+                                return ControlFlow::Continue(());
+                            }
                         }
                     }
 
@@ -793,6 +837,22 @@ async fn handle_swarm_event(
                         }
                     }
                 } else {
+                    // v0.19.10: a peer on another identify protocol version is not one
+                    // of ours. Until now it was only traced — and so escaped both the
+                    // genesis gate and discovery's inbound cap while gossipsub and the
+                    // broadcast carrier kept working on its connection. Once our
+                    // genesis digest is set, drop it.
+                    if hk_our_genesis_digest().is_some() {
+                        warn!(
+                            "Peer {peer_id} is using an incompatible protocol version {:?} \
+                             (agent={}) — disconnecting (v0.19.10: the gate fails closed)",
+                            info.protocol_version, info.agent_version
+                        );
+                        HK_UNTAGGED_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        hk_peer_closed(&peer_id, 0);
+                        let _ = swarm.disconnect_peer_id(peer_id);
+                        return ControlFlow::Continue(());
+                    }
                     trace!(
                         "Peer {peer_id} is using incompatible protocol version: {:?}",
                         info.protocol_version
@@ -963,6 +1023,21 @@ async fn handle_broadcast_event(
                 "Received message from {peer_id} on channel {channel} of {} bytes",
                 message.len()
             );
+
+            // HK (v0.19.10): when consensus runs over gossipsub, the broadcast
+            // (libp2p-scatter) carrier is here only for Sync — yet it raised
+            // Received for ANY topic a directly connected peer sent, with no
+            // subscription check and no relay: a one-hop side door for consensus,
+            // liveness and proposal-part frames that bypassed the gossipsub mesh
+            // entirely. Accept only the Sync channel from it in that mode.
+            if config.pubsub_protocol.is_gossipsub() && channel != Channel::Sync {
+                HK_BROADCAST_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                trace!(
+                    "Refusing a {channel} frame from {peer_id} on the broadcast carrier: \
+                     consensus runs over gossipsub, the broadcast carrier is Sync-only"
+                );
+                return ControlFlow::Continue(());
+            }
 
             let peer_id = PeerId::from_libp2p(&peer_id);
 

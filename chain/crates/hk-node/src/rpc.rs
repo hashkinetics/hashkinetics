@@ -47,7 +47,8 @@
 //!   hk_getValidators                           -> the live validator set + power (+ queued set changes)
 //!   hk_getPeers                                -> this node's live p2p peer table (N1, v0.15.2):
 //!                                                 {self, count, inbound, outbound, public_addr,
-//!                                                  identified, islands_refused, peers[{peer_id,
+//!                                                  identified, islands_refused, untagged_refused,
+//!                                                  broadcast_refused (v0.19.10), peers[{peer_id,
 //!                                                  direction, addr (masked /24 · /48), private_addr,
 //!                                                  version, genesis, connected_secs, last_connection_secs, reconnects}]}
 //!   hk_submitSetChange {cert}                  -> {accepted, queued}  (V1: a seat admitted/removed
@@ -864,6 +865,10 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
                 "public_addr": public_addr,
                 "identified": identified,
                 "islands_refused": malachitebft_network::hk_islands_refused(),
+                // v0.19.10: the gate fails closed (untagged or foreign-protocol peers dropped),
+                // and the broadcast carrier accepts Sync frames only.
+                "untagged_refused": malachitebft_network::hk_untagged_refused(),
+                "broadcast_refused": malachitebft_network::hk_broadcast_refused(),
                 "peers": list,
                 "note": "live from this node's swarm; addresses masked to /24 (v4) · /48 (v6) — a peer's real source address, not what it claims to listen on; private_addr = loopback/RFC 1918/CGNAT/ULA (the founding fleet peers over its private network)",
             }})

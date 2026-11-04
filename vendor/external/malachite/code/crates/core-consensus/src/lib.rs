@@ -8,6 +8,11 @@ pub use input::Input;
 
 mod state;
 pub use state::State;
+// v0.19.10 (HK): the R8 / buffer-bound constants, so the in-tree tests pin the values that ship.
+pub use state::{
+    BufferAdmission, BUFFER_HEIGHT_WINDOW, BUFFER_MAX_PROPOSAL_ROUNDS_PER_HEIGHT,
+    BUFFER_MAX_VOTE_ROUNDS_PER_ADDRESS, CLAIM_VERIFY_BUDGET,
+};
 
 mod error;
 pub use error::Error;

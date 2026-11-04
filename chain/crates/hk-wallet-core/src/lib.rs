@@ -30,6 +30,8 @@
 
 pub mod account;
 pub mod client;
+pub mod eth;
+pub mod hw;
 pub mod shield;
 pub mod vault;
 

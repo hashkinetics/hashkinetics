@@ -93,10 +93,17 @@ impl Node for App {
         pk.public()
     }
 
-    /// Network/transport identity: libp2p Ed25519 from the same master seed
-    /// (peer auth, NOT ledger security — the consensus votes are hash-based).
+    /// Network/transport identity: libp2p Ed25519 (peer auth, NOT ledger
+    /// security — the consensus votes are hash-based), derived from the master
+    /// seed through a tagged SHAKE-256 (v0.19.10, I-1). Until then the transport
+    /// secret WAS the 32-byte master seed, the same bytes that derive the HSS
+    /// operational keys and the SLH-DSA root that certifies rotations: a leak of
+    /// the transport key would have been a full seat takeover. Key separation
+    /// costs one derivation; every seat's peer ID changes once at the upgrade
+    /// (`persistent_peers` are plain multiaddrs, so dialing is unaffected).
     fn get_keypair(&self, pk: HkPriv) -> Keypair {
-        Keypair::ed25519_from_bytes(pk.seed).unwrap()
+        let transport_seed = hk_crypto::hash::shake256_32("hk/v1/transport-identity", &[&pk.seed]);
+        Keypair::ed25519_from_bytes(transport_seed).unwrap()
     }
 
     fn load_private_key(&self, file: Self::PrivateKeyFile) -> HkPriv {

@@ -85,10 +85,17 @@ where
     /// protocol-safe: it is indistinguishable from the node being offline,
     /// which BFT already tolerates.
     ///
-    /// "Corroborated" = the SECOND-highest height claimed by DISTINCT members
-    /// of the current validator set (via buffered future-height votes and
-    /// proposals) — one faulty or malicious validator cannot fabricate the
-    /// signal alone, and a lone ahead-of-quorum node cannot stall the others.
+    /// "Corroborated" (v0.19.10) = the highest height such that the current-set
+    /// validators whose future-height VOTE carried that height, and whose
+    /// signature VERIFIED under their current operational key, hold more than
+    /// one third of the set's voting power. With faulty power at most f, such a
+    /// set contains an honest validator, and an honest validator votes only at
+    /// its current height — so the network has decided at least up to one below
+    /// that height, and no faulty minority, let alone a peer without a key, can
+    /// fabricate the signal. (Until v0.19.10 the signal was "the second-highest
+    /// height claimed by two distinct addresses" taken from unverified frames,
+    /// which anyone could satisfy with two public addresses.) Proposals no
+    /// longer count: their verification carries the whole value.
     ///
     /// The default `None` disables the feature (upstream behavior unchanged).
     fn abstain_threshold(&self) -> Option<u64> {

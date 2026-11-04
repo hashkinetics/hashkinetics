@@ -2,6 +2,7 @@ use crate::handle::driver::apply_driver_input;
 use crate::handle::signature::verify_signature;
 use crate::input::Input;
 use crate::prelude::*;
+use crate::state::BufferAdmission;
 use crate::types::{ConsensusMsg, ProposedValue, SignedConsensusMsg, WalEntry};
 use crate::util::pretty::PrettyProposal;
 
@@ -41,6 +42,23 @@ where
     let proposal_round = signed_proposal.round();
     let proposer_address = signed_proposal.validator_address();
 
+    // v0.19.10 (HK): no honest proposal carries round Nil (-1). Until now a
+    // current-height proposal naming a current-set member with round Nil
+    // reached `verify_signed_proposal` → `get_proposer` → `select_proposer`,
+    // which asserts a defined round: a panic on the consensus actor from a
+    // frame nobody signed (found while writing the v0.19.10 tests). Refuse it
+    // here, before any other work; `pol_round` Nil stays legitimate (no polka).
+    if proposal_round.is_nil() {
+        warn!(
+            consensus.height = %consensus_height,
+            proposal.height = %proposal_height,
+            proposer = %proposer_address,
+            "Received proposal with round Nil, dropping"
+        );
+
+        return Ok(());
+    }
+
     // Discard proposals for heights lower than the current height.
     if proposal_height < consensus_height {
         debug!(
@@ -62,10 +80,15 @@ where
             "Received proposal for higher height {proposal_height}, queuing for later"
         );
 
-        // HK-R8: a proposal above our height is peer evidence the network is ahead.
-        state.note_future_height_claim(proposer_address, proposal_height);
-
-        state.buffer_input(proposal_height, Input::Proposal(signed_proposal), metrics);
+        // HK-R8 (v0.19.10, VZ-2): a future-height proposal no longer records a
+        // height claim. Until v0.19.10 it did, from the frame's proposer field,
+        // before the signature and proposer-selection checks — a second keyless
+        // way to fire R8. Proposals are a redundant signal (every height carries
+        // 2f+1 votes, which now count only once their signatures verify) and the
+        // only one whose verification is expensive: the sign-bytes carry the whole
+        // transaction batch, milliseconds per MiB. The proposal is still buffered
+        // for its own height, bounded and only once its signature verifies (`buffer_proposal`).
+        buffer_proposal(co, state, metrics, signed_proposal).await?;
 
         return Ok(());
     }
@@ -82,7 +105,7 @@ where
             "Received proposal at round -1, queuing for later"
         );
 
-        state.buffer_input(proposal_height, Input::Proposal(signed_proposal), metrics);
+        buffer_proposal(co, state, metrics, signed_proposal).await?;
 
         return Ok(());
     }
@@ -150,6 +173,42 @@ where
             proposal.round = %proposal_round,
             "No full proposal for this round yet, stored proposal for later"
         );
+    }
+
+    Ok(())
+}
+
+/// v0.19.10 (HK): buffer a proposal for a later height (or for the current height before the
+/// driver has started) only after its signature verifies under the scheduled proposer's current
+/// key. `State::buffer_admission` first confines it to the window, to a defined round, to the
+/// proposer `select_proposer` names for (height, round) and to a free slot, so a frame that
+/// cannot matter costs nothing; a verification costs milliseconds per MiB of value, bounded by
+/// what the wire delivers. Until v0.19.10 every frame was buffered unverified and without limit.
+async fn buffer_proposal<Ctx>(
+    co: &Co<Ctx>,
+    state: &mut State<Ctx>,
+    metrics: &Metrics,
+    signed_proposal: SignedProposal<Ctx>,
+) -> Result<(), Error<Ctx>>
+where
+    Ctx: Context,
+{
+    let height = signed_proposal.height();
+    let input = Input::Proposal(signed_proposal);
+    match state.buffer_admission(&height, &input) {
+        BufferAdmission::Drop => state.note_buffer_drop(&height),
+        BufferAdmission::Admit => state.buffer_input(height, input, metrics),
+        BufferAdmission::Verify(validator) => {
+            let Input::Proposal(proposal) = &input else {
+                return Ok(());
+            };
+            let signed_msg = proposal.clone().map(ConsensusMsg::Proposal);
+            if verify_signature(co, signed_msg, &validator).await? {
+                state.buffer_verified(height, input, metrics);
+            } else {
+                state.note_buffer_drop(&height);
+            }
+        }
     }
 
     Ok(())

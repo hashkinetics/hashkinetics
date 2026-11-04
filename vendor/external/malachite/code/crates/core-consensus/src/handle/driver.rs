@@ -371,9 +371,23 @@ where
                 if state.last_abstain_logged != Some(state.height()) {
                     let our_height = state.height();
                     state.last_abstain_logged = Some(our_height);
+                    // v0.19.10: name the evidence — which validators vouched for which
+                    // height with a VERIFIED vote, their summed power against the
+                    // total, and how many future-claim verifications have failed
+                    // since the process started (a forgery signal). Until then this
+                    // line named nobody, and an attack left no attributable trace.
+                    let (claimants, weight, total) = state.abstain_evidence();
+                    let claimants: Vec<String> = claimants
+                        .iter()
+                        .map(|(a, h, p)| format!("{a}@{}×{p}", h.as_u64()))
+                        .collect();
                     info!(
                         height = %our_height,
                         peer_tip = ?state.corroborated_peer_tip().map(|h| h.as_u64()),
+                        ?claimants,
+                        weight,
+                        total,
+                        failed_claim_verifications_total = state.claim_verify_failures_total,
                         "R8: behind the network — abstaining from voting, preserving signer leaves"
                     );
                 }

@@ -37,6 +37,20 @@ fn sig(raw: RawSig) -> Result<HkSig, JsonError> {
     Ok(HkSig(raw))
 }
 
+/// v0.19.10: no honest vote, proposal or certificate carries round Nil (-1) — the driver only
+/// emits defined rounds, and the proposer lookup (`select_proposer`) asserts one. The wire format
+/// admits the value, so a gossiped round Nil is refused HERE, at decode, before the engine sees
+/// the message; the core-consensus handlers refuse it again (the cheap first refusal, not the only
+/// one). `pol_round` Nil stays legitimate: it means "no polka".
+fn defined_round(round: Round, what: &str) -> Result<Round, JsonError> {
+    if round.is_nil() {
+        return Err(Box::new(bincode::ErrorKind::Custom(format!(
+            "{what} carries round Nil"
+        ))));
+    }
+    Ok(round)
+}
+
 use malachitebft_codec::{Codec, HasEncodedLen};
 
 use malachitebft_app_channel::app::streaming::{StreamContent, StreamId, StreamMessage};
@@ -175,12 +189,14 @@ impl Codec<SignedConsensusMsg<HkContext>> for HkCodec {
         let raw: RawSignedConsensusMsg = dec(&bytes)?;
         Ok(match raw {
             RawSignedConsensusMsg::Vote { vote, signature } => {
+                defined_round(vote.round, "consensus vote")?;
                 SignedConsensusMsg::Vote(SignedVote {
                     message: vote.into(),
                     signature: sig(signature)?,
                 })
             }
             RawSignedConsensusMsg::Proposal { proposal, signature } => {
+                defined_round(proposal.round, "consensus proposal")?;
                 SignedConsensusMsg::Proposal(SignedProposal {
                     message: proposal.into(),
                     signature: sig(signature)?,
@@ -251,14 +267,17 @@ impl Codec<LivenessMsg<HkContext>> for HkCodec {
     fn decode(&self, bytes: Bytes) -> Result<LivenessMsg<HkContext>, Self::Error> {
         let raw: RawLivenessMsg = dec(&bytes)?;
         Ok(match raw {
-            RawLivenessMsg::Vote { vote, signature } => LivenessMsg::Vote(SignedVote {
-                message: vote.into(),
-                signature: sig(signature)?,
-            }),
+            RawLivenessMsg::Vote { vote, signature } => {
+                defined_round(vote.round, "liveness vote")?;
+                LivenessMsg::Vote(SignedVote {
+                    message: vote.into(),
+                    signature: sig(signature)?,
+                })
+            }
             RawLivenessMsg::PolkaCertificate(c) => {
                 LivenessMsg::PolkaCertificate(PolkaCertificate {
                     height: c.height,
-                    round: c.round,
+                    round: defined_round(c.round, "polka certificate")?,
                     value_id: c.value_id,
                     polka_signatures: c
                         .polka_signatures
@@ -272,7 +291,7 @@ impl Codec<LivenessMsg<HkContext>> for HkCodec {
             RawLivenessMsg::SkipRoundCertificate(c) => {
                 LivenessMsg::SkipRoundCertificate(RoundCertificate {
                     height: c.height,
-                    round: c.round,
+                    round: defined_round(c.round, "round certificate")?,
                     cert_type: c.cert_type,
                     round_signatures: c
                         .round_signatures
@@ -548,11 +567,16 @@ impl Codec<Response<HkContext>> for HkCodec {
             values: raw
                 .values
                 .into_iter()
-                .map(|v| RawDecidedValue {
-                    value_bytes: v.value_bytes,
-                    certificate: v.certificate.into(),
+                .map(|v| -> Result<RawDecidedValue<HkContext>, JsonError> {
+                    // v0.19.10: a commit certificate never carries round Nil; the sync handler
+                    // looks the proposer up by round before verifying the certificate.
+                    defined_round(v.certificate.round, "commit certificate")?;
+                    Ok(RawDecidedValue {
+                        value_bytes: v.value_bytes,
+                        certificate: v.certificate.into(),
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, JsonError>>()?,
         }))
     }
 
@@ -652,5 +676,57 @@ mod rz1_tests {
         });
         let bytes = <HkCodec as Codec<LM>>::encode(&codec, &polka).unwrap();
         assert!(<HkCodec as Codec<LM>>::decode(&codec, bytes).is_ok());
+    }
+
+    /// v0.19.10: a vote, proposal, liveness vote or certificate whose round is Nil is refused at
+    /// decode (the proposer lookup downstream asserts a defined round); `pol_round` Nil still decodes.
+    #[test]
+    fn v0_19_10_round_nil_fails_to_decode_pol_round_nil_still_decodes() {
+        let codec = HkCodec;
+        let good_sig = HkSig(vec![0xAB; CONSENSUS_SIG_LEN]);
+        let nil_vote = HkVote::new_prevote(HkHeight::new(7), Round::Nil, NilOrVal::Nil, addr());
+        let v = SCM::Vote(SignedVote { message: nil_vote.clone(), signature: good_sig.clone() });
+        let bytes = <HkCodec as Codec<SCM>>::encode(&codec, &v).unwrap();
+        assert!(<HkCodec as Codec<SCM>>::decode(&codec, bytes).is_err(), "consensus vote, round Nil");
+        let lv = LM::Vote(SignedVote { message: nil_vote, signature: good_sig.clone() });
+        let bytes = <HkCodec as Codec<LM>>::encode(&codec, &lv).unwrap();
+        assert!(<HkCodec as Codec<LM>>::decode(&codec, bytes).is_err(), "liveness vote, round Nil");
+        let nil_proposal = HkProposal::new(
+            HkHeight::new(7),
+            Round::Nil,
+            HkValue::new(Bytes::from_static(b"txs")),
+            Round::Nil,
+            addr(),
+        );
+        let p = SCM::Proposal(SignedProposal { message: nil_proposal, signature: good_sig.clone() });
+        let bytes = <HkCodec as Codec<SCM>>::encode(&codec, &p).unwrap();
+        assert!(<HkCodec as Codec<SCM>>::decode(&codec, bytes).is_err(), "proposal, round Nil");
+        for round in [Round::Nil] {
+            let polka = LM::PolkaCertificate(PolkaCertificate {
+                height: HkHeight::new(7),
+                round,
+                value_id: HkValueId::new([1u8; 32]),
+                polka_signatures: vec![PolkaSignature { address: addr(), signature: good_sig.clone() }],
+            });
+            let bytes = <HkCodec as Codec<LM>>::encode(&codec, &polka).unwrap();
+            assert!(<HkCodec as Codec<LM>>::decode(&codec, bytes).is_err(), "polka certificate, round Nil");
+            let rc = LM::SkipRoundCertificate(RoundCertificate {
+                height: HkHeight::new(7),
+                round,
+                cert_type: RoundCertificateType::Skip,
+                round_signatures: vec![RoundSignature {
+                    vote_type: VoteType::Prevote,
+                    value_id: NilOrVal::Nil,
+                    address: addr(),
+                    signature: good_sig.clone(),
+                }],
+            });
+            let bytes = <HkCodec as Codec<LM>>::encode(&codec, &rc).unwrap();
+            assert!(<HkCodec as Codec<LM>>::decode(&codec, bytes).is_err(), "round certificate, round Nil");
+        }
+        // The honest shape still round-trips: round 0 with pol_round Nil (no polka).
+        let good_p = SCM::Proposal(SignedProposal { message: proposal(), signature: good_sig });
+        let bytes = <HkCodec as Codec<SCM>>::encode(&codec, &good_p).unwrap();
+        assert!(<HkCodec as Codec<SCM>>::decode(&codec, bytes).is_ok(), "round 0, pol_round Nil decodes");
     }
 }

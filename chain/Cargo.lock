@@ -3304,13 +3304,16 @@ dependencies = [
  "hex",
  "hk-crypto",
  "hk-primitives",
+ "informalsystems-malachitebft-core-consensus",
  "informalsystems-malachitebft-core-types",
+ "informalsystems-malachitebft-metrics",
  "informalsystems-malachitebft-signing",
  "informalsystems-malachitebft-signing-ed25519",
  "rayon",
  "serde",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -3447,9 +3450,11 @@ dependencies = [
  "hk-spend-circuit",
  "hk-state",
  "hk-wallet",
+ "k256",
  "rand 0.8.7",
  "serde",
  "serde_json",
+ "sha3 0.10.9",
  "thiserror 2.0.20",
  "uniffi",
  "ureq",

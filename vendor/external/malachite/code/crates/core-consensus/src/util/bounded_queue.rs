@@ -82,6 +82,12 @@ where
             .flat_map(|values| values.into_iter())
     }
 
+    /// The values queued at `index`, if any (read-only; v0.19.10, for the
+    /// per-height bound in `State::buffer_admission`).
+    pub fn get(&self, index: &I) -> Option<&[T]> {
+        self.queue.get(index).map(|values| values.as_slice())
+    }
+
     /// Whether the queue is full
     pub fn is_full(&self) -> bool {
         self.queue.len() >= self.capacity

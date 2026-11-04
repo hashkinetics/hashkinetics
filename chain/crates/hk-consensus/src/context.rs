@@ -709,13 +709,21 @@ impl Context for HkContext {
     }
 
     /// HK-R8: abstain-while-behind, ON by default for hash-based signers.
-    /// While ≥2 distinct current-set validators have sent consensus messages
-    /// ≥ gap heights above us, we stop signing votes/proposals: they are
-    /// worthless at a height the network has passed, and each would burn an
-    /// irreplaceable one-time leaf (val-0's fresh 32,768-leaf tree burned to
-    /// zero in ~20 h of exactly this). `HK_ABSTAIN_GAP` overrides the gap;
-    /// `HK_ABSTAIN_GAP=0` disables. Default 20 heights (~40 s of chain time —
-    /// far above any live round-lag, far below any real parked/wedged state).
+    /// While current-set validators holding more than one third of the voting
+    /// power have sent VOTES ≥ gap heights above us whose signatures verify
+    /// under their current operational keys (v0.19.10, VZ-2 — until then two
+    /// unverified frames naming two public addresses were enough), we stop
+    /// signing votes/proposals: they are worthless at a height the network has
+    /// passed, and each would burn an irreplaceable one-time leaf (val-0's fresh
+    /// 32,768-leaf tree burned to zero in ~20 h of exactly this). `HK_ABSTAIN_GAP`
+    /// overrides the gap; `HK_ABSTAIN_GAP=0` disables (and then no future-height
+    /// vote is ever verified early, no claim recorded). Default 20 heights (~40 s
+    /// of chain time — far above any live round-lag, far below any real
+    /// parked/wedged state). The residual: a vote signed with a key rotated after
+    /// our height fails verification and is simply not evidence, so a seat
+    /// restarted more than one rotation interval behind cannot arm R8 until it
+    /// syncs past its peers' last rotation — it votes (and spends leaves on slow
+    /// catch-up) instead of staying silent, which R1.b/R9 recover.
     fn abstain_threshold(&self) -> Option<u64> {
         static GAP: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
         *GAP.get_or_init(|| {

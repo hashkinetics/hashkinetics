@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use eyre::{eyre, Result};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use malachitebft_app_channel::app::streaming::{StreamContent, StreamId, StreamMessage};
 use malachitebft_app_channel::app::types::core::{CommitCertificate, Round, Validity, VoteExtensions};
@@ -1103,26 +1103,68 @@ impl HkApp {
     ) -> Option<ProposedValue<HkContext>> {
         let parts = self.streams.insert(from, part)?;
 
-        let mut batch = Vec::new();
-        for p in &parts.parts {
-            if let Some(data) = p.as_tx_batch() {
-                batch.extend_from_slice(data);
-            }
+        // v0.19.10 (the VZ-2 review): the host is where the bytes live, so the host gates
+        // what a reassembled stream may become. Proposal parts are not signed — the engine
+        // verifies the proposer's SignedProposal over the value id and decides only on a
+        // matching value — so until v0.19.10 a peer with no key could make every seat hold
+        // a value for ANY height, round and proposer, of any size, until the chain passed
+        // that height (a memory lever), and a stream carrying the honest bytes with a wrong
+        // Fin produced a `Validity::Invalid` entry that stuck to the honest value's id in the
+        // engine's keeper, so the node refused the real proposal (and, with the certificate
+        // arriving by sync, hit an assert). Now a stream is kept only if: its round is
+        // defined; it does not name our own address (our values are built here, never
+        // received); its height is within `PROPOSAL_HEIGHT_WINDOW` of ours; its proposer is
+        // the one the schedule names for (height, round) under the current set; its round is
+        // not absurdly ahead; it is exactly one tx-batch part within the frame cap whose Fin
+        // names the hash of the bytes; and the (height, round) slot holds fewer than two
+        // values. Anything else is dropped — never handed on as "invalid".
+        use malachitebft_core_types::Context as _;
+        let height = parts.height.as_u64();
+        let current = self.current_height.as_u64();
+        if parts.round.is_nil() {
+            warn!(proposer = %parts.proposer, height, "proposal stream with round Nil — dropped");
+            return None;
         }
-        let value = HkValue::new(Bytes::from(batch));
-
-        // Consistency check only: the Fin's declared value id must match the reassembled
-        // content. This is NOT the security boundary — the engine independently verifies
-        // the proposer's SignedProposal over this id and only decides on a matching value,
-        // so a self-consistent forgery from a relay is inert. See MAINNET-KEY-MANAGEMENT.md.
-        let validity = match parts.fin() {
-            Some(fin) if fin.value_id == value.id => Validity::Valid,
-            Some(_) => {
-                error!(proposer = %parts.proposer, "proposal Fin value-id mismatch");
-                Validity::Invalid
+        if parts.proposer == self.address {
+            warn!(height, round = %parts.round, "proposal stream naming our own address arrived from the network — dropped (a forgery)");
+            return None;
+        }
+        if height < current || height > current.saturating_add(crate::streaming::PROPOSAL_HEIGHT_WINDOW) {
+            debug!(height, current, "proposal stream outside the height window — dropped");
+            return None;
+        }
+        let set = self.validator_set();
+        if set.is_empty() {
+            return None;
+        }
+        let scheduled = HkContext::new().select_proposer(&set, parts.height, parts.round).address;
+        if scheduled != parts.proposer {
+            warn!(height, round = %parts.round, proposer = %parts.proposer, %scheduled, "proposal stream from a proposer the schedule does not name — dropped");
+            return None;
+        }
+        // Rounds: at our height a stream may run up to three rounds ahead of the round we are
+        // in (a lagging node still gets the proposal it will need); at a future height only
+        // rounds 0 and 1 are kept (a proposal there is useful only if we arrive in time).
+        let max_round = if height == current { self.current_round.as_i64().max(0) + 3 } else { 1 };
+        if parts.round.as_i64() > max_round {
+            debug!(height, round = %parts.round, max_round, "proposal stream for a round too far ahead — dropped");
+            return None;
+        }
+        let value = match parts.reassembled() {
+            Ok(value) => value,
+            Err(why) => {
+                warn!(proposer = %parts.proposer, height, round = %parts.round, why, "proposal stream refused");
+                return None;
             }
-            None => Validity::Invalid,
         };
+        if self
+            .undecided
+            .get(&(height, parts.round.as_i64()))
+            .map_or(false, |vs| vs.len() >= 2)
+        {
+            debug!(height, round = %parts.round, "two values already held for this height and round — dropped");
+            return None;
+        }
 
         let proposed = ProposedValue {
             height: parts.height,
@@ -1130,7 +1172,7 @@ impl HkApp {
             valid_round: parts.pol_round,
             proposer: parts.proposer,
             value,
-            validity,
+            validity: Validity::Valid,
         };
         self.store_undecided(proposed.clone());
         Some(proposed)

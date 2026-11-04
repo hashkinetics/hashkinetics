@@ -34,6 +34,10 @@ hk-spend-circuit = { path = "../../../zkvm-bakeoff/circuit" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
+# The hardware signer's verification code and fingerprint (plain SHAKE-256), and the check on
+# its Ethereum signatures (Keccak-256, recovery; the same k256 hk-node locks).
+sha3 = { workspace = true }
+k256 = { version = "0.13", features = ["ecdsa"] }
 thiserror = { workspace = true }
 rand = "0.8"
 # rustls + ring + bundled webpki roots: no system certificate store needed (Android).

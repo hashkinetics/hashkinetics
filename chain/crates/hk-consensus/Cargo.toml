@@ -26,3 +26,9 @@ malachitebft-signing-ed25519 = { package = "informalsystems-malachitebft-signing
 [dev-dependencies]
 # RZ-1 (2026-10-22): the provider tests drive the async verify surface on a current-thread runtime.
 tokio = { version = "1", features = ["rt", "sync"] }
+# VZ-2 (v0.19.10, 2026-11-03): tests/r8_claims.rs drives the vendored core-consensus entry point
+# (`process!`) with State<HkContext> in process — the same path the engine feeds network votes
+# into — and records every Effect, so a signature check is visible as an Effect::VerifySignature.
+malachitebft-core-consensus = { package = "informalsystems-malachitebft-core-consensus", path = "../../../vendor/external/malachite/code/crates/core-consensus" }
+malachitebft-metrics = { package = "informalsystems-malachitebft-metrics", path = "../../../vendor/external/malachite/code/crates/metrics" }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
