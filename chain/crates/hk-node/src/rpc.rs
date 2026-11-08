@@ -108,12 +108,46 @@
 //! unless every tx is a proof-less `MintToPool` / `ShieldedSpend` — what P2.3 defines a
 //! bundle as, and exactly what `demo_agg` builds (`bundle_shape_verdict`). Nothing else on
 //! this surface changes.
+//!
+//! HR-1 (mr-hrydarie, reported 2026-11-04, confirmed 2026-11-08; v0.19.11, client-side, no gate,
+//! no activation height): `hk_submitBundle` queued a bundle for the proposer after the shape
+//! check alone — no envelope or signature, no sender, nonce, anchor or nullifier check, no
+//! bound on the aggregate bytes but the 8 MiB body cap — behind nothing but the browser-Origin
+//! check, and `build_batch` rides the head bundle whole: a 1,024-tx garbage bundle pre-empted
+//! this node's whole block, committed as all-Err receipts, and wrote its aggregate into every
+//! node's block log; and because the commit prune pushed EVERY block tx's (sender, nonce) into
+//! the mempool's `remove_included`, a refused bundle tx naming a victim's pending slot evicted
+//! the victim's honest tx fleet-wide. The one legitimate caller in the tree is the devnet's
+//! `demo-agg`; there is no aggregator role. v0.19.11:
+//!   * THE SWITCH — the door is closed unless the operator opens it: `hk_rpc.accept_bundles`
+//!     (config.rs; false by default, false on every seat `config-gen` writes, true only in the
+//!     devnet generator) or HK_RPC_ACCEPT_BUNDLES=1 (`bundles_open`, the mirror of
+//!     `browser_ops_allowed`). A closed door answers before reading `params`.
+//!   * THE HONEST DOOR — when open, a bundle queues only if every tx in it would apply
+//!     (`submit_bundle`): the free refusals first — `bundle_shape_verdict` now also demands
+//!     right-length envelopes (`PK_LEN` / `SIG_LEN`) and bounded stealth ciphertexts
+//!     (`mempool::MAX_STEALTH_CT_BYTES`), the aggregate is capped at `MAX_BUNDLE_AGG_BYTES`,
+//!     and under the queue lock the H4 cap and dedup plus E1 (no (sender, nonce) slot or
+//!     nullifier that a queued bundle already carries) — then ONE admission slot per node
+//!     (`BUNDLE_ADMIT`, F1), the envelope hashes with no lock held, and under the chain lock a
+//!     dry run of every tx through `Mempool::try_admit_verified` on a SCRATCH pool (the live
+//!     mempool is never touched: nothing from a bundle is WAL'd, gossiped or indexed), so a
+//!     legitimate bundle's sequential nonces pass and a refused tx is named with hk_submitTx's
+//!     own reason.
+//!   * E3 — `hk_submitTx` / `hk_gossipTxs` refuse a proof-less pool tx at the door
+//!     (`refuse_proof_less_pool_tx`): uncovered, it could only ride a block and die at apply.
+//!   * E4 — the commit prune is receipt-aware (state.rs `commit_prune_sets` in
+//!     `apply_batch_to_chain`, `Mempool::remove_refused`): an applied tx prunes its slot, a
+//!     refused tx prunes only its identical pending copy.
+//! Not in this release: verifying the aggregate at submit, a per-block byte budget in
+//! `build_batch`, any change to the state machine, the batch encoding, consensus or the store.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -121,13 +155,14 @@ use tracing::{info, warn};
 
 use hk_consensus::rotation::RotationRules;
 use hk_consensus::{HkAddress, HkValidatorSet, RotationCert, SetChange, SetChangeCert};
+use hk_crypto::lamport::{PK_LEN, SIG_LEN};
 use hk_crypto::slhdsa_adapter::{ROOT_PK_LEN, ROOT_SIG_LEN};
-use hk_primitives::{AssetId, H256};
+use hk_primitives::{AccountId, AssetId, H256};
 use hk_state::tx::{SignedTx, Tx};
 use hk_state::PoolKey;
 
 use crate::batch::{txid, Batch, MAX_TXS_PER_BLOCK};
-use crate::mempool::Mempool;
+use crate::mempool::{stealth_ct_over_cap, Mempool, MAX_STEALTH_CT_BYTES};
 use crate::state::SharedHandles;
 
 /// H1 (v0.13.2): a request must arrive within this window, headers and body — a
@@ -145,6 +180,14 @@ const RPC_MAX_CONNS: usize = 256;
 /// epoch — two slots are plenty; the rest answer "busy — retry" (`busy_error`).
 const CERT_VERIFY_SLOTS: usize = 2;
 static CERT_VERIFY: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(CERT_VERIFY_SLOTS);
+
+/// HR-1 (mr-hrydarie, reported 2026-11-04; v0.19.11), F1: at most ONE bundle admission — the
+/// per-tx envelope hashes plus the scratch-pool dry run of `submit_bundle`, up to 1,024 txs —
+/// runs at once per node, `try_acquire` like `CERT_VERIFY`; the rest answer "busy — retry".
+/// Every free refusal (closed door, parse, shape, lengths, byte caps, queue cap / dedup /
+/// overlap) comes BEFORE the slot, so a flood of garbage never touches it. A bundle is a few
+/// txs every few blocks on the one devnet that opens the door; one slot is plenty.
+static BUNDLE_ADMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
 /// L-5 residual (R17 review, 2026-10-06): `hk_getPoolPath` still copies 32 B × every leaf
 /// of a pool UNDER the feed lock (32 MB at a million notes) and then hashes the whole tree
@@ -205,6 +248,16 @@ fn browser_ops_allowed() -> bool {
     std::env::var("HK_RPC_ALLOW_BROWSER_OPS").map(|v| v == "1").unwrap_or(false)
 }
 
+/// HR-1 (mr-hrydarie, reported 2026-11-04; v0.19.11): the P2.3 aggregation door is closed unless
+/// the operator opens it — `hk_rpc.accept_bundles = true` in config.toml (`SharedHandles::
+/// accept_bundles`, copied in node.rs; false by default and on every seat `config-gen` writes)
+/// or HK_RPC_ACCEPT_BUNDLES=1 for one process, the mirror of `browser_ops_allowed`. There is
+/// no aggregator role yet; the one legitimate caller in the tree is the devnet's `demo-agg`,
+/// and the devnet generator opens the door for it.
+fn bundles_open(h: &SharedHandles) -> bool {
+    h.accept_bundles || std::env::var("HK_RPC_ACCEPT_BUNDLES").map(|v| v == "1").unwrap_or(false)
+}
+
 /// C2.1: the shared admission gate for `hk_submitTx` AND `hk_gossipTxs`.
 /// Lock order: chain BEFORE mempool (the commit path's order — no deadlocks).
 /// WAL on success only: the WAL replays through this same gate at restart, so
@@ -222,7 +275,12 @@ fn browser_ops_allowed() -> bool {
 /// R18 (2026-10-08): an over-cap `ChannelOpen` is refused inside `envelope_verdict`, i.e.
 /// before the hashes; an over-cap `ChannelSettle` under the locks, one channel lookup,
 /// before the account walk (mempool.rs `r18_caps_refuse_the_same_through_both_doors`).
+///
+/// HR-1 (v0.19.11, E3): a proof-less pool tx is refused first of all — by its payload, before
+/// the hashes and outside the mempool's verdict (`refuse_proof_less_pool_tx`): its only
+/// legitimate carrier is a bundle, and uncovered it would ride a block and die at apply.
 fn admit_one(h: &SharedHandles, tx: &SignedTx) -> Result<[u8; 32], String> {
+    refuse_proof_less_pool_tx(tx)?;
     let verdict = Mempool::envelope_verdict(tx);
     let admitted = {
         let chain = h.chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -307,6 +365,43 @@ async fn handle_conn(sock: &mut tokio::net::TcpStream, h: &SharedHandles) -> eyr
 const BUNDLE_QUEUE_MAX: usize = 64;
 const GOSSIP_MAX_TXS: usize = 1_024;
 
+/// HR-1 (mr-hrydarie, reported 2026-11-04; v0.19.11): the most aggregate bytes `hk_submitBundle`
+/// takes. An aggregate STARK is 1,242 KB and constant in N — the P2.3 measurement
+/// (docs/MASTER-BUILD-PLAN.md, the metrics table: "Aggregate STARK (any N): 1,242 KB
+/// constant"; `demo-agg` prints the size it got) — so 2 MiB is ≈ 1.6× headroom. Until this the
+/// only bound was the 8 MiB body cap, and a garbage aggregate rode whole into every node's
+/// block log once the proposer picked the bundle (≈ 4 MiB per pre-empted block in the report).
+/// Re-pin on an SP1 upgrade that changes the compressed-proof size; the error names the
+/// legitimate size so a real aggregator that outgrows it knows what to ask for.
+const MAX_BUNDLE_AGG_BYTES: usize = 2 * 1024 * 1024;
+
+/// HR-1: the one shape a `MintToPool` / `ShieldedSpend` has when its truth is a block
+/// aggregate's — an EMPTY `proof` (P2.3). `bundle_shape_verdict` requires it of every bundle
+/// tx; `admit_one` refuses it (`refuse_proof_less_pool_tx`), because through `hk_submitTx` /
+/// `hk_gossipTxs` such a tx can only ride uncovered and die at apply (`pool proof rejected`),
+/// a block slot burnt for the price of an envelope.
+fn proof_less_pool_tx(tx: &SignedTx) -> bool {
+    matches!(&tx.payload, Tx::MintToPool { proof, .. } | Tx::ShieldedSpend { proof, .. } if proof.is_empty())
+}
+
+/// HR-1 (E3): the `hk_submitTx` / `hk_gossipTxs` refusal of a proof-less pool tx — at the
+/// door, before the envelope hashes, and NOT inside `Mempool::envelope_verdict`: the bundle
+/// door's scratch dry run (`submit_bundle`) runs that same verdict on txs that are proof-less
+/// by definition. There is a second reason the two must stay apart: a proof-less pool tx in
+/// the same block as a bundle enters the aggregate digest (state.rs `apply_batch_to_chain`
+/// folds EVERY proof-less pool tx of the block into it), so one such pool tx would refuse the
+/// whole honest bundle beside it. The reason tells the caller where such a tx belongs. The one
+/// legitimate proof-less sender in the tree, `demo_agg`, submits its spends through
+/// `hk_submitBundle` only (its step [5] fallback spend carries a proof); the CLI wallet
+/// (`wallet_cli.rs`), the desktop/Android core (`hk-wallet-core` `shield.rs`) and the demos
+/// attach the prover's proof to every pool tx they send through `hk_submitTx`.
+fn refuse_proof_less_pool_tx(tx: &SignedTx) -> Result<(), String> {
+    if proof_less_pool_tx(tx) {
+        return Err("a proof-less pool tx can only be covered by a bundle's aggregate — submit it through hk_submitBundle".into());
+    }
+    Ok(())
+}
+
 /// R18 review (2026-10-08): what `hk_submitBundle` may queue — P2.3's definition of a
 /// bundle, exactly: proof-less pool txs (`MintToPool` / `ShieldedSpend` with an empty
 /// `proof`) whose truth the ONE aggregate STARK carries, and no more of them than a block
@@ -317,22 +412,207 @@ const GOSSIP_MAX_TXS: usize = 1_024;
 /// the bundle path was the one door through which an over-cap settle reached an UPGRADED
 /// proposer's own block (the module doc). The verdict reads payloads only; the mempool
 /// never sees bundle txs, so it is judged here, before the queue.
+///
+/// HR-1 (mr-hrydarie, reported 2026-11-04; v0.19.11): two more payload-reading, state-free rules
+/// per tx, so that the report's frames — keyless, with megabytes of advisory bytes — are
+/// refused for free, before the queue lock and the admission slot: the envelope must have the
+/// one shape a Lamport signature can verify in (`PK_LEN` / `SIG_LEN`, the rule
+/// `Mempool::envelope_verdict` applies to every other tx — a bundle tx is account-signed like
+/// any other), and every stealth ciphertext must be inside `MAX_STEALTH_CT_BYTES` (one number
+/// for both doors, mempool.rs). Whether each tx would APPLY — sender, nonce, key, anchor,
+/// nullifier, signature — is `submit_bundle`'s dry run, after this.
 pub(crate) fn bundle_shape_verdict(txs: &[SignedTx]) -> Result<(), String> {
     if txs.len() > MAX_TXS_PER_BLOCK {
         return Err(format!("bad txs: a bundle may carry at most {MAX_TXS_PER_BLOCK} txs (one block)"));
     }
     for (i, t) in txs.iter().enumerate() {
-        let proof_less_pool_tx = matches!(
-            &t.payload,
-            Tx::MintToPool { proof, .. } | Tx::ShieldedSpend { proof, .. } if proof.is_empty()
-        );
-        if !proof_less_pool_tx {
+        if !proof_less_pool_tx(t) {
             return Err(format!(
                 "bad txs: a bundle may carry only proof-less MintToPool / ShieldedSpend txs covered by its aggregate (tx {i} is not one — submit it through hk_submitTx)"
             ));
         }
+        if t.lamport_pk.len() != PK_LEN || t.sig.len() != SIG_LEN {
+            return Err(format!(
+                "bad txs: tx {i} has a malformed envelope ({} B pk, {} B sig) — a bundle tx is account-signed like any other",
+                t.lamport_pk.len(),
+                t.sig.len()
+            ));
+        }
+        if let Some(n) = stealth_ct_over_cap(t) {
+            return Err(format!("bad txs: tx {i} carries a {n}-byte stealth ciphertext (max {MAX_STEALTH_CT_BYTES})"));
+        }
     }
     Ok(())
+}
+
+/// HR-1 (E1 + H4): the free checks on the bundle QUEUE, run under its lock before the
+/// admission slot and again before the push (the queue may have changed in between): the H4
+/// cap and aggregate-bytes dedup (v0.13.2), and no overlap with a queued bundle — a
+/// (sender, nonce) slot or a `ShieldedSpend` nullifier that a queued bundle already carries
+/// refuses the new one (two bundles claiming one slot cannot both apply; the loser would ride
+/// a later block as all-Err receipts). The two sets are rebuilt from the queue each call: at
+/// most `BUNDLE_QUEUE_MAX` × `MAX_TXS_PER_BLOCK` entries.
+fn bundle_queue_verdict(q: &[(Vec<SignedTx>, Vec<u8>)], txs: &[SignedTx], agg: &[u8]) -> Result<(), String> {
+    if q.len() >= BUNDLE_QUEUE_MAX {
+        return Err(format!("bundle queue full (max {BUNDLE_QUEUE_MAX}) — retry after the next block"));
+    }
+    if q.iter().any(|(_, a)| a.as_slice() == agg) {
+        return Err("duplicate bundle (same aggregate proof already queued)".into());
+    }
+    let mut slots: HashSet<(AccountId, u64)> = HashSet::new();
+    let mut nullifiers: HashSet<[u8; 32]> = HashSet::new();
+    for t in q.iter().flat_map(|(btxs, _)| btxs.iter()) {
+        slots.insert((t.sender, t.nonce));
+        if let Tx::ShieldedSpend { nullifier, .. } = &t.payload {
+            nullifiers.insert(nullifier.0);
+        }
+    }
+    for (i, t) in txs.iter().enumerate() {
+        let nullifier_queued =
+            matches!(&t.payload, Tx::ShieldedSpend { nullifier, .. } if nullifiers.contains(&nullifier.0));
+        if slots.contains(&(t.sender, t.nonce)) || nullifier_queued {
+            return Err(format!("bad txs: a queued bundle already carries tx {i}'s (sender, nonce) slot or nullifier"));
+        }
+    }
+    Ok(())
+}
+
+/// `hk_submitBundle` (P2.3; R18 review; HR-1, mr-hrydarie, reported 2026-11-04, v0.19.11):
+/// queue a bundle — proof-less pool txs + ONE aggregate STARK — for this node's next proposal
+/// (`build_batch` rides the head bundle whole, ahead of the pool; every validator verifies the
+/// aggregate once at commit). The door is CLOSED unless `open` (`bundles_open`: the operator's
+/// `hk_rpc.accept_bundles`, or HK_RPC_ACCEPT_BUNDLES=1) — there is no aggregator role yet — and
+/// an open door admits a bundle only if every tx in it would apply, in this order:
+///   1. free, no lock: the aggregate cap `MAX_BUNDLE_AGG_BYTES` on the hex string's LENGTH,
+///      before it is decoded and before the txs are parsed (S3); the parse, by reference —
+///      the body may be 8 MiB (S4); `bundle_shape_verdict` (the R18 shape, the HR-1 envelope
+///      lengths and stealth caps); the aggregate cap again on the decoded bytes;
+///   2. free, the queue lock only: `bundle_queue_verdict` (cap, dedup, E1 overlap);
+///   3. the one admission slot (`BUNDLE_ADMIT`, F1) — or "busy", so a flood of well-shaped
+///      bundles costs this node one dry run at a time and the garbage above costs it nothing;
+///   4. no lock held: per tx the txid and `Mempool::envelope_verdict` — the key commitment and
+///      the Lamport verify over the tx's own bytes, ≈ 0.3 ms each — failing fast on a
+///      hash-free refusal. Every hash of the admission happens here (S1);
+///   5. the chain lock (R17 order: chain before mempool; the live mempool is NEVER taken):
+///      every tx in order through `Mempool::try_admit_verified_with_id` on a SCRATCH pool —
+///      account, nonce, anchor, nullifier, the key→account binding along the pending ratchet,
+///      the signature at its own position, nothing hashed — so a legitimate bundle's sequential
+///      nonces pass (the live pool would answer NonceGap for the 2nd..nth, and nothing from a
+///      bundle may be WAL'd, gossiped or indexed into it) and a refusal names the tx with
+///      hk_submitTx's reason for the same frame;
+///   6. the queue lock again: `push_bundle` — the free queue checks re-run against the queue
+///      as it is NOW (it may have changed since step 2), then the push.
+/// The dry run judges a bundle against the CHAIN, not the live pool: whole from each sender's
+/// current nonce (one outstanding bundle per account; at most `mempool::NONCE_WINDOW` txs per
+/// sender), and no balance is checked — an unfunded account's bundle is refused at apply, as
+/// its hk_submitTx twin would be. Takes the handles it touches rather than `SharedHandles` so
+/// `hr1_tests` drives it without a node; `dispatch` passes `bundles_open(h)`, `&h.chain`,
+/// `&h.bundles`, `&BUNDLE_ADMIT`. Not in this release: verifying the aggregate at submit — a
+/// queued bundle whose aggregate is invalid still rides one of this node's blocks and its txs
+/// are refused there, by every node, as before.
+fn submit_bundle(
+    params: &Value,
+    open: bool,
+    chain: &Mutex<hk_state::State>,
+    bundles: &Mutex<Vec<(Vec<SignedTx>, Vec<u8>)>>,
+    admit: &tokio::sync::Semaphore,
+) -> Value {
+    if !open {
+        return json!({"error": "hk_submitBundle is closed on this node (hk_rpc.accept_bundles = false): there is no aggregator role yet — a devnet opens it with accept_bundles = true or HK_RPC_ACCEPT_BUNDLES=1"});
+    }
+    let agg_hex = params.get("agg_proof").and_then(|p| p.as_str()).unwrap_or("");
+    // HR-1 (S3): the aggregate cap on the hex string, before `hex::decode` allocates and
+    // decodes it and before the tx parse — two hex digits per byte, an odd digit rounds up.
+    if agg_hex.len() > 2 * MAX_BUNDLE_AGG_BYTES {
+        return agg_too_large(agg_hex.len().div_ceil(2));
+    }
+    // HR-1 (S4): the txs are read from `params` by reference — `serde_json::from_value` needs
+    // an owned `Value`, i.e. a clone of a body of up to 8 MiB first.
+    let null = Value::Null;
+    let txs_val = params.get("txs").unwrap_or(&null);
+    let (txs, agg) = match (Vec::<SignedTx>::deserialize(txs_val), hex::decode(agg_hex)) {
+        (Ok(txs), Ok(agg)) if !txs.is_empty() && !agg.is_empty() => (txs, agg),
+        (Err(e), _) => return json!({"error": format!("bad txs: {e}")}),
+        (_, Err(e)) => return json!({"error": format!("bad agg_proof hex: {e}")}),
+        _ => return json!({"error": "txs (non-empty) and agg_proof required"}),
+    };
+    // R18 review + HR-1: shape, envelope lengths, stealth caps — payloads only, no lock.
+    if let Err(reason) = bundle_shape_verdict(&txs) {
+        warn!(txs = txs.len(), "hk_submitBundle refused: {reason}");
+        return json!({"error": reason});
+    }
+    // unreachable while `hex::decode` is exact (the hex-length check above already bounds the
+    // decoded size); kept as the belt if the aggregate ever arrives in another encoding.
+    if agg.len() > MAX_BUNDLE_AGG_BYTES {
+        return agg_too_large(agg.len());
+    }
+    // H4 + E1 under the queue lock, dropped before the slot.
+    {
+        let q = bundles.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(reason) = bundle_queue_verdict(&q, &txs, &agg) {
+            return json!({"error": reason});
+        }
+    }
+    // F1: one admission in flight per node; the permit is held until the push.
+    let Ok(_permit) = admit.try_acquire() else {
+        return json!({"error": "busy: a bundle admission is already in flight — retry in a moment"});
+    };
+    // The hashes, no lock held: each tx's txid (the dry run and the push reuse it — S1: nothing
+    // is hashed under a lock) and its envelope verdict. A bad signature is not judged here: the
+    // scratch pool judges it at its own position, after the account and key checks, so the
+    // reason a caller reads is the one hk_submitTx would give for the same frame.
+    let mut judged: Vec<([u8; 32], crate::mempool::EnvelopeVerdict)> = Vec::with_capacity(txs.len());
+    for (i, t) in txs.iter().enumerate() {
+        let id = txid(t);
+        let v = Mempool::envelope_verdict(t);
+        // unreachable after `bundle_shape_verdict` (the lengths and the stealth cap are its
+        // rules, and a bundle tx is never a `ChannelOpen`); kept so a future shape change
+        // cannot hash past a `BadEnvelope`.
+        if let Some(e) = v.hash_free_refusal() {
+            return json!({"error": format!("bad txs: tx {i} would not apply: {}", e.as_str())});
+        }
+        judged.push((id, v));
+    }
+    // The dry run: the chain lock only, nothing hashed; the scratch pool indexes as it goes
+    // and dies here.
+    {
+        let chain = chain.lock().unwrap_or_else(|e| e.into_inner());
+        let mut scratch = Mempool::new(txs.len());
+        for (i, (t, (id, v))) in txs.iter().zip(&judged).enumerate() {
+            if let Err(e) = scratch.try_admit_verified_with_id(t.clone(), *id, &chain, v) {
+                return json!({"error": format!("bad txs: tx {i} would not apply: {}", e.as_str())});
+            }
+        }
+    }
+    let ids: Vec<String> = judged.iter().map(|(id, _)| hex::encode(id)).collect();
+    let mut q = bundles.lock().unwrap_or_else(|e| e.into_inner());
+    match push_bundle(&mut q, txs, agg, ids) {
+        Ok(ids) => json!({"result": {"accepted": true, "txids": ids}}),
+        Err(reason) => json!({"error": reason}),
+    }
+}
+
+/// HR-1: the one wording of the aggregate cap, whether the hex string's length or the decoded
+/// bytes tripped it. It names the legitimate size so a real aggregator that outgrows the cap
+/// knows what to ask for.
+fn agg_too_large(bytes: usize) -> Value {
+    json!({"error": format!("bad agg_proof: {bytes} bytes (max {MAX_BUNDLE_AGG_BYTES} — an aggregate STARK is ~1,242 KB)")})
+}
+
+/// HR-1 (E1, review item S2): the push, under the queue lock the caller holds. The free queue
+/// checks (`bundle_queue_verdict`: cap, dedup, overlap) re-run against the queue AS IT IS NOW —
+/// it may have changed since `submit_bundle` judged it before the admission slot — and then the
+/// bundle is pushed. `ids` are the txs' txids (hex), computed once with no lock held, handed
+/// back for the response. A refusal leaves the queue untouched.
+fn push_bundle(
+    q: &mut Vec<(Vec<SignedTx>, Vec<u8>)>,
+    txs: Vec<SignedTx>,
+    agg: Vec<u8>,
+    ids: Vec<String>,
+) -> Result<Vec<String>, String> {
+    bundle_queue_verdict(q, &txs, &agg)?;
+    q.push((txs, agg));
+    Ok(ids)
 }
 
 fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
@@ -556,39 +836,14 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
             }
             None => json!({"error": "id must be 64-char hex"}),
         },
-        "hk_submitBundle" => {
-            // P2.3: proof-less pool txs + ONE aggregate STARK. The proposer includes the
-            // bundle whole; every validator verifies the aggregate once at commit.
-            let txs_val = params.get("txs").cloned().unwrap_or(Value::Null);
-            let agg_hex = params.get("agg_proof").and_then(|p| p.as_str()).unwrap_or("");
-            match (serde_json::from_value::<Vec<SignedTx>>(txs_val), hex::decode(agg_hex)) {
-                (Ok(txs), Ok(agg)) if !txs.is_empty() && !agg.is_empty() => {
-                    // R18 review (2026-10-08): only proof-less pool txs ride a bundle —
-                    // judged before the queue, so a ChannelSettle can never reach
-                    // `build_batch` through this door (`bundle_shape_verdict`).
-                    if let Err(reason) = bundle_shape_verdict(&txs) {
-                        warn!(txs = txs.len(), "hk_submitBundle refused: {reason}");
-                        return json!({"error": reason});
-                    }
-                    // H4 (v0.13.2): the queue is bounded and de-duplicated by the
-                    // aggregate bytes — an unauthenticated push can no longer grow
-                    // memory or block the proposer's head-of-line behind copies.
-                    let mut q = h.bundles.lock().unwrap_or_else(|e| e.into_inner());
-                    if q.len() >= BUNDLE_QUEUE_MAX {
-                        return json!({"error": format!("bundle queue full (max {BUNDLE_QUEUE_MAX}) — retry after the next block")});
-                    }
-                    if q.iter().any(|(_, a)| *a == agg) {
-                        return json!({"error": "duplicate bundle (same aggregate proof already queued)"});
-                    }
-                    let ids: Vec<String> = txs.iter().map(|t| hex::encode(txid(t))).collect();
-                    q.push((txs, agg));
-                    json!({"result": {"accepted": true, "txids": ids}})
-                }
-                (Err(e), _) => json!({"error": format!("bad txs: {e}")}),
-                (_, Err(e)) => json!({"error": format!("bad agg_proof hex: {e}")}),
-                _ => json!({"error": "txs (non-empty) and agg_proof required"}),
-            }
-        }
+        // P2.3: proof-less pool txs + ONE aggregate STARK. The proposer includes the
+        // bundle whole; every validator verifies the aggregate once at commit.
+        // HR-1 (mr-hrydarie, reported 2026-11-04; v0.19.11): closed unless the operator opened
+        // it (`bundles_open`), and an open door admits only a bundle whose every tx would
+        // apply — the body is `submit_bundle`: the free refusals (R18 shape, envelope lengths,
+        // byte caps, the H4 queue checks, E1 overlap) before one admission slot, the envelope
+        // hashes with no lock held, then the scratch-pool dry run under the chain lock.
+        "hk_submitBundle" => submit_bundle(params, bundles_open(h), &h.chain, &h.bundles, &BUNDLE_ADMIT),
         "hk_getPoolInfo" => {
             // P6: `asset` (64-hex, optional) selects a per-asset pool; absent = the legacy
             // pool — every pre-P6 wallet keeps working unchanged.
@@ -1673,12 +1928,23 @@ mod n1_tests {
 #[cfg(test)]
 mod r18_tests {
     use super::{bundle_shape_verdict, MAX_TXS_PER_BLOCK};
+    use hk_crypto::lamport::{PK_LEN, SIG_LEN};
     use hk_primitives::H256;
     use hk_state::tx::{SignedTx, Tx};
 
-    /// Unsigned frames: the verdict reads payloads only (the aggregate is the proof).
+    /// Frames with right-length junk keys: the verdict reads payloads and lengths only (the
+    /// aggregate is the proof; whether the key is the account's is `submit_bundle`'s dry run).
+    /// HR-1 (v0.19.11): an EMPTY key / signature — the pre-HR-1 fixture — is refused by the
+    /// length rule now, so the shape semantics are asserted on frames that pass it.
     fn frame(payload: Tx) -> SignedTx {
-        SignedTx { sender: H256([1; 32]), nonce: 0, payload, next_auth: H256([0; 32]), lamport_pk: vec![], sig: vec![] }
+        SignedTx {
+            sender: H256([1; 32]),
+            nonce: 0,
+            payload,
+            next_auth: H256([0; 32]),
+            lamport_pk: vec![0xAA; PK_LEN],
+            sig: vec![0xBB; SIG_LEN],
+        }
     }
     fn spend(proof: Vec<u8>) -> SignedTx {
         frame(Tx::ShieldedSpend {
@@ -1718,6 +1984,15 @@ mod r18_tests {
         // a pool tx that carries its own proof is the classic per-proof path, not a bundle
         assert!(bundle_shape_verdict(&[spend(vec![1, 2, 3])]).is_err());
         assert!(bundle_shape_verdict(&[mint(vec![1])]).is_err());
+        // HR-1 (v0.19.11): a keyless frame — the report's PoC shape, and this fixture before
+        // HR-1 — is refused by the length rule, after the proof-less rule, at its position
+        let mut keyless = spend(vec![]);
+        keyless.lamport_pk = vec![];
+        keyless.sig = vec![];
+        assert_eq!(
+            bundle_shape_verdict(&[spend(vec![]), keyless]).unwrap_err(),
+            "bad txs: tx 1 has a malformed envelope (0 B pk, 0 B sig) — a bundle tx is account-signed like any other"
+        );
         // longer than a block: never picked by build_batch, so never queued
         let too_long: Vec<SignedTx> = (0..=MAX_TXS_PER_BLOCK).map(|_| spend(vec![])).collect();
         assert_eq!(
@@ -2181,5 +2456,571 @@ mod r17_tests {
             assert_eq!(queue.lock().unwrap().len(), 1);
             assert_eq!(slots.available_permits(), CERT_VERIFY_SLOTS);
         });
+    }
+}
+
+/// HR-1 (mr-hrydarie, reported 2026-11-04, confirmed 2026-11-08): `hk_submitBundle` queued a
+/// bundle for the proposer after a shape check only — no envelope, sender, nonce, anchor or
+/// nullifier check, no bound on the aggregate bytes but the 8 MiB body cap — and the commit
+/// prune evicted a victim's pending tx on a refused bundle tx's (sender, nonce) (that half is
+/// mempool.rs `hr1_a_refused_twin_does_not_evict_the_victims_pending_tx` and state.rs
+/// `hr1_tests`). `submit_bundle` is driven here over the handles it takes, as `r17_tests`
+/// drives the operator submits, and `dispatch` itself over `SharedHandles::for_tests`. The
+/// chain and the signers are the shared fixture (`mempool::test_fixtures`): genesis accounts
+/// behind real L-ratchet commitments, funded, the genesis pool's first anchor as the recent
+/// anchor, `demo::Wallet` (the faucet's and the CLI's signer) signing at any ratchet position.
+/// A zero-permit `Semaphore` stands for "an admission is in flight": a refusal that still comes
+/// back through it provably happened before the slot.
+#[cfg(test)]
+mod hr1_tests {
+    use super::*;
+    use crate::mempool::test_fixtures::*;
+    use crate::mempool::AdmitError;
+    use tokio::sync::Semaphore;
+
+    type Queue = Mutex<Vec<(Vec<SignedTx>, Vec<u8>)>>;
+
+    /// The report's frame: no key, no signature, an arbitrary sender at nonce 0, empty fields.
+    fn keyless_frame(i: usize) -> SignedTx {
+        let mut nf = [0u8; 32];
+        nf[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        SignedTx {
+            sender: H256([0xAB; 32]),
+            nonce: 0,
+            payload: Tx::ShieldedSpend {
+                anchor: H256([0; 32]),
+                nullifier: H256(nf),
+                out_commitment: H256([0; 32]),
+                out2_commitment: H256([0; 32]),
+                fee: 0,
+                credit: None,
+                mandate: None,
+                proof: vec![],
+                stealth_ct: vec![],
+                stealth_ct2: vec![],
+            },
+            next_auth: H256([0; 32]),
+            lamport_pk: vec![],
+            sig: vec![],
+        }
+    }
+    /// A stand-in aggregate: the door reads its length and its identity only (verifying it at
+    /// submit is not in this release).
+    fn agg(tag: u8) -> Vec<u8> {
+        vec![tag; 64]
+    }
+    fn params(txs: &[SignedTx], agg: &[u8]) -> Value {
+        json!({"txs": serde_json::to_value(txs).unwrap(), "agg_proof": hex::encode(agg)})
+    }
+    fn submit(open: bool, chain: &Mutex<hk_state::State>, q: &Queue, slots: &Semaphore, txs: &[SignedTx], agg: &[u8]) -> Value {
+        submit_bundle(&params(txs, agg), open, chain, q, slots)
+    }
+    fn error(v: &Value) -> String {
+        v.get("error").and_then(|e| e.as_str()).unwrap_or("").to_string()
+    }
+    fn accepted(v: &Value) -> bool {
+        v["result"]["accepted"] == json!(true)
+    }
+    fn would_not_apply(i: usize, e: AdmitError) -> String {
+        format!("bad txs: tx {i} would not apply: {}", e.as_str())
+    }
+    fn ids(txs: &[SignedTx]) -> Vec<String> {
+        txs.iter().map(|t| hex::encode(txid(t))).collect()
+    }
+    fn agg_too_large_msg(bytes: usize) -> String {
+        format!("bad agg_proof: {bytes} bytes (max {MAX_BUNDLE_AGG_BYTES} — an aggregate STARK is ~1,242 KB)")
+    }
+    const CLOSED: &str = "hk_submitBundle is closed on this node (hk_rpc.accept_bundles = false): there is no aggregator role yet — a devnet opens it with accept_bundles = true or HK_RPC_ACCEPT_BUNDLES=1";
+    const E3: &str = "a proof-less pool tx can only be covered by a bundle's aggregate — submit it through hk_submitBundle";
+
+    /// Kill: drop the `open` check from `submit_bundle` (or default `accept_bundles` to true)
+    /// and a networked seat queues any stranger's bundle for its next block again.
+    #[test]
+    fn hr1_the_bundle_door_is_closed_by_default() {
+        // the default the door reads from config.toml (handles() sets the same false)
+        assert!(!crate::config::HkRpcConfig::default().accept_bundles);
+        let chain = Mutex::new(mini_chain(1));
+        let q: Queue = Mutex::new(Vec::new());
+        let bundle = demo_bundle(&chain.lock().unwrap(), 1, 0x10);
+        // zero permits and garbage params alike: the closed door answers before the parse,
+        // before every check and before the slot — a closed door costs nothing
+        let no_slots = Semaphore::new(0);
+        for p in [params(&bundle, &agg(1)), json!({}), json!({"txs": "garbage", "agg_proof": "zz"}), Value::Null] {
+            let r = submit_bundle(&p, false, &chain, &q, &no_slots);
+            assert_eq!(error(&r), CLOSED, "{r}");
+        }
+        assert!(q.lock().unwrap().is_empty());
+        // the same bundle through the open door, with a slot: queued — the switch is the door
+        let r = submit(true, &chain, &q, &Semaphore::new(1), &bundle, &agg(1));
+        assert!(accepted(&r), "{r}");
+        assert_eq!(q.lock().unwrap().len(), 1);
+    }
+
+    /// Kill: drop `bundles_open(h)` from the `hk_submitBundle` arm of `dispatch` (pass `true`)
+    /// and (a) fails — a networked seat's door is open; drop the env-var half of
+    /// `bundles_open` and (c) fails; dry-run on `h.mempool` instead of a scratch pool and the
+    /// live-pool assertion in (b) fails. ONE test drives `dispatch` for this method:
+    /// HK_RPC_ACCEPT_BUNDLES is process-global, so a second test setting it would race this one.
+    #[test]
+    #[allow(non_snake_case)]
+    fn hr1_dispatch_hk_submitBundle_follows_the_switch_and_never_touches_the_live_pool() {
+        // this test owns HK_RPC_ACCEPT_BUNDLES for the process: a shell that exports it (the
+        // devnet convenience) must not turn (a) into a failure unrelated to the code
+        std::env::remove_var("HK_RPC_ACCEPT_BUNDLES");
+        let mut h = SharedHandles::for_tests(mini_chain(3));
+        let bundle = demo_bundle(&h.chain.lock().unwrap(), 1, 0x10);
+        let second = demo_bundle(&h.chain.lock().unwrap(), 2, 0x60);
+        let third = demo_bundle(&h.chain.lock().unwrap(), 3, 0x70);
+        let a = anchor(&h.chain.lock().unwrap());
+        // (a) the default handles: closed, before the params are read
+        assert!(!h.accept_bundles);
+        for p in [params(&bundle, &agg(1)), json!({}), Value::Null] {
+            let r = dispatch("hk_submitBundle", &p, &h);
+            assert_eq!(error(&r), CLOSED, "{r}");
+        }
+        assert!(h.bundles.lock().unwrap().is_empty());
+        // (b) the operator's switch: a demo-shaped bundle queues; the LIVE mempool saw nothing;
+        // the slot came back
+        h.accept_bundles = true;
+        let r = dispatch("hk_submitBundle", &params(&bundle, &agg(1)), &h);
+        assert!(accepted(&r), "{r}");
+        assert_eq!(r["result"]["txids"], json!(ids(&bundle)));
+        assert_eq!(h.bundles.lock().unwrap().len(), 1);
+        assert_eq!(h.mempool.lock().unwrap().len(), 0, "nothing from a bundle enters the live pool");
+        assert_eq!(BUNDLE_ADMIT.available_permits(), 1);
+        // a refused bundle through dispatch: hk_submitTx's reason, nothing queued, the slot back
+        let wrong_key = vec![sign_as(2, 3, 0, spend_payload(a, 0x20))];
+        let r = dispatch("hk_submitBundle", &params(&wrong_key, &agg(2)), &h);
+        assert_eq!(error(&r), would_not_apply(0, AdmitError::AuthMismatch), "{r}");
+        assert_eq!(h.bundles.lock().unwrap().len(), 1);
+        assert_eq!(BUNDLE_ADMIT.available_permits(), 1);
+        // (c) the env var opens a closed door for one process, and closes it again when unset
+        h.accept_bundles = false;
+        assert_eq!(error(&dispatch("hk_submitBundle", &params(&second, &agg(3)), &h)), CLOSED);
+        std::env::set_var("HK_RPC_ACCEPT_BUNDLES", "1");
+        let r = dispatch("hk_submitBundle", &params(&second, &agg(3)), &h);
+        std::env::remove_var("HK_RPC_ACCEPT_BUNDLES");
+        assert!(accepted(&r), "{r}");
+        assert_eq!(h.bundles.lock().unwrap().len(), 2);
+        assert_eq!(error(&dispatch("hk_submitBundle", &params(&third, &agg(4)), &h)), CLOSED);
+        assert_eq!(h.bundles.lock().unwrap().len(), 2);
+        assert_eq!(h.mempool.lock().unwrap().len(), 0);
+        assert_eq!(BUNDLE_ADMIT.available_permits(), 1);
+        // the queue holds what was submitted, whole — what `build_batch` rides
+        let q = h.bundles.lock().unwrap();
+        assert_eq!(q[0].0.iter().map(txid).collect::<Vec<_>>(), bundle.iter().map(txid).collect::<Vec<_>>());
+        assert_eq!(q[0].1, agg(1));
+        assert_eq!(q[1].0.iter().map(txid).collect::<Vec<_>>(), second.iter().map(txid).collect::<Vec<_>>());
+        assert_eq!(q[1].1, agg(3));
+    }
+
+    /// Kill: judge the 2nd and 3rd spend against the chain's nonce instead of the scratch
+    /// pool's ratchet (NonceGap) and the demo-shaped bundle stops queueing. (A dry run on the
+    /// LIVE pool is invisible here — this test takes no mempool handle;
+    /// `hr1_dispatch_hk_submitBundle_follows_the_switch_and_never_touches_the_live_pool`
+    /// catches it.)
+    #[test]
+    fn hr1_the_switch_opens_the_door_for_a_demo_shaped_bundle() {
+        let chain = Mutex::new(mini_chain(2));
+        let q: Queue = Mutex::new(Vec::new());
+        let slots = Semaphore::new(1);
+        let bundle = demo_bundle(&chain.lock().unwrap(), 1, 0x10);
+        let r = submit(true, &chain, &q, &slots, &bundle, &agg(1));
+        assert!(accepted(&r), "{r}");
+        let got: Vec<String> =
+            r["result"]["txids"].as_array().unwrap().iter().map(|t| t.as_str().unwrap().to_string()).collect();
+        assert_eq!(got, ids(&bundle));
+        {
+            let q = q.lock().unwrap();
+            assert_eq!(q.len(), 1);
+            assert_eq!(q[0].0.iter().map(txid).collect::<Vec<_>>(), bundle.iter().map(txid).collect::<Vec<_>>());
+            assert_eq!(q[0].1, agg(1));
+        }
+        // the slot came back
+        assert_eq!(slots.available_permits(), 1);
+        // the dry run applied nothing: the account's nonce and the pool's nullifiers are as at
+        // genesis — and the LIVE mempool is untouchable from here by construction
+        // (`submit_bundle` takes no mempool handle; the scratch pool dies with the chain lock;
+        // the dispatch test above asserts it on the real handles)
+        {
+            let c = chain.lock().unwrap();
+            assert_eq!(c.accounts[&acct(1)].nonce, 0);
+            assert!(c.pool.nullifiers.is_empty());
+        }
+        // a shield rides a bundle too: a proof-less mint, then two spends, from another account
+        let a = anchor(&chain.lock().unwrap());
+        let mixed = vec![
+            sign_at(2, 0, mint_payload(vec![0x5c; LEGIT_CT + 6])),
+            sign_at(2, 1, sealed_spend_payload(a, 0x20, vec![0x5c; LEGIT_CT], vec![0x5c; LEGIT_CT])),
+            sign_at(2, 2, sealed_spend_payload(a, 0x21, vec![0x5c; LEGIT_CT], vec![])),
+        ];
+        let r = submit(true, &chain, &q, &slots, &mixed, &agg(2));
+        assert!(accepted(&r), "{r}");
+        assert_eq!(q.lock().unwrap().len(), 2);
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    /// Kill: drop the length rule from `bundle_shape_verdict` and the report's 1,024 keyless
+    /// frames reach the slot (busy here; with a slot, the hashes and the chain lock).
+    #[test]
+    fn hr1_keyless_frames_are_refused_free_before_the_slot() {
+        let chain = Mutex::new(mini_chain(1));
+        let q: Queue = Mutex::new(Vec::new());
+        // the permit is held by "an admission in flight": anything reaching the slot answers busy
+        let no_slots = Semaphore::new(0);
+        let frames: Vec<SignedTx> = (0..MAX_TXS_PER_BLOCK).map(keyless_frame).collect();
+        let r = submit(true, &chain, &q, &no_slots, &frames, &agg(1));
+        assert_eq!(
+            error(&r),
+            "bad txs: tx 0 has a malformed envelope (0 B pk, 0 B sig) — a bundle tx is account-signed like any other",
+            "{r}"
+        );
+        // the rule reads both fields and names the lengths it saw
+        let mut half = keyless_frame(0);
+        half.lamport_pk = vec![0xAA; PK_LEN];
+        let r = submit(true, &chain, &q, &no_slots, &[half], &agg(1));
+        assert_eq!(
+            error(&r),
+            format!("bad txs: tx 0 has a malformed envelope ({PK_LEN} B pk, 0 B sig) — a bundle tx is account-signed like any other")
+        );
+        let mut long = keyless_frame(0);
+        long.lamport_pk = vec![0xAA; PK_LEN + 1];
+        long.sig = vec![0xBB; SIG_LEN];
+        let r = submit(true, &chain, &q, &no_slots, &[long], &agg(1));
+        assert!(error(&r).contains(&format!("({} B pk, {SIG_LEN} B sig)", PK_LEN + 1)), "{r}");
+        // one more than a block: the R18 count rule first, still free
+        let too_many: Vec<SignedTx> = (0..=MAX_TXS_PER_BLOCK).map(keyless_frame).collect();
+        let r = submit(true, &chain, &q, &no_slots, &too_many, &agg(1));
+        assert_eq!(error(&r), format!("bad txs: a bundle may carry at most {MAX_TXS_PER_BLOCK} txs (one block)"));
+        // the position is named: a good tx 0 followed by a keyless tx 1
+        let good = demo_bundle(&chain.lock().unwrap(), 1, 0x10);
+        let r = submit(true, &chain, &q, &no_slots, &[good[0].clone(), keyless_frame(1)], &agg(1));
+        assert!(error(&r).starts_with("bad txs: tx 1 has a malformed envelope"), "{r}");
+        // and a good bundle with no slot answers busy — every refusal above came before it
+        let r = submit(true, &chain, &q, &no_slots, &good, &agg(1));
+        assert!(error(&r).starts_with("busy:"), "{r}");
+        assert!(q.lock().unwrap().is_empty());
+        // the same frames through `bundle_shape_verdict` directly; the R18 semantics intact
+        assert!(bundle_shape_verdict(&frames).is_err());
+        assert_eq!(bundle_shape_verdict(&good), Ok(()));
+    }
+
+    /// Kill: skip the scratch-pool dry run (queue after the shape check, as before v0.19.11)
+    /// and every bundle below is queued for the proposer.
+    #[test]
+    fn hr1_right_length_junk_unknown_sender_and_wrong_key_are_refused() {
+        let chain = Mutex::new(mini_chain(2));
+        let q: Queue = Mutex::new(Vec::new());
+        let slots = Semaphore::new(1);
+        let a = anchor(&chain.lock().unwrap());
+        // right-length junk keys for an unknown sender: the account walk's first refusal, worded
+        // as hk_submitTx words it (the junk signature is judged after the account, not before)
+        let mut junk = keyless_frame(0);
+        junk.lamport_pk = vec![0xAA; PK_LEN];
+        junk.sig = vec![0xBB; SIG_LEN];
+        let r = submit(true, &chain, &q, &slots, &[junk], &agg(1));
+        assert_eq!(error(&r), would_not_apply(0, AdmitError::UnknownSender), "{r}");
+        // a known account signed under the wrong key: a VALID Lamport signature whose key does
+        // not open the account's commitment
+        let wrong_key = sign_as(1, 2, 0, spend_payload(a, 0x21));
+        let r = submit(true, &chain, &q, &slots, &[wrong_key], &agg(1));
+        assert_eq!(error(&r), would_not_apply(0, AdmitError::AuthMismatch), "{r}");
+        // the account's own key, the signature zeroed: judged last, like at hk_submitTx
+        let mut nosig = sign_at(1, 0, spend_payload(a, 0x22));
+        nosig.sig = vec![0; SIG_LEN];
+        let r = submit(true, &chain, &q, &slots, &[nosig], &agg(1));
+        assert_eq!(error(&r), would_not_apply(0, AdmitError::BadSignature), "{r}");
+        // an anchor no pool knows
+        let stale = sign_at(1, 0, spend_payload(H256([0xAA; 32]), 0x23));
+        let r = submit(true, &chain, &q, &slots, &[stale], &agg(1));
+        assert_eq!(error(&r), would_not_apply(0, AdmitError::UnknownAnchor), "{r}");
+        // a good tx 0 and a wrong-key tx 1 (along the pending ratchet): the position is named
+        let good = sign_at(1, 0, spend_payload(a, 0x24));
+        let bad_second = sign_as(1, 2, 1, spend_payload(a, 0x25));
+        let r = submit(true, &chain, &q, &slots, &[good, bad_second], &agg(1));
+        assert_eq!(error(&r), would_not_apply(1, AdmitError::AuthMismatch), "{r}");
+        // nothing queued, the slot always came back, the chain untouched
+        assert!(q.lock().unwrap().is_empty());
+        assert_eq!(slots.available_permits(), 1);
+        assert_eq!(chain.lock().unwrap().accounts[&acct(1)].nonce, 0);
+    }
+
+    /// Kill: drop the aggregate cap (or the stealth cap from `bundle_shape_verdict`) and the
+    /// oversize bundles below reach the slot (`busy` here, with no permit; with a slot they
+    /// queue — up to 8 MiB of aggregate per block into every node's log); drop the hex-length
+    /// check (S3) alone and the two over-cap strings below are parsed first — the non-hex one
+    /// answers `bad txs: …` (its garbage txs are judged first), the odd-length one
+    /// `bad agg_proof hex: Odd number of digits` — instead of the size; the decoded-length
+    /// check after the decode is the belt neither string reaches.
+    #[test]
+    fn hr1_the_aggregate_and_stealth_fields_are_bounded() {
+        let chain = Mutex::new(mini_chain(1));
+        let q: Queue = Mutex::new(Vec::new());
+        let no_slots = Semaphore::new(0);
+        let mib = 1024 * 1024;
+        let bundle = demo_bundle(&chain.lock().unwrap(), 1, 0x10);
+        // one byte over: refused by the size, before the slot
+        let r = submit(true, &chain, &q, &no_slots, &bundle, &vec![0x11; MAX_BUNDLE_AGG_BYTES + 1]);
+        assert_eq!(error(&r), agg_too_large_msg(MAX_BUNDLE_AGG_BYTES + 1), "{r}");
+        // S3: the hex string's length is judged before it is decoded and before the txs are
+        // parsed — an over-cap string that is not even hex, beside garbage txs, is refused by the
+        // size (an odd digit counts as a whole byte)
+        let not_hex = "zz".repeat(MAX_BUNDLE_AGG_BYTES + 1);
+        let r = submit_bundle(&json!({"txs": "garbage", "agg_proof": not_hex}), true, &chain, &q, &no_slots);
+        assert_eq!(error(&r), agg_too_large_msg(MAX_BUNDLE_AGG_BYTES + 1), "{r}");
+        let odd = format!("{}f", "00".repeat(MAX_BUNDLE_AGG_BYTES));
+        let r = submit_bundle(&params(&bundle, &[]).as_object().map(|o| {
+            let mut o = o.clone();
+            o.insert("agg_proof".into(), json!(odd));
+            Value::Object(o)
+        }).unwrap(), true, &chain, &q, &no_slots);
+        assert_eq!(error(&r), agg_too_large_msg(MAX_BUNDLE_AGG_BYTES + 1), "{r}");
+        // under the hex cap but not hex: the decode names it (the size check did not fire)
+        let r = submit_bundle(&json!({"txs": serde_json::to_value(&bundle).unwrap(), "agg_proof": "zz"}), true, &chain, &q, &no_slots);
+        assert!(error(&r).starts_with("bad agg_proof hex:"), "{r}");
+        // the real thing's size — 1,242 KB — and exactly the cap are not refused by the size
+        // check: with no slot they reach the slot (busy)
+        for n in [1_242 * 1024, MAX_BUNDLE_AGG_BYTES] {
+            let r = submit(true, &chain, &q, &no_slots, &bundle, &vec![0x22; n]);
+            assert!(error(&r).starts_with("busy:"), "{n}: {r}");
+        }
+        // … and with a slot the 1,242 KB one queues
+        let r = submit(true, &chain, &q, &Semaphore::new(1), &bundle, &vec![0x22; 1_242 * 1024]);
+        assert!(accepted(&r), "{r}");
+        // the stealth fields: one byte over on any of them is refused by the shape check, free
+        let a = anchor(&chain.lock().unwrap());
+        let over = MAX_STEALTH_CT_BYTES + 1;
+        let cases = [
+            sign_at(1, 0, sealed_spend_payload(a, 0x30, vec![0; over], vec![])),
+            sign_at(1, 0, sealed_spend_payload(a, 0x31, vec![], vec![0; over])),
+            sign_at(1, 0, mint_payload(vec![0; over])),
+        ];
+        for tx in cases {
+            let r = submit(true, &chain, &q, &no_slots, &[tx], &agg(3));
+            assert_eq!(
+                error(&r),
+                format!("bad txs: tx 0 carries a {over}-byte stealth ciphertext (max {MAX_STEALTH_CT_BYTES})"),
+                "{r}"
+            );
+        }
+        // a 1 MiB ciphertext names its size, and the position is named
+        let big = sign_at(1, 1, mint_payload(vec![0; mib]));
+        let r = submit(true, &chain, &q, &no_slots, &[bundle[0].clone(), big], &agg(3));
+        assert_eq!(
+            error(&r),
+            format!("bad txs: tx 1 carries a {mib}-byte stealth ciphertext (max {MAX_STEALTH_CT_BYTES})")
+        );
+        // the legitimate size (1,192 B plus a memo) and exactly the cap pass the shape check
+        let legit = sign_at(1, 0, sealed_spend_payload(a, 0x32, vec![0; LEGIT_CT + 8], vec![0; MAX_STEALTH_CT_BYTES]));
+        assert_eq!(bundle_shape_verdict(&[legit]), Ok(()));
+        assert_eq!(q.lock().unwrap().len(), 1);
+    }
+
+    /// Kill: drop the overlap check from `bundle_queue_verdict` and two bundles claiming one
+    /// (sender, nonce) or one nullifier both reach the slot (`busy` here, with no permit; with a
+    /// slot both queue) — the loser rides a later block as all-Err receipts (and, before E4,
+    /// evicted the victim's pending tx with them).
+    #[test]
+    fn hr1_a_second_bundle_overlapping_a_queued_one_is_refused() {
+        let chain = Mutex::new(mini_chain(3));
+        let q: Queue = Mutex::new(Vec::new());
+        let slots = Semaphore::new(1);
+        let a = anchor(&chain.lock().unwrap());
+        let first = demo_bundle(&chain.lock().unwrap(), 1, 0x10);
+        let r = submit(true, &chain, &q, &slots, &first, &agg(1));
+        assert!(accepted(&r), "{r}");
+        let no_slots = Semaphore::new(0);
+        // the same slot (account 1, nonce 0), a fresh nullifier, another aggregate: refused free
+        let same_slot = vec![sign_at(1, 0, spend_payload(a, 0x40))];
+        let r = submit(true, &chain, &q, &no_slots, &same_slot, &agg(2));
+        assert_eq!(error(&r), "bad txs: a queued bundle already carries tx 0's (sender, nonce) slot or nullifier", "{r}");
+        // another account, but its tx 1 reuses the first bundle's third nullifier: refused free,
+        // the position named
+        let same_nf = vec![sign_at(2, 0, spend_payload(a, 0x50)), sign_at(2, 1, spend_payload(a, 0x12))];
+        let r = submit(true, &chain, &q, &no_slots, &same_nf, &agg(3));
+        assert_eq!(error(&r), "bad txs: a queued bundle already carries tx 1's (sender, nonce) slot or nullifier", "{r}");
+        // the same aggregate bytes again: the H4 dedup, still free
+        let second = demo_bundle(&chain.lock().unwrap(), 2, 0x60);
+        let r = submit(true, &chain, &q, &no_slots, &second, &agg(1));
+        assert_eq!(error(&r), "duplicate bundle (same aggregate proof already queued)", "{r}");
+        assert_eq!(q.lock().unwrap().len(), 1);
+        // a disjoint bundle (account 2, fresh nullifiers, its own aggregate): queued behind the first
+        let r = submit(true, &chain, &q, &slots, &second, &agg(4));
+        assert!(accepted(&r), "{r}");
+        assert_eq!(q.lock().unwrap().len(), 2);
+        // the H4 cap, free: with the queue full, a disjoint honest bundle is refused by the cap
+        {
+            let mut qq = q.lock().unwrap();
+            while qq.len() < BUNDLE_QUEUE_MAX {
+                let i = qq.len();
+                qq.push((vec![keyless_frame(i)], vec![i as u8; 3]));
+            }
+        }
+        let third = demo_bundle(&chain.lock().unwrap(), 3, 0x70);
+        let r = submit(true, &chain, &q, &no_slots, &third, &agg(5));
+        assert_eq!(error(&r), format!("bundle queue full (max {BUNDLE_QUEUE_MAX}) — retry after the next block"), "{r}");
+        assert_eq!(q.lock().unwrap().len(), BUNDLE_QUEUE_MAX);
+    }
+
+    /// Kill: delete the `bundle_queue_verdict` re-run from `push_bundle` and the three pushes
+    /// below land — a bundle judged free before the slot would ride into a queue that filled,
+    /// or took its aggregate, slot or nullifier, while the dry run held the chain lock.
+    #[test]
+    fn hr1_push_bundle_rechecks_the_queue_before_the_push() {
+        let chain = mini_chain(3);
+        let a = anchor(&chain);
+        let first = demo_bundle(&chain, 1, 0x10);
+        let mut q: Vec<(Vec<SignedTx>, Vec<u8>)> = vec![(first.clone(), agg(1))];
+        // the queue already carries the slot (account 1, nonce 0) …
+        let same_slot = vec![sign_at(1, 0, spend_payload(a, 0x40))];
+        assert_eq!(
+            push_bundle(&mut q, same_slot.clone(), agg(2), ids(&same_slot)),
+            Err("bad txs: a queued bundle already carries tx 0's (sender, nonce) slot or nullifier".to_string())
+        );
+        // … the nullifier (the first bundle's third, 0x12, reused by tx 1 of another account) …
+        let same_nf = vec![sign_at(2, 0, spend_payload(a, 0x50)), sign_at(2, 1, spend_payload(a, 0x12))];
+        assert_eq!(
+            push_bundle(&mut q, same_nf.clone(), agg(3), ids(&same_nf)),
+            Err("bad txs: a queued bundle already carries tx 1's (sender, nonce) slot or nullifier".to_string())
+        );
+        // … and the aggregate bytes
+        let second = demo_bundle(&chain, 2, 0x60);
+        assert_eq!(
+            push_bundle(&mut q, second.clone(), agg(1), ids(&second)),
+            Err("duplicate bundle (same aggregate proof already queued)".to_string())
+        );
+        assert_eq!(q.len(), 1, "a refusal leaves the queue untouched");
+        // the disjoint bundle is pushed, its ids echoed back as given
+        assert_eq!(push_bundle(&mut q, second.clone(), agg(4), ids(&second)), Ok(ids(&second)));
+        assert_eq!(q.len(), 2);
+        assert_eq!(q[1].0.iter().map(txid).collect::<Vec<_>>(), second.iter().map(txid).collect::<Vec<_>>());
+        assert_eq!(q[1].1, agg(4));
+        // the cap: a queue that filled in the meantime refuses a disjoint honest bundle
+        while q.len() < BUNDLE_QUEUE_MAX {
+            let i = q.len();
+            q.push((vec![keyless_frame(i)], vec![i as u8; 3]));
+        }
+        let third = demo_bundle(&chain, 3, 0x70);
+        assert_eq!(
+            push_bundle(&mut q, third.clone(), agg(5), ids(&third)),
+            Err(format!("bundle queue full (max {BUNDLE_QUEUE_MAX}) — retry after the next block"))
+        );
+        assert_eq!(q.len(), BUNDLE_QUEUE_MAX);
+    }
+
+    /// Kill: dry-run each tx in a FRESH scratch pool (or in none) and a bundle that collides
+    /// with itself queues; `build_batch` would ride it and every tx past the first copy dies.
+    #[test]
+    fn hr1_intra_bundle_duplicate_slot_or_nullifier_is_refused() {
+        let chain = Mutex::new(mini_chain(1));
+        let q: Queue = Mutex::new(Vec::new());
+        let slots = Semaphore::new(1);
+        let a = anchor(&chain.lock().unwrap());
+        let s = |nonce: u64, nf: u8| sign_at(1, nonce, spend_payload(a, nf));
+        // the same slot twice with two payloads → the scratch pool's DuplicateSlot on tx 1
+        let r = submit(true, &chain, &q, &slots, &[s(0, 0x10), s(0, 0x11)], &agg(1));
+        assert_eq!(error(&r), would_not_apply(1, AdmitError::DuplicateSlot { pending_nonce: 0 }), "{r}");
+        // the same tx twice → DuplicateTx
+        let r = submit(true, &chain, &q, &slots, &[s(0, 0x10), s(0, 0x10)], &agg(1));
+        assert_eq!(error(&r), would_not_apply(1, AdmitError::DuplicateTx), "{r}");
+        // one nullifier spent twice at consecutive nonces → NullifierPending on tx 1
+        let r = submit(true, &chain, &q, &slots, &[s(0, 0x10), s(1, 0x10)], &agg(1));
+        assert_eq!(error(&r), would_not_apply(1, AdmitError::NullifierPending), "{r}");
+        // a nonce gap inside the bundle → NonceGap (a bundle is whole from the chain's nonce up)
+        let r = submit(true, &chain, &q, &slots, &[s(0, 0x10), s(2, 0x12)], &agg(1));
+        assert_eq!(error(&r), would_not_apply(1, AdmitError::NonceGap { got: 2, missing: 1 }), "{r}");
+        // out of nonce order → NonceGap on tx 0
+        let r = submit(true, &chain, &q, &slots, &[s(1, 0x11), s(0, 0x10)], &agg(1));
+        assert_eq!(error(&r), would_not_apply(0, AdmitError::NonceGap { got: 1, missing: 0 }), "{r}");
+        assert!(q.lock().unwrap().is_empty());
+        assert_eq!(slots.available_permits(), 1);
+        // the honest shape queues
+        let r = submit(true, &chain, &q, &slots, &[s(0, 0x10), s(1, 0x11), s(2, 0x12)], &agg(1));
+        assert!(accepted(&r), "{r}");
+        assert_eq!(q.lock().unwrap().len(), 1);
+    }
+
+    /// Kill: drop the `refuse_proof_less_pool_tx` call from `admit_one` and the proof-less
+    /// spend and mint below are admitted to the live pool through `hk_submitTx` and
+    /// `hk_gossipTxs` (the mempool itself checks no proof — the last lines show it), ride a
+    /// block uncovered and die at apply — a block slot for the price of an envelope.
+    #[test]
+    #[allow(non_snake_case)]
+    fn hr1_a_proof_less_pool_tx_is_refused_at_hk_submitTx_and_hk_gossipTxs() {
+        let h = SharedHandles::for_tests(mini_chain(2));
+        let a = anchor(&h.chain.lock().unwrap());
+        let proof_less_spend = sign_at(1, 0, spend_payload(a, 0x10));
+        let proof_less_mint = sign_at(2, 0, mint_payload(vec![0x5c; LEGIT_CT]));
+        // through the real doors: the E3 reason, and the live pool untouched
+        for tx in [&proof_less_spend, &proof_less_mint] {
+            let r = dispatch("hk_submitTx", &json!({"tx": tx}), &h);
+            assert_eq!(r["result"]["accepted"], json!(false), "{r}");
+            assert_eq!(r["result"]["reason"], json!(E3), "{r}");
+        }
+        let r = dispatch("hk_gossipTxs", &json!({"txs": [proof_less_spend, proof_less_mint]}), &h);
+        assert_eq!(r["result"]["dropped"], json!(2), "{r}");
+        assert_eq!(r["result"]["admitted"], json!(0), "{r}");
+        assert_eq!(h.mempool.lock().unwrap().len(), 0);
+        // a pool tx that carries its proof reaches the normal admission: refused for ITS reason
+        // (a stale anchor here), never E3 …
+        let mut stale = spend_payload(H256([0xAA; 32]), 0x11);
+        if let Tx::ShieldedSpend { proof, .. } = &mut stale {
+            *proof = vec![1, 2, 3];
+        }
+        let r = dispatch("hk_submitTx", &json!({"tx": sign_at(1, 0, stale)}), &h);
+        assert_eq!(r["result"]["accepted"], json!(false), "{r}");
+        assert_eq!(r["result"]["reason"], json!(AdmitError::UnknownAnchor.as_str()), "{r}");
+        // … and admitted when it would apply (the mempool checks no proof)
+        let mut proven = spend_payload(a, 0x12);
+        if let Tx::ShieldedSpend { proof, .. } = &mut proven {
+            *proof = vec![1, 2, 3];
+        }
+        let proven = sign_at(1, 0, proven);
+        let r = dispatch("hk_submitTx", &json!({"tx": proven}), &h);
+        assert_eq!(r["result"]["accepted"], json!(true), "{r}");
+        assert_eq!(r["result"]["txid"], json!(hex::encode(txid(&proven))));
+        let shield = sign_at(2, 0, proven_mint_payload(vec![0x5c; LEGIT_CT]));
+        assert_eq!(dispatch("hk_submitTx", &json!({"tx": shield}), &h)["result"]["accepted"], json!(true));
+        assert_eq!(h.mempool.lock().unwrap().len(), 2);
+        // the two gates are complementary — what a bundle must carry is what hk_submitTx
+        // refuses — and the mempool judges no proof (the bundle dry run relies on that)
+        assert_eq!(refuse_proof_less_pool_tx(&proof_less_spend), Err(E3.to_string()));
+        assert_eq!(refuse_proof_less_pool_tx(&proof_less_mint), Err(E3.to_string()));
+        assert_eq!(bundle_shape_verdict(&[proof_less_spend.clone(), proof_less_mint]), Ok(()));
+        let transfer = sign_at(1, 0, Tx::Transfer { to: acct(2), asset: ASSET, amount: 1 });
+        assert_eq!(refuse_proof_less_pool_tx(&transfer), Ok(()));
+        let mut mp = Mempool::new(4);
+        mp.try_admit(proof_less_spend, &h.chain.lock().unwrap()).expect("the mempool judges no proof");
+    }
+
+    /// Kill: drop the `try_acquire` and two concurrent floods of well-formed bundles hash and
+    /// dry-run in parallel on every worker; the slot caps it at one per node.
+    #[test]
+    fn hr1_busy_when_an_admission_is_in_flight() {
+        let chain = Mutex::new(mini_chain(2));
+        let q: Queue = Mutex::new(Vec::new());
+        let slots = Semaphore::new(1);
+        let bundle = demo_bundle(&chain.lock().unwrap(), 1, 0x10);
+        let a = anchor(&chain.lock().unwrap());
+        // the permit is held by an admission in flight: a bundle that passes every free check
+        // answers busy, nothing queued
+        let in_flight = slots.try_acquire().unwrap();
+        let r = submit(true, &chain, &q, &slots, &bundle, &agg(1));
+        assert_eq!(error(&r), "busy: a bundle admission is already in flight — retry in a moment", "{r}");
+        assert!(q.lock().unwrap().is_empty());
+        // the free refusals do not wait for the slot (the keyless and the bounds tests pin the rest)
+        let r = submit(true, &chain, &q, &slots, &[keyless_frame(0)], &agg(1));
+        assert!(error(&r).starts_with("bad txs: tx 0 has a malformed envelope"), "{r}");
+        drop(in_flight);
+        // the slot comes back after a refusal in the dry run …
+        let wrong_key = sign_as(1, 2, 0, spend_payload(a, 0x20));
+        let r = submit(true, &chain, &q, &slots, &[wrong_key], &agg(1));
+        assert!(error(&r).contains("would not apply"), "{r}");
+        assert_eq!(slots.available_permits(), 1);
+        // … and after a success
+        let r = submit(true, &chain, &q, &slots, &bundle, &agg(1));
+        assert!(accepted(&r), "{r}");
+        assert_eq!(slots.available_permits(), 1);
+        assert_eq!(q.lock().unwrap().len(), 1);
     }
 }

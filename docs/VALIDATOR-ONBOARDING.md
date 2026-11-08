@@ -30,7 +30,11 @@ operating post-quantum BFT.
   payments, not validating them.
 - Rust (stable) + the public repo: `git clone https://github.com/hashkinetics/hashkinetics`.
 - One open inbound TCP port for consensus (default **27000**). Do NOT expose the node RPC
-  (26000) publicly — it has no auth; keep it loopback or behind your own proxy.
+  (26000) publicly — it has no auth; keep it loopback or behind your own proxy. **v0.19.11:** the
+  aggregation door `hk_submitBundle` is closed by default (`[hk_rpc] accept_bundles = false` — leave it
+  closed on a validator; `config-gen` writes it so). The public endpoint `rpc.hashkinetics.org` refuses
+  the four operator methods (`hk_submitBundle`, `hk_gossipTxs`, `hk_submitRotation`, `hk_submitSetChange`)
+  with HTTP 403 since 2026-11-08.
 - At mainnet each node needs a Node Key (a software license, not a token); Node Keys are available at https://nodes.hashkinetics.org.
 
 Build once:
@@ -248,7 +252,7 @@ matches other validators'. On restarts you'll also see
   on the node you will submit to, and the chain id; a node behind the one you read the
   tip from refuses the certificate as "past its activation height". Submit through
   YOUR OWN node or a validator you trust over a firewalled RPC, never the public
-  endpoint: `hk_submitRotation` / `hk_submitSetChange` allow two root-signature
+  endpoint (which refuses them with 403 since 2026-11-08): `hk_submitRotation` / `hk_submitSetChange` allow two root-signature
   verifies in flight per node and answer `busy` past that, which a flood on a public
   endpoint can hold indefinitely (`docs/RPC.md` "Limits and refusals").
 - **Syncing across rotation history works (v0.10.7):** commit certificates are

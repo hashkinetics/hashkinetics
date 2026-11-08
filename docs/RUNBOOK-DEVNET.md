@@ -91,7 +91,7 @@ BIN=~/hk-target-chain/release/hk-node
 $BIN demo-mandates http://127.0.0.1:26000 http://127.0.0.1:9911   # P2.4 thesis demo
 $BIN demo-shielded http://127.0.0.1:26000 http://127.0.0.1:9911   # P2.1 stealth storyline
 $BIN demo-disclose http://127.0.0.1:26000 http://127.0.0.1:9911   # P2.2 CVA (writes disclosure-*.json)
-$BIN demo-agg      http://127.0.0.1:26000 http://127.0.0.1:9911   # P2.3 one STARK per block
+$BIN demo-agg      http://127.0.0.1:26000 http://127.0.0.1:9911   # P2.3 one STARK per block (v0.19.11: needs accept_bundles = true under [hk_rpc] on node0 — a fresh `hk-node testnet` writes it; see the note below)
 $BIN demo          http://127.0.0.1:26000                          # P0 $50 storyline (transparent)
 ```
 
@@ -167,7 +167,7 @@ sp1 v6.4.0 toolchain via sp1up · `cargo test --release` for the heavy crypto su
 
 Since 0.10.0 every node is DURABLE: block log (`node*/blocks/`), snapshots every 16
 blocks (`node*/snapshot.bin`, commitment-verified on load — refuse-on-mismatch), and a
-mempool WAL. **Restart = resume.** `./devnet.sh` without `--fresh` relaunches on the
+mempool WAL. **v0.19.11 (HR-1):** the aggregation door `hk_submitBundle` is CLOSED unless `[hk_rpc] accept_bundles = true` is in the node's config.toml (or `HK_RPC_ACCEPT_BUNDLES=1` is in its environment); `hk-node testnet` writes `true` for a devnet, `config-gen` writes `false` for a seat, and a config.toml WITHOUT the key is closed — so a devnet home generated before v0.19.11 refuses `demo-agg` with "hk_submitBundle is closed on this node …" until you regenerate it (`./devnet.sh --fresh …`) or add the line to node0's config and restart node0. **Restart = resume.** `./devnet.sh` without `--fresh` relaunches on the
 existing homes and each node logs `Snapshot restored — commitment verified` and
 `PERSISTENCE RESTORE COMPLETE — resuming, not resyncing`; the chain continues from its
 tip, old receipts stay queryable, wallets keep their note index. `HK_NO_PERSIST=1`

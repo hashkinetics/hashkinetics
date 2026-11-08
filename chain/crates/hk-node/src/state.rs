@@ -252,6 +252,11 @@ pub struct SharedHandles {
     /// N1 (v0.15.2): this node's libp2p peer id (base58) — named in `hk_getPeers.self`.
     /// node.rs fills it after the keypair is derived; empty in tests.
     pub self_peer_id: String,
+    /// HR-1 (mr-hrydarie, reported 2026-11-04; v0.19.11): `hk_rpc.accept_bundles` — whether
+    /// `hk_submitBundle` is open on this node (rpc.rs `bundles_open`; HK_RPC_ACCEPT_BUNDLES=1
+    /// opens it too). node.rs copies it from the config; `handles()` and tests start closed —
+    /// there is no aggregator role yet, and the door is closed unless the operator opens it.
+    pub accept_bundles: bool,
 }
 
 /// Bounded map of txid -> human receipt string ("ok: ..." / "rejected: ...").
@@ -262,7 +267,8 @@ pub struct ReceiptLog {
 }
 
 impl ReceiptLog {
-    fn new(cap: usize) -> Self {
+    /// `pub(crate)`: `SharedHandles::for_tests` (the HR-1 tests) builds one.
+    pub(crate) fn new(cap: usize) -> Self {
         Self { map: HashMap::new(), order: VecDeque::new(), cap }
     }
     fn insert(&mut self, id: [u8; 32], detail: String) {
@@ -289,6 +295,102 @@ impl ReceiptLog {
     pub fn restore(&mut self, entries: Vec<([u8; 32], String)>) {
         for (id, detail) in entries {
             self.insert(id, detail);
+        }
+    }
+}
+
+/// HR-1 (mr-hrydarie, reported 2026-11-04; v0.19.11), E4 — what the commit path does with a
+/// block's receipts, split out of `apply_batch_to_chain` as a pure function so the wiring is
+/// tested (`hr1_tests`): the receipt-log rows and the three prune sets. One txid per block tx,
+/// computed here once — the refused entries and the log rows reuse it.
+pub(crate) struct CommitPrune {
+    /// EVERY block tx's (sender, nonce) — the bundle retain's input: a ridden bundle leaves the
+    /// queue whatever its receipts.
+    pub included: Vec<(hk_primitives::AccountId, u64)>,
+    /// The APPLIED txs' slots: each consumed its nonce, so every pending tx there is dead —
+    /// `Mempool::remove_included`.
+    pub applied: Vec<(hk_primitives::AccountId, u64)>,
+    /// The REFUSED txs' (slot, txid): each consumed nothing, so only an identical pending copy
+    /// is dead — `Mempool::remove_refused`. Before v0.19.11 these slots were pruned like the
+    /// applied ones, and a refused bundle tx naming a victim's pending slot evicted the victim's
+    /// honest tx on every node (HR-1's eviction axis).
+    pub refused: Vec<((hk_primitives::AccountId, u64), [u8; 32])>,
+    /// (txid, "ok: N event(s)" / "rejected: <reason>") per block tx, in order — the receipt
+    /// log's rows.
+    pub log: Vec<([u8; 32], String)>,
+}
+
+impl CommitPrune {
+    /// The two mempool prunes the commit path runs, in this order: the APPLIED slots, then the
+    /// REFUSED (slot, txid) pairs. Returns (pruned by slot, pruned as identical copies).
+    pub(crate) fn prune_mempool(&self, mp: &mut crate::mempool::Mempool) -> (usize, usize) {
+        (mp.remove_included(&self.applied), mp.remove_refused(&self.refused))
+    }
+}
+
+/// HR-1 (E4): split a committed block's receipts — `receipts[i]` is `txs[i]`'s — into a
+/// [`CommitPrune`]. Pure: reads the block and its receipts, hashes each tx once.
+pub(crate) fn commit_prune_sets(txs: &[SignedTx], receipts: &[hk_state::Receipt]) -> CommitPrune {
+    let mut p = CommitPrune {
+        included: Vec::with_capacity(txs.len()),
+        applied: Vec::new(),
+        refused: Vec::new(),
+        log: Vec::with_capacity(txs.len()),
+    };
+    for (tx, r) in txs.iter().zip(receipts.iter()) {
+        let id = txid(tx);
+        let slot = (tx.sender, tx.nonce);
+        let detail = match &r.result {
+            Ok(events) => {
+                p.applied.push(slot);
+                format!("ok: {} event(s)", events.len())
+            }
+            Err(e) => {
+                p.refused.push((slot, id));
+                format!("rejected: {e}")
+            }
+        };
+        p.log.push((id, detail));
+        p.included.push(slot);
+    }
+    p
+}
+
+/// HR-1 (v0.19.11, review item M3): the handles `rpc::dispatch` takes, for tests — a
+/// `SharedHandles` otherwise needs `HkApp::new` (a genesis, a signer, a store). Everything
+/// empty or closed: no store, no gossip, one placeholder validator seat, the bundle door shut
+/// (the config default), the v2 rotation rule never.
+#[cfg(test)]
+impl SharedHandles {
+    pub(crate) fn for_tests(chain: hk_state::State) -> Self {
+        Self {
+            chain: Arc::new(Mutex::new(chain)),
+            mempool: Arc::new(Mutex::new(crate::mempool::Mempool::new(1_024))),
+            receipts: Arc::new(Mutex::new(ReceiptLog::new(16))),
+            pool_notes: Default::default(),
+            pool_notes_by_asset: Default::default(),
+            bundles: Default::default(),
+            chain_id: "test".to_string(),
+            genesis_digest: [0; 32],
+            store: None,
+            // one placeholder seat: the set type refuses to be empty, and nothing these
+            // tests drive reads it (HkValidator::new stores the bytes and derives an address)
+            validators: Arc::new(Mutex::new(HkValidatorSet::new([HkValidator::new(
+                vec![0u8; 48],
+                hk_consensus::HkPub(vec![0u8; 32]),
+                1,
+            )]))),
+            genesis_roots: Vec::new(),
+            chain_start_time: 0,
+            gossip: None,
+            foreign_rotations: Default::default(),
+            rotation_v2_from: u64::MAX,
+            pending_set_changes: Default::default(),
+            signer_gauge: Arc::new(Mutex::new((0, 0))),
+            tx_index: Default::default(),
+            acct_index: Default::default(),
+            self_peer_id: String::new(),
+            accept_bundles: false,
         }
     }
 }
@@ -732,6 +834,7 @@ impl HkApp {
             tx_index: self.tx_index.clone(),
             acct_index: self.acct_index.clone(),
             self_peer_id: String::new(),
+            accept_bundles: false,
         }
     }
 
@@ -1290,7 +1393,14 @@ impl HkApp {
                                     })
                                     .collect();
                                 let digest = hk_spend_circuit::agg::agg_digest(&leaves);
-                                if agg_verify(&b.agg_proof, &digest) {
+                                // RZ-1's lesson: a panic boundary around third-party proof parsing — a
+                                // panic counts as an invalid aggregate, the same empty coverage every node
+                                // derives, so deterministic (chain/Cargo.toml sets no `panic = "abort"`).
+                                let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    agg_verify(&b.agg_proof, &digest)
+                                }))
+                                .unwrap_or(false);
+                                if verified {
                                     info!(
                                         covered = leaves.len(),
                                         "Aggregate STARK verified — ONE verify covers this block's shielded txs"
@@ -1323,26 +1433,35 @@ impl HkApp {
                 .map_err(|e| eyre!("apply_block failed: {e}"))?;
             apply_ms = t_apply.elapsed().as_millis() as u64;
 
-            // Record receipts + drop included txs from the mempool.
+            // Record receipts + prune the mempool and the bundle queue.
+            //
+            // HR-1 (mr-hrydarie, reported 2026-11-04; v0.19.11) — the prune is RECEIPT-AWARE;
+            // the split is `commit_prune_sets` (pure, tested in `hr1_tests`) and the two prunes
+            // are `CommitPrune::prune_mempool`. An APPLIED tx consumed its nonce, so every
+            // pending tx at that (sender, nonce) is dead (`remove_included`, as before). A
+            // REFUSED tx consumed nothing — a refusal ratchets no nonce and burns no nullifier
+            // (`State::apply_tx_at`) — so only an identical pending tx (same txid) is dead and a
+            // different pending tx at the same slot may still apply (`Mempool::remove_refused`).
+            // Before v0.19.11 every block tx's slot was pruned whatever its receipt, so a refused
+            // bundle tx naming a victim's pending (account, nonce) evicted the victim's honest tx
+            // on every node that committed the block — HR-1's eviction axis. `included` still
+            // names EVERY block tx: a ridden bundle leaves the queue whatever its receipts. The
+            // store replay path (`restore_from_store`) comes through this same function.
+            let mut prune = commit_prune_sets(&txs, &receipts);
             let mut rlog = self.receipts.lock().unwrap();
-            let mut included: Vec<(hk_primitives::AccountId, u64)> = Vec::new();
-            for (tx, r) in txs.iter().zip(receipts.iter()) {
-                let detail = match &r.result {
-                    Ok(events) => format!("ok: {} event(s)", events.len()),
-                    Err(e) => format!("rejected: {e}"),
-                };
-                rlog.insert(txid(tx), detail);
-                included.push((tx.sender, tx.nonce));
+            for (id, detail) in prune.log.drain(..) {
+                rlog.insert(id, detail);
             }
             drop(rlog);
             // v0.11.2: search indexes (live commits AND store replay both pass here).
             self.index_txs(height, &txs);
-            if !included.is_empty() {
-                // C2.2: indexed prune — one O(mempool) pass, O(1) membership tests.
-                self.mempool.lock().unwrap().remove_included(&included);
-                // P2.3: a bundle is spent once any of its txs committed.
+            if !prune.included.is_empty() {
+                // C2.2: indexed prune — one O(mempool) pass each, O(1) membership tests.
+                prune.prune_mempool(&mut self.mempool.lock().unwrap());
+                // P2.3: a bundle is spent once any of its txs committed (applied or refused —
+                // it rode, so it leaves the queue).
                 let gone: std::collections::HashSet<(hk_primitives::AccountId, u64)> =
-                    included.iter().copied().collect();
+                    prune.included.iter().copied().collect();
                 let mut bundles = self.bundles.lock().unwrap();
                 bundles.retain(|(btxs, _)| {
                     !btxs.iter().any(|t| gone.contains(&(t.sender, t.nonce)))
@@ -2704,5 +2823,115 @@ mod r11_process_tests {
         // …then the first value sticks; a second wiring attempt cannot overwrite it.
         set_verifier_init_ms(9_999);
         assert_eq!(verifier_init_ms(), Some(before.unwrap_or(7)));
+    }
+}
+
+/// HR-1 (mr-hrydarie, reported 2026-11-04, confirmed 2026-11-08; v0.19.11), E4: the commit
+/// prune is receipt-aware. `apply_batch_to_chain` needs an `HkApp` (a genesis, a signer, a
+/// store), so the split it runs — `commit_prune_sets` and `CommitPrune::prune_mempool`, the
+/// very code it calls — is driven here over blocks applied through `State::apply_block` on the
+/// shared fixture (`mempool::test_fixtures`).
+#[cfg(test)]
+mod hr1_tests {
+    use super::commit_prune_sets;
+    use crate::batch::txid;
+    use crate::mempool::test_fixtures::*;
+    use crate::mempool::Mempool;
+
+    /// Kill: make `commit_prune_sets` push a refused tx's slot into `applied` (the pre-v0.19.11
+    /// split, where every block tx's slot was pruned whatever its receipt), or make
+    /// `prune_mempool` run `remove_included(&self.included)` — and the honest (1, 0) is gone in
+    /// the first scenario (`prune_mempool` returns (2, 0), not (1, 0)); the second scenario
+    /// asserts that eviction on `included` directly.
+    #[test]
+    fn hr1_e4_a_refused_twin_prunes_nothing_and_an_applied_tx_prunes_its_slot() {
+        let mut chain = mini_chain(2);
+        let mut mp = Mempool::new(16);
+        // pending: the victim's honest tx at (1, 0) with txid Y, and a copy of (2, 0)
+        let honest = transfer(1, 0);
+        let y = mp.try_admit(honest.clone(), &chain).expect("admits");
+        let two = transfer(2, 0);
+        let two_id = mp.try_admit(two.clone(), &chain).expect("admits");
+        assert_eq!(mp.len(), 2);
+        // the block: a wrong-key twin at (1, 0) → an Err receipt; (2, 0) → an Ok receipt
+        let twin = sign_as(1, 2, 0, transfer_payload(5));
+        assert_ne!(txid(&twin), y);
+        let block = vec![twin.clone(), two.clone()];
+        let receipts = chain.apply_block(1, 0, &block).expect("block applies");
+        assert!(receipts[0].result.is_err(), "{:?}", receipts[0].result);
+        assert!(receipts[1].result.is_ok(), "{:?}", receipts[1].result);
+        assert_eq!(chain.accounts[&acct(1)].nonce, 0, "a refusal ratchets no nonce");
+        assert_eq!(chain.accounts[&acct(2)].nonce, 1);
+        // the split
+        let p = commit_prune_sets(&block, &receipts);
+        assert_eq!(p.included, vec![(acct(1), 0), (acct(2), 0)], "the bundle retain's input: every block tx");
+        assert_eq!(p.applied, vec![(acct(2), 0)]);
+        assert_eq!(p.refused, vec![((acct(1), 0), txid(&twin))]);
+        assert_eq!(p.log.len(), 2);
+        assert_eq!(p.log[0].0, txid(&twin));
+        assert!(p.log[0].1.starts_with("rejected: "), "{}", p.log[0].1);
+        assert_eq!(p.log[1].0, two_id);
+        assert!(p.log[1].1.starts_with("ok: "), "{}", p.log[1].1);
+        // the commit path's two prunes: the honest (1, 0) stays, (2, 0) is gone
+        assert_eq!(p.prune_mempool(&mut mp), (1, 0));
+        assert_eq!(mp.len(), 1);
+        assert_eq!(mp.iter().map(txid).collect::<Vec<_>>(), vec![y]);
+        // the same through the explicit pair the method stands for
+        let fresh = mini_chain(2);
+        let mut mp2 = Mempool::new(16);
+        mp2.try_admit(honest.clone(), &fresh).unwrap();
+        mp2.try_admit(two.clone(), &fresh).unwrap();
+        assert_eq!(mp2.remove_included(&p.applied), 1);
+        assert_eq!(mp2.remove_refused(&p.refused), 0);
+        assert_eq!(mp2.iter().map(txid).collect::<Vec<_>>(), vec![y]);
+        // scenario 2 — the pre-v0.19.11 prune, `remove_included(&included)`, evicts the honest tx
+        let mut old = Mempool::new(16);
+        old.try_admit(honest.clone(), &fresh).unwrap();
+        old.try_admit(two, &fresh).unwrap();
+        assert_eq!(old.remove_included(&p.included), 2, "the eviction axis: the honest tx goes with the twin");
+        assert_eq!(old.len(), 0);
+        // the honest tx still applies on the chain the block advanced
+        let receipts = chain.apply_block(2, 0, &[honest]).expect("block applies");
+        assert!(receipts[0].result.is_ok(), "{:?}", receipts[0].result);
+        assert_eq!(chain.accounts[&acct(1)].nonce, 1);
+    }
+
+    /// Kill: the same reversion on the HR-1 frame itself — twins under the account's OWN key
+    /// that die at dispatch: put a refused slot into `applied` (or prune `included`) and the
+    /// honest tx is evicted (`prune_mempool` returns (1, 0), not (0, 0)). Pins the receipt a
+    /// refused bundle tx leaves: Err, the fee refunded, the nonce not ratcheted.
+    #[test]
+    fn hr1_e4_own_key_twins_refused_at_dispatch_leave_the_honest_tx_pending() {
+        let mut chain = mini_chain_with_fee(1, 100);
+        assert_eq!(chain.balance(&acct(1), &hk_state::FEE_ASSET), 1_000);
+        let mut mp = Mempool::new(16);
+        let honest = transfer(1, 0);
+        let y = mp.try_admit(honest.clone(), &chain).expect("admits");
+        // two twins under the account's own key at (1, 0): a transfer above the balance and a
+        // proof-less spend with no aggregate coverage — both pass the envelope, both die at dispatch
+        let broke = sign_at(1, 0, transfer_payload(5_000));
+        let uncovered = sign_at(1, 0, spend_payload(anchor(&chain), 0x10));
+        let block = vec![broke.clone(), uncovered.clone()];
+        let receipts = chain.apply_block(1, 0, &block).expect("block applies");
+        let reason = |i: usize| receipts[i].result.as_ref().unwrap_err().clone();
+        assert!(reason(0).contains("insufficient balance"), "{}", reason(0));
+        assert!(reason(1).contains("pool proof rejected"), "{}", reason(1));
+        // the refusals cost nothing: the fee came back, the nonce did not move
+        assert_eq!(chain.accounts[&acct(1)].nonce, 0);
+        assert_eq!(chain.balance(&acct(1), &hk_state::FEE_ASSET), 1_000);
+        assert_eq!(chain.balance(&acct(1), &ASSET), 1_000);
+        let p = commit_prune_sets(&block, &receipts);
+        assert!(p.applied.is_empty());
+        assert_eq!(p.refused, vec![((acct(1), 0), txid(&broke)), ((acct(1), 0), txid(&uncovered))]);
+        assert_eq!(p.included, vec![(acct(1), 0), (acct(1), 0)]);
+        assert!(p.log.iter().all(|(_, d)| d.starts_with("rejected: ")));
+        assert_eq!(p.prune_mempool(&mut mp), (0, 0));
+        assert_eq!(mp.iter().map(txid).collect::<Vec<_>>(), vec![y]);
+        // the honest tx applies in the next block, paying the fee once
+        let receipts = chain.apply_block(2, 0, &[honest]).expect("block applies");
+        assert!(receipts[0].result.is_ok(), "{:?}", receipts[0].result);
+        assert_eq!(chain.accounts[&acct(1)].nonce, 1);
+        assert_eq!(chain.balance(&acct(1), &hk_state::FEE_ASSET), 900);
+        assert_eq!(chain.balance(&acct(1), &ASSET), 999);
     }
 }

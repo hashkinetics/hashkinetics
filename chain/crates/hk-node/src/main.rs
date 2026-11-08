@@ -13,7 +13,7 @@
 
 /// The release label this binary reports (`hk-node --version`, the usage banner).
 /// Bump with every node release; the crate version is workspace-wide and not it.
-pub const NODE_VERSION: &str = "v0.19.10";
+pub const NODE_VERSION: &str = "v0.19.11";
 
 mod account;
 mod app;
@@ -603,6 +603,8 @@ fn cmd_testnet(n: usize, home: &PathBuf) -> eyre::Result<()> {
             .filter(|j| *j != i)
             .map(|j| format!("\"http://127.0.0.1:{}\"", RPC_BASE_PORT + j))
             .collect();
+        // HR-1 (v0.19.11): the loopback devnet opens the P2.3 aggregation door — `demo-agg`
+        // submits its bundle to node0 — the one place the door is open by default.
         let config = config_template(
             &format!("hk-{i}"),
             &format!("/ip4/127.0.0.1/tcp/{}", CONSENSUS_BASE_PORT + i),
@@ -611,6 +613,7 @@ fn cmd_testnet(n: usize, home: &PathBuf) -> eyre::Result<()> {
             &format!("127.0.0.1:{}", METRICS_BASE_PORT + i),
             &format!("127.0.0.1:{}", RPC_BASE_PORT + i),
             &gossip_peers.join(", "),
+            true,
         );
         std::fs::write(dir.join("config.toml"), config)?;
         println!("wrote {}  (rpc :{}) ", dir.display(), RPC_BASE_PORT + i);
@@ -622,6 +625,9 @@ fn cmd_testnet(n: usize, home: &PathBuf) -> eyre::Result<()> {
     Ok(())
 }
 
+/// The node's config.toml, complete (config.rs relies on no engine defaults). `accept_bundles`
+/// is HR-1's switch (v0.19.11): true only for the loopback devnet (`testnet`), false for every
+/// WAN seat `config-gen` writes — `hk_submitBundle` is closed unless the operator opens it.
 fn config_template(
     moniker: &str,
     listen_addr: &str,
@@ -630,6 +636,7 @@ fn config_template(
     metrics_addr: &str,
     rpc_addr: &str,
     gossip_peers: &str,
+    accept_bundles: bool,
 ) -> String {
     format!(
         r#"moniker = "{moniker}"
@@ -707,6 +714,9 @@ listen_addr = "{rpc_addr}"
 # C2.3: peer RPC endpoints to push admitted txs to (single-hop tx gossip).
 # Empty = v0 behavior (submit to your home node; only it can propose your tx).
 gossip_peers = [{gossip_peers}]
+# HR-1 (v0.19.11): the P2.3 aggregation door. false = hk_submitBundle is refused — the default for a networked
+# seat (there is no aggregator role yet). true only on a loopback devnet that runs demo-agg.
+accept_bundles = {accept_bundles}
 "#
     )
 }
@@ -1198,6 +1208,7 @@ fn cmd_config_gen(rest: &[String]) -> eyre::Result<()> {
         .map(|s| format!("\"{}\"", s.trim()))
         .collect();
     std::fs::create_dir_all(&home)?;
+    // HR-1 (v0.19.11): a WAN seat's aggregation door stays closed (no aggregator role yet).
     let cfg = config_template(
         &moniker,
         &listen,
@@ -1206,6 +1217,7 @@ fn cmd_config_gen(rest: &[String]) -> eyre::Result<()> {
         metrics.as_deref().unwrap_or("127.0.0.1:29000"),
         &rpc_addr,
         &gossip_quoted.join(", "),
+        false,
     );
     std::fs::write(home.join("config.toml"), cfg)?;
     println!(
@@ -1227,4 +1239,48 @@ fn os_seed() -> [u8; 32] {
     let mut seed = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut seed);
     seed
+}
+
+/// HR-1 (mr-hrydarie, reported 2026-11-04; v0.19.11): the generators write the bundle door's
+/// switch — true on the loopback devnet (`demo-agg` keeps working), false on every WAN seat
+/// `config-gen` writes — and the template still loads as the node's `Config`.
+#[cfg(test)]
+mod hr1_tests {
+    use super::config_template;
+    use crate::config::Config;
+
+    fn template(accept_bundles: bool) -> String {
+        config_template(
+            "hk-test",
+            "/ip4/127.0.0.1/tcp/27000",
+            "\"/ip4/127.0.0.1/tcp/27001\"",
+            false,
+            "127.0.0.1:29000",
+            "127.0.0.1:26000",
+            "\"http://127.0.0.1:26001\"",
+            accept_bundles,
+        )
+    }
+
+    /// Kill: drop the `accept_bundles` line from the template, or hard-code it — the devnet's
+    /// nodes stop answering `hk_submitBundle`, or a `config-gen` seat opens its door.
+    #[test]
+    fn hr1_config_template_writes_the_bundle_switch_it_was_given() {
+        let open = template(true);
+        assert!(open.contains("\naccept_bundles = true\n"), "{open}");
+        let closed = template(false);
+        assert!(closed.contains("\naccept_bundles = false\n"), "{closed}");
+        assert!(closed.contains("# HR-1 (v0.19.11): the P2.3 aggregation door."), "{closed}");
+        // the whole template loads as the node's Config (the engine sections included), and
+        // the switch reads back as written
+        let cfg: Config = toml::from_str(&open).expect("the devnet template parses");
+        assert!(cfg.hk_rpc.accept_bundles);
+        assert!(cfg.hk_rpc.enabled);
+        assert_eq!(cfg.hk_rpc.listen_addr, "127.0.0.1:26000");
+        assert_eq!(cfg.hk_rpc.gossip_peers, vec!["http://127.0.0.1:26001".to_string()]);
+        let cfg: Config = toml::from_str(&closed).expect("the config-gen template parses");
+        assert!(!cfg.hk_rpc.accept_bundles);
+        assert_eq!(cfg.moniker, "hk-test");
+        assert_eq!(crate::NODE_VERSION, "v0.19.11");
+    }
 }

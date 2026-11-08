@@ -31,7 +31,11 @@ boundary around the verify; client-only, every node restarts on it); VZ-2, repor
 VanSecQA (@0x123van), fixed in v0.19.10 (the "abstain while behind" evidence counted unverified
 future-height votes, so a peer without a validator key could silence nodes; now a vote counts only
 after its signature verifies and the trigger is weighted by voting power; client-only, every node
-restarts on it)), the spend/mint circuits and
+restarts on it); HR-1, reported 2026-11-04 by mr-hrydarie, fixed in v0.19.11 (the
+aggregation door `hk_submitBundle` queued unverified bundles ahead of the mempool; now closed by
+default and, when open, admitted through the mempool's own checks with byte bounds; a refused
+transaction no longer evicts an honest pending one; the public endpoint refuses operator methods;
+client-only, every node restarts on it)), the spend/mint circuits and
 aggregation digests (`zkvm-bakeoff/circuit` — M-1, reported 2026-10-14 by Tuan Berdasi: the spend
 signature covers only `credit ‖ fee`, so until circuit v4 the prover a wallet sends its witness to is
 trusted with the value of every spend it proves — the documents corrected 2026-10-23, the circuit

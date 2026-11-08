@@ -302,6 +302,9 @@ impl Node for App {
         if config.hk_rpc.enabled {
             let mut handles = state.handles();
             handles.self_peer_id = self_peer_id.clone();
+            // HR-1 (v0.19.11): the P2.3 aggregation door — closed unless config.toml opens it
+            // (`hk_rpc.accept_bundles`; rpc.rs `bundles_open`).
+            handles.accept_bundles = config.hk_rpc.accept_bundles;
             // C2.3: single-hop tx gossip — locally admitted txs push to peer RPCs.
             if !config.hk_rpc.gossip_peers.is_empty() {
                 handles.gossip =

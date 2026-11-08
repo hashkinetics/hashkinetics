@@ -117,6 +117,24 @@
 //! `hoisted_verdict_and_try_admit_agree`), and `try_admit` keeps the cheap-first order for
 //! the WAL replay loop, where a cap-full or duplicate frame should still cost no hash.
 //!
+//! HR-1 (mr-hrydarie, reported 2026-11-04, confirmed 2026-11-08; v0.19.11, client-side, no gate)
+//! touches this module in three places:
+//!   * [`MAX_STEALTH_CT_BYTES`] — a pool tx's stealth ciphertext is bounded by its own bytes
+//!     inside [`Mempool::envelope_verdict`], beside the R18 open cap (`StealthTooLarge`);
+//!     `rpc::bundle_shape_verdict` applies the same number through [`stealth_ct_over_cap`];
+//!   * [`Mempool::remove_refused`] — the commit prune is receipt-aware (state.rs
+//!     `commit_prune_sets`, run by `apply_batch_to_chain`): an APPLIED tx consumed its nonce,
+//!     so every pending tx at its (sender, nonce) is dead (`remove_included`, as before); a
+//!     REFUSED tx consumed nothing, so only an identical pending copy (same txid) is dead and
+//!     a different pending tx at that slot may still apply — before this, a refused bundle tx
+//!     naming a victim's pending (account, nonce) evicted the victim's honest tx fleet-wide;
+//!   * [`EnvelopeVerdict::hash_free_refusal`] — `rpc::submit_bundle` dry-runs a bundle's txs
+//!     through `envelope_verdict` (no lock held) and [`Mempool::try_admit_verified`] on a
+//!     SCRATCH pool under the chain lock, so a bundle queues only if every tx would apply;
+//!     the live pool never sees a bundle tx (nothing from a bundle is WAL'd, gossiped or
+//!     indexed here), and a bundle's sequential nonces pass because the scratch pool indexes
+//!     as it goes.
+//!
 //! Lock discipline: callers that need both locks take `chain` BEFORE `mempool`
 //! (the commit path in state.rs already does; rpc.rs follows the same order).
 
@@ -140,6 +158,19 @@ pub const DEFAULT_CAP: usize = 8192;
 /// needs a wider window (measured C2.4: 5 genesis senders × 64 = 320 pending
 /// could never fill a 1024-cap block).
 pub const NONCE_WINDOW: u64 = 64;
+
+/// HR-1 (mr-hrydarie, reported 2026-11-04; v0.19.11): the most bytes a pool tx's stealth
+/// ciphertext (`MintToPool.stealth_ct`, `ShieldedSpend.stealth_ct` / `stealth_ct2`) may carry
+/// through either door — `envelope_verdict` here (hk_submitTx / hk_gossipTxs) and
+/// `rpc::bundle_shape_verdict` (hk_submitBundle), one number for both. The legitimate size
+/// is fixed by `hk_wallet::seal_note`: the ML-KEM-768 ciphertext (`hk_crypto::mlkem::CT_LEN`
+/// = 1,088 B) ‖ `noteenc::seal`(value 8 B ‖ rho 32 B ‖ rcm 32 B ‖ memo) ‖ its 32-byte tag =
+/// **1,192 B + the memo**; the demos' and the wallets' memos are a few bytes (`b"shield"`,
+/// `b"change"`, `b"agg-out"`, a user memo). 4,096 B is ≥ 2× the memo-less note (2,384 B) and
+/// leaves a memo up to 2,904 B — the field is advisory (consensus stores and gossips it,
+/// scanners read it), so before this cap a tx could carry megabytes of it into every node's
+/// block log and pool-note index for the price of one envelope.
+pub const MAX_STEALTH_CT_BYTES: usize = 4096;
 
 fn nonce_window() -> u64 {
     static W: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -196,6 +227,10 @@ pub enum AdmitError {
     /// pool-exhaustion vector the module doc describes). Reachable only on a channel opened
     /// before the height — the consensus cap keeps a post-height channel inside the budget.
     SettleTooCostly { links: u64 },
+    /// HR-1 (v0.19.11): a `MintToPool` / `ShieldedSpend` whose stealth ciphertext exceeds
+    /// [`MAX_STEALTH_CT_BYTES`] — refused by the tx's own bytes, before any hash, like
+    /// `ChannelTooLong`. `len` is the offending field's length.
+    StealthTooLarge { len: usize },
 }
 
 impl AdmitError {
@@ -240,6 +275,10 @@ impl AdmitError {
             AdmitError::SettleTooCostly { links } => {
                 format!("settle too costly to propose ({links} links from the tip, max {MAX_SETTLE_LINKS_PER_BLOCK} per block until verification is incremental — settle in pieces)")
             }
+            // HR-1: admission wording — no receipt ever says this; the number is the cap.
+            AdmitError::StealthTooLarge { len } => {
+                format!("stealth ciphertext too large ({len} B, max {MAX_STEALTH_CT_BYTES})")
+            }
         }
     }
 }
@@ -256,8 +295,26 @@ pub struct EnvelopeVerdict {
     pk_commit: Option<[u8; 32]>,
     /// M-2 (b): `Ok` when `State::verify_envelope` accepted the signature over the tx's own
     /// bytes; `BadSignature`, or `BadEnvelope` when the signing digest cannot form. With
-    /// `pk_commit == None`: `BadEnvelope` or `ChannelTooLong`, the hash-free refusal.
+    /// `pk_commit == None`: `BadEnvelope`, `ChannelTooLong` or (HR-1) `StealthTooLarge`, the
+    /// hash-free refusal.
     signature: Result<(), AdmitError>,
+}
+
+impl EnvelopeVerdict {
+    /// HR-1 (v0.19.11): the refusal this verdict reached BEFORE any hash — wrong lengths
+    /// (`BadEnvelope`), an over-cap `ChannelOpen` (`ChannelTooLong`) or an over-cap stealth
+    /// ciphertext (`StealthTooLarge`) — or `None` when the two hashes ran. A `BadSignature`
+    /// is deliberately not reported here: `try_admit_verified` judges it at its own position,
+    /// after the account, nonce and key checks, so the bundle door (`rpc::submit_bundle`,
+    /// which fails fast on this before taking the chain lock) keeps the one precedence of
+    /// reasons `hoisted_verdict_and_try_admit_agree` pins. The fields stay private.
+    pub fn hash_free_refusal(&self) -> Option<AdmitError> {
+        if self.pk_commit.is_none() {
+            self.signature.clone().err()
+        } else {
+            None
+        }
+    }
 }
 
 pub struct Mempool {
@@ -330,19 +387,31 @@ impl Mempool {
     }
 
     /// The three map checks every admission starts with (cap, exact duplicate, pending
-    /// slot) — O(1), no hashing beyond the txid. Returns the txid.
+    /// slot) — O(1), no hashing beyond the txid. Returns the txid. The cap is read before
+    /// the hash: a full pool costs the WAL replay loop nothing.
     fn gate(&self, tx: &SignedTx) -> Result<[u8; 32], AdmitError> {
         if self.q.len() >= self.cap {
             return Err(AdmitError::Full);
         }
         let id = txid(tx);
-        if self.ids.contains(&id) {
+        self.gate_with_id(tx, &id)?;
+        Ok(id)
+    }
+
+    /// HR-1 (v0.19.11, review item S1): the same three checks on a txid the caller already
+    /// holds — `rpc::submit_bundle` hashes every bundle tx with no lock held and dry-runs it
+    /// on a scratch pool under the chain lock, so nothing is hashed there.
+    fn gate_with_id(&self, tx: &SignedTx, id: &[u8; 32]) -> Result<(), AdmitError> {
+        if self.q.len() >= self.cap {
+            return Err(AdmitError::Full);
+        }
+        if self.ids.contains(id) {
             return Err(AdmitError::DuplicateTx);
         }
         if self.keys.contains_key(&(tx.sender, tx.nonce)) {
             return Err(AdmitError::DuplicateSlot { pending_nonce: tx.nonce });
         }
-        Ok(id)
+        Ok(())
     }
 
     /// The state-free half of admission (R17 review, 2026-10-06): the M-2 lengths check,
@@ -364,6 +433,11 @@ impl Mempool {
         // either path (the RPC computes this verdict with no lock held).
         if let Err(e) = Self::channel_open_cap(tx) {
             return EnvelopeVerdict { pk_commit: None, signature: Err(e) };
+        }
+        // HR-1: an over-cap stealth ciphertext is refused by its own bytes too — the same
+        // place, the same cost (one length compare per field), the same `None`.
+        if let Some(len) = stealth_ct_over_cap(tx) {
+            return EnvelopeVerdict { pk_commit: None, signature: Err(AdmitError::StealthTooLarge { len }) };
         }
         let pk_commit = lamport::pk_commit(&tx.lamport_pk);
         let signature = if hk_state::State::verify_envelope(tx) {
@@ -436,6 +510,24 @@ impl Mempool {
         verdict: &EnvelopeVerdict,
     ) -> Result<[u8; 32], AdmitError> {
         let id = self.gate(&tx)?;
+        Self::channel_settle_cap(&tx, chain)?;
+        self.admit_gated(tx, id, chain, verdict)
+    }
+
+    /// HR-1 (v0.19.11, review item S1): `try_admit_verified` on a txid the caller already
+    /// computed — `id` MUST be `txid(&tx)` — so the bundle door's dry run (`rpc::submit_bundle`),
+    /// which hashes with no lock held, hashes nothing under the chain lock in a release build (a
+    /// debug build re-hashes here, as the guard). Same checks, same order, same reasons as
+    /// `try_admit`.
+    pub fn try_admit_verified_with_id(
+        &mut self,
+        tx: SignedTx,
+        id: [u8; 32],
+        chain: &hk_state::State,
+        verdict: &EnvelopeVerdict,
+    ) -> Result<[u8; 32], AdmitError> {
+        debug_assert_eq!(id, txid(&tx), "try_admit_verified_with_id: `id` is not this tx's txid");
+        self.gate_with_id(&tx, &id)?;
         Self::channel_settle_cap(&tx, chain)?;
         self.admit_gated(tx, id, chain, verdict)
     }
@@ -554,63 +646,182 @@ impl Mempool {
         self.q = kept;
         before - self.q.len()
     }
+
+    /// HR-1 (mr-hrydarie, reported 2026-11-04; v0.19.11): the commit-time prune for the
+    /// block's REFUSED txs (`remove_included` is the prune for the APPLIED ones; state.rs
+    /// `commit_prune_sets` splits a block's receipts into the two). Each entry is a refused
+    /// block tx's (sender, nonce) and txid. Semantics — applied ⇒ pruned by slot (the nonce is
+    /// consumed, every pending tx there is dead); refused ⇒ the identical pending tx only (a
+    /// refusal ratchets no nonce and burns no nullifier, `State::apply_tx_at`, so a different
+    /// pending tx at the same slot may still apply and stays). Correctness, hash-free:
+    /// `ids.contains(id)` means the identical tx is pending here; the sender and the nonce are
+    /// inside the txid preimage and one tx occupies a slot (`DuplicateSlot`), so pruning that
+    /// slot removes exactly it — no queued tx's txid is recomputed to find it; the only hash
+    /// left is `unindex`'s one per REMOVED tx (as before), and the common case — nothing
+    /// refused is pending — costs no hash and no pass. Before v0.19.11 the commit path pruned
+    /// every block tx's slot whatever its receipt, so a refused bundle tx naming a victim's
+    /// pending (account, nonce) evicted the victim's honest tx on every node that committed
+    /// the block (HR-1, the eviction axis). Returns the removed count.
+    pub fn remove_refused(&mut self, refused: &[((AccountId, u64), [u8; 32])]) -> usize {
+        let slots: Vec<(AccountId, u64)> =
+            refused.iter().filter(|(_, id)| self.ids.contains(id)).map(|(slot, _)| *slot).collect();
+        self.remove_included(&slots)
+    }
 }
 
+/// HR-1 (v0.19.11), the state-free stealth cap: the length of the first stealth ciphertext
+/// field of a `MintToPool` / `ShieldedSpend` that exceeds [`MAX_STEALTH_CT_BYTES`], or `None`
+/// (any other payload, or every field inside the cap). Reads the payload only; both doors call
+/// it — `Mempool::envelope_verdict` before the hashes and `rpc::bundle_shape_verdict` before
+/// the bundle queue — so the two refuse the same bytes by the same number.
+pub fn stealth_ct_over_cap(tx: &SignedTx) -> Option<usize> {
+    let fields: &[&Vec<u8>] = match &tx.payload {
+        Tx::MintToPool { stealth_ct, .. } => &[stealth_ct],
+        Tx::ShieldedSpend { stealth_ct, stealth_ct2, .. } => &[stealth_ct, stealth_ct2],
+        _ => &[],
+    };
+    fields.iter().map(|f| f.len()).find(|len| *len > MAX_STEALTH_CT_BYTES)
+}
+
+/// HR-1 (v0.19.11, review item M6): the ONE chain-and-signer fixture the hk-node test modules
+/// share — `mempool::tests`, `rpc::hr1_tests` and `state::hr1_tests` import it, so the three
+/// doors are judged on the same accounts, keys, anchors and payloads. Genesis accounts behind
+/// REAL L-ratchet commitments (M-2: the door opens them), funded in `ASSET`, the genesis pool's
+/// first anchor as the recent anchor, `demo::Wallet` (the faucet's and the CLI's signer)
+/// signing at any ratchet position.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_fixtures {
     use super::*;
     use crate::demo::{commit_at, Wallet};
     use hk_primitives::{Amount, H256};
 
     /// The transfer asset; unregistered, so `asset_gate` is a no-op and a funded
     /// account's transfer applies cleanly (the admission↔apply agreement test).
-    const ASSET: H256 = H256([7; 32]);
+    pub(crate) const ASSET: H256 = H256([7; 32]);
 
-    fn acct(i: u8) -> AccountId {
+    /// The size `hk_wallet::seal_note` produces for a memo-less note — the ML-KEM-768
+    /// ciphertext ‖ `noteenc::seal`(value 8 B ‖ rho 32 B ‖ rcm 32 B) ‖ its tag — derived from
+    /// the code's own constants, not a literal; `tests::
+    /// hr1_a_stealth_ciphertext_over_the_cap_is_refused_before_any_hash` seals a real note
+    /// and checks it is this many bytes (1,192).
+    pub(crate) const LEGIT_CT: usize = hk_crypto::mlkem::CT_LEN + 72 + hk_crypto::noteenc::TAG_LEN;
+
+    pub(crate) fn acct(i: u8) -> AccountId {
         H256([i; 32])
     }
 
     /// The L-ratchet seed of account `i` — the one secret the tests hold per account.
-    fn seed(i: u8) -> Vec<u8> {
+    pub(crate) fn seed(i: u8) -> Vec<u8> {
         vec![i]
     }
 
     /// A minimal chain with `n` genesis accounts (ids 1..=n), each at nonce 0 behind a
     /// REAL L-ratchet commitment (M-2: the door now opens it) and funded in `ASSET`.
-    fn mini_chain(n: u8) -> hk_state::State {
+    pub(crate) fn mini_chain(n: u8) -> hk_state::State {
+        mini_chain_with_fee(n, 0)
+    }
+
+    /// `mini_chain` with the U4 envelope fee set to `fee_micro` of `hk_state::FEE_ASSET` from
+    /// height 1 and every account funded with 1,000 of it — so a test can watch a refused tx's
+    /// fee come back (`state::hr1_tests`). `0` = no fee (the genesis `fee` stays `None`).
+    pub(crate) fn mini_chain_with_fee(n: u8, fee_micro: Amount) -> hk_state::State {
         let accounts = (1..=n)
             .map(|i| hk_state::GenesisAccount { id: acct(i), auth_commit: commit_at(&seed(i), 0) })
             .collect();
-        let alloc = (1..=n).map(|i| (acct(i), ASSET, 1_000)).collect();
-        hk_state::State::from_genesis(&hk_state::Genesis { time: 0, accounts, alloc, fee: None, assets: vec![] })
+        let mut alloc: Vec<(AccountId, H256, Amount)> = (1..=n).map(|i| (acct(i), ASSET, 1_000)).collect();
+        let fee = if fee_micro > 0 {
+            alloc.extend((1..=n).map(|i| (acct(i), hk_state::FEE_ASSET, 1_000)));
+            Some(hk_state::GenesisFee { micro: fee_micro, from_height: 1, asset: None })
+        } else {
+            None
+        };
+        hk_state::State::from_genesis(&hk_state::Genesis { time: 0, accounts, alloc, fee, assets: vec![] })
             .expect("mini genesis")
     }
 
-    fn genesis_anchor(chain: &hk_state::State) -> H256 {
+    /// The genesis pool's first anchor (the empty-tree root `from_genesis` seals) — or, on a
+    /// chain that has applied blocks, its latest sealed anchor; recent either way.
+    pub(crate) fn anchor(chain: &hk_state::State) -> H256 {
         H256(*chain.pool.latest_anchor().expect("genesis seals an anchor"))
     }
 
-    /// Sign `payload` for account `sender` at ratchet position `nonce` with the
-    /// crate's own L-ratchet wallet (`demo::Wallet`, the faucet's and the account
-    /// CLI's signer). Keys are deterministic in (seed, nonce), so any slot can be
-    /// signed on demand and re-signed after a prune.
-    fn sign_at(sender: u8, nonce: u64, payload: Tx) -> SignedTx {
+    /// Sign `payload` for account `sender` at ratchet position `nonce` with the crate's own
+    /// L-ratchet wallet (`demo::Wallet`, the faucet's and the account CLI's signer). Keys are
+    /// deterministic in (seed, nonce), so any slot can be signed on demand and re-signed
+    /// after a prune.
+    pub(crate) fn sign_at(sender: u8, nonce: u64, payload: Tx) -> SignedTx {
         Wallet::from_seed(seed(sender), acct(sender), nonce).sign(payload)
     }
 
     /// Sign `payload` claiming to be `sender`, but with `signer`'s key: a VALID Lamport
     /// signature under a key that is not the account's (the wrong-key attacker).
-    fn sign_as(sender: u8, signer: u8, nonce: u64, payload: Tx) -> SignedTx {
+    pub(crate) fn sign_as(sender: u8, signer: u8, nonce: u64, payload: Tx) -> SignedTx {
         Wallet::from_seed(seed(signer), acct(sender), nonce).sign(payload)
     }
 
-    fn transfer_payload(amount: Amount) -> Tx {
+    pub(crate) fn transfer_payload(amount: Amount) -> Tx {
         Tx::Transfer { to: acct(99), asset: ASSET, amount }
     }
 
-    fn transfer(sender: u8, nonce: u64) -> SignedTx {
+    pub(crate) fn transfer(sender: u8, nonce: u64) -> SignedTx {
         sign_at(sender, nonce, transfer_payload(1))
     }
+
+    /// A proof-less spend (a bundle tx's shape) with empty stealth fields.
+    pub(crate) fn spend_payload(anchor: H256, nf: u8) -> Tx {
+        sealed_spend_payload(anchor, nf, vec![], vec![])
+    }
+
+    /// A proof-less spend carrying the given stealth ciphertexts.
+    pub(crate) fn sealed_spend_payload(anchor: H256, nf: u8, stealth_ct: Vec<u8>, stealth_ct2: Vec<u8>) -> Tx {
+        Tx::ShieldedSpend {
+            anchor,
+            nullifier: H256([nf; 32]),
+            out_commitment: H256([1; 32]),
+            out2_commitment: H256([2; 32]),
+            fee: 0,
+            credit: None,
+            mandate: None,
+            proof: vec![],
+            stealth_ct,
+            stealth_ct2,
+        }
+    }
+
+    /// The signature covers the payload, so the anchor is fixed BEFORE signing.
+    pub(crate) fn spend(sender: u8, nonce: u64, nf: u8, anchor: H256) -> SignedTx {
+        sign_at(sender, nonce, spend_payload(anchor, nf))
+    }
+
+    /// A proof-less shield (a bundle tx's shape) with the given stealth ciphertext.
+    pub(crate) fn mint_payload(stealth_ct: Vec<u8>) -> Tx {
+        Tx::MintToPool { asset: ASSET, value: 1, commitment: H256([6; 32]), proof: vec![], stealth_ct }
+    }
+
+    /// A shield with a proof of its own — what `hk_submitTx` carries (the mempool checks no
+    /// proof; `rpc::admit_one` is where a proof-less one is refused).
+    pub(crate) fn proven_mint_payload(stealth_ct: Vec<u8>) -> Tx {
+        Tx::MintToPool { asset: ASSET, value: 1, commitment: H256([0x5a; 32]), proof: vec![1, 2, 3], stealth_ct }
+    }
+
+    /// What `demo_agg` builds: one account, three proof-less spends at consecutive nonces
+    /// with fresh nullifiers (`nf0`, `nf0 + 1`, `nf0 + 2`) against a recent anchor, each with
+    /// a sealed output of the legitimate size.
+    pub(crate) fn demo_bundle(chain: &hk_state::State, sender: u8, nf0: u8) -> Vec<SignedTx> {
+        let a = anchor(chain);
+        (0..3u64)
+            .map(|n| sign_at(sender, n, sealed_spend_payload(a, nf0 + n as u8, vec![0x5c; LEGIT_CT], vec![])))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_fixtures::anchor as genesis_anchor;
+    use super::test_fixtures::*;
+    use super::*;
+    use crate::demo::commit_at;
+    use hk_primitives::{Amount, H256};
 
     /// The pre-M-2 parking frame: a syntactically complete tx with no key and no
     /// signature. Before M-2 the door admitted it.
@@ -623,26 +834,6 @@ mod tests {
             lamport_pk: vec![],
             sig: vec![],
         }
-    }
-
-    fn spend_payload(anchor: H256, nf: u8) -> Tx {
-        Tx::ShieldedSpend {
-            anchor,
-            nullifier: H256([nf; 32]),
-            out_commitment: H256([1; 32]),
-            out2_commitment: H256([2; 32]),
-            fee: 0,
-            credit: None,
-            mandate: None,
-            proof: vec![],
-            stealth_ct: vec![],
-            stealth_ct2: vec![],
-        }
-    }
-
-    /// The signature covers the payload, so the anchor is fixed BEFORE signing.
-    fn spend(sender: u8, nonce: u64, nf: u8, anchor: H256) -> SignedTx {
-        sign_at(sender, nonce, spend_payload(anchor, nf))
     }
 
     fn assert_nothing_indexed(mp: &Mempool) {
@@ -1276,5 +1467,126 @@ mod tests {
         let same: Vec<(AccountId, u64)> = direct.iter().map(|t| (t.sender, t.nonce)).collect();
         let same2: Vec<(AccountId, u64)> = hoisted.iter().map(|t| (t.sender, t.nonce)).collect();
         assert_eq!(same, same2);
+    }
+
+    // ---- HR-1 (mr-hrydarie, reported 2026-11-04, fixed 2026-11-08): the prune and the stealth cap ----
+
+    /// Kill: drop the `ids.contains` filter from `remove_refused` — prune every refused tx's
+    /// (sender, nonce) through `remove_included`, the pre-v0.19.11 commit path — and the first
+    /// `remove_refused` below returns 1: the victim's pending tx is gone with the twin.
+    #[test]
+    fn hr1_a_refused_twin_does_not_evict_the_victims_pending_tx() {
+        let mut chain = mini_chain(2);
+        let mut mp = Mempool::new(16);
+        // the victim's honest tx is pending at (1, 0)
+        let honest = transfer(1, 0);
+        let honest_id = mp.try_admit(honest.clone(), &chain).expect("admits");
+        // the attacker's bundle tx names the same slot with another payload under a key that
+        // is not the account's (as a bundle tx it never passed this door): a different txid
+        let twin = sign_as(1, 2, 0, transfer_payload(5));
+        let twin_id = txid(&twin);
+        assert_ne!(twin_id, honest_id);
+        // the block carries the attacker's frame — apply refuses it and consumes nothing
+        let receipts = chain.apply_block(1, 0, &[twin.clone()]).expect("block applies");
+        assert!(receipts[0].result.is_err(), "{:?}", receipts[0].result);
+        assert_eq!(chain.accounts[&acct(1)].nonce, 0, "a refusal ratchets no nonce");
+        // the v0.19.11 prune for a REFUSED tx removes the identical pending tx only: the
+        // honest tx at the slot stays …
+        assert_eq!(mp.remove_refused(&[((acct(1), 0), twin_id)]), 0);
+        assert_eq!(mp.len(), 1);
+        assert!(mp.ids.contains(&honest_id) && mp.keys.contains_key(&(acct(1), 0)));
+        // … and still applies in the next block
+        let receipts = chain.apply_block(2, 0, &[honest.clone()]).expect("block applies");
+        assert!(receipts[0].result.is_ok(), "{:?}", receipts[0].result);
+        assert_eq!(chain.accounts[&acct(1)].nonce, 1);
+        // the identical pending copy IS pruned by its (slot, txid), indexes cleaned
+        assert_eq!(mp.remove_refused(&[((acct(1), 0), honest_id)]), 1);
+        assert_nothing_indexed(&mp);
+        // an APPLIED tx prunes its slot whatever is pending there (`remove_included`, unchanged)
+        let mut mp = Mempool::new(16);
+        mp.try_admit(sign_at(2, 0, transfer_payload(1)), &chain).unwrap();
+        assert_eq!(mp.remove_included(&[(acct(2), 0)]), 1);
+        assert_nothing_indexed(&mp);
+        // a txid that is not pending removes nothing — not even when its slot IS pending (the
+        // index is asked first, so it also costs no hash and no pass); a pruned spend frees its
+        // nullifier like `remove_included` does
+        let mut mp = Mempool::new(16);
+        let s = spend(2, 0, 0x33, genesis_anchor(&chain));
+        let sid = mp.try_admit(s.clone(), &chain).unwrap();
+        assert_eq!(mp.remove_refused(&[((acct(2), 0), [0xEE; 32]), ((acct(1), 0), twin_id)]), 0);
+        assert_eq!(mp.remove_refused(&[]), 0);
+        assert_eq!(mp.len(), 1);
+        assert_eq!(mp.remove_refused(&[((acct(2), 0), [0xEE; 32]), ((acct(2), 0), sid)]), 1);
+        assert_nothing_indexed(&mp);
+        mp.try_admit(s, &chain).expect("nullifier freed after the prune");
+    }
+
+    /// Kill: drop the `stealth_ct_over_cap` call from `envelope_verdict` and every over-cap
+    /// frame below is hashed and admitted — the mempool checks no proof, so nothing else
+    /// stops a megabyte of advisory bytes per envelope.
+    #[test]
+    fn hr1_a_stealth_ciphertext_over_the_cap_is_refused_before_any_hash() {
+        let chain = mini_chain(1);
+        let anchor = genesis_anchor(&chain);
+        let mut mp = Mempool::new(16);
+        let over = MAX_STEALTH_CT_BYTES + 1;
+        let mib = 1024 * 1024;
+        // the state-free verdict refuses it with no hash computed (no pk_commit formed) …
+        let big_mint = sign_at(1, 0, proven_mint_payload(vec![0x5c; over]));
+        assert_eq!(
+            Mempool::envelope_verdict(&big_mint),
+            EnvelopeVerdict { pk_commit: None, signature: Err(AdmitError::StealthTooLarge { len: over }) }
+        );
+        assert_eq!(
+            Mempool::envelope_verdict(&big_mint).hash_free_refusal(),
+            Some(AdmitError::StealthTooLarge { len: over })
+        );
+        // … and the accessor reports only the hash-free refusals: a bad signature is the
+        // scratch pool's to judge at its own position
+        let mut nosig = transfer(1, 0);
+        nosig.sig = vec![0; SIG_LEN];
+        assert_eq!(Mempool::envelope_verdict(&nosig).hash_free_refusal(), None);
+        assert_eq!(Mempool::envelope_verdict(&transfer(1, 0)).hash_free_refusal(), None);
+        assert_eq!(Mempool::envelope_verdict(&unsigned_transfer(1, 0)).hash_free_refusal(), Some(AdmitError::BadEnvelope));
+        // through both doors, on every stealth field, nothing indexed
+        let big_spend = sealed_spend_payload(anchor, 0x11, vec![0; over], vec![]);
+        let big_spend2 = sealed_spend_payload(anchor, 0x12, vec![], vec![0; mib]);
+        for (tx, len) in [(big_mint, over), (sign_at(1, 0, big_spend), over), (sign_at(1, 0, big_spend2), mib)] {
+            let want = Err(AdmitError::StealthTooLarge { len });
+            assert_eq!(mp.try_admit(tx.clone(), &chain), want);
+            assert_eq!(mp.try_admit_verified(tx.clone(), &chain, &Mempool::envelope_verdict(&tx)), want);
+        }
+        assert_nothing_indexed(&mp);
+        // the lengths check comes first: an unsigned over-cap mint is still BadEnvelope
+        let mut unsigned = unsigned_transfer(1, 0);
+        unsigned.payload = proven_mint_payload(vec![0; over]);
+        assert_eq!(mp.try_admit(unsigned, &chain), Err(AdmitError::BadEnvelope));
+        // the cap precedes the account walk: an unknown sender's over-cap mint names the cap
+        assert_eq!(
+            mp.try_admit(sign_at(9, 0, proven_mint_payload(vec![0; over])), &chain),
+            Err(AdmitError::StealthTooLarge { len: over })
+        );
+        // the reason a wallet reads (admission wording — docs/RPC.md quotes it)
+        assert_eq!(
+            AdmitError::StealthTooLarge { len: over }.as_str(),
+            format!("stealth ciphertext too large ({over} B, max {MAX_STEALTH_CT_BYTES})")
+        );
+        // the legitimate size is the code's, not a literal: seal a real note once through
+        // `hk_wallet::seal_note` (`build_output`) — ML-KEM-768 ct (`mlkem::CT_LEN`, 1,088 B)
+        // ‖ 72 B note plaintext ‖ `noteenc::TAG_LEN` (32 B) = `LEGIT_CT` = 1,192 B, plus the
+        // memo (6 B for `b"shield"`); the cap is at least twice the memo-less note, and both
+        // the sealed note and a ciphertext exactly at the cap admit
+        let keys = hk_wallet::WalletKeys::new(b"hr1 fixture");
+        let sealed = hk_wallet::build_output(&keys.address(), 1, &[1; 32], &[2; 32], b"").expect("seals");
+        assert_eq!(sealed.stealth_ct.len(), LEGIT_CT);
+        assert_eq!(sealed.stealth_ct.len(), 1192);
+        let with_memo = hk_wallet::build_output(&keys.address(), 1, &[1; 32], &[2; 32], b"shield").expect("seals");
+        assert_eq!(with_memo.stealth_ct.len(), LEGIT_CT + 6);
+        assert!(MAX_STEALTH_CT_BYTES >= 2 * sealed.stealth_ct.len());
+        mp.try_admit(sign_at(1, 0, proven_mint_payload(vec![0x5c; MAX_STEALTH_CT_BYTES])), &chain).expect("a ciphertext at the cap admits");
+        mp.try_admit(sign_at(1, 1, proven_mint_payload(with_memo.stealth_ct)), &chain).expect("a legitimate note admits");
+        assert_eq!(stealth_ct_over_cap(&sign_at(1, 2, mint_payload(sealed.stealth_ct))), None);
+        assert_eq!(stealth_ct_over_cap(&transfer(1, 2)), None);
+        assert_eq!(mp.len(), 2);
     }
 }
