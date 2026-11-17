@@ -193,6 +193,33 @@ where
                 }
             }
 
+            // HK (v0.19.12): the value of a signature-verified proposal.
+            HostMsg::ReceivedVerifiedProposal {
+                height,
+                round,
+                valid_round,
+                proposer,
+                value,
+                reply_to,
+            } => {
+                let (reply, rx) = oneshot::channel();
+
+                self.sender
+                    .send(AppMsg::ReceivedVerifiedProposal {
+                        height,
+                        round,
+                        valid_round,
+                        proposer,
+                        value,
+                        reply,
+                    })
+                    .await?;
+
+                if let Some(value) = rx.await? {
+                    reply_to.send(value)?;
+                }
+            }
+
             HostMsg::Decided {
                 certificate,
                 extensions,

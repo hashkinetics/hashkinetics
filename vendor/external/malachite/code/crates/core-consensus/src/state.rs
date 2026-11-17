@@ -56,16 +56,20 @@ where
     /// `corroborated_peer_tip()` / `should_abstain()`.
     pub peer_height_claims: Vec<(Ctx::Address, Ctx::Height)>,
 
-    /// HK-R8 (v0.19.10): failed future-claim signature verifications per
-    /// address in the current budget window (`CLAIM_VERIFY_BUDGET` per address
-    /// per window). Bounds the CPU a flood of forged frames can cost; the window
-    /// refills when our height has advanced by `gap` since the last refill
-    /// (`reset_and_start_height`), so it never refills on a node that makes no
-    /// progress — such a node is protocol-quiescent and burns nothing anyway.
-    pub claim_verify_failures: Vec<(Ctx::Address, u32)>,
+    /// HK-R8 (v0.19.12): failed future-claim signature verifications per
+    /// address in the current warn window, kept to throttle the warning:
+    /// `on_vote` logs an address's first `CLAIM_FAILURE_WARNS_PER_WINDOW`
+    /// failures per window, so repeated failures for one address are logged a
+    /// bounded number of times. One entry per address, and only current-set
+    /// members reach it (the free filters of `future_claim_wants_verify` run
+    /// first); the window restarts when our height has advanced by `gap`
+    /// since it last restarted (`reset_and_start_height`), never by time, and
+    /// a restart clears every entry.
+    pub claim_failures_in_warn_window: Vec<(Ctx::Address, u32)>,
 
-    /// HK-R8 (v0.19.10): the height at which the verify budget last refilled.
-    pub claim_budget_refilled_at: Ctx::Height,
+    /// HK-R8 (v0.19.12): the height at which the warn window last
+    /// restarted.
+    pub claim_warn_window_from: Ctx::Height,
 
     /// HK-R8 (v0.19.10): failed future-claim verifications since the process
     /// started (a forgery signal for the operator; printed in the R8 line).
@@ -80,9 +84,11 @@ where
     pub last_abstain_logged: Option<Ctx::Height>,
 }
 
-/// HK-R8 (v0.19.10): failed future-claim signature verifications a single
-/// validator address may cost us per budget window (see `State::claim_verify_failures`).
-pub const CLAIM_VERIFY_BUDGET: u32 = 3;
+/// HK-R8 (v0.19.12): failed future-claim verifications per validator
+/// address that are logged per warn window (see
+/// `State::claim_failures_in_warn_window`). Failures past it in the same
+/// window are still counted, without a log line.
+pub const CLAIM_FAILURE_WARNS_PER_WINDOW: u32 = 1;
 
 /// v0.19.10: the buffer keeps at most this many distinct rounds of VERIFIED
 /// votes per (height, validator address) — one prevote and one precommit per
@@ -143,8 +149,8 @@ where
             last_signed_precommit: None,
             last_verified_certificate: None,
             peer_height_claims: Vec::new(),
-            claim_verify_failures: Vec::new(),
-            claim_budget_refilled_at: initial_height,
+            claim_failures_in_warn_window: Vec::new(),
+            claim_warn_window_from: initial_height,
             claim_verify_failures_total: 0,
             buffer_dropped_total: 0,
             last_abstain_logged: None,
@@ -170,16 +176,22 @@ where
         }
     }
 
-    /// HK-R8 (v0.19.10): should `on_vote` spend a signature verification on a
-    /// future-height vote that names `addr` and claims `height`? Every check is
-    /// free, in this order: the context opts in (`HK_ABSTAIN_GAP=0` skips the
-    /// whole claim path); we are an active validator (an observer never
-    /// abstains, so its verifications would be attacker-controlled CPU); the
-    /// claim is at least `gap` above us (a lower one can never fire R8, our
-    /// height only rises); the address is not our own (such a frame can only be
-    /// a forgery); the address is a current-set member whose recorded claim is
-    /// below `height` (no information gain otherwise); and the address is under
-    /// its verify budget for this window.
+    /// HK-R8 (v0.19.10; v0.19.12): should `on_vote` spend a signature
+    /// verification on a future-height vote that names `addr` and claims
+    /// `height`? Every check is free, in this order: the context opts in
+    /// (`HK_ABSTAIN_GAP=0` skips the whole claim path); we are an active
+    /// validator (an observer never abstains, so its verifications would be
+    /// attacker-controlled CPU); the claim is at least `gap` above us (a lower
+    /// one can never fire R8, our height only rises); the address is not our
+    /// own (such a frame can only be a forgery); and the address is a
+    /// current-set member whose recorded claim is below `height` (no
+    /// information gain otherwise).
+    ///
+    /// Each check reads state this node holds: the context's
+    /// `abstain_threshold`, whether this node is an active validator, its
+    /// height and address, the current validator set and the claims recorded
+    /// so far (`peer_height_claims`). `true` means `on_vote` verifies the
+    /// frame's signature, and only a verified frame records a claim.
     pub fn future_claim_wants_verify(&self, addr: &Ctx::Address, height: Ctx::Height) -> bool {
         use malachitebft_core_types::ValidatorSet as _;
         let Some(gap) = self.ctx.abstain_threshold() else {
@@ -202,27 +214,24 @@ where
                 return false;
             }
         }
-        let failures = self
-            .claim_verify_failures
-            .iter()
-            .find(|(a, _)| a == addr)
-            .map(|(_, n)| *n)
-            .unwrap_or(0);
-        failures < CLAIM_VERIFY_BUDGET
+        true
     }
 
-    /// HK-R8 (v0.19.10): count a failed future-claim verification against
-    /// `addr`. Returns the failures charged to that address in the current
-    /// window (1 = the first, which the caller logs).
+    /// HK-R8 (v0.19.10; v0.19.12): count a failed future-claim
+    /// verification, in the process-wide total and against `addr` in the
+    /// current warn window. Returns the failures counted against that address
+    /// in the window (1 = the first); the caller logs while that is at most
+    /// `CLAIM_FAILURE_WARNS_PER_WINDOW`. Both counts saturate at their maximum
+    /// instead of wrapping.
     pub fn note_future_claim_failure(&mut self, addr: &Ctx::Address) -> u32 {
         self.claim_verify_failures_total = self.claim_verify_failures_total.saturating_add(1);
-        match self.claim_verify_failures.iter_mut().find(|(a, _)| a == addr) {
+        match self.claim_failures_in_warn_window.iter_mut().find(|(a, _)| a == addr) {
             Some((_, n)) => {
                 *n = n.saturating_add(1);
                 *n
             }
             None => {
-                self.claim_verify_failures.push((addr.clone(), 1));
+                self.claim_failures_in_warn_window.push((addr.clone(), 1));
                 1
             }
         }
@@ -345,12 +354,18 @@ where
 
         // Get the commits for the height and round.
         if let Some(per_round) = self.driver.votes().per_round(round) {
+            // v0.19.12 (HK): one precommit per validator, the first held, the same rule as the
+            // vote keeper's (one vote per validator per round and type): the filter below keeps
+            // a validator's first precommit for this value and skips any later one, so each
+            // validator appears at most once in what is returned.
+            let mut seen = std::collections::BTreeSet::new();
             per_round
                 .received_votes()
                 .iter()
                 .filter(|vote| {
                     vote.vote_type() == VoteType::Precommit
                         && vote.value() == &NilOrVal::Val(value.id())
+                        && seen.insert(vote.validator_address())
                 })
                 .cloned()
                 .collect()
@@ -423,17 +438,18 @@ where
 
         // HK-R8 (v0.19.10, VZ-2): a claim at or below the height we are starting
         // is provably stale, and a claimant that left the set no longer counts —
-        // prune both; the verify budget refills once per `gap` heights of OUR
-        // progress (never by time, never on a peer disconnect: no PeerId reaches
-        // core-consensus).
+        // prune both. The failed-verification warn window restarts once per `gap`
+        // heights of OUR progress (never by time, never on a peer disconnect: no
+        // PeerId reaches core-consensus). A restart clears the per-address counts and
+        // leaves the process-wide total (`claim_verify_failures_total`) as it is.
         {
             use malachitebft_core_types::ValidatorSet as _;
             self.peer_height_claims
                 .retain(|(a, h)| *h > height && validator_set.get_by_address(a).is_some());
             if let Some(gap) = self.ctx.abstain_threshold() {
-                if height.as_u64() >= self.claim_budget_refilled_at.as_u64().saturating_add(gap) {
-                    self.claim_verify_failures.clear();
-                    self.claim_budget_refilled_at = height;
+                if height.as_u64() >= self.claim_warn_window_from.as_u64().saturating_add(gap) {
+                    self.claim_failures_in_warn_window.clear();
+                    self.claim_warn_window_from = height;
                 }
             }
         }

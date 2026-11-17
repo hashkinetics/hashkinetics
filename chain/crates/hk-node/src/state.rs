@@ -17,7 +17,7 @@ use tracing::{debug, error, info, warn};
 use malachitebft_app_channel::app::streaming::{StreamContent, StreamId, StreamMessage};
 use malachitebft_app_channel::app::types::core::{CommitCertificate, Round, Validity, VoteExtensions};
 use malachitebft_app_channel::app::types::sync::RawDecidedValue;
-use malachitebft_app_channel::app::types::{LocallyProposedValue, PeerId, ProposedValue};
+use malachitebft_app_channel::app::types::{LocallyProposedValue, ProposedValue};
 use malachitebft_core_types::Height as _;
 
 use hk_consensus::rotation::RotationRules;
@@ -196,7 +196,6 @@ fn kind_static(s: &str) -> &'static str {
     ];
     KINDS.iter().copied().find(|k| *k == s).unwrap_or("unknown")
 }
-use crate::streaming::PartStreamsMap;
 use hk_consensus::HkValidator;
 
 /// Shared handles the RPC server holds (all cheap clones of Arc).
@@ -326,6 +325,197 @@ impl CommitPrune {
     pub(crate) fn prune_mempool(&self, mp: &mut crate::mempool::Mempool) -> (usize, usize) {
         (mp.remove_included(&self.applied), mp.remove_refused(&self.refused))
     }
+}
+
+/// The most bytes a proposed value may carry: the pubsub frame cap of the fleet's config
+/// template (32 MiB); an honest proposal is one frame. It bounds the value of a signed proposal
+/// (`admit_signed_value`).
+pub(crate) const MAX_PROPOSAL_BYTES: usize = 32 * 1024 * 1024;
+
+/// v0.19.12: at most this many values are kept per (height, round) in the host's store.
+/// One is the honest case. More than one exists only when the scheduled proposer signs several
+/// proposals for the same round (equivocation): they are kept, so that the engine can follow
+/// whichever value the network locks on. A value past the bound is refused
+/// (`ValueRefusal::SlotFull`); a value already held under the same id is still answered from
+/// the store.
+pub(crate) const MAX_VALUES_PER_ROUND: usize = 4;
+
+/// v0.19.12: why `admit_signed_value` does not keep a value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ValueRefusal {
+    /// The proposal's round is `Round::Nil`. The engine refuses such a proposal before it
+    /// verifies anything, so this is not expected here.
+    RoundNil,
+    /// The proposal is for a height this node has already committed: the engine was still
+    /// closing that height when it asked. Routine.
+    BelowOurHeight,
+    /// The proposal is for a height above the host's. The engine hands over proposals of its
+    /// own height only (a proposal for a later height waits in its buffer until that height
+    /// starts), and the host's height is never behind the engine's, so this is not expected.
+    AboveOurHeight,
+    /// The value is larger than `MAX_PROPOSAL_BYTES`.
+    OverByteCap,
+    /// The (height, round) already holds `MAX_VALUES_PER_ROUND` values.
+    SlotFull,
+    /// The id the proposal carries is not the hash of the bytes it carries. Since v0.19.12
+    /// such a proposal already fails verification in the engine
+    /// (`HkSigningProvider::verify_signed_proposal`); this is the second line.
+    IdMismatch,
+}
+
+impl ValueRefusal {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ValueRefusal::RoundNil => "round Nil",
+            ValueRefusal::BelowOurHeight => "below our height",
+            ValueRefusal::AboveOurHeight => "above our height",
+            ValueRefusal::OverByteCap => "over the proposal byte cap",
+            ValueRefusal::SlotFull => "too many values for this height and round",
+            ValueRefusal::IdMismatch => "value id is not the hash of the bytes",
+        }
+    }
+
+    /// A proposal that arrives after its height has been committed is routine. Every other
+    /// refusal means that something happened which no honest node and no correct engine does.
+    pub(crate) fn is_routine(self) -> bool {
+        matches!(self, ValueRefusal::BelowOurHeight)
+    }
+}
+
+/// v0.19.12: decide whether the value of a signed proposal enters the store of
+/// undecided values, and return the proposed value the engine is answered with.
+///
+/// `candidate` is built from a proposal whose signature the engine has ALREADY verified under
+/// the key of the proposer the schedule names for (height, round), and whose id the same
+/// verification has checked against its bytes. This function trusts the first and repeats the
+/// second: the id is recomputed here from the bytes, as the sync path does.
+///
+/// The store keeps values from verified signed proposals of the current height, at most
+/// `MAX_VALUES_PER_ROUND` per round, and answers a value it does not keep with the reason
+/// (`ValueRefusal`).
+///
+/// Every round of the current height is taken: the candidate is signed by that round's
+/// scheduled proposer, and a node that is behind in rounds needs the value when it gets
+/// there. A value is kept under the round of the proposal that carried it, at most
+/// `MAX_VALUES_PER_ROUND` per round. Other heights are not taken: the engine never asks
+/// for them.
+///
+/// Pure: it reads and writes the map it is given and nothing else.
+pub(crate) fn admit_signed_value(
+    undecided: &mut BTreeMap<(u64, i64), Vec<ProposedValue<HkContext>>>,
+    current_height: u64,
+    candidate: ProposedValue<HkContext>,
+) -> std::result::Result<ProposedValue<HkContext>, ValueRefusal> {
+    let ProposedValue { height, round, valid_round, proposer, value, .. } = candidate;
+
+    if round.is_nil() {
+        return Err(ValueRefusal::RoundNil);
+    }
+    let h = height.as_u64();
+    if h < current_height {
+        return Err(ValueRefusal::BelowOurHeight);
+    }
+    if h > current_height {
+        return Err(ValueRefusal::AboveOurHeight);
+    }
+    if value.txs.len() > MAX_PROPOSAL_BYTES {
+        return Err(ValueRefusal::OverByteCap);
+    }
+
+    let key = (h, round.as_i64());
+
+    // Held already under this id: answer from the store. Every stored value's id is the hash
+    // of its bytes (built here by `propose_value`, hashed below, or rebuilt by the sync arm),
+    // so the stored bytes are the ones this id names.
+    if let Some(held) =
+        undecided.get(&key).and_then(|vs| vs.iter().find(|v| v.value.id() == value.id()))
+    {
+        return Ok(ProposedValue {
+            height,
+            round,
+            valid_round,
+            proposer,
+            value: held.value.clone(),
+            validity: Validity::Valid,
+        });
+    }
+
+    if undecided.get(&key).map_or(0, |vs| vs.len()) >= MAX_VALUES_PER_ROUND {
+        return Err(ValueRefusal::SlotFull);
+    }
+
+    let rebuilt = HkValue::new(value.txs.clone());
+    if rebuilt.id() != value.id() {
+        return Err(ValueRefusal::IdMismatch);
+    }
+
+    let proposed = ProposedValue {
+        height,
+        round,
+        valid_round,
+        proposer,
+        value: rebuilt,
+        validity: Validity::Valid,
+    };
+    undecided.entry(key).or_default().push(proposed.clone());
+    Ok(proposed)
+}
+
+/// The value with this id held under ANY round of the height, as `commit` finds it.
+///
+/// A value is stored under the round of the proposal that first delivered it. A later
+/// re-proposal of the same value is completed inside the engine, from the value it holds for
+/// the earlier round, without the host being asked: the value can therefore be held under an
+/// earlier round than either round a restream names. Every stored value's id is the hash of
+/// its bytes, so any hit carries the right bytes.
+pub(crate) fn find_value_in_height(
+    undecided: &BTreeMap<(u64, i64), Vec<ProposedValue<HkContext>>>,
+    height: u64,
+    value_id: hk_consensus::HkValueId,
+) -> Option<&ProposedValue<HkContext>> {
+    undecided
+        .range((height, i64::MIN)..=(height, i64::MAX))
+        .flat_map(|(_, vs)| vs.iter())
+        .find(|v| v.value.id() == value_id)
+}
+
+/// The part stream of one proposal: an Init, the batch, a Fin that carries the value id, and
+/// the end of the stream. `proposer` is the address the Init names: this node's own when it
+/// proposes, and the signer of the proposal when it restreams one (v0.19.12; for a re-proposal
+/// of this node's own the two are the same, they differ when it restreams another seat's
+/// proposal).
+///
+/// A node takes its values from signed proposals (`admit_signed_value`). It sends a stream with
+/// each proposal it builds, and one when the engine asks for a restream and the host holds the
+/// value, for seats on older releases.
+pub(crate) fn proposal_stream(
+    value: LocallyProposedValue<HkContext>,
+    pol_round: Round,
+    proposer: HkAddress,
+) -> Vec<StreamMessage<HkProposalPart>> {
+    let mut sid = Vec::with_capacity(16);
+    sid.extend_from_slice(&value.height.as_u64().to_le_bytes());
+    sid.extend_from_slice(&value.round.as_i64().to_le_bytes());
+    let stream_id = StreamId::new(Bytes::from(sid));
+
+    let init = HkProposalPart::Init(HkProposalInit {
+        height: value.height,
+        round: value.round,
+        pol_round,
+        proposer,
+    });
+    let batch = HkProposalPart::TxBatch(value.value.txs.clone());
+    // The Fin carries the value id only (no consensus-key signature): the engine's
+    // SignedProposal over this same id is the authenticator, and a second signer over
+    // the one-time-leaf tree would reuse leaves. See docs/MAINNET-KEY-MANAGEMENT.md.
+    let fin = HkProposalPart::Fin(HkProposalFin { value_id: value.value.id });
+
+    vec![
+        StreamMessage::new(stream_id.clone(), 0, StreamContent::Data(init)),
+        StreamMessage::new(stream_id.clone(), 1, StreamContent::Data(batch)),
+        StreamMessage::new(stream_id.clone(), 2, StreamContent::Data(fin)),
+        StreamMessage::new(stream_id, 3, StreamContent::Fin),
+    ]
 }
 
 /// HR-1 (E4): split a committed block's receipts — `receipts[i]` is `txs[i]`'s — into a
@@ -553,8 +743,15 @@ pub struct HkApp {
     pub current_round: Round,
     pub current_proposer: Option<HkAddress>,
 
-    streams: PartStreamsMap,
+    /// Proposed values not decided yet, by (height, round). Every entry is one this
+    /// node built itself, one taken from a proposal whose signature the engine
+    /// verified (`admit_signed_value`), or one the sync arm stored after rebuilding
+    /// its id from its bytes (a value the network decided; the engine matches it with its
+    /// commit certificate).
     undecided: BTreeMap<(u64, i64), Vec<ProposedValue<HkContext>>>,
+    /// v0.19.12: values of signed proposals refused so far for a reason that is not routine
+    /// (`ValueRefusal::is_routine`); it thins the warn line out.
+    values_refused: u64,
     /// R10 v2: a bounded RAM cache of the newest decided heights (`decided_window()`
     /// entries; 0 = unbounded). Value-sync requests below the window are served from
     /// the block log on disk. Restore no longer rehydrates history into this map —
@@ -735,8 +932,8 @@ impl HkApp {
             current_height: HkHeight::INITIAL,
             current_round: Round::Nil,
             current_proposer: None,
-            streams: PartStreamsMap::new(),
             undecided: BTreeMap::new(),
+            values_refused: 0,
             decided: BTreeMap::new(),
             history_min: 0,
             index_floor: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
@@ -1025,17 +1222,40 @@ impl HkApp {
     /// P2.3 bundle, which rides ahead of the pool, is costed into the same budget
     /// (R18 review, 2026-10-08: `hk_submitBundle` now admits only proof-less pool txs,
     /// so the seed is 0 in practice; counting it here is belt and braces so that NO path
-    /// into a block this node builds is uncosted).
+    /// into a block this node builds is uncosted). v0.19.12: the block's transaction
+    /// bytes are budgeted the same way — the bundle's first, then the pool's
+    /// (`select_batch_txs_sized`) — under `crate::batch::MAX_BATCH_TX_BYTES`, so the batch
+    /// fits the one pubsub frame the signed proposal travels in.
     fn build_batch(&self, height: u64) -> Bytes {
         let parent_app_hash = self.chain.lock().unwrap().state_commitment().0;
         // P2.3: a pending aggregation bundle rides whole (proof-less txs + ONE aggregate).
-        let (mut txs, agg_proof) = {
-            let bundles = self.bundles.lock().unwrap();
-            match bundles.first() {
-                Some((btxs, aggp)) if btxs.len() <= MAX_TXS_PER_BLOCK => {
-                    (btxs.clone(), aggp.clone())
+        // Its txs' encoded bytes open the block's byte budget. A head bundle larger than
+        // the whole budget can never ride — the bundle door refuses one
+        // (`rpc::bundle_shape_verdict`) — and one found here anyway is dropped from the queue
+        // with a warning rather than left at its head.
+        let (mut txs, agg_proof, bundle_bytes) = {
+            let mut bundles = self.bundles.lock().unwrap();
+            let head = bundles.first().map(|(btxs, _)| {
+                let bytes = btxs.iter().map(crate::mempool::tx_encoded_len).fold(0usize, usize::saturating_add);
+                (btxs.len(), bytes)
+            });
+            match head {
+                Some((n, bytes)) if n <= MAX_TXS_PER_BLOCK && bytes <= crate::batch::MAX_BATCH_TX_BYTES => {
+                    let (btxs, aggp) = &bundles[0];
+                    (btxs.clone(), aggp.clone(), bytes)
                 }
-                _ => (Vec::new(), Vec::new()),
+                Some((n, bytes)) if bytes > crate::batch::MAX_BATCH_TX_BYTES => {
+                    warn!(
+                        height,
+                        txs = n,
+                        bytes,
+                        budget_bytes = crate::batch::MAX_BATCH_TX_BYTES,
+                        "the head bundle's txs exceed a block's byte budget — dropped from the queue, no block could carry it"
+                    );
+                    bundles.remove(0);
+                    (Vec::new(), Vec::new(), 0)
+                }
+                _ => (Vec::new(), Vec::new(), 0),
             }
         };
         let room = MAX_TXS_PER_BLOCK - txs.len();
@@ -1053,17 +1273,36 @@ impl HkApp {
             if bundle_links > 0 {
                 warn!(height, bundle_links, "R18: the pending bundle carries ChannelSettles — costed into this block's settle-link budget");
             }
-            let mp = self.mempool.lock().unwrap();
-            let (picked, held) = select_batch_txs(&chain, mp.iter(), room, bundle_links);
-            if held > 0 {
+            let mut mp = self.mempool.lock().unwrap();
+            let pick = select_batch_txs_sized(&chain, mp.iter(), room, bundle_links, bundle_bytes);
+            if pick.held > 0 {
                 info!(
                     height,
-                    held,
+                    held = pick.held,
                     budget_links = MAX_SETTLE_LINKS_PER_BLOCK,
                     "R18: txs left in the mempool for a later block — this block's settle-link budget is full"
                 );
             }
-            txs.extend(picked);
+            // The byte budget ended the selection; the rest waits, in order.
+            if pick.byte_budget_full {
+                info!(
+                    height,
+                    bytes = bundle_bytes.saturating_add(pick.bytes),
+                    budget_bytes = crate::batch::MAX_BATCH_TX_BYTES,
+                    "txs left in the mempool for a later block — this block's byte budget is full"
+                );
+            }
+            // A pending tx no block can carry is dropped, not offered again every turn.
+            if !pick.oversize.is_empty() {
+                let dropped = mp.remove_included(&pick.oversize);
+                warn!(
+                    height,
+                    dropped,
+                    budget_bytes = crate::batch::MAX_BATCH_TX_BYTES,
+                    "pending txs larger than a whole block's byte budget dropped from the mempool — no block could carry them"
+                );
+            }
+            txs.extend(pick.picked);
         }
         // Include any rotation certs we've issued but not yet seen committed — PLUS
         // foreign certs peers submitted via `hk_submitRotation` (R2: an exhausted
@@ -1156,15 +1395,14 @@ impl HkApp {
         self.undecided.get(&(height.as_u64(), round.as_i64())).cloned().unwrap_or_default()
     }
 
-    pub fn find_undecided(
+    /// v0.19.12: the value with this id held under any round of the height (see
+    /// `find_value_in_height`). The restream arm of `app.rs` uses it.
+    pub fn find_undecided_in_height(
         &self,
         height: HkHeight,
-        round: Round,
         value_id: hk_consensus::HkValueId,
     ) -> Option<ProposedValue<HkContext>> {
-        self.undecided
-            .get(&(height.as_u64(), round.as_i64()))
-            .and_then(|vs| vs.iter().find(|v| v.value.id() == value_id).cloned())
+        find_value_in_height(&self.undecided, height.as_u64(), value_id).cloned()
     }
 
     pub fn stream_proposal(
@@ -1172,113 +1410,44 @@ impl HkApp {
         value: LocallyProposedValue<HkContext>,
         pol_round: Round,
     ) -> Vec<StreamMessage<HkProposalPart>> {
-        let mut sid = Vec::with_capacity(16);
-        sid.extend_from_slice(&value.height.as_u64().to_le_bytes());
-        sid.extend_from_slice(&value.round.as_i64().to_le_bytes());
-        let stream_id = StreamId::new(Bytes::from(sid));
-
-        let init = HkProposalPart::Init(HkProposalInit {
-            height: value.height,
-            round: value.round,
-            pol_round,
-            proposer: self.address,
-        });
-        let batch = HkProposalPart::TxBatch(value.value.txs.clone());
-        // The Fin carries the value id only (no consensus-key signature): the engine's
-        // SignedProposal over this same id is the authenticator, and a second signer over
-        // the one-time-leaf tree would reuse leaves. See docs/MAINNET-KEY-MANAGEMENT.md.
-        let fin = HkProposalPart::Fin(HkProposalFin { value_id: value.value.id });
-
-        vec![
-            StreamMessage::new(stream_id.clone(), 0, StreamContent::Data(init)),
-            StreamMessage::new(stream_id.clone(), 1, StreamContent::Data(batch)),
-            StreamMessage::new(stream_id.clone(), 2, StreamContent::Data(fin)),
-            StreamMessage::new(stream_id, 3, StreamContent::Fin),
-        ]
+        proposal_stream(value, pol_round, self.address)
     }
 
     // ---- receiving ----
 
-    pub fn received_proposal_part(
+    /// v0.19.12: the value of a proposal whose signature the engine has verified under
+    /// the scheduled proposer's key. Returns the proposed value the engine is answered
+    /// with, or `None` when the value is not kept (`admit_signed_value` holds the rules
+    /// and the reasons). While a height is open this is the door for a value that is not
+    /// decided yet; the sync arm of `app.rs` is the other door, for a value the network
+    /// has already decided.
+    pub fn received_verified_proposal(
         &mut self,
-        from: PeerId,
-        part: StreamMessage<HkProposalPart>,
+        height: HkHeight,
+        round: Round,
+        valid_round: Round,
+        proposer: HkAddress,
+        value: HkValue,
     ) -> Option<ProposedValue<HkContext>> {
-        let parts = self.streams.insert(from, part)?;
-
-        // v0.19.10 (the VZ-2 review): the host is where the bytes live, so the host gates
-        // what a reassembled stream may become. Proposal parts are not signed — the engine
-        // verifies the proposer's SignedProposal over the value id and decides only on a
-        // matching value — so until v0.19.10 a peer with no key could make every seat hold
-        // a value for ANY height, round and proposer, of any size, until the chain passed
-        // that height (a memory lever), and a stream carrying the honest bytes with a wrong
-        // Fin produced a `Validity::Invalid` entry that stuck to the honest value's id in the
-        // engine's keeper, so the node refused the real proposal (and, with the certificate
-        // arriving by sync, hit an assert). Now a stream is kept only if: its round is
-        // defined; it does not name our own address (our values are built here, never
-        // received); its height is within `PROPOSAL_HEIGHT_WINDOW` of ours; its proposer is
-        // the one the schedule names for (height, round) under the current set; its round is
-        // not absurdly ahead; it is exactly one tx-batch part within the frame cap whose Fin
-        // names the hash of the bytes; and the (height, round) slot holds fewer than two
-        // values. Anything else is dropped — never handed on as "invalid".
-        use malachitebft_core_types::Context as _;
-        let height = parts.height.as_u64();
-        let current = self.current_height.as_u64();
-        if parts.round.is_nil() {
-            warn!(proposer = %parts.proposer, height, "proposal stream with round Nil — dropped");
-            return None;
-        }
-        if parts.proposer == self.address {
-            warn!(height, round = %parts.round, "proposal stream naming our own address arrived from the network — dropped (a forgery)");
-            return None;
-        }
-        if height < current || height > current.saturating_add(crate::streaming::PROPOSAL_HEIGHT_WINDOW) {
-            debug!(height, current, "proposal stream outside the height window — dropped");
-            return None;
-        }
-        let set = self.validator_set();
-        if set.is_empty() {
-            return None;
-        }
-        let scheduled = HkContext::new().select_proposer(&set, parts.height, parts.round).address;
-        if scheduled != parts.proposer {
-            warn!(height, round = %parts.round, proposer = %parts.proposer, %scheduled, "proposal stream from a proposer the schedule does not name — dropped");
-            return None;
-        }
-        // Rounds: at our height a stream may run up to three rounds ahead of the round we are
-        // in (a lagging node still gets the proposal it will need); at a future height only
-        // rounds 0 and 1 are kept (a proposal there is useful only if we arrive in time).
-        let max_round = if height == current { self.current_round.as_i64().max(0) + 3 } else { 1 };
-        if parts.round.as_i64() > max_round {
-            debug!(height, round = %parts.round, max_round, "proposal stream for a round too far ahead — dropped");
-            return None;
-        }
-        let value = match parts.reassembled() {
-            Ok(value) => value,
-            Err(why) => {
-                warn!(proposer = %parts.proposer, height, round = %parts.round, why, "proposal stream refused");
-                return None;
+        let candidate =
+            ProposedValue { height, round, valid_round, proposer, value, validity: Validity::Valid };
+        match admit_signed_value(&mut self.undecided, self.current_height.as_u64(), candidate) {
+            Ok(proposed) => Some(proposed),
+            Err(why) if why.is_routine() => {
+                debug!(%height, %round, %proposer, why = why.as_str(), "value of a signed proposal not kept");
+                None
             }
-        };
-        if self
-            .undecided
-            .get(&(height, parts.round.as_i64()))
-            .map_or(false, |vs| vs.len() >= 2)
-        {
-            debug!(height, round = %parts.round, "two values already held for this height and round — dropped");
-            return None;
+            Err(why) => {
+                // Say it once, then every hundredth time, so the log stays readable however
+                // often the same refused proposal arrives.
+                let n = self.values_refused;
+                self.values_refused = n.saturating_add(1);
+                if n % 100 == 0 {
+                    warn!(%height, %round, %proposer, why = why.as_str(), refused_so_far = n + 1, "value of a signed proposal REFUSED");
+                }
+                None
+            }
         }
-
-        let proposed = ProposedValue {
-            height: parts.height,
-            round: parts.round,
-            valid_round: parts.pol_round,
-            proposer: parts.proposer,
-            value,
-            validity: Validity::Valid,
-        };
-        self.store_undecided(proposed.clone());
-        Some(proposed)
     }
 
     // ---- committing ----
@@ -1592,11 +1761,22 @@ impl HkApp {
                                     error!("rotation key mismatch: regenerated tree != cert pubkey");
                                 }
                                 self.current_epoch = cert.epoch;
-                                info!(
-                                    epoch = cert.epoch,
-                                    remaining = self.op_handle.remaining(),
-                                    "Rotated OUR operational signing key (live) — fresh tree"
-                                );
+                                // HR-7: the new epoch's tree attaches used up when a state file
+                                // at its path is damaged or not this tree's — say which.
+                                let remaining = self.op_handle.remaining();
+                                if remaining == 0 {
+                                    warn!(
+                                        epoch = cert.epoch,
+                                        remaining,
+                                        "Rotated OUR operational signing key (live) — the new tree attached USED UP (a damaged or foreign state file at its path)"
+                                    );
+                                } else {
+                                    info!(
+                                        epoch = cert.epoch,
+                                        remaining,
+                                        "Rotated OUR operational signing key (live) — fresh tree"
+                                    );
+                                }
                             }
                         }
                         self.pending_rotations
@@ -1762,7 +1942,9 @@ impl HkApp {
         } else {
             self.home_dir.join(format!("consensus_state_e{chain_epoch}.bin"))
         };
-        let resumed = path.exists();
+        // Log only: whether an entry is at the path at all — `exists()` follows a symlink and
+        // reports a dangling one as absent.
+        let resumed = std::fs::symlink_metadata(&path).is_ok();
         let new_pk = self.op_handle.rotate_to(seed, path);
         if new_pk != expected_pk {
             error!(
@@ -2087,9 +2269,16 @@ impl HkApp {
             self.receipts.lock().unwrap().restore(snap.receipts);
             {
                 // Rebuild WITH indexes (C2); duplicate frames in an old image are suppressed.
+                // v0.19.12: a pending tx the door's field and size rules or one of the
+                // pool's caps refuse is dropped (`Mempool::restore_unchecked`; still no chain
+                // checks here) and the drops are reported once.
                 let mut mp = self.mempool.lock().unwrap();
-                for tx in snap.mempool {
-                    mp.insert_unchecked(tx);
+                let (_, dropped) = mp.restore_unchecked(snap.mempool);
+                if dropped > 0 {
+                    warn!(
+                        dropped,
+                        "snapshot restore dropped pending txs the admission field and size rules or the pool's caps refuse"
+                    );
                 }
             }
             if !snap.validators.is_empty() {
@@ -2283,16 +2472,20 @@ impl HkApp {
         // Mempool WAL: admissions since the last snapshot, re-run through the SAME
         // admission gate as live traffic (C2.1) — stale nonces, spent nullifiers and
         // duplicates all drop here for the same reasons they would at the door.
-        let mut wal_restored = 0usize;
-        {
+        // v0.19.12: so do frames the field and size rules or the pool's caps refuse;
+        // those are counted apart (`Mempool::restore_admitted`) and reported once.
+        let wal_restored = {
             let chain = self.chain.lock().unwrap();
             let mut mp = self.mempool.lock().unwrap();
-            for tx in store.wal_load() {
-                if mp.try_admit(tx, &chain).is_ok() {
-                    wal_restored += 1;
-                }
+            let (restored, dropped) = mp.restore_admitted(store.wal_load(), &chain);
+            if dropped > 0 {
+                warn!(
+                    dropped,
+                    "WAL replay dropped pending txs the admission field and size rules or the pool's caps refuse"
+                );
             }
-        }
+            restored
+        };
 
         if tip > 0 || replayed > 0 {
             let app_hash = self.chain.lock().unwrap().state_commitment();
@@ -2383,36 +2576,110 @@ mod r10_history_tests {
 /// never reaches this pool through the door; one that does (a channel opened before the
 /// height, restored from a pre-review snapshot) is simply never picked. Returns the picked
 /// txs (pool order) and how many were held back.
+///
+/// v0.19.12: this is [`select_batch_txs_sized`] with the whole byte budget free (no
+/// bundle ahead of the pool) — the form the selector tests and the mempool's door-agreement
+/// tests call; `build_batch` calls the sized form. (Kept in every build, so the doc links to
+/// it stay valid; only the tests call it.)
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn select_batch_txs<'a>(
     chain: &hk_state::State,
     pending: impl Iterator<Item = &'a SignedTx>,
     room: usize,
     links_so_far: u64,
 ) -> (Vec<SignedTx>, usize) {
-    let mut picked: Vec<SignedTx> = Vec::new();
-    let mut held = 0usize;
+    let pick = select_batch_txs_sized(chain, pending, room, links_so_far, 0);
+    (pick.picked, pick.held)
+}
+
+/// v0.19.12: what [`select_batch_txs_sized`] picked for the block being built.
+pub(crate) struct BatchPick {
+    /// The picked txs, in pool order.
+    pub(crate) picked: Vec<SignedTx>,
+    /// How many txs the R18 settle-link budget held back (with their senders' later txs).
+    pub(crate) held: usize,
+    /// The encoded bytes of `picked` (`crate::mempool::tx_encoded_len`, summed).
+    pub(crate) bytes: usize,
+    /// The selection ended at a tx that does not fit the block's remaining byte budget: it
+    /// and every tx behind it wait for a later block, in pool order.
+    pub(crate) byte_budget_full: bool,
+    /// (sender, nonce) of every tx larger than a whole block's byte budget — no block can
+    /// carry one. Skipped, with its sender's later txs held behind it; `build_batch` drops
+    /// them from the pool with one warning.
+    pub(crate) oversize: Vec<(hk_primitives::AccountId, u64)>,
+}
+
+/// R18 and v0.19.12: the selection `select_batch_txs` documents (just above) — FIFO,
+/// per-sender nonce order, the settle-link budget and its holds, unchanged — plus the block's
+/// byte budget.
+/// A running total of `crate::mempool::tx_encoded_len` over the picked txs, starting at
+/// `bytes_so_far` (the P2.3 bundle's txs, 0 when there is none), never passes
+/// `crate::batch::MAX_BATCH_TX_BYTES`: the signed proposal carries the whole batch in one
+/// pubsub frame, and this budget keeps every block this node builds inside that frame. The
+/// first tx that does not fit ENDS the selection — it and
+/// everything behind it wait for a later block, so no sender's later nonce rides ahead of an
+/// earlier one and the next block starts exactly where this one stopped. A
+/// settle the link budget holds is held as before, and the byte check follows it, so the
+/// R18 behaviour is unchanged. A tx larger than the whole budget is skipped:
+/// its sender's later txs wait behind it, and it is reported in `oversize` for
+/// `build_batch` to drop. Admission (`mempool::MAX_TX_BYTES`, below the budget)
+/// and both restore paths keep such a tx out of the pool; this is the second
+/// line.
+pub(crate) fn select_batch_txs_sized<'a>(
+    chain: &hk_state::State,
+    pending: impl Iterator<Item = &'a SignedTx>,
+    room: usize,
+    links_so_far: u64,
+    bytes_so_far: usize,
+) -> BatchPick {
+    let budget = crate::batch::MAX_BATCH_TX_BYTES;
+    let mut pick = BatchPick { picked: Vec::new(), held: 0, bytes: 0, byte_budget_full: false, oversize: Vec::new() };
     let mut links: u64 = links_so_far;
+    let mut bytes: usize = bytes_so_far;
     let mut held_senders: std::collections::BTreeSet<hk_primitives::AccountId> = Default::default();
+    // Senders whose next tx no block can carry — their later txs wait behind it (not an
+    // R18 hold, so not counted in `held`).
+    let mut blocked_senders: std::collections::BTreeSet<hk_primitives::AccountId> = Default::default();
     for tx in pending {
-        if picked.len() >= room {
+        if pick.picked.len() >= room {
             break;
         }
-        if held_senders.contains(&tx.sender) {
-            held += 1;
+        if blocked_senders.contains(&tx.sender) {
             continue;
         }
-        if let Tx::ChannelSettle { id, step, .. } = &tx.payload {
-            let cost = settle_cost(chain, id, *step);
+        if held_senders.contains(&tx.sender) {
+            pick.held += 1;
+            continue;
+        }
+        let cost = match &tx.payload {
+            Tx::ChannelSettle { id, step, .. } => Some(settle_cost(chain, id, *step)),
+            _ => None,
+        };
+        if let Some(cost) = cost {
             if links.saturating_add(cost) > MAX_SETTLE_LINKS_PER_BLOCK {
-                held += 1;
+                pick.held += 1;
                 held_senders.insert(tx.sender);
                 continue;
             }
+        }
+        let size = crate::mempool::tx_encoded_len(tx);
+        if size > budget {
+            pick.oversize.push((tx.sender, tx.nonce));
+            blocked_senders.insert(tx.sender);
+            continue;
+        }
+        if bytes.saturating_add(size) > budget {
+            pick.byte_budget_full = true;
+            break;
+        }
+        if let Some(cost) = cost {
             links = links.saturating_add(cost);
         }
-        picked.push(tx.clone());
+        bytes += size;
+        pick.bytes += size;
+        pick.picked.push(tx.clone());
     }
-    (picked, held)
+    pick
 }
 
 #[cfg(test)]
@@ -2609,6 +2876,114 @@ mod r18_batch_tests {
         let (picked, _) = select_batch_txs(&st, pool.iter(), 1024, u64::MAX);
         assert_eq!(nonces(&picked), vec![(3, 0)]);
     }
+
+    /// v0.19.12: the block byte budget. Fat shields from two senders in pool order, then
+    /// a small transfer: the selection takes the longest run that fits `MAX_BATCH_TX_BYTES` and
+    /// ENDS at the first tx that does not — the transfer behind the stop waits too — and the
+    /// next block resumes exactly there. A bundle already in the block shrinks the room; a full
+    /// block of small txs is unaffected (the count binds first); the settle-link holds come
+    /// first, as before. KILL: drop the fit check (the seventh 4 MB shield rides past the
+    /// budget), or `continue` past it instead of ending the selection (the transfer behind the
+    /// stop rides ahead of an earlier tx).
+    #[test]
+    fn the_block_byte_budget_ends_the_selection_in_pool_order() {
+        use crate::batch::{MAX_BATCH_TX_BYTES, MAX_TXS_PER_BLOCK};
+        use crate::mempool::tx_encoded_len;
+        let st = State::default();
+        let fat = |sender: u8, nonce: u64, proof_len: usize| {
+            tx(sender, nonce, Tx::MintToPool {
+                asset: h(9),
+                value: 1,
+                commitment: h(6),
+                proof: vec![0xAB; proof_len],
+                stealth_ct: vec![],
+            })
+        };
+        // 4 MB proofs against the real budget: six fit, the seventh does not
+        {
+            let pool = vec![
+                fat(1, 0, 4_000_000),
+                fat(2, 0, 4_000_000),
+                fat(1, 1, 4_000_000),
+                fat(2, 1, 4_000_000),
+                fat(1, 2, 4_000_000),
+                fat(2, 2, 4_000_000),
+                fat(1, 3, 4_000_000),
+                transfer(3, 0),
+            ];
+            let size = tx_encoded_len(&pool[0]);
+            assert_eq!(MAX_BATCH_TX_BYTES / size, 6, "{size} B per fat tx");
+            let pick = super::select_batch_txs_sized(&st, pool.iter(), MAX_TXS_PER_BLOCK, 0, 0);
+            assert_eq!(nonces(&pick.picked), vec![(1, 0), (2, 0), (1, 1), (2, 1), (1, 2), (2, 2)]);
+            assert_eq!(pick.bytes, 6 * size);
+            assert!(pick.bytes <= MAX_BATCH_TX_BYTES);
+            assert!(pick.byte_budget_full);
+            assert_eq!((pick.held, pick.oversize.len()), (0, 0));
+        }
+        // the same rule on a block whose room a bundle already took down to 100 kB (the
+        // bundle's bytes seed the total), with 30 kB shields: the stop, the order, the resume
+        let room_left = 100_000;
+        let seed = MAX_BATCH_TX_BYTES - room_left;
+        let pool = vec![
+            fat(1, 0, 30_000),
+            fat(2, 0, 30_000),
+            fat(1, 1, 30_000),
+            fat(2, 1, 30_000),
+            transfer(3, 0),
+            fat(1, 2, 30_000),
+            transfer(3, 1),
+        ];
+        let size = tx_encoded_len(&pool[0]);
+        assert_eq!(room_left / size, 3);
+        let pick = super::select_batch_txs_sized(&st, pool.iter(), MAX_TXS_PER_BLOCK, 0, seed);
+        assert_eq!(nonces(&pick.picked), vec![(1, 0), (2, 0), (1, 1)]);
+        assert!(pick.byte_budget_full);
+        assert!(seed + pick.bytes <= MAX_BATCH_TX_BYTES);
+        // the rest stays pending, in order: the next block (no bundle) resumes at the stop
+        let next = super::select_batch_txs_sized(&st, pool[3..].iter(), MAX_TXS_PER_BLOCK, 0, 0);
+        assert_eq!(nonces(&next.picked), vec![(2, 1), (3, 0), (1, 2), (3, 1)]);
+        assert!(!next.byte_budget_full);
+        // small txs are unaffected: a full block of them, the count binding first
+        let small: Vec<SignedTx> = (0..(MAX_TXS_PER_BLOCK as u64 + 10)).map(|n| transfer(4, n)).collect();
+        let pick = super::select_batch_txs_sized(&st, small.iter(), MAX_TXS_PER_BLOCK, 0, 0);
+        assert_eq!(pick.picked.len(), MAX_TXS_PER_BLOCK);
+        assert!(!pick.byte_budget_full);
+        // the settle-link hold comes first, as before: with the link budget full a settle is
+        // held (not a stop), and the transfer behind it still rides in the bytes left
+        let st = chain_with_channels(1);
+        let pool = [settle(5, 0, 1, 1), transfer(6, 0)];
+        let pick = super::select_batch_txs_sized(&st, pool.iter(), MAX_TXS_PER_BLOCK, MAX_SETTLE_LINKS_PER_BLOCK, seed);
+        assert_eq!(nonces(&pick.picked), vec![(6, 0)]);
+        assert_eq!(pick.held, 1);
+        assert!(!pick.byte_budget_full);
+    }
+
+    /// v0.19.12: a tx larger than a whole block's byte budget never blocks the pool: it
+    /// is skipped and reported (for `build_batch` to drop), its sender's later tx waits behind
+    /// it, and every other sender's txs ride in pool order. Admission and both restore paths
+    /// keep such a tx out of the pool; this is the second line. KILL: treat it as a tx that
+    /// does not fit (end the selection) and nothing behind it ever rides again.
+    #[test]
+    fn a_tx_larger_than_any_block_is_skipped_and_reported() {
+        use crate::batch::MAX_BATCH_TX_BYTES;
+        let st = State::default();
+        let huge = tx(1, 0, Tx::MintToPool {
+            asset: h(9),
+            value: 1,
+            commitment: h(6),
+            proof: vec![0; MAX_BATCH_TX_BYTES],
+            stealth_ct: vec![],
+        });
+        assert!(crate::mempool::tx_encoded_len(&huge) > MAX_BATCH_TX_BYTES);
+        let pool = vec![huge, transfer(1, 1), transfer(2, 0), transfer(2, 1)];
+        let pick = super::select_batch_txs_sized(&st, pool.iter(), 1024, 0, 0);
+        assert_eq!(nonces(&pick.picked), vec![(2, 0), (2, 1)]);
+        assert_eq!(pick.oversize, vec![(h(1), 0)]);
+        assert_eq!(pick.held, 0, "not a settle-link hold");
+        assert!(!pick.byte_budget_full);
+        // the wrapper the other tests use agrees
+        assert_eq!(nonces(&select_batch_txs(&st, pool.iter(), 1024, 0).0), vec![(2, 0), (2, 1)]);
+    }
 }
 
 /// v0.11.2: the kind tag the explorer shows — matches rpc.rs's tx_summary kinds.
@@ -2646,7 +3021,37 @@ fn tx_counterparty(tx: &hk_state::tx::Tx) -> Option<hk_primitives::AccountId> {
         // X1: a mint reaches `to`; a freeze names the account it acts on.
         Tx::AssetMint { to, .. } => Some(*to),
         Tx::AssetFreeze { account, .. } => Some(*account),
+        // HR-5 (v0.19.12): a mandate's designated holder — the account that spends from that
+        // node and delegates under it — is indexed in its own history, so an agent (or a
+        // root holder who is not the funder) finds the mandate it was handed. A node-local
+        // index: it covers blocks committed or replayed by a node running this version, not
+        // an `index3.bin` restored from an earlier one.
+        Tx::MandateCreate { holder, .. } => Some(*holder),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod hr5_tests {
+    use super::tx_counterparty;
+    use hk_primitives::H256;
+    use hk_state::tx::Tx;
+
+    /// HR-5 (v0.19.12): a mandate's designated holder is a counterparty of its `MandateCreate`,
+    /// for a root and a child alike; the other kinds are unchanged. KILL: remove the
+    /// `Tx::MandateCreate { holder, .. }` arm of `tx_counterparty` and the first two
+    /// assertions see `None`.
+    #[test]
+    fn hr5_a_mandate_create_indexes_its_holder() {
+        let holder = H256([0x42; 32]);
+        let mk = |parent| Tx::MandateCreate {
+            id: H256([1; 32]), parent, holder, asset: H256([9; 32]), rate_per_sec: 0, buffer_max: 1,
+            per_tx_max: 1, initial_buffer: 1, expiry: 1, tier: 0,
+        };
+        assert_eq!(tx_counterparty(&mk(None)), Some(holder));
+        assert_eq!(tx_counterparty(&mk(Some(H256([2; 32])))), Some(holder));
+        assert_eq!(tx_counterparty(&Tx::MandateRevoke { target: H256([1; 32]) }), None);
+        assert_eq!(tx_counterparty(&Tx::Transfer { to: holder, asset: H256([9; 32]), amount: 1 }), Some(holder));
     }
 }
 
@@ -2933,5 +3338,291 @@ mod hr1_tests {
         assert_eq!(chain.accounts[&acct(1)].nonce, 1);
         assert_eq!(chain.balance(&acct(1), &hk_state::FEE_ASSET), 900);
         assert_eq!(chain.balance(&acct(1), &ASSET), 999);
+    }
+}
+
+/// v0.19.12: another node's value enters the store of undecided values from a proposal whose
+/// signature the engine verified. `admit_signed_value` is the whole rule and is pure, so it is
+/// driven here on a plain map, with `find_value_in_height` (the restream's lookup) and
+/// `proposal_stream` (the frames this node sends). The engine's side (a verified proposal is
+/// handed to the host, one that fails verification is not; the value is written to the WAL
+/// when it completes its proposal) is tested in hk-consensus: `tests/r8_claims.rs` and
+/// `src/provider.rs`.
+///
+/// Run: `cargo test --offline -p hk-node signed_value -- --nocapture`
+#[cfg(test)]
+mod signed_value_tests {
+    use std::collections::BTreeMap;
+
+    use bytes::Bytes;
+    use hk_consensus::{HkAddress, HkContext, HkHeight, HkProposalPart, HkValue, HkValueId};
+    use malachitebft_app_channel::app::streaming::StreamContent;
+    use malachitebft_app_channel::app::types::core::{Round, Validity};
+    use malachitebft_app_channel::app::types::{LocallyProposedValue, ProposedValue};
+
+    use super::{
+        admit_signed_value, find_value_in_height, proposal_stream, ValueRefusal,
+        MAX_PROPOSAL_BYTES, MAX_VALUES_PER_ROUND,
+    };
+
+    type Store = BTreeMap<(u64, i64), Vec<ProposedValue<HkContext>>>;
+
+    /// The height the node under test is at.
+    const H: u64 = 41;
+
+    fn addr(b: u8) -> HkAddress {
+        HkAddress::new([b; 20])
+    }
+
+    fn candidate(
+        height: u64,
+        round: Round,
+        valid_round: Round,
+        proposer: HkAddress,
+        value: HkValue,
+    ) -> ProposedValue<HkContext> {
+        ProposedValue {
+            height: HkHeight::new(height),
+            round,
+            valid_round,
+            proposer,
+            value,
+            validity: Validity::Valid,
+        }
+    }
+
+    /// What an honest proposer signs: a fresh value whose id is the hash of its bytes.
+    fn honest(height: u64, round: u32, proposer: HkAddress, txs: &'static [u8]) -> ProposedValue<HkContext> {
+        candidate(height, Round::new(round), Round::Nil, proposer, HkValue::new(Bytes::from_static(txs)))
+    }
+
+    fn held(store: &Store, height: u64, round: i64) -> usize {
+        store.get(&(height, round)).map_or(0, |vs| vs.len())
+    }
+
+    /// The honest case: the value is kept, and the answer carries the bytes, the id of those
+    /// bytes, and the proposal's own round, proof-of-lock round and proposer.
+    #[test]
+    fn signed_value_is_kept_and_answered_with_the_id_of_its_bytes() {
+        let mut store = Store::new();
+        let v = HkValue::new(Bytes::from_static(b"batch"));
+        let got = admit_signed_value(&mut store, H, honest(H, 0, addr(7), b"batch")).expect("kept");
+        assert_eq!(got.value.id(), v.id());
+        assert_eq!(got.value.txs, v.txs);
+        assert_eq!(got.height, HkHeight::new(H));
+        assert_eq!(got.round, Round::new(0));
+        assert_eq!(got.valid_round, Round::Nil);
+        assert_eq!(got.proposer, addr(7));
+        assert_eq!(got.validity, Validity::Valid);
+        assert_eq!(held(&store, H, 0), 1);
+        assert_eq!(store[&(H, 0)][0].value.id(), v.id());
+        assert_eq!(store[&(H, 0)][0].proposer, addr(7));
+    }
+
+    /// The second line behind the engine's check: a value whose id is not the hash of its bytes
+    /// is refused, nothing is kept, and no slot is created. Kill: drop the `IdMismatch` check
+    /// and this value is stored.
+    #[test]
+    fn signed_value_whose_id_is_not_the_hash_of_its_bytes_is_refused_and_nothing_is_kept() {
+        let mut store = Store::new();
+        let mut mismatched = HkValue::new(Bytes::from_static(b"the bytes"));
+        mismatched.id = HkValue::new(Bytes::from_static(b"other bytes")).id();
+        let got = admit_signed_value(&mut store, H, candidate(H, Round::new(0), Round::Nil, addr(7), mismatched));
+        assert!(matches!(got, Err(ValueRefusal::IdMismatch)));
+        assert!(store.is_empty(), "no slot is created by a refusal");
+        assert!(!ValueRefusal::IdMismatch.is_routine(), "no honest proposer signs this");
+    }
+
+    /// Each round holds at most `MAX_VALUES_PER_ROUND` values of its own, and a later round of
+    /// the height takes its own proposer's value.
+    #[test]
+    fn signed_values_are_bounded_per_round() {
+        let mut store = Store::new();
+        let names: [&'static [u8]; 4] = [b"w", b"x", b"y", b"z"];
+        for round in 1..=20u32 {
+            for txs in names.iter().take(MAX_VALUES_PER_ROUND) {
+                admit_signed_value(&mut store, H, honest(H, round, addr(round as u8), txs)).expect("kept");
+            }
+        }
+        assert_eq!(held(&store, H, 0), 0);
+        let got = admit_signed_value(&mut store, H, honest(H, 0, addr(7), b"the round-0 value"));
+        assert!(got.is_ok(), "round 0 takes its proposer's value");
+        assert_eq!(held(&store, H, 0), 1);
+
+        let far = admit_signed_value(&mut store, H, honest(H, 400, addr(9), b"far ahead"));
+        assert!(far.is_ok(), "a later round of the height takes its value");
+        assert_eq!(held(&store, H, 400), 1);
+    }
+
+    /// A proposer who signs several values for one round: they are kept up to the bound, so
+    /// the engine can follow whichever the network locks on, and no further. A value already
+    /// held is still answered when the slot is full.
+    #[test]
+    fn signed_values_of_an_equivocating_proposer_are_kept_up_to_the_bound() {
+        assert!(MAX_VALUES_PER_ROUND >= 2, "both values of an equivocation must fit");
+        let mut store = Store::new();
+        let p = addr(7);
+        let names: [&'static [u8]; 6] = [b"a", b"b", b"c", b"d", b"e", b"f"];
+        for (i, txs) in names.iter().enumerate() {
+            let got = admit_signed_value(&mut store, H, honest(H, 0, p, txs));
+            if i < MAX_VALUES_PER_ROUND {
+                assert!(got.is_ok(), "value {i} is kept");
+            } else {
+                assert!(matches!(got, Err(ValueRefusal::SlotFull)), "value {i} is past the bound");
+            }
+        }
+        assert_eq!(held(&store, H, 0), MAX_VALUES_PER_ROUND);
+        assert!(!ValueRefusal::SlotFull.is_routine());
+
+        let again = admit_signed_value(&mut store, H, honest(H, 0, p, b"a")).expect("a held value is answered");
+        assert_eq!(again.value.txs.as_ref(), b"a");
+        assert_eq!(again.validity, Validity::Valid);
+        assert_eq!(held(&store, H, 0), MAX_VALUES_PER_ROUND, "and is not stored twice");
+    }
+
+    /// The same proposal again (a republished copy) is answered from the store without a
+    /// second entry, as a VALID value that carries the candidate's own proof-of-lock round and
+    /// proposer. A copy that carries a held id over OTHER bytes is answered with the held bytes:
+    /// the stored bytes are the ones that id names. Kill: answer `Validity::Invalid` from the
+    /// shortcut and the `Validity::Valid` assertions fail.
+    #[test]
+    fn signed_value_with_a_held_id_is_answered_with_the_held_bytes() {
+        let mut store = Store::new();
+        let p = addr(7);
+        let good = HkValue::new(Bytes::from_static(b"good"));
+        admit_signed_value(&mut store, H, honest(H, 0, p, b"good")).expect("kept");
+
+        let same = admit_signed_value(
+            &mut store,
+            H,
+            candidate(H, Round::new(0), Round::new(0), addr(8), good.clone()),
+        )
+        .expect("answered");
+        assert_eq!(same.value.txs.as_ref(), b"good");
+        assert_eq!(same.validity, Validity::Valid);
+        assert_eq!(same.valid_round, Round::new(0), "the candidate's proof-of-lock round");
+        assert_eq!(same.proposer, addr(8), "the candidate's proposer");
+        assert_eq!(held(&store, H, 0), 1);
+
+        let mut mismatched = HkValue::new(Bytes::from_static(b"other bytes"));
+        mismatched.id = good.id();
+        let got = admit_signed_value(&mut store, H, candidate(H, Round::new(0), Round::Nil, p, mismatched))
+            .expect("answered from the store");
+        assert_eq!(got.value.id(), good.id());
+        assert_eq!(got.value.txs.as_ref(), b"good", "the stored bytes, not the ones this copy carried");
+        assert_eq!(got.validity, Validity::Valid);
+        assert_eq!(held(&store, H, 0), 1);
+    }
+
+    /// Only the node's own height is taken, and never round Nil. A proposal for a height
+    /// already committed is the routine case (the engine was still closing it); one for a
+    /// later height is not expected at all, because the engine keeps such a proposal in its
+    /// buffer until that height starts.
+    #[test]
+    fn signed_value_is_kept_for_the_current_height_only() {
+        let p = addr(7);
+        let mut store = Store::new();
+        let below = admit_signed_value(&mut store, H, honest(H - 1, 0, p, b"late"));
+        assert!(matches!(below, Err(ValueRefusal::BelowOurHeight)));
+        let above = admit_signed_value(&mut store, H, honest(H + 1, 0, p, b"early"));
+        assert!(matches!(above, Err(ValueRefusal::AboveOurHeight)));
+        let nil = admit_signed_value(
+            &mut store,
+            H,
+            candidate(H, Round::Nil, Round::Nil, p, HkValue::new(Bytes::from_static(b"nil"))),
+        );
+        assert!(matches!(nil, Err(ValueRefusal::RoundNil)));
+        assert!(store.is_empty(), "none of the three left anything");
+
+        assert!(ValueRefusal::BelowOurHeight.is_routine());
+        assert!(!ValueRefusal::AboveOurHeight.is_routine());
+        assert!(!ValueRefusal::RoundNil.is_routine());
+        assert!(!ValueRefusal::OverByteCap.is_routine());
+    }
+
+    /// A value over the byte cap is refused before it is hashed (the id below is not its hash,
+    /// and the refusal is the cap, not the id).
+    #[test]
+    fn signed_value_over_the_byte_cap_is_refused_before_it_is_hashed() {
+        let mut store = Store::new();
+        let big = HkValue {
+            id: HkValueId::new([0u8; 32]),
+            txs: Bytes::from(vec![0u8; MAX_PROPOSAL_BYTES + 1]),
+        };
+        let got = admit_signed_value(&mut store, H, candidate(H, Round::new(0), Round::Nil, addr(7), big));
+        assert!(matches!(got, Err(ValueRefusal::OverByteCap)));
+        assert!(store.is_empty());
+    }
+
+    /// A re-proposal (a value locked in round 0, proposed again in round 2) that reaches this
+    /// node without the earlier round is kept under the round of the proposal that carried it,
+    /// with its proof-of-lock round.
+    #[test]
+    fn signed_value_of_a_re_proposal_is_kept_under_its_own_round_with_its_valid_round() {
+        let mut store = Store::new();
+        let v = HkValue::new(Bytes::from_static(b"locked"));
+        let got = admit_signed_value(&mut store, H, candidate(H, Round::new(2), Round::new(0), addr(9), v.clone()))
+            .expect("kept");
+        assert_eq!(got.round, Round::new(2));
+        assert_eq!(got.valid_round, Round::new(0));
+        assert_eq!(got.value.id(), v.id());
+        assert_eq!(held(&store, H, 2), 1);
+        assert_eq!(held(&store, H, 0), 0);
+    }
+
+    /// The restream's lookup: a value held under round 0 only is found for a restream that
+    /// names rounds 1 and 2 (the engine completed the round-1 re-proposal by itself, so the
+    /// host was never asked to store the value under round 1). Another height and an unknown
+    /// id find nothing. Kill: look under the two rounds a restream names and the first
+    /// assertion fails — seats on older releases would get no stream for that re-proposal.
+    #[test]
+    fn signed_value_is_found_for_a_restream_under_any_round_of_the_height() {
+        let mut store = Store::new();
+        let v = HkValue::new(Bytes::from_static(b"locked"));
+        admit_signed_value(&mut store, H, honest(H, 0, addr(7), b"locked")).expect("kept under round 0");
+        admit_signed_value(&mut store, H, honest(H, 3, addr(8), b"another value")).expect("kept under round 3");
+
+        let found = find_value_in_height(&store, H, v.id()).expect("found under round 0");
+        assert_eq!(found.value.txs.as_ref(), b"locked");
+        assert_eq!(found.round, Round::new(0));
+
+        assert!(find_value_in_height(&store, H + 1, v.id()).is_none(), "another height");
+        assert!(find_value_in_height(&store, H - 1, v.id()).is_none(), "another height");
+        let unknown = HkValue::new(Bytes::from_static(b"never proposed")).id();
+        assert!(find_value_in_height(&store, H, unknown).is_none(), "an id nobody proposed");
+    }
+
+    /// The stream this node SENDS names the proposer it is given: its own address when it
+    /// proposes, the signer of the proposal when it restreams. The frames are an Init, one
+    /// batch, a Fin with the value id, and the end of the stream.
+    #[test]
+    fn signed_value_stream_names_the_proposer_it_is_given() {
+        let value = HkValue::new(Bytes::from_static(b"batch"));
+        let lpv = LocallyProposedValue {
+            height: HkHeight::new(H),
+            round: Round::new(2),
+            value: value.clone(),
+        };
+        let msgs = proposal_stream(lpv, Round::new(0), addr(9));
+        assert_eq!(msgs.len(), 4);
+        match &msgs[0].content {
+            StreamContent::Data(HkProposalPart::Init(init)) => {
+                assert_eq!(init.proposer, addr(9));
+                assert_eq!(init.height, HkHeight::new(H));
+                assert_eq!(init.round, Round::new(2));
+                assert_eq!(init.pol_round, Round::new(0));
+            }
+            _ => panic!("the first frame is the Init"),
+        }
+        match &msgs[1].content {
+            StreamContent::Data(HkProposalPart::TxBatch(batch)) => assert_eq!(batch.as_ref(), b"batch"),
+            _ => panic!("the second frame is the batch"),
+        }
+        match &msgs[2].content {
+            StreamContent::Data(HkProposalPart::Fin(fin)) => assert_eq!(fin.value_id, value.id()),
+            _ => panic!("the third frame is the Fin"),
+        }
+        assert!(matches!(msgs[3].content, StreamContent::Fin));
+        assert!(msgs.iter().all(|m| m.stream_id == msgs[0].stream_id));
     }
 }

@@ -4,10 +4,12 @@
 //! (`priv_validator_key.json`, `account.json`, `wallet.json`) ONE behaviour:
 //!
 //! - read a plain OR a sealed file transparently (a plain file never asks for anything);
-//! - write a file back in the state it was found — a sealed file stays sealed, under the
-//!   same key; a plain one stays plain;
-//! - convert one way or the other ONLY through the explicit commands
-//!   `key-seal` / `key-unseal <HOME>` and `account-seal` / `account-unseal <DIR>`.
+//! - write a sealed file back sealed, under the same key; and once this process holds a key
+//!   for a kind of secret (it opened or sealed a file of that kind), seal a missing or plain
+//!   target of that kind under that key too — never write it plain (HR-10, v0.19.12). A
+//!   process that holds no key writes plain, unless `<PREFIX>_PASSPHRASE` is set;
+//! - put plaintext back on disk ONLY through the explicit commands `key-unseal <HOME>` and
+//!   `account-unseal <DIR>` (`key-seal` / `account-seal` seal a plain file on purpose).
 //!
 //! The passphrase is resolved once per process (`<PREFIX>_PASSPHRASE`, `_PASSPHRASE_FILE`,
 //! systemd `LoadCredential=`, or a terminal prompt — see `hk_wallet::sealed`), the optional
@@ -115,11 +117,13 @@ fn forget(which: Secret) {
     with_cache(which, |c| *c = Cache::default());
 }
 
-/// The derived key for an existing envelope: cached by salt, else derived (≈1 s) from
-/// the resolved passphrase (+ key file) and cached.
+/// A key derived (≈1 s at the default profile) for an existing envelope — its salt and
+/// parameters, bounded by `Kdf::validate` — from the resolved passphrase (+ key file). It
+/// neither reads nor fills the cache: the callers look there first and cache the key
+/// (`remember_key`) only after it has opened the envelope.
 fn key_for(which: Secret, env: &Sealed) -> Result<SealKey, SealError> {
-    // SealKey is not Clone on purpose (one zeroize on drop); the cache hands out a fresh
-    // derivation only when it has to, and otherwise we open with the cached key in place.
+    // SealKey is not Clone on purpose (one zeroize on drop): a cached key is used in place
+    // under the cache lock, and a new one is derived here only when the cache has none.
     let pass = passphrase(which)?;
     let kf = keyfile(which)?;
     SealKey::for_envelope(env, &pass, kf.as_deref())
@@ -138,6 +142,14 @@ fn open_with_cache(which: Secret, env: &Sealed) -> Result<Vec<u8>, SealError> {
     out
 }
 
+/// HR-10 (v0.19.12): a save never adopts a key for an envelope this process has not opened.
+/// Until v0.19.12 the key for the envelope being replaced was taken from the file itself —
+/// its salt and parameters — and the plaintext was re-sealed under it: an envelope swapped
+/// in at the owner's secret path (by whoever can write there) had the owner's real secret
+/// re-encrypted under the attacker's salt and, before the floor, the attacker's cheap
+/// parameters at the owner's next save, silently. Now the key — cached or freshly derived —
+/// must OPEN the envelope on disk (plaintext discarded) before anything is sealed under it;
+/// otherwise the save is refused with `SealError::NotOpened` and the file is left as it is.
 fn seal_with_cache(which: Secret, existing: Option<&Sealed>, plaintext: &str) -> Result<String, SealError> {
     // Re-seal under the key of the envelope being replaced (same salt); a NEW file goes
     // under the primary key, deriving one with a fresh salt if this process has none yet.
@@ -149,6 +161,11 @@ fn seal_with_cache(which: Secret, existing: Option<&Sealed>, plaintext: &str) ->
             if !k.fits(e) {
                 return None;
             }
+            // verify-then-adopt: the cached key fits the envelope's labels; it must open
+            // its body too (one AEAD call), or this is not the file this process read.
+            if k.open(e).is_err() {
+                return Some(Err(SealError::NotOpened));
+            }
         }
         Some(k.seal_to_json(plaintext))
     });
@@ -156,7 +173,14 @@ fn seal_with_cache(which: Secret, existing: Option<&Sealed>, plaintext: &str) ->
         return r;
     }
     let key = match existing {
-        Some(e) => key_for(which, e)?,
+        Some(e) => {
+            // An envelope under a salt this process has not derived for (a file sealed in
+            // another run): derive for it — bounded by `Kdf::validate` — and adopt the key
+            // only if it opens the file. A foreign envelope is never re-sealed under.
+            let key = key_for(which, e)?;
+            key.open(e).map_err(|_| SealError::NotOpened)?;
+            key
+        }
         None => SealKey::new(&passphrase(which)?, keyfile(which)?.as_deref(), Kdf::default_profile())?,
     };
     let out = key.seal_to_json(plaintext);
@@ -188,19 +212,35 @@ pub(crate) fn read_secret(path: &Path, which: Secret) -> eyre::Result<String> {
     }
 }
 
-/// Write a secret file atomically (tmp → fsync → rename, mode 0600 on Unix), keeping it
-/// sealed if it already was. New files are written plain unless `<PREFIX>_PASSPHRASE` is
-/// set — a scripted install that exports the passphrase gets sealed files from the start.
+/// Write a secret file atomically (tmp → fsync → rename, mode 0600 on Unix). A sealed file
+/// stays sealed, under its own key. A missing or plain target is sealed under the primary key
+/// when this process holds a key for this kind of secret — it opened or sealed a file of that
+/// kind — or when `<PREFIX>_PASSPHRASE` is set (a scripted install that exports the passphrase
+/// gets sealed files from the start); only a process that holds neither writes it plain.
+/// HR-10 (v0.19.12): until v0.19.12 the choice came from the file on disk and that variable
+/// alone, so a process that opened a sealed file with a passphrase from `_PASSPHRASE_FILE`,
+/// `LoadCredential=` (a service) or the prompt wrote the secret back in PLAIN TEXT
+/// once the file was removed or replaced by plain JSON. And a sealed file this process's key
+/// does not open is never overwritten — the error names the path; the file on disk is
+/// untouched. `unseal_path` (`key-unseal` / `account-unseal`) writes plain on purpose, through
+/// `write_atomic`.
 pub(crate) fn write_secret(path: &Path, plaintext: &str, which: Secret) -> eyre::Result<()> {
     let existing = std::fs::read_to_string(path).ok().filter(|s| sealed::is_sealed(s));
     let body = match existing {
         Some(raw) => {
             let env = sealed::parse(&raw).map_err(|e| eyre::eyre!("{}: {e}", path.display()))?;
-            seal_with_cache(which, Some(&env), plaintext)?
+            seal_with_cache(which, Some(&env), plaintext).map_err(|e| eyre::eyre!("{}: {e}", path.display()))?
         }
         None => {
+            // `remember_key` makes the first key this process derives the primary, so a
+            // primary with its key cached = this process holds a key for this kind of secret.
+            let holds_key = with_cache(which, |c| c.primary.as_ref().is_some_and(|salt| c.keys.contains_key(salt)));
             let seal_new = std::env::var(format!("{}_PASSPHRASE", which.prefix())).map(|p| !p.is_empty()).unwrap_or(false);
-            if seal_new { seal_with_cache(which, None, plaintext)? } else { plaintext.to_string() }
+            if holds_key || seal_new {
+                seal_with_cache(which, None, plaintext).map_err(|e| eyre::eyre!("{}: {e}", path.display()))?
+            } else {
+                plaintext.to_string()
+            }
         }
     };
     write_atomic(path, body.as_bytes())
@@ -481,6 +521,147 @@ mod tests {
         std::env::remove_var("HK_KEY_PASSPHRASE");
         std::env::remove_var("HK_KEY_PASSPHRASE_FILE");
         forget(Secret::ValidatorKey);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// HR-10 (v0.19.12): a save never adopts an envelope this process did not open. The
+    /// owner seals and reads `account.json`; an envelope under another key (a different
+    /// passphrase, the attacker's salt) is swapped in at the path; the owner's next save is
+    /// REFUSED and the file is left byte for byte — the owner's secret is never re-sealed
+    /// under parameters taken from the file. A sub-floor envelope is refused before any
+    /// derivation; a tampered body under the owner's own salt is refused too. The owner's
+    /// OWN envelope under another salt (a file sealed in another run) still re-seals, and the
+    /// result opens with the real passphrase and parameters.
+    /// KILL: remove either open check from `seal_with_cache` (`k.open(e)`, `key.open(e)`; the
+    /// pre-v0.19.12 path) and a save that must be refused succeeds — (c) without the first, (a)
+    /// without the second, the owner's secret landing under the swapped file's salt and parameters.
+    #[test]
+    fn hr10_a_save_never_adopts_an_envelope_this_process_did_not_open() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        fast_kdf();
+        std::env::remove_var("HK_WALLET_KEYFILE");
+        std::env::remove_var("HK_WALLET_PASSPHRASE");
+        forget(Secret::Wallet);
+        let d = tmpdir("hr10");
+        let p = d.join("account.json");
+        let owner = "correct horse battery staple";
+        let fast = Kdf { m_kib: 65_536, t: 3, p: 1 };
+        std::fs::write(&p, "{\"seed\":\"00\",\"id\":\"11\",\"next_nonce\":0}").unwrap();
+        let mut pass = Some(owner.to_string());
+        seal_path(&p, Secret::Wallet, &mut pass).unwrap();
+        assert_eq!(read_secret(&p, Secret::Wallet).unwrap(), "{\"seed\":\"00\",\"id\":\"11\",\"next_nonce\":0}");
+        let own_json = std::fs::read_to_string(&p).unwrap();
+
+        // (a) a swapped envelope under another passphrase (and salt): the save is refused,
+        //     the file is untouched, and nothing under the owner's secret is on disk
+        let attacker = SealKey::new("attacker chosen passphrase 1", None, fast).unwrap();
+        let swapped = attacker.seal_to_json("{\"seed\":\"ff\"}").unwrap();
+        std::fs::write(&p, &swapped).unwrap();
+        let e = write_secret(&p, "{\"seed\":\"00\",\"id\":\"11\",\"next_nonce\":1}", Secret::Wallet).unwrap_err().to_string();
+        assert!(e.contains("not the sealed file this process opened"), "{e}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), swapped, "the file on disk is left as it was");
+        let still_theirs = sealed::parse(&swapped).unwrap();
+        assert_eq!(attacker.open(&still_theirs).unwrap(), b"{\"seed\":\"ff\"}");
+
+        // (b) a swapped envelope below the floor: refused before any derivation, untouched
+        let mut weak = sealed::parse(&swapped).unwrap();
+        weak.m_kib = 8;
+        weak.t = 1;
+        weak.p = 1;
+        let weak_json = serde_json::to_string_pretty(&weak).unwrap();
+        std::fs::write(&p, &weak_json).unwrap();
+        let e = write_secret(&p, "{\"seed\":\"00\",\"id\":\"11\",\"next_nonce\":1}", Secret::Wallet).unwrap_err().to_string();
+        assert!(e.contains("kdf parameters out of range"), "{e}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), weak_json);
+
+        // (c) the owner's own salt and labels, a tampered body: the cached key fits the
+        //     envelope but does not open it → refused, untouched
+        let mut tampered = sealed::parse(&own_json).unwrap();
+        let mut ct = hex::decode(&tampered.ct).unwrap();
+        ct[0] ^= 0x01;
+        tampered.ct = hex::encode(ct);
+        let tampered_json = serde_json::to_string_pretty(&tampered).unwrap();
+        std::fs::write(&p, &tampered_json).unwrap();
+        let e = write_secret(&p, "{\"seed\":\"00\",\"id\":\"11\",\"next_nonce\":1}", Secret::Wallet).unwrap_err().to_string();
+        assert!(e.contains("not the sealed file this process opened"), "{e}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), tampered_json);
+        // and the untampered file still saves under its own key, same salt
+        std::fs::write(&p, &own_json).unwrap();
+        write_secret(&p, "{\"seed\":\"00\",\"id\":\"11\",\"next_nonce\":1}", Secret::Wallet).unwrap();
+        assert_eq!(sealed::parse(&std::fs::read_to_string(&p).unwrap()).unwrap().salt, sealed::parse(&own_json).unwrap().salt);
+        assert_eq!(read_secret(&p, Secret::Wallet).unwrap(), "{\"seed\":\"00\",\"id\":\"11\",\"next_nonce\":1}");
+
+        // (d) the owner's OWN envelope under another salt (sealed in another run): the save
+        //     derives for it, it opens, and the re-seal lands under that salt with the real
+        //     parameters — readable with the owner's passphrase
+        let other_run = SealKey::new(owner, None, fast).unwrap();
+        std::fs::write(&p, other_run.seal_to_json("{\"seed\":\"00\",\"id\":\"11\",\"next_nonce\":0}").unwrap()).unwrap();
+        write_secret(&p, "{\"seed\":\"00\",\"id\":\"11\",\"next_nonce\":2}", Secret::Wallet).unwrap();
+        let after = sealed::parse(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(after.salt, other_run.salt_hex());
+        assert_eq!((after.m_kib, after.t, after.p), (fast.m_kib, fast.t, fast.p));
+        assert_eq!(
+            SealKey::for_envelope(&after, owner, None).unwrap().open(&after).unwrap(),
+            b"{\"seed\":\"00\",\"id\":\"11\",\"next_nonce\":2}"
+        );
+        assert_eq!(read_secret(&p, Secret::Wallet).unwrap(), "{\"seed\":\"00\",\"id\":\"11\",\"next_nonce\":2}");
+        std::env::remove_var("HK_WALLET_PASSPHRASE");
+        forget(Secret::Wallet);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// HR-10 (v0.19.12): a process that holds the key for a kind of secret never writes that
+    /// secret plain. The owner seals `account.json`; a process that takes the passphrase from
+    /// `HK_WALLET_PASSPHRASE_FILE` (a service's `LoadCredential=` shape), not from
+    /// `HK_WALLET_PASSPHRASE`, opens it; the file is then replaced by plain JSON, and later
+    /// deleted: each save lands SEALED under the key the process holds (the same salt, no new
+    /// derivation) and opens with the owner's passphrase. `unseal_path` still writes plain.
+    /// KILL: choose sealed-or-plain for a missing or plain target from `<PREFIX>_PASSPHRASE`
+    /// alone again (the pre-fix `write_secret`) and both saves put the seed on disk in plain
+    /// text (the `is_sealed` assertion fails).
+    #[test]
+    fn hr10_a_process_that_holds_the_key_never_writes_the_secret_plain() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        fast_kdf();
+        std::env::remove_var("HK_WALLET_KEYFILE");
+        std::env::remove_var("HK_WALLET_PASSPHRASE");
+        forget(Secret::Wallet);
+        let d = tmpdir("hr10-plain");
+        let p = d.join("account.json");
+        let owner = "correct horse battery staple";
+        std::fs::write(&p, "{\"seed\":\"00\",\"id\":\"11\",\"next_nonce\":0}").unwrap();
+        let mut pass = Some(owner.to_string());
+        seal_path(&p, Secret::Wallet, &mut pass).unwrap();
+        let salt = sealed::parse(&std::fs::read_to_string(&p).unwrap()).unwrap().salt;
+
+        // a fresh process: the passphrase from a file, the sealed file opened with it
+        forget(Secret::Wallet);
+        let f = d.join("wallet-passphrase");
+        std::fs::write(&f, format!("{owner}\n")).unwrap();
+        std::env::set_var("HK_WALLET_PASSPHRASE_FILE", &f);
+        assert_eq!(read_secret(&p, Secret::Wallet).unwrap(), "{\"seed\":\"00\",\"id\":\"11\",\"next_nonce\":0}");
+
+        let sealed_under_the_held_key = |want: &str| {
+            let raw = std::fs::read_to_string(&p).unwrap();
+            assert!(sealed::is_sealed(&raw), "the secret must not be on disk in plain text: {raw}");
+            let env = sealed::parse(&raw).unwrap();
+            assert_eq!(env.salt, salt, "sealed under the key this process holds");
+            assert_eq!(SealKey::for_envelope(&env, owner, None).unwrap().open(&env).unwrap(), want.as_bytes());
+        };
+        // (a) the file replaced by plain JSON: the save seals it
+        std::fs::write(&p, "{\"seed\":\"ff\"}").unwrap();
+        write_secret(&p, "{\"seed\":\"00\",\"id\":\"11\",\"next_nonce\":1}", Secret::Wallet).unwrap();
+        sealed_under_the_held_key("{\"seed\":\"00\",\"id\":\"11\",\"next_nonce\":1}");
+        // (b) the file deleted: the save seals it
+        std::fs::remove_file(&p).unwrap();
+        write_secret(&p, "{\"seed\":\"00\",\"id\":\"11\",\"next_nonce\":2}", Secret::Wallet).unwrap();
+        sealed_under_the_held_key("{\"seed\":\"00\",\"id\":\"11\",\"next_nonce\":2}");
+        // the explicit command is still the way back to plain
+        unseal_path(&p, Secret::Wallet).unwrap();
+        assert!(!is_sealed_file(&p));
+        assert!(std::fs::read_to_string(&p).unwrap().contains("\"next_nonce\":2"));
+        std::env::remove_var("HK_WALLET_PASSPHRASE_FILE");
+        forget(Secret::Wallet);
         let _ = std::fs::remove_dir_all(&d);
     }
 }

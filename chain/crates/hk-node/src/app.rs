@@ -2,10 +2,9 @@
 //! driving HkApp (which drives the verified hk-state chain).
 
 use eyre::eyre;
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
 use malachitebft_app_channel::app::engine::host::Next;
-use malachitebft_app_channel::app::streaming::StreamContent;
 use malachitebft_app_channel::app::types::core::Round;
 use malachitebft_app_channel::app::types::LocallyProposedValue;
 use malachitebft_app_channel::{AppMsg, Channels, NetworkMsg};
@@ -84,15 +83,30 @@ pub async fn run(state: &mut HkApp, channels: &mut Channels<HkContext>) -> eyre:
             }
 
             AppMsg::ReceivedProposalPart { from, part, reply } => {
-                let part_type = match &part.content {
-                    StreamContent::Data(p) => p.get_type(),
-                    StreamContent::Fin => "end of stream",
-                };
-                info!(%from, sequence = %part.sequence, part = %part_type, "Received proposal part");
-
-                let proposed_value = state.received_proposal_part(from, part);
-                if reply.send(proposed_value).is_err() {
+                // v0.19.12: a received proposal's value is taken from the signed proposal
+                // (`ReceivedVerifiedProposal` below), which carries the same bytes under
+                // a signature the engine has checked. The parts are dropped on arrival:
+                // nothing is buffered, reassembled or stored, and the engine is answered
+                // `None`. This node still SENDS its own proposals as streams, for seats on
+                // older releases.
+                debug!(%from, sequence = %part.sequence, "Proposal part ignored: values come from signed proposals");
+                if reply.send(None).is_err() {
                     error!("Failed to send ReceivedProposalPart reply");
+                }
+            }
+
+            AppMsg::ReceivedVerifiedProposal { height, round, valid_round, proposer, value, reply } => {
+                // v0.19.12: the engine verified this proposal under the scheduled
+                // proposer's key (the signature, and that the id is the hash of the bytes) and
+                // has no value for it yet. The proposal carries the whole batch and the
+                // signature covers it. The engine writes the answer to its WAL.
+                let proposed_value =
+                    state.received_verified_proposal(height, round, valid_round, proposer, value);
+                if let Some(v) = &proposed_value {
+                    info!(%height, %round, %proposer, value = %v.value.id(), "Value taken from the signed proposal");
+                }
+                if reply.send(proposed_value).is_err() {
+                    error!("Failed to send ReceivedVerifiedProposal reply");
                 }
             }
 
@@ -187,17 +201,31 @@ pub async fn run(state: &mut HkApp, channels: &mut Channels<HkContext>) -> eyre:
                 }
             }
 
-            AppMsg::RestreamProposal { height, round, valid_round, address: _, value_id } => {
-                let proposal_round = if valid_round == Round::Nil { round } else { valid_round };
-                info!(%height, %proposal_round, "Restreaming proposal");
+            AppMsg::RestreamProposal { height, round, valid_round, address, value_id } => {
+                info!(%height, %round, %valid_round, "Restreaming proposal");
 
-                if let Some(p) = state.find_undecided(height, proposal_round, value_id) {
-                    let lpv = LocallyProposedValue { height, round, value: p.value };
-                    for stream_message in state.stream_proposal(lpv, valid_round) {
-                        channels
-                            .network
-                            .send(NetworkMsg::PublishProposalPart(stream_message))
-                            .await?;
+                // v0.19.12: the value is looked up by id under every round of the height, as
+                // `commit` does. It is stored under the round of the proposal that first
+                // delivered it. A later re-proposal of the same value is completed inside the
+                // engine, without the host being asked, when the engine holds the value for
+                // its valid round, so the value can be held under an earlier round than
+                // either round named here. When it is found, the stream below is built from
+                // it for this round; when it is not, nothing is sent and the miss is logged.
+                match state.find_undecided_in_height(height, value_id) {
+                    Some(p) => {
+                        let lpv = LocallyProposedValue { height, round, value: p.value };
+                        // v0.19.12: the stream names the proposer who signed the proposal (this
+                        // node for its own re-proposal, the original seat otherwise), which is
+                        // what seats on older releases expect of a stream.
+                        for stream_message in crate::state::proposal_stream(lpv, valid_round, address) {
+                            channels
+                                .network
+                                .send(NetworkMsg::PublishProposalPart(stream_message))
+                                .await?;
+                        }
+                    }
+                    None => {
+                        warn!(%height, %round, %valid_round, value = %value_id, "Restream asked for a value this node does not hold: no stream sent");
                     }
                 }
             }

@@ -307,6 +307,20 @@ impl<Ctx: Context> FullProposalKeeper<Ctx> {
         }
     }
 
+    /// HK (v0.19.12): whether the VALUE itself is held for (height, round): a full entry or a
+    /// value-only entry with this id. Unlike `value_exists`, an entry that holds only the
+    /// proposal does not count.
+    pub fn value_held(&self, value: &ProposedValue<Ctx>) -> bool {
+        match self.keeper.get(&(value.height, value.round)) {
+            None => false,
+            Some(entries) => entries.iter().any(|entry| match entry {
+                Entry::Full(p) => p.builder_value.id() == value.value.id(),
+                Entry::ValueOnly(v, _) => v.id() == value.value.id(),
+                Entry::ProposalOnly(_) | Entry::Empty => false,
+            }),
+        }
+    }
+
     fn store_value_at_value_round(&mut self, new_value: &ProposedValue<Ctx>) {
         let key = (new_value.height, new_value.round);
         let entries = self.keeper.get_mut(&key);

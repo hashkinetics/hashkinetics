@@ -62,7 +62,7 @@ only).
 | SHAKE-256 (all non-circuit hashing, domains, AEAD) | `sha3` crate | test-vectored upstream | Medium |
 | SHA-256 (in-circuit + chain pool hashing) | `sha2` crate (+ SP1/RISC0 precompile patches, OpenVM lib) | patch-equality observed via cycle counts + identical outputs | **High** (patch paths) |
 | Lamport + L-ratchet (account auth v0) | `hk-crypto::lamport` | unit tests; retry-hygiene caveat documented | Medium (replaced by LMS later) |
-| LMS/HSS (consensus votes) | vendored `hbs-lms` (RFC 8554) **+ the R15 patch (v0.18.2, 2026-09-08): `src/hss/aux.rs` MAC-compare bound, `src/hss/mod.rs` `HssSigningSession` (~250 lines) — a HashKinetics change to a vendored crypto crate, in scope by name** | **KAT-verified**; live on testnet-1; R15 tests: byte-equality vs `hss_sign` across rollovers, rollback, failed-write, restart | **High** (leaf reuse leaks key material; repeated reuse = cheap forgery; the session must never release a signature its state write has not made durable — R16, v0.19.4, SHIPPED the `write_atomic` directory fsync and the upward resume on load (file header `used` vs the key state vs the in-memory position); NOT shipped: the floor from the node's own evidence — `attach_persistence_with_floor` exists in `hk-crypto::hashsig`, but the node side (`hk-consensus/src/hashsig_scheme.rs:66,97`) still calls `attach_persistence`, i.e. floor 0 — open, R17/L-3 2026-10-06, MBP §7.3; in v0.19.6 the same write routine moved to `hk_crypto::fsutil` and now also backs the node's secret files, the wallets' counters and the block log — R17/L-1) |
+| LMS/HSS (consensus votes) | vendored `hbs-lms` (RFC 8554) **+ the R15 patch (v0.18.2, 2026-09-08): `src/hss/aux.rs` MAC-compare bound, `src/hss/mod.rs` `HssSigningSession` (~250 lines) — a HashKinetics change to a vendored crypto crate, in scope by name** | **KAT-verified**; live on testnet-1; R15 tests: byte-equality vs `hss_sign` across rollovers, rollback, failed-write, restart | **High** (leaf reuse leaks key material; repeated reuse = cheap forgery; the session must never release a signature its state write has not made durable — R16, v0.19.4, SHIPPED the `write_atomic` directory fsync and the upward resume on load (file header `used` vs the key state vs the in-memory position); NOT shipped: the floor from the node's own evidence — `attach_persistence_with_floor` exists in `hk-crypto::hashsig`, but the node side (`hk-consensus/src/hashsig_scheme.rs`, `attach_state_file`, which both the start and a live rotation use since v0.19.12) still calls `attach_persistence`, i.e. floor 0 — open, R17/L-3 2026-10-06, MBP §7.3; in v0.19.6 the same write routine moved to `hk_crypto::fsutil` and now also backs the node's secret files, the wallets' counters and the block log — R17/L-1) |
 | SLH-DSA-SHAKE-192s (roots) | `fips205` crate | KAT'd upstream; live (RotationCert) | **High** |
 | WOTS w=16, 67 chains (in-circuit spend auth) | `hk-spend-circuit` (hand-written) | 16 native tests incl. forgery paths; **NO external KAT (bench-grade plain W-OTS, not WOTS+)** | **Highest** |
 | Spend-tree Merkle (depth 10) + address tag + nullifier | `hk-spend-circuit` | native + keystone tests | **Highest** |
@@ -103,7 +103,12 @@ Invariant: no two uses share a domain; auditors should verify the registry is to
 10. **Issued-asset conservation and authority (X1)** — for every registered asset
     `Σ balances + Σ open escrow + pool = supply − burned − fees_burned`; supply changes
     only by issuer-signed mint and holder-signed burn; freeze/pause are issuer-only and
-    policy-gated; every movement of a registered asset passes the same gate; unregistered
+    policy-gated; every movement of a registered asset passes the same gate — and each
+    channel exit gates one party only (`ChannelSettle` the payee, `ChannelRefund` the payer),
+    so a freeze closes the frozen party's own exit for its duration, a pause closes both, a
+    payee freeze outlasting `expiry` lets the payer refund the unsettled steps whole and ends
+    settlement for good, and escrow already committed is never recalled (HR-8, pinned by
+    `hr8_a_freeze_closes_only_the_frozen_partys_exit`); unregistered
     assets are untouched; the registry enters the commitment only when non-empty (so a
     rolling upgrade cannot fork); a runtime registration can never claim an id whose
     (issuer, symbol) preimage it does not hold; the fee asset cannot be pausable/freezable.

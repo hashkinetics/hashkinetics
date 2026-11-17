@@ -13,7 +13,7 @@
 
 /// The release label this binary reports (`hk-node --version`, the usage banner).
 /// Bump with every node release; the crate version is workspace-wide and not it.
-pub const NODE_VERSION: &str = "v0.19.11";
+pub const NODE_VERSION: &str = "v0.19.12";
 
 mod account;
 mod app;
@@ -215,12 +215,15 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
             account::cmd_balance(&rpc, &who)
         }
         Some("account-send") => {
-            let usage = "usage: hk-node account-send <DIR> <RPC> <TO-hex> <AMOUNT-micro> [ASSET-hex]";
+            // HR-9 (v0.19.12): a recipient with no account is refused unless
+            // `--allow-new-recipient` (anywhere in the line) says the sender holds its auth commit.
+            let usage = "usage: hk-node account-send <DIR> <RPC> <TO-hex> <AMOUNT-micro> [ASSET-hex] [--allow-new-recipient]";
+            let (allow_new_recipient, args) = account::take_allow_new_recipient(&args);
             let dir = PathBuf::from(args.get(2).cloned().ok_or_else(|| eyre::eyre!(usage))?);
             let rpc = args.get(3).cloned().ok_or_else(|| eyre::eyre!(usage))?;
             let to = args.get(4).cloned().ok_or_else(|| eyre::eyre!(usage))?;
             let amount: u128 = args.get(5).and_then(|s| s.parse().ok()).ok_or_else(|| eyre::eyre!(usage))?;
-            account::cmd_send(&dir, &rpc, &to, amount, args.get(6).map(|s| s.as_str()))
+            account::cmd_send(&dir, &rpc, &to, amount, args.get(6).map(|s| s.as_str()), allow_new_recipient)
         }
         Some("account-create") => {
             let usage = "usage: hk-node account-create <DIR> <RPC> <AUTH-COMMIT-hex> <AMOUNT-micro> [ASSET-hex]";
@@ -467,12 +470,12 @@ fn real_main(args: Vec<String>) -> eyre::Result<()> {
             eprintln!("HashKinetics node {NODE_VERSION} (hash-based consensus + shielded pool + disclosure + durable store)");
             eprintln!("usage: hk-node testnet <N> <HOME> | start <NODE_HOME> | wallet <CMD …> | keygen <HOME> [MONIKER] | issue-rotation <HOME> [EPOCH] [VALID_FROM] | set-change propose|approve|assemble … | genesis-build <VALIDATORS.json> <OUT.json> | config-gen <HOME> --listen … --peers … | storm <RPC> [RATE] [DURATION_S] | demo <RPC> | demo-economy <RPC> <PROVER> | demo-shielded <RPC> <PROVER> | demo-disclose <RPC> <PROVER> | demo-agg <RPC> <PROVER> | demo-mandates <RPC> <PROVER> | verify-disclosure <package.json>");
             eprintln!("join a testnet: docs/VALIDATOR-ONBOARDING.md (keygen → send validator.json → receive genesis → config-gen → start)");
-            eprintln!("accounts (U1): account-new DIR · account-info DIR · account-balance RPC ID|DIR · account-send DIR RPC TO MICRO [ASSET] · account-create DIR RPC AUTH_COMMIT MICRO [ASSET] · faucet-serve DIR RPC [--drip …]");
+            eprintln!("accounts (U1): account-new DIR · account-info DIR · account-balance RPC ID|DIR · account-send DIR RPC TO MICRO [ASSET] [--allow-new-recipient] · account-create DIR RPC AUTH_COMMIT MICRO [ASSET] · faucet-serve DIR RPC [--drip …]");
             eprintln!("verifying keys (K6): vks-fetch PROVER_URL [-o vks.json] [--genesis genesis.json]  — a node reads HK_VKS_FILE or <HOME>/vks.json and needs no prover to verify");
             eprintln!("keys at rest (K1/K2): key-seal|key-unseal HOME (priv_validator_key.json; HK_KEY_PASSPHRASE[_FILE] / LoadCredential=hk-key-passphrase) · account-seal|account-unseal DIR (account.json + wallet.json; HK_WALLET_PASSPHRASE[_FILE] / LoadCredential=hk-wallet-passphrase) · keyfile-new PATH (second factor via HK_KEY_KEYFILE / HK_WALLET_KEYFILE) · passphrase-new [WORDS]");
             eprintln!("bridge (B1): attest-serve CONFIG.toml · attest-cosign CONFIG.toml · attest-ledger LEDGER list [STATE] | resolve KIND ID STATE [--hk-txid X] [--eth-tx X] · attest-key-new OUT-FILE   (docs/BRIDGE-SEPOLIA-USDC-PLAN.md)");
-            eprintln!("issued assets (X1): asset-id ISSUER|DIR SYMBOL · asset register DIR RPC SYMBOL DECIMALS FLAGS(m/f/p/s|-) · asset mint DIR RPC ASSET TO MICRO · asset burn DIR RPC ASSET MICRO [DEST-hex] · asset freeze|unfreeze DIR RPC ASSET ACCOUNT · asset pause|unpause DIR RPC ASSET · asset info RPC ASSET|SYMBOL@ISSUER · asset list RPC");
-            eprintln!("wallet: init DIR ACCOUNT-DIR|demo-name [RPC] · status DIR [RPC] · address DIR [RPC] · scan DIR [RPC] · transfer DIR TO USD [RPC] · shield DIR USD [RPC] [PROVER] · unshield DIR USD [RPC] [PROVER] · pay DIR HKADDR USD [MEMO] [RPC] [PROVER] · disclose DIR COMMITMENT OUT.json [RPC]");
+            eprintln!("issued assets (X1): asset-id ISSUER|DIR SYMBOL · asset register DIR RPC SYMBOL DECIMALS FLAGS(m/f/p/s|-) · asset mint DIR RPC ASSET TO MICRO [--allow-new-recipient] · asset burn DIR RPC ASSET MICRO [DEST-hex] · asset freeze|unfreeze DIR RPC ASSET ACCOUNT · asset pause|unpause DIR RPC ASSET · asset info RPC ASSET|SYMBOL@ISSUER · asset list RPC");
+            eprintln!("wallet: init DIR ACCOUNT-DIR|demo-name [RPC] · status DIR [RPC] · address DIR [RPC] · scan DIR [RPC] · transfer DIR TO USD [RPC] [--allow-new-recipient] · shield DIR USD [RPC] [PROVER] · unshield DIR USD [RPC] [PROVER] · pay DIR HKADDR USD [MEMO] [RPC] [PROVER] · disclose DIR COMMITMENT OUT.json [RPC]");
             eprintln!("pool (H3): pool-path RPC LEAF-INDEX  — fetch one authentication path and re-fold it locally");
             // v0.16.1: an unknown command is a FAILURE (exit 2), not a successful usage print —
             // `hk-node account-unseal DIR && shred -u passfile` on an older binary shredded the
@@ -773,10 +776,11 @@ fn cmd_keygen(home: &PathBuf, moniker: &str) -> eyre::Result<()> {
 /// so it can never PROPOSE its own cert; any live peer carries it instead).
 ///
 /// Flow: run this on the validator's machine (needs priv_validator_key.json) →
-/// submit the printed JSON to any peer's RPC (`hk_submitRotation`) → the cert rides
-/// that peer's next proposal → on commit every node swaps this validator's key in the
-/// set → restart the exhausted node: `adopt_epoch_signer` builds the fresh epoch tree
-/// (never-signed ⇒ starts at leaf 0) and it rejoins consensus.
+/// submit the printed JSON to a live validator's firewalled RPC (`hk_submitRotation`) →
+/// the cert rides that node's next proposal → on commit every node swaps this validator's
+/// key in the set, and a RUNNING exhausted node switches to the fresh epoch tree by itself
+/// (`apply_rotations`); a stopped node adopts it at its next start (`adopt_epoch_signer`;
+/// never-signed ⇒ starts at leaf 0) and rejoins consensus.
 ///
 /// L-2 (R17, reported 2026-10-06): the certificate's signing domain follows the chain's
 /// rule where it will commit (`hk_consensus::rotation`). Without `chain_id` this mints the
@@ -841,13 +845,17 @@ fn cmd_issue_rotation(home: &PathBuf, epoch: Option<u64>, valid_from: u64, chain
             "  domain        : v1 (no chain binding) — refused by a chain past its rotation-v2 height: pass CHAIN_ID + the tip + 1 there"
         ),
     }
-    println!("\nsubmit it through ANY live peer (the cert rides that peer's next proposal):");
+    println!("\nsubmit it through a live validator's firewalled RPC (the cert rides that node's next proposal;");
+    println!("your own node only while its tree can still sign; the public endpoint refuses it):");
     println!(
         "  printf '{{\"method\":\"hk_submitRotation\",\"params\":%s}}' \"$(cat {})\" | \\",
         out.display()
     );
     println!("    curl -s -X POST <PEER_RPC> -d @-");
-    println!("\nthen restart THIS validator's node — it adopts the fresh epoch-{epoch} tree on boot.");
+    println!("\nonce it commits, a running node switches to the fresh epoch-{epoch} tree by itself;");
+    println!("a stopped node adopts it on its next start.");
+    println!("never restore a signer state file from a backup and never copy one between hosts; if the node");
+    println!("retired a damaged one it could read, its bytes are beside it as <file>.damaged-<unix seconds> — leave them there.");
     Ok(())
 }
 
@@ -1281,6 +1289,6 @@ mod hr1_tests {
         let cfg: Config = toml::from_str(&closed).expect("the config-gen template parses");
         assert!(!cfg.hk_rpc.accept_bundles);
         assert_eq!(cfg.moniker, "hk-test");
-        assert_eq!(crate::NODE_VERSION, "v0.19.11");
+        assert_eq!(crate::NODE_VERSION, "v0.19.12");
     }
 }

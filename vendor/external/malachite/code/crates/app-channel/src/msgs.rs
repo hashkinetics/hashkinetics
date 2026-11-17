@@ -243,6 +243,29 @@ pub enum AppMsg<Ctx: Context> {
         reply: Reply<Option<ProposedValue<Ctx>>>,
     },
 
+    /// HK (v0.19.12): notifies the application that consensus has verified the
+    /// signature of a proposal for the current height, under the scheduled proposer's key,
+    /// and holds no value for it yet.
+    ///
+    /// `value` is the proposal's own value. With the HashKinetics context the signed proposal
+    /// carries the whole batch and its signature covers it. The application MUST recompute
+    /// the value's id from its bytes, and responds with the proposed value if it accepts it,
+    /// with `None` otherwise.
+    ReceivedVerifiedProposal {
+        /// Height of the proposal
+        height: Ctx::Height,
+        /// Round of the proposal
+        round: Round,
+        /// The proposal's proof-of-lock round (`Round::Nil` for a fresh value)
+        valid_round: Round,
+        /// Address that signed the proposal: the scheduled proposer of (height, round)
+        proposer: Ctx::Address,
+        /// The value carried by the signed proposal
+        value: Ctx::Value,
+        /// Channel for returning the proposed value if the application accepts it
+        reply: Reply<Option<ProposedValue<Ctx>>>,
+    },
+
     /// Notifies the application that consensus has decided on a value.
     ///
     /// This message includes a commit certificate containing the ID of

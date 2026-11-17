@@ -180,19 +180,85 @@ fn sign_submit(dir: &Path, rpc: &str, payload: Tx) -> eyre::Result<()> {
     Ok(())
 }
 
-/// `account-send <DIR> <RPC> <TO-hex> <AMOUNT-micro> [ASSET-hex]`
+/// HR-9 (v0.19.12): the recipient pre-flight every CLI credit runs before it builds the tx.
+/// The chain credits ANY 32-byte id — `Transfer`, `AssetMint`, `MandateSpend`, the unshield
+/// leg and a channel's payee never check that an account exists — so a credit to an id with
+/// no account lands as a balance nobody can spend until an `AccountCreate` carrying the auth
+/// commitment the id derives from binds it; a mistyped or random id never gets one. The
+/// decision is pure, over `hk_getAccount`'s answer as `demo::rpc` returns it (`rpc` only names
+/// the node in the message), and three-way: `found: true` passes; `found: false` is refused
+/// unless `allow_new` — the `--allow-new-recipient` flag for the one legitimate case,
+/// pre-funding an id whose auth commitment the sender holds; anything else — an `error`
+/// (`demo::rpc` folds a transport failure, a timeout and an HTTP error body into one), no
+/// `result`, no boolean `found` — means the lookup failed, which is not "no account": it is
+/// refused whatever the flag says, and the message does not offer the flag.
+pub(crate) fn recipient_preflight(rpc: &str, answer: &serde_json::Value, allow_new: bool) -> Result<(), String> {
+    let found = match answer.get("error") {
+        Some(_) => None,
+        None => answer.get("result").and_then(|r| r.get("found")).and_then(|f| f.as_bool()),
+    };
+    match found {
+        Some(true) => Ok(()),
+        Some(false) if allow_new => Ok(()),
+        Some(false) => Err("no account exists at this id — the recipient must create their account first \
+                            (or pass --allow-new-recipient if you hold the auth_commit its id derives from)"
+            .to_string()),
+        None => {
+            let reason = match answer.get("error") {
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(e) => e.to_string(),
+                None => format!(
+                    "no boolean `found` in the answer {}",
+                    answer.to_string().chars().take(200).collect::<String>()
+                ),
+            };
+            Err(format!("could not check the recipient at {rpc}: {reason} — nothing was signed"))
+        }
+    }
+}
+
+/// HR-9 (v0.19.12): the pre-flight over a live node — one `hk_getAccount` for `to`, then the
+/// pure decision above. Shared by `account-send`, `asset mint` and `wallet transfer`, each of
+/// which runs it before anything is signed.
+pub(crate) fn check_recipient(rpc: &str, to: &H256, allow_new: bool) -> eyre::Result<()> {
+    let answer = demo::rpc(rpc, "hk_getAccount", json!({ "id": hex::encode(to.0) }));
+    recipient_preflight(rpc, &answer, allow_new).map_err(|e| eyre::eyre!("{e}"))
+}
+
+/// HR-9 (v0.19.12): `--allow-new-recipient` anywhere in the argument list, removed so the
+/// positional parsing around it is untouched (the `--asset` pattern of `wallet`).
+pub(crate) fn take_allow_new_recipient(args: &[String]) -> (bool, Vec<String>) {
+    let mut allow = false;
+    let rest = args
+        .iter()
+        .filter(|a| {
+            if a.as_str() == "--allow-new-recipient" {
+                allow = true;
+                false
+            } else {
+                true
+            }
+        })
+        .cloned()
+        .collect();
+    (allow, rest)
+}
+
+/// `account-send <DIR> <RPC> <TO-hex> <AMOUNT-micro> [ASSET-hex] [--allow-new-recipient]`
 pub(crate) fn cmd_send(
     dir: &Path,
     rpc: &str,
     to: &str,
     amount: Amount,
     asset: Option<&str>,
+    allow_new_recipient: bool,
 ) -> eyre::Result<()> {
     let to = parse_h256(to)?;
     let asset = match asset {
         Some(a) => parse_h256(a)?,
         None => demo::usd(),
     };
+    check_recipient(rpc, &to, allow_new_recipient)?;
     println!("→ sending {amount} micro to {}", hex::encode(to.0));
     sign_submit(dir, rpc, Tx::Transfer { to, asset, amount })
 }
@@ -268,11 +334,100 @@ pub(crate) fn cmd_asset_id(who: &str, symbol: &str) -> eyre::Result<()> {
     Ok(())
 }
 
+/// HR-4 (v0.19.12): `hk_getAssets` answers at most 1,000 entries per call with `next`, the
+/// following page's `from` (`null` on the last page; absent from a node older than v0.19.12,
+/// which answers the whole registry at once). `asset list` follows `next` for at most this
+/// many pages, and refuses a registry that does not end within them rather than print part of it.
+const ASSET_LIST_MAX_PAGES: usize = 100;
+/// A node runs one registry scan at a time and answers the rest "busy — retry": such a page is
+/// asked for again, up to this many tries in all, before the answer is reported …
+const ASSET_LIST_BUSY_TRIES: usize = 3;
+/// … with this pause between two tries.
+const ASSET_LIST_BUSY_PAUSE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Whether an RPC answer is a "busy — retry" refusal: the node's one registry-scan slot is
+/// taken (`busy: an asset registry scan is already in flight …`, HTTP 400) or its connection
+/// table is full (`rpc busy — try again`, HTTP 503). `demo::rpc` hands both bodies back.
+fn answer_is_busy(answer: &serde_json::Value) -> bool {
+    answer
+        .get("error")
+        .and_then(|e| e.as_str())
+        .is_some_and(|s| s.starts_with("busy") || s.starts_with("rpc busy"))
+}
+
+/// HR-4 (v0.19.12): the whole registry from `hk_getAssets`' pages, as one answer. `fetch(from)`
+/// is one call (the RPC in `asset list`, canned pages in the tests). A page answered "busy" is
+/// asked for again (up to `ASSET_LIST_BUSY_TRIES` tries, `pause` apart) before the answer is
+/// reported; any other answer without a `result` is reported at once; `next` is followed until
+/// it is null or absent and must move forward; a registry that does not end within
+/// `ASSET_LIST_MAX_PAGES` pages is refused. The answer is the last page's, with `assets[]`
+/// holding every page's entries (an id already read is skipped: an asset registered between two
+/// pages shifts the later indices by one), `from` 0 and `next` null — for a registry that fits
+/// one page, exactly what the node answered.
+pub(crate) fn read_asset_pages(
+    mut fetch: impl FnMut(u64) -> serde_json::Value,
+    pause: std::time::Duration,
+) -> Result<serde_json::Value, String> {
+    let mut assets: Vec<serde_json::Value> = Vec::new();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut from: u64 = 0;
+    for _ in 0..ASSET_LIST_MAX_PAGES {
+        let mut answer = fetch(from);
+        let mut tries = 1;
+        while answer_is_busy(&answer) && tries < ASSET_LIST_BUSY_TRIES {
+            std::thread::sleep(pause);
+            answer = fetch(from);
+            tries += 1;
+        }
+        let Some(page) = answer.get("result").and_then(|r| r.as_object()) else {
+            let reason = match answer.get("error") {
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(e) => e.to_string(),
+                None => format!("no result in {}", answer.to_string().chars().take(200).collect::<String>()),
+            };
+            return Err(format!("hk_getAssets (the page from {from}): {reason}"));
+        };
+        for a in page.get("assets").and_then(|l| l.as_array()).into_iter().flatten() {
+            let fresh = match a.get("asset").and_then(|x| x.as_str()) {
+                Some(id) => seen.insert(id.to_string()),
+                None => true,
+            };
+            if fresh {
+                assets.push(a.clone());
+            }
+        }
+        match page.get("next") {
+            None | Some(serde_json::Value::Null) => {
+                let mut whole = page.clone();
+                if let Some(f) = whole.get_mut("from") {
+                    *f = json!(0);
+                }
+                whole.insert("assets".to_string(), serde_json::Value::Array(assets));
+                return Ok(json!({ "result": serde_json::Value::Object(whole) }));
+            }
+            Some(next) => match next.as_u64() {
+                Some(n) if n > from => from = n,
+                _ => {
+                    return Err(format!(
+                        "hk_getAssets: the page from {from} answered next = {next} — refusing to read it as a following page"
+                    ))
+                }
+            },
+        }
+    }
+    Err(format!(
+        "hk_getAssets: the registry did not end within {ASSET_LIST_MAX_PAGES} pages — refusing a partial list"
+    ))
+}
+
 /// `asset <verb> …` — the five issuer/holder verbs, signed with the DIR's account
 /// through the same reserve-then-sign path as `account-send`, plus two read-only views.
 pub(crate) fn cmd_asset(args: &[String]) -> eyre::Result<()> {
+    // HR-9 (v0.19.12): `--allow-new-recipient` (mint's pre-flight override) may sit anywhere.
+    let (allow_new_recipient, args) = take_allow_new_recipient(args);
+    let args = &args[..];
     let usage = "usage: hk-node asset register <DIR> <RPC> <SYMBOL> <DECIMALS> <FLAGS m/f/p/s|-> \
-                 | mint <DIR> <RPC> <ASSET-hex> <TO-hex> <MICRO> \
+                 | mint <DIR> <RPC> <ASSET-hex> <TO-hex> <MICRO> [--allow-new-recipient] \
                  | burn <DIR> <RPC> <ASSET-hex> <MICRO> [DESTINATION-hex] \
                  | freeze|unfreeze <DIR> <RPC> <ASSET-hex> <ACCOUNT-hex> \
                  | pause|unpause <DIR> <RPC> <ASSET-hex> \
@@ -301,6 +456,7 @@ pub(crate) fn cmd_asset(args: &[String]) -> eyre::Result<()> {
             let asset = parse_h256(&arg(3)?)?;
             let to = parse_h256(&arg(4)?)?;
             let amount: Amount = arg(5)?.parse().map_err(|_| eyre::eyre!("bad amount"))?;
+            check_recipient(&rpc, &to, allow_new_recipient)?;
             println!("→ minting {amount} of {} to {}", hex::encode(asset.0), hex::encode(to.0));
             sign_submit(&dir, &rpc, Tx::AssetMint { asset, to, amount })
         }
@@ -349,10 +505,191 @@ pub(crate) fn cmd_asset(args: &[String]) -> eyre::Result<()> {
         }
         Some("list") => {
             let rpc = arg(1)?;
-            let v = demo::rpc(&rpc, "hk_getAssets", json!({}));
+            // HR-4 (v0.19.12): every page of the registry, not only the first.
+            let v = read_asset_pages(|from| demo::rpc(&rpc, "hk_getAssets", json!({ "from": from })), ASSET_LIST_BUSY_PAUSE)
+                .map_err(|e| eyre::eyre!("{e}"))?;
             println!("{}", serde_json::to_string_pretty(&v)?);
             Ok(())
         }
         _ => Err(eyre::eyre!(usage)),
+    }
+}
+
+#[cfg(test)]
+mod hr9_tests {
+    use super::{recipient_preflight, take_allow_new_recipient};
+    use serde_json::json;
+
+    const RPC: &str = "http://127.0.0.1:26000";
+
+    /// HR-9 (v0.19.12): the pre-flight refuses a recipient with no account unless the caller
+    /// overrides, and the override is a flag that can sit anywhere. KILL: make
+    /// `recipient_preflight` return `Ok` for `found: false` without the flag (the pre-v0.19.12
+    /// behaviour — no check at all) and the first assertion fails; make
+    /// `take_allow_new_recipient` leave the flag in the list and the positional check fails.
+    #[test]
+    fn hr9_recipient_preflight_refuses_absent_accounts_unless_overridden() {
+        // `hk_getAccount`'s two answers (rpc.rs `get_account`)
+        let absent = json!({"result": {"found": false, "nonce": null, "auth_commit": null, "balances": []}});
+        let present = |nonce: u64| json!({"result": {"found": true, "nonce": nonce, "auth_commit": "00", "balances": []}});
+        let e = recipient_preflight(RPC, &absent, false).unwrap_err();
+        assert!(e.starts_with("no account exists at this id"), "{e}");
+        assert!(e.contains("--allow-new-recipient"), "{e}");
+        assert_eq!(recipient_preflight(RPC, &absent, true), Ok(()));
+        assert_eq!(recipient_preflight(RPC, &present(0), false), Ok(()));
+        assert_eq!(recipient_preflight(RPC, &present(42), true), Ok(()));
+        let args: Vec<String> = ["mint", "DIR", "--allow-new-recipient", "RPC", "ASSET", "TO", "5"].iter().map(|s| s.to_string()).collect();
+        let (allow, rest) = take_allow_new_recipient(&args);
+        assert!(allow);
+        assert_eq!(rest, ["mint", "DIR", "RPC", "ASSET", "TO", "5"]);
+        let (allow, rest) = take_allow_new_recipient(&rest);
+        assert!(!allow);
+        assert_eq!(rest.len(), 6);
+    }
+
+    /// HR-9 (v0.19.12): a lookup that failed is not "no account". An `error` answer (a
+    /// transport failure, a timeout or an HTTP error body — `demo::rpc` folds them into one),
+    /// an answer with no `result` and one with no boolean `found` are each refused as "could
+    /// not check the recipient", with or without the flag, and the message never offers the
+    /// flag. KILL: read a failed lookup as `found: false` again (what `demo::account_nonce`
+    /// does) and the flag passes it and the message offers the flag; let an `error` fall
+    /// through to a `result` beside it and that answer passes.
+    #[test]
+    fn hr9_recipient_preflight_fails_closed_when_the_lookup_fails() {
+        for answer in [
+            json!({"error": "http://127.0.0.1:26000: Connection Failed: Connect error: connection refused"}),
+            json!({"error": "http://127.0.0.1:26000: HTTP 502: <html>bad gateway</html>"}),
+            json!({"error": "rpc busy — try again"}),
+            json!({"error": {"code": 1}}),
+            json!({"error": "unknown method", "result": {"found": true, "nonce": 3}}),
+            json!({"result": null}),
+            json!({}),
+            json!({"result": {"nonce": 3}}),
+            json!({"result": {"found": "false"}}),
+        ] {
+            for allow_new in [false, true] {
+                let e = recipient_preflight(RPC, &answer, allow_new).unwrap_err();
+                assert!(e.starts_with("could not check the recipient at http://127.0.0.1:26000: "), "{answer} -> {e}");
+                assert!(e.ends_with(" — nothing was signed"), "{answer} -> {e}");
+                assert!(!e.contains("--allow-new-recipient"), "{answer} -> {e}");
+            }
+        }
+        // the node's own reason is carried through
+        let e = recipient_preflight(RPC, &json!({"error": "rpc busy — try again"}), true).unwrap_err();
+        assert_eq!(e, "could not check the recipient at http://127.0.0.1:26000: rpc busy — try again — nothing was signed");
+    }
+}
+
+#[cfg(test)]
+mod hr4_tests {
+    use super::{read_asset_pages, ASSET_LIST_BUSY_TRIES, ASSET_LIST_MAX_PAGES};
+    use serde_json::{json, Value};
+    use std::time::Duration;
+
+    const BUSY: &str = "busy: an asset registry scan is already in flight — retry in a moment";
+
+    /// One `hk_getAssets` page as rpc.rs `get_assets` answers it.
+    fn page(from: u64, ids: &[&str], next: Value) -> Value {
+        let assets: Vec<Value> = ids.iter().map(|id| json!({"asset": id, "symbol": id.to_uppercase()})).collect();
+        json!({"result": {"count": 5, "total": 5, "from": from, "limit": 2, "next": next, "fee_asset": "09", "assets": assets}})
+    }
+
+    /// HR-4 (v0.19.12): `asset list` reads every page — `next` followed until null, a page
+    /// answered "busy" asked for again, an entry a later page repeats listed once — and prints
+    /// one answer; a registry that fits one page comes back exactly as the node answered it.
+    /// KILL: read only the first page (the pre-fix behaviour) and two entries come back instead
+    /// of five; drop the busy retry and the second page's "busy" is reported as the answer;
+    /// drop the repeat check and `b` is listed twice.
+    #[test]
+    fn hr4_asset_list_reads_every_page_and_retries_busy() {
+        let mut calls = Vec::new();
+        let mut busy_left = 2;
+        let v = read_asset_pages(
+            |from| {
+                calls.push(from);
+                match from {
+                    0 => page(0, &["a", "b"], json!(2)),
+                    2 if busy_left > 0 => {
+                        busy_left -= 1;
+                        json!({ "error": BUSY })
+                    }
+                    2 => page(2, &["b", "c", "d"], json!(4)),
+                    4 => page(4, &["e"], Value::Null),
+                    _ => panic!("unexpected page from {from}"),
+                }
+            },
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(calls, [0, 2, 2, 2, 4]);
+        let r = &v["result"];
+        let ids: Vec<&str> = r["assets"].as_array().unwrap().iter().map(|a| a["asset"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["a", "b", "c", "d", "e"]);
+        assert_eq!(r["count"], json!(5));
+        assert_eq!(r["from"], json!(0));
+        assert_eq!(r["next"], Value::Null);
+        let one = page(0, &["a"], Value::Null);
+        assert_eq!(read_asset_pages(|_| one.clone(), Duration::ZERO).unwrap(), one);
+    }
+
+    /// HR-4 (v0.19.12): the reader stops and says why. A page that is busy on every try is
+    /// reported after `ASSET_LIST_BUSY_TRIES` calls; any other error answer at once; a `next`
+    /// that does not move forward is refused at the page that answered it; a registry with no
+    /// end is refused after `ASSET_LIST_MAX_PAGES` pages instead of printed in part. KILL: retry
+    /// "busy" without a bound, read a stuck `next` again, or follow `next` without a bound, and
+    /// a call-count assertion fails (inside the fetch, before any hang); return the partial
+    /// list at the bound and `unwrap_err` fails.
+    #[test]
+    fn hr4_asset_list_is_bounded_and_reports_failures() {
+        let mut n = 0;
+        let e = read_asset_pages(
+            |_| {
+                n += 1;
+                assert!(n < 10, "the busy retry has no bound");
+                json!({ "error": BUSY })
+            },
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert_eq!(n, ASSET_LIST_BUSY_TRIES);
+        assert_eq!(e, format!("hk_getAssets (the page from 0): {BUSY}"));
+
+        let mut n = 0;
+        let e = read_asset_pages(
+            |_| {
+                n += 1;
+                json!({ "error": "http://127.0.0.1:26000: Connection Failed" })
+            },
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert_eq!(n, 1);
+        assert_eq!(e, "hk_getAssets (the page from 0): http://127.0.0.1:26000: Connection Failed");
+
+        let mut n = 0;
+        let e = read_asset_pages(
+            |from| {
+                n += 1;
+                assert!(n < 10, "a stuck next is read again");
+                page(from, &["a"], json!(from))
+            },
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert_eq!(n, 1);
+        assert!(e.contains("the page from 0 answered next = 0"), "{e}");
+
+        let mut n = 0;
+        let e = read_asset_pages(
+            |from| {
+                n += 1;
+                assert!(n <= 1_000, "the page loop has no bound");
+                page(from, &[], json!(from + 1))
+            },
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert_eq!(n, ASSET_LIST_MAX_PAGES);
+        assert!(e.contains("did not end within 100 pages"), "{e}");
     }
 }

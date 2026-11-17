@@ -18,6 +18,9 @@
 //! tests: on the current-height path such a proposal reached `select_proposer`, which asserts a
 //! defined round — a panic on the consensus actor from a frame nobody signed).
 //!
+//! The tests at the end pin the vote keeper's rule: one vote per validator per round and type,
+//! the first copy whose signature verified; a vote for another value is kept as evidence.
+//!
 //! Every input enters through the real core-consensus entry point, the `process!` macro, which runs
 //! `handle()` as a coroutine and hands every yielded `Effect` to the recorder below — the same path
 //! the engine feeds network votes and proposals into (engine/src/consensus.rs `process_input`). A
@@ -27,10 +30,15 @@
 //! The recorder answers `VerifySignature` by signature MARKER (no LMS runs here):
 //!   - all-zero bytes (a frame no key ever signed)              → false, as the real verifier does
 //!     (hk-crypto hashsig.rs: `!verify(msg, &vec![0u8; CONSENSUS_SIG_LEN], &pk)`);
-//!   - 0xA5-filled (a vote this harness itself "signed": honest) → true;
+//!   - 0xA5-filled (a vote this harness itself "signed": honest) → true, also when its last eight
+//!     bytes carry a sequence number (`signed_sig`);
 //!   - 0x5A-filled (a key we do not hold, e.g. rotated after our height) → false;
-//! and resumes `SignVote` / `SignProposal` with 0xA5 signatures. Every signature has the wire
-//! length the codec admits (RZ-1: exactly `CONSENSUS_SIG_LEN` = 9,140 bytes).
+//! and resumes every `SignVote` / `SignProposal` with a NEW honest signature, the 0xA5 marker with
+//! the signer's sequence number in its last eight bytes (v0.19.12): a stateful hash-based signer
+//! spends another one-time leaf on every signature, so the same vote signed twice has two valid
+//! signatures with different bytes. It answers the commit, polka and round certificate checks as
+//! the engine's verifier does (signing `ext.rs`). Every signature has the wire length the codec
+//! admits (RZ-1: exactly `CONSENSUS_SIG_LEN` = 9,140 bytes).
 //!
 //! Thread safety: the captured log is process-wide, so every test that builds a `Node` holds the
 //! `SERIAL` guard for its whole body (the guard lives in the `Node`); the file is safe under the
@@ -50,13 +58,14 @@ use hk_consensus::{
 };
 use malachitebft_core_consensus::{
     BufferAdmission, ConsensusMsg, Effect, Error, Input, Params, ProposedValue, Resumable,
-    Resume, Role, SignedConsensusMsg, State, ThresholdParams, BUFFER_HEIGHT_WINDOW,
+    Resume, Role, SignedConsensusMsg, State, ThresholdParams, WalEntry, BUFFER_HEIGHT_WINDOW,
     BUFFER_MAX_PROPOSAL_ROUNDS_PER_HEIGHT, BUFFER_MAX_VOTE_ROUNDS_PER_ADDRESS,
-    CLAIM_VERIFY_BUDGET,
+    CLAIM_FAILURE_WARNS_PER_WINDOW,
 };
 use malachitebft_core_types::{
-    Context as _, NilOrVal, Round, SignedMessage, SignedProposal, SignedVote, Timeout,
-    Validity, ValueOrigin, ValuePayload, VoteType, VotingPower,
+    CertificateError, CommitCertificate, CommitSignature, Context as _, NilOrVal, Round,
+    RoundCertificate, RoundCertificateType, SignedMessage, SignedProposal, SignedVote, Threshold,
+    ThresholdParam, Timeout, Validity, ValueOrigin, ValuePayload, VoteType, VotingPower,
 };
 use malachitebft_metrics::Metrics;
 
@@ -70,17 +79,18 @@ const GAP: u64 = 20;
 /// app/src/spawn.rs `queue_capacity` = sync.parallel_requests (5) × sync.batch_size (20).
 const QUEUE_CAPACITY: usize = 100;
 
-// The budget and buffer constants (`CLAIM_VERIFY_BUDGET`, `BUFFER_MAX_VOTE_ROUNDS_PER_ADDRESS`,
-// `BUFFER_MAX_PROPOSAL_ROUNDS_PER_HEIGHT`, `BUFFER_HEIGHT_WINDOW`) are imported from
-// core-consensus, which re-exports them for these tests; `preconditions_…` pins them to the
-// design's frozen numbers (ROLL §1.3 / §1.4), so a change on either side comes back through this file.
+// The warn-throttle and buffer constants (`CLAIM_FAILURE_WARNS_PER_WINDOW`,
+// `BUFFER_MAX_VOTE_ROUNDS_PER_ADDRESS`, `BUFFER_MAX_PROPOSAL_ROUNDS_PER_HEIGHT`,
+// `BUFFER_HEIGHT_WINDOW`) are imported from core-consensus, which re-exports them for these tests;
+// `preconditions_…` pins them to the design's numbers (ROLL §1.4), so a change on either
+// side comes back through this file.
 
 /// Signature markers (the whole 9,140-byte signature is filled with one byte).
 const ZERO: u8 = 0x00; // no key ever signed this
 const HONEST: u8 = 0xA5; // this harness's own signer: verifies
 const ROTATED: u8 = 0x5A; // a key we do not hold (rotated after our height): refused
 
-/// The warn the vote handler logs once per address per budget window (vote.rs).
+/// The warn the vote handler logs once per address per warn window (vote.rs).
 const FAILED_VERIFY_WARN: &str = "failed signature verification";
 /// The once-per-height R8 line (driver.rs).
 const R8_LINE: &str = "R8: behind the network";
@@ -89,12 +99,20 @@ fn sig(marker: u8) -> HkSig {
     HkSig(vec![marker; SIG_LEN])
 }
 
+/// The `n`-th signature of the recorder's signer: the honest marker with `n` in its last eight
+/// bytes. It verifies as `sig(HONEST)` does, and signatures with different `n` differ.
+fn signed_sig(n: u64) -> HkSig {
+    let mut s = vec![HONEST; SIG_LEN];
+    s[SIG_LEN - 8..].copy_from_slice(&n.to_be_bytes());
+    HkSig(s)
+}
+
 fn sig_marker(s: &[u8]) -> &'static str {
     if s.len() != SIG_LEN {
         "bad-length"
     } else if s.iter().all(|b| *b == ZERO) {
         "zero"
-    } else if s.iter().all(|b| *b == HONEST) {
+    } else if s[..SIG_LEN - 8].iter().all(|b| *b == HONEST) {
         "honest"
     } else if s.iter().all(|b| *b == ROTATED) {
         "rotated"
@@ -167,6 +185,11 @@ struct Rec {
 #[derive(Default)]
 struct Harness {
     log: Vec<Rec>,
+    /// How many signatures the recorder's signer has made. `clear` keeps the count, so every
+    /// signature the signer returns differs from every earlier one (`signed_sig`).
+    signed: u64,
+    /// The commit certificate handed over with each `Effect::Decide`, in order.
+    decided: Vec<CommitCertificate<HkContext>>,
 }
 
 impl Harness {
@@ -184,6 +207,7 @@ impl Harness {
     }
     fn clear(&mut self) {
         self.log.clear();
+        self.decided.clear();
     }
 }
 
@@ -191,7 +215,8 @@ fn rec(log: &mut Vec<Rec>, kind: &'static str, detail: String) {
     log.push(Rec { kind, detail });
 }
 
-fn on_effect(log: &mut Vec<Rec>, effect: Effect<HkContext>) -> Result<Resume<HkContext>, String> {
+fn on_effect(h: &mut Harness, effect: Effect<HkContext>) -> Result<Resume<HkContext>, String> {
+    let log = &mut h.log;
     Ok(match effect {
         Effect::ResetTimeouts(r) => {
             rec(log, "ResetTimeouts", String::new());
@@ -247,6 +272,23 @@ fn on_effect(log: &mut Vec<Rec>, effect: Effect<HkContext>) -> Result<Resume<HkC
             rec(log, "RestreamProposal", format!("h={h} r={round}"));
             r.resume_with(())
         }
+        // v0.19.12: the value of a signature-verified proposal, on its way to the host.
+        Effect::VerifiedProposal(p, r) => {
+            rec(
+                log,
+                "VerifiedProposal",
+                format!(
+                    "h={} r={} pol={} addr={} value={} sig={}",
+                    p.message.height,
+                    p.message.round,
+                    p.message.pol_round,
+                    p.message.validator_address,
+                    p.message.value.id(),
+                    sig_marker(&p.signature.0)
+                ),
+            );
+            r.resume_with(())
+        }
         Effect::ValidSyncValue(_, _, r) => {
             rec(log, "ValidSyncValue", String::new());
             r.resume_with(())
@@ -255,8 +297,13 @@ fn on_effect(log: &mut Vec<Rec>, effect: Effect<HkContext>) -> Result<Resume<HkC
             rec(log, "InvalidSyncValue", String::new());
             r.resume_with(())
         }
-        Effect::Decide(_, _, r) => {
-            rec(log, "Decide", String::new());
+        Effect::Decide(c, _, r) => {
+            rec(
+                log,
+                "Decide",
+                format!("h={} r={} signatures={}", c.height, c.round, c.commit_signatures.len()),
+            );
+            h.decided.push(c);
             r.resume_with(())
         }
         Effect::SignVote(vote, r) => {
@@ -268,37 +315,86 @@ fn on_effect(log: &mut Vec<Rec>, effect: Effect<HkContext>) -> Result<Resume<HkC
                     vote.typ, vote.height, vote.round, vote.value, vote.validator_address
                 ),
             );
-            r.resume_with(SignedMessage::new(vote, sig(HONEST)))
+            // v0.19.12: every call returns a new valid signature, as a stateful hash-based
+            // signer does.
+            h.signed += 1;
+            r.resume_with(SignedMessage::new(vote, signed_sig(h.signed)))
         }
         Effect::SignProposal(p, r) => {
             rec(log, "SignProposal", format!("h={} r={}", p.height, p.round));
-            r.resume_with(SignedMessage::new(p, sig(HONEST)))
+            h.signed += 1;
+            r.resume_with(SignedMessage::new(p, signed_sig(h.signed)))
         }
         Effect::VerifySignature(msg, _pk, r) => {
             let marker = sig_marker(&msg.signature.0);
-            let what = match &msg.message {
-                ConsensusMsg::Vote(v) => format!("vote h={} addr={}", v.height, v.validator_address),
-                ConsensusMsg::Proposal(p) => {
-                    format!("proposal h={} addr={}", p.height, p.validator_address)
+            // v0.19.12: the real provider also refuses a proposal whose value id is not
+            // the hash of the bytes it carries (hk-consensus provider.rs, tested there against
+            // a real key). The recorder answers as the provider does and marks the reason.
+            let (what, id_ok) = match &msg.message {
+                ConsensusMsg::Vote(v) => {
+                    (format!("vote h={} addr={}", v.height, v.validator_address), true)
+                }
+                ConsensusMsg::Proposal(p) => (
+                    format!("proposal h={} addr={}", p.height, p.validator_address),
+                    HkValue::new(p.value.txs.clone()).id() == p.value.id(),
+                ),
+            };
+            let reason = if id_ok { "" } else { " id-mismatch" };
+            rec(log, "VerifySignature", format!("{what} sig={marker}{reason}"));
+            r.resume_with(harness_verifies(&msg.signature.0) && id_ok)
+        }
+        // v0.19.12: the certificate checks answer as the engine's verifier does
+        // (`certificate_verdict`).
+        Effect::VerifyCommitCertificate(c, set, t, r) => {
+            let signers: Vec<(HkAddress, bool)> = c
+                .commit_signatures
+                .iter()
+                .map(|s| (s.address, harness_verifies(&s.signature.0)))
+                .collect();
+            let verdict = certificate_verdict(&signers, &set, t.quorum);
+            rec(log, "VerifyCommitCertificate", verdict_detail(&verdict));
+            r.resume_with(verdict)
+        }
+        Effect::VerifyPolkaCertificate(c, set, t, r) => {
+            let signers: Vec<(HkAddress, bool)> = c
+                .polka_signatures
+                .iter()
+                .map(|s| (s.address, harness_verifies(&s.signature.0)))
+                .collect();
+            let verdict = certificate_verdict(&signers, &set, t.quorum);
+            rec(log, "VerifyPolkaCertificate", verdict_detail(&verdict));
+            r.resume_with(verdict)
+        }
+        Effect::VerifyRoundCertificate(c, set, t, r) => {
+            let prevote_in_precommit_cert = c.round_signatures.iter().find(|s| {
+                c.cert_type == RoundCertificateType::Precommit && s.vote_type == VoteType::Prevote
+            });
+            let verdict = match prevote_in_precommit_cert {
+                Some(s) => Err(CertificateError::InvalidVoteType(s.address)),
+                None => {
+                    let signers: Vec<(HkAddress, bool)> = c
+                        .round_signatures
+                        .iter()
+                        .map(|s| (s.address, harness_verifies(&s.signature.0)))
+                        .collect();
+                    let threshold = match c.cert_type {
+                        RoundCertificateType::Precommit => t.quorum,
+                        RoundCertificateType::Skip => t.honest,
+                    };
+                    certificate_verdict(&signers, &set, threshold)
                 }
             };
-            rec(log, "VerifySignature", format!("{what} sig={marker}"));
-            r.resume_with(harness_verifies(&msg.signature.0))
+            rec(log, "VerifyRoundCertificate", verdict_detail(&verdict));
+            r.resume_with(verdict)
         }
-        Effect::VerifyCommitCertificate(_, _, _, r) => {
-            rec(log, "VerifyCommitCertificate", String::new());
-            r.resume_with(Ok(()))
-        }
-        Effect::VerifyPolkaCertificate(_, _, _, r) => {
-            rec(log, "VerifyPolkaCertificate", String::new());
-            r.resume_with(Ok(()))
-        }
-        Effect::VerifyRoundCertificate(_, _, _, r) => {
-            rec(log, "VerifyRoundCertificate", String::new());
-            r.resume_with(Ok(()))
-        }
-        Effect::WalAppend(h, _e, r) => {
-            rec(log, "WalAppend", format!("h={h}"));
+        Effect::WalAppend(h, e, r) => {
+            let kind = match &e {
+                WalEntry::ConsensusMsg(SignedConsensusMsg::Vote(_)) => "vote",
+                WalEntry::ConsensusMsg(SignedConsensusMsg::Proposal(_)) => "proposal",
+                WalEntry::Timeout(_) => "timeout",
+                WalEntry::ProposedValue(_) => "value",
+            };
+            rec(log, "WalAppend", format!("h={h} {kind}"));
             r.resume_with(())
         }
         Effect::ExtendVote(_, _, _, r) => {
@@ -310,6 +406,48 @@ fn on_effect(log: &mut Vec<Rec>, effect: Effect<HkContext>) -> Result<Resume<HkC
             r.resume_with(Ok(()))
         }
     })
+}
+
+/// What the recorder answers to a certificate check, as the engine's verifier does (signing
+/// `ext.rs`): a validator named twice or a non-member refuses the certificate, and the power of
+/// the signatures that verify must reach the threshold. `signers` holds, in the certificate's
+/// order, each signature's address and whether it verifies (by marker).
+fn certificate_verdict(
+    signers: &[(HkAddress, bool)],
+    set: &HkValidatorSet,
+    threshold: ThresholdParam,
+) -> Result<(), CertificateError<HkContext>> {
+    let mut seen: Vec<HkAddress> = Vec::new();
+    let mut signed: VotingPower = 0;
+    for (address, verifies) in signers {
+        if seen.contains(address) {
+            return Err(CertificateError::DuplicateVote(*address));
+        }
+        seen.push(*address);
+        let Some(validator) = set.get_by_address(address) else {
+            return Err(CertificateError::UnknownValidator(*address));
+        };
+        if *verifies {
+            signed += validator.voting_power;
+        }
+    }
+    let total = set.total_voting_power();
+    if threshold.is_met(signed, total) {
+        Ok(())
+    } else {
+        Err(CertificateError::NotEnoughVotingPower {
+            signed,
+            total,
+            expected: threshold.min_expected(total),
+        })
+    }
+}
+
+fn verdict_detail(verdict: &Result<(), CertificateError<HkContext>>) -> String {
+    match verdict {
+        Ok(()) => "ok".to_string(),
+        Err(e) => e.to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -379,13 +517,17 @@ impl Node {
 
     /// Feed one input through the real entry point, recording every effect.
     fn feed(&mut self, input: Input<HkContext>) {
-        let r: Result<(), Error<HkContext>> = malachitebft_core_consensus::process!(
+        self.try_feed(input).expect("core-consensus returned an error");
+    }
+
+    /// The same, returning what core-consensus returned instead of requiring Ok.
+    fn try_feed(&mut self, input: Input<HkContext>) -> Result<(), Error<HkContext>> {
+        malachitebft_core_consensus::process!(
             input: input,
             state: &mut self.st,
             metrics: &self.m,
-            with: effect => on_effect(&mut self.h.log, effect)
-        );
-        r.expect("core-consensus returned an error");
+            with: effect => on_effect(&mut self.h, effect)
+        )
     }
 
     fn start_height(&mut self, height: u64) {
@@ -410,8 +552,10 @@ impl Node {
         self.st.peer_height_claims.iter().map(|(a, h)| (*a, h.as_u64())).collect()
     }
 
+    /// Failed claim verifications per address in the current warn window (they throttle the
+    /// warning).
     fn failures(&self) -> Vec<(HkAddress, u32)> {
-        self.st.claim_verify_failures.clone()
+        self.st.claim_failures_in_warn_window.clone()
     }
 
     fn evidence(&self) -> (Vec<(HkAddress, u64, VotingPower)>, VotingPower, VotingPower) {
@@ -530,45 +674,85 @@ fn proposed_value(height: u64, round: Round, proposer: HkAddress, txs: &[u8]) ->
 // ---------------------------------------------------------------------------------------------
 
 /// The recorder answers VerifySignature by marker (zero → false, 0xA5 → true, 0x5A → false) and
-/// resumes SignVote / SignProposal with 0xA5 signatures of the wire length.
+/// resumes SignVote / SignProposal with 0xA5 signatures of the wire length. Since v0.19.12 every
+/// signature it returns is new (the same vote signed twice: two signatures that differ and both
+/// verify), and its certificate checks answer as `certificate_verdict` does.
 #[test]
 fn harness_answers_verify_by_signature_marker_and_signs_with_a5() {
-    let a = equal_set().iter().next().unwrap().address;
+    let set = equal_set();
+    let a = set.iter().next().unwrap().address;
     let pk = HkPub(vec![1u8; 60]);
-    let mut log = Vec::new();
+    let mut h = Harness::default();
 
-    let verdict = |marker: u8, log: &mut Vec<Rec>| {
+    let verdict = |s: HkSig, h: &mut Harness| {
         let v = HkVote::new_prevote(HkHeight::new(CLAIM), Round::new(0), NilOrVal::Nil, a);
-        let msg = SignedMessage::new(ConsensusMsg::Vote(v), sig(marker));
+        let msg = SignedMessage::new(ConsensusMsg::Vote(v), s);
         let eff: Effect<HkContext> = Effect::VerifySignature(msg, pk.clone(), Default::default());
-        match on_effect(log, eff) {
+        match on_effect(h, eff) {
             Ok(Resume::SignatureValidity(b)) => b,
             other => panic!("unexpected resume {other:?}"),
         }
     };
-    assert!(!verdict(ZERO, &mut log), "an all-zero signature is refused");
-    assert!(verdict(HONEST, &mut log), "the harness's own 0xA5 signature verifies");
-    assert!(!verdict(ROTATED, &mut log), "a 0x5A signature (a key we do not hold) is refused");
-    assert_eq!(log.iter().filter(|r| r.kind == "VerifySignature").count(), 3);
-    assert!(log[0].detail.ends_with("sig=zero"));
-    assert!(log[1].detail.ends_with("sig=honest"));
-    assert!(log[2].detail.ends_with("sig=rotated"));
+    assert!(!verdict(sig(ZERO), &mut h), "an all-zero signature is refused");
+    assert!(verdict(sig(HONEST), &mut h), "the harness's own 0xA5 signature verifies");
+    assert!(!verdict(sig(ROTATED), &mut h), "a 0x5A signature (a key we do not hold) is refused");
+    assert_eq!(h.count("VerifySignature"), 3);
+    assert!(h.log[0].detail.ends_with("sig=zero"));
+    assert!(h.log[1].detail.ends_with("sig=honest"));
+    assert!(h.log[2].detail.ends_with("sig=rotated"));
 
-    let v = HkVote::new_prevote(HkHeight::new(H), Round::new(0), NilOrVal::Nil, a);
-    let eff: Effect<HkContext> = Effect::SignVote(v, Default::default());
-    match on_effect(&mut log, eff) {
-        Ok(Resume::SignedVote(sv)) => {
-            assert_eq!(sv.signature.0.len(), SIG_LEN);
-            assert_eq!(sig_marker(&sv.signature.0), "honest");
+    let sign_vote = |h: &mut Harness| {
+        let v = HkVote::new_prevote(HkHeight::new(H), Round::new(0), NilOrVal::Nil, a);
+        let eff: Effect<HkContext> = Effect::SignVote(v, Default::default());
+        match on_effect(h, eff) {
+            Ok(Resume::SignedVote(sv)) => sv.signature,
+            other => panic!("unexpected resume {other:?}"),
         }
-        other => panic!("unexpected resume {other:?}"),
+    };
+    let (s1, s2) = (sign_vote(&mut h), sign_vote(&mut h));
+    for s in [&s1, &s2] {
+        assert_eq!(s.0.len(), SIG_LEN);
+        assert_eq!(sig_marker(&s.0), "honest");
     }
+    // A stateful hash-based signer spends another one-time leaf on every signature, so the same
+    // vote signed twice has two valid signatures with different bytes.
+    assert!(s1 != s2, "the same vote signed twice: two different signatures");
+    assert!(s1 != sig(HONEST) && s2 != sig(HONEST), "and neither is the bare marker the tests use");
+    assert!(verdict(s1, &mut h) && verdict(s2, &mut h), "both verify");
+
     let p = HkProposal::new(HkHeight::new(H), Round::new(0), HkValue::new(Bytes::new()), Round::Nil, a);
     let eff: Effect<HkContext> = Effect::SignProposal(p, Default::default());
-    match on_effect(&mut log, eff) {
+    match on_effect(&mut h, eff) {
         Ok(Resume::SignedProposal(sp)) => assert_eq!(sig_marker(&sp.signature.0), "honest"),
         other => panic!("unexpected resume {other:?}"),
     }
+
+    // v0.19.12: the certificate checks answer as the engine's verifier does.
+    let addrs: Vec<HkAddress> = set.iter().map(|v| v.address).collect();
+    let commit = |names: &[HkAddress], h: &mut Harness| {
+        let c: CommitCertificate<HkContext> = CommitCertificate {
+            height: HkHeight::new(H),
+            round: Round::new(0),
+            value_id: HkValue::new(Bytes::new()).id(),
+            commit_signatures: names.iter().map(|x| CommitSignature::new(*x, sig(HONEST))).collect(),
+        };
+        let eff: Effect<HkContext> =
+            Effect::VerifyCommitCertificate(c, set.clone(), ThresholdParams::default(), Default::default());
+        match on_effect(h, eff) {
+            Ok(Resume::CertificateValidity(v)) => v,
+            other => panic!("unexpected resume {other:?}"),
+        }
+    };
+    assert_eq!(commit(&addrs[..3], &mut h), Ok(()), "three of four, each named once");
+    assert_eq!(
+        commit(&[addrs[0], addrs[1], addrs[1], addrs[2]], &mut h),
+        Err(CertificateError::DuplicateVote(addrs[1])),
+        "a validator named twice refuses the certificate"
+    );
+    assert!(
+        matches!(commit(&addrs[..2], &mut h), Err(CertificateError::NotEnoughVotingPower { .. })),
+        "two of four is not a quorum"
+    );
 }
 
 /// R8 is on with the shipped default gap 20, the env override is unset, the signature length is
@@ -579,7 +763,10 @@ fn preconditions_gap_on_by_default_and_design_constants() {
     assert_eq!(HkContext::new().abstain_threshold(), Some(GAP));
     assert_eq!(GAP, 20);
     assert_eq!(SIG_LEN, 9_140);
-    assert_eq!(CLAIM_VERIFY_BUDGET, 3, "ROLL §1.3: K = 3 failed verifies per address per window");
+    assert_eq!(
+        CLAIM_FAILURE_WARNS_PER_WINDOW, 1,
+        "one failed-verification warn per address per window"
+    );
     assert_eq!(BUFFER_MAX_VOTE_ROUNDS_PER_ADDRESS, 8, "ROLL §1.4: 8 vote rounds per address per height");
     assert_eq!(BUFFER_MAX_PROPOSAL_ROUNDS_PER_HEIGHT, 2, "ROLL §1.4: 2 proposal rounds per height");
     assert_eq!(BUFFER_HEIGHT_WINDOW, 4, "ROLL §1.4: buffered inputs within h ..= h + 4 only");
@@ -880,27 +1067,28 @@ fn testnet_u64_max_claims_from_key_holding_minority_do_not_raise_tip() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The verify budget (CPU bound).
+// Failed claim verifications: counted, and warned about once per address per window.
 // ---------------------------------------------------------------------------------------------
 
-/// Budget + 3 zero-signature votes at increasing heights (all above the buffer window) from one
-/// address cost exactly CLAIM_VERIFY_BUDGET verifications; another address has its own budget; the
-/// warn is logged once per address per window.
+/// Six zero-signature votes at increasing heights (all above the buffer window) from one address
+/// cost six verifications and record no claim; a second address likewise. The total counts every
+/// failure; the warn is logged once per address per window.
 #[test]
-fn verify_budget_caps_failed_verifies_per_address() {
+fn forged_future_votes_are_each_verified_and_warned_once_per_address_per_window() {
     let mut n = Node::at(H);
     n.start_height(H);
     clear_captured_log();
     n.h.clear();
     let (a, b) = (n.addrs[1], n.addrs[2]);
-    let frames = CLAIM_VERIFY_BUDGET as u64 + 3;
+    let frames: u64 = 6;
 
     for i in 0..frames {
         n.feed(Input::Vote(zero_vote(CLAIM + i, a)));
     }
-    assert_eq!(n.verifies(), CLAIM_VERIFY_BUDGET as usize, "then silence for that address");
-    assert_eq!(n.failures(), vec![(a, CLAIM_VERIFY_BUDGET)]);
-    assert_eq!(n.st.claim_verify_failures_total, CLAIM_VERIFY_BUDGET as u64);
+    assert_eq!(n.verifies(), frames as usize, "every frame is verified");
+    assert!(n.h.details("VerifySignature").iter().all(|d| d.ends_with("sig=zero")));
+    assert_eq!(n.failures(), vec![(a, frames as u32)]);
+    assert_eq!(n.st.claim_verify_failures_total, frames);
     assert_eq!(n.queued(), 0, "96.. is outside the window: nothing buffered, no buffer verify");
     assert_eq!(n.dropped(), frames);
     assert!(n.claims().is_empty());
@@ -908,9 +1096,9 @@ fn verify_budget_caps_failed_verifies_per_address() {
     for i in 0..frames {
         n.feed(Input::Vote(zero_vote(CLAIM + i, b)));
     }
-    assert_eq!(n.verifies(), 2 * CLAIM_VERIFY_BUDGET as usize, "a second address, its own budget");
-    assert_eq!(n.failures(), vec![(a, CLAIM_VERIFY_BUDGET), (b, CLAIM_VERIFY_BUDGET)]);
-    assert_eq!(n.st.claim_verify_failures_total, 2 * CLAIM_VERIFY_BUDGET as u64);
+    assert_eq!(n.verifies(), 2 * frames as usize, "a second address: every frame verified too");
+    assert_eq!(n.failures(), vec![(a, frames as u32), (b, frames as u32)]);
+    assert_eq!(n.st.claim_verify_failures_total, 2 * frames);
     assert!(n.claims().is_empty());
     assert_eq!(n.tip(), None);
     assert!(!n.st.should_abstain());
@@ -921,53 +1109,61 @@ fn verify_budget_caps_failed_verifies_per_address() {
     assert!(log.contains(&format!("validator={a}")) && log.contains(&format!("validator={b}")));
 }
 
-/// The window refills only when OUR height has advanced by `gap` since the last refill:
-/// StartHeight at 41 and at 59 do not refill; StartHeight at 60 does (a full budget again).
+/// The warn window restarts only when OUR height has advanced by `gap` since it last restarted:
+/// StartHeight at 41 and at 59 keep the window (the address does not warn again), StartHeight at
+/// 60 restarts it (the address warns once more). Every frame before and after the restart is
+/// verified, and the total counts each failure.
 #[test]
-fn verify_budget_refills_only_after_gap_heights_of_progress() {
+fn failure_warn_window_restarts_only_after_gap_heights_of_progress() {
     let mut n = Node::at(H);
     n.start_height(H);
+    clear_captured_log();
     let a = n.addrs[1];
-    assert_eq!(n.st.claim_budget_refilled_at, HkHeight::new(H));
+    assert_eq!(n.st.claim_warn_window_from, HkHeight::new(H));
 
-    for i in 0..CLAIM_VERIFY_BUDGET as u64 {
+    for i in 0..3u64 {
         n.feed(Input::Vote(zero_vote(CLAIM + i, a)));
     }
     n.h.clear();
     n.feed(Input::Vote(zero_vote(CLAIM + 10, a)));
-    assert_eq!(n.verifies(), 0, "the budget is spent");
+    assert_eq!(n.verifies(), 1, "the next frame in the window is verified");
+    assert_eq!(n.failures(), vec![(a, 4)]);
+    assert_eq!(captured_log().matches(FAILED_VERIFY_WARN).count(), 1, "warned once in the window");
 
     n.start_height(H + 1);
-    assert_eq!(n.st.claim_budget_refilled_at, HkHeight::new(H), "41 < 40 + 20: no refill");
+    assert_eq!(n.st.claim_warn_window_from, HkHeight::new(H), "41 < 40 + 20: the same window");
     n.h.clear();
     n.feed(Input::Vote(zero_vote(CLAIM + 20, a)));
-    assert_eq!(n.verifies(), 0);
+    assert_eq!(n.verifies(), 1);
+    assert_eq!(n.failures(), vec![(a, 5)]);
 
     n.start_height(H + GAP - 1);
-    assert_eq!(n.st.claim_budget_refilled_at, HkHeight::new(H), "59 < 40 + 20: no refill");
+    assert_eq!(n.st.claim_warn_window_from, HkHeight::new(H), "59 < 40 + 20: the same window");
     n.h.clear();
     n.feed(Input::Vote(zero_vote(CLAIM + 21, a)));
-    assert_eq!(n.verifies(), 0);
+    assert_eq!(n.verifies(), 1);
+    assert_eq!(n.failures(), vec![(a, 6)]);
+    assert_eq!(captured_log().matches(FAILED_VERIFY_WARN).count(), 1, "still one warn: the same window");
 
     n.start_height(H + GAP);
-    assert_eq!(n.st.claim_budget_refilled_at, HkHeight::new(H + GAP), "60 >= 40 + 20: refilled");
+    assert_eq!(n.st.claim_warn_window_from, HkHeight::new(H + GAP), "60 >= 40 + 20: restarted");
     assert!(n.failures().is_empty());
     n.h.clear();
-    n.feed(Input::Vote(zero_vote(CLAIM + 30, a)));
-    assert_eq!(n.verifies(), 1, "one more verify is allowed");
-    for i in 1..=CLAIM_VERIFY_BUDGET as u64 {
+    for i in 0..4u64 {
         n.feed(Input::Vote(zero_vote(CLAIM + 30 + i, a)));
     }
-    assert_eq!(n.verifies(), CLAIM_VERIFY_BUDGET as usize, "and the window is a full budget");
-    assert_eq!(n.failures(), vec![(a, CLAIM_VERIFY_BUDGET)]);
+    assert_eq!(n.verifies(), 4, "every frame verified in the new window too");
+    assert_eq!(n.failures(), vec![(a, 4)]);
+    assert_eq!(captured_log().matches(FAILED_VERIFY_WARN).count(), 2, "one warn per window");
+    assert_eq!(n.st.claim_verify_failures_total, 10, "the total counts every failure");
     assert!(n.claims().is_empty());
     assert_eq!(n.queued(), 0, "every frame was above the buffer window");
 }
 
 /// Recorded honest claims persist through a flood of zero-signature frames for a third member
-/// (budgeted) and through frames re-using the recorded claimants at or below their recorded
-/// height (filtered without a verify); forged frames above the recorded height fail and change
-/// nothing.
+/// (every frame verified and refused) and through frames re-using the recorded claimants at or
+/// below their recorded height (filtered without a verify); forged frames above the recorded
+/// height are verified, fail and change nothing.
 #[test]
 fn recorded_honest_claims_persist_through_forged_floods() {
     let mut n = Node::at(H);
@@ -980,11 +1176,12 @@ fn recorded_honest_claims_persist_through_forged_floods() {
     assert!(n.st.should_abstain());
     n.h.clear();
 
-    // A flood for the third member: budget, then silence; the honest claims are untouched.
+    // A flood for the third member: every frame verified and refused; the honest claims are
+    // untouched.
     for i in 0..30u64 {
         n.feed(Input::Vote(zero_vote(CLAIM + i, c)));
     }
-    assert_eq!(n.verifies(), CLAIM_VERIFY_BUDGET as usize);
+    assert_eq!(n.verifies(), 30);
     assert_eq!(n.claims(), vec![(a, CLAIM), (b, CLAIM)]);
     assert_eq!(n.tip(), Some(CLAIM));
     assert!(n.st.should_abstain());
@@ -999,16 +1196,106 @@ fn recorded_honest_claims_persist_through_forged_floods() {
     assert_eq!(n.claims(), vec![(a, CLAIM), (b, CLAIM)]);
     n.h.clear();
 
-    // Above the recorded height: verified (budgeted), refused, the claim stays where it was.
+    // Above the recorded height: verified, refused, the claim stays where it was.
     for i in 1..=5u64 {
         n.feed(Input::Vote(zero_vote(CLAIM + i, a)));
     }
-    assert_eq!(n.verifies(), CLAIM_VERIFY_BUDGET as usize);
+    assert_eq!(n.verifies(), 5);
     assert_eq!(n.claims(), vec![(a, CLAIM), (b, CLAIM)], "a refused forgery never moves a claim");
     assert_eq!(n.tip(), Some(CLAIM));
     assert!(n.st.should_abstain());
-    assert_eq!(n.st.claim_verify_failures_total, 2 * CLAIM_VERIFY_BUDGET as u64);
+    assert_eq!(n.st.claim_verify_failures_total, 30 + 5, "the total counts every failure");
     assert_eq!(n.queued(), 0);
+}
+
+/// Two founders (power 8 of 23) each send three zero-signature far-future votes, then their
+/// honest votes: all eight are verified, the six forged ones are refused and record no claim,
+/// the two honest ones are recorded, the tip is their height and the node abstains (the propose
+/// timeout yields no SignVote).
+#[test]
+fn honest_votes_after_failed_verifications_arm_the_abstain() {
+    let mut n = Node::testnet_at(H);
+    n.start_height(H);
+    n.h.clear();
+    let (f1, f2) = (n.addrs[1], n.addrs[2]);
+
+    for i in 0..3u64 {
+        n.feed(Input::Vote(zero_vote(CLAIM + i, f1)));
+        n.feed(Input::Vote(zero_vote(CLAIM + i, f2)));
+    }
+    assert_eq!(n.verifies(), 6, "every forged frame is verified");
+    assert!(n.h.details("VerifySignature").iter().all(|d| d.ends_with("sig=zero")));
+    assert!(n.claims().is_empty(), "a refused signature records no claim");
+    assert_eq!(n.failures(), vec![(f1, 3), (f2, 3)]);
+    assert!(!n.st.should_abstain());
+
+    n.feed(Input::Vote(honest_vote(CLAIM, f1)));
+    n.feed(Input::Vote(honest_vote(CLAIM, f2)));
+    assert_eq!(n.verifies(), 6 + 2, "both honest votes are verified");
+    assert_eq!(
+        n.h.details("VerifySignature")[6..].to_vec(),
+        vec![
+            format!("vote h={CLAIM} addr={f1} sig=honest"),
+            format!("vote h={CLAIM} addr={f2} sig=honest"),
+        ]
+    );
+    assert_eq!(n.claims(), vec![(f1, CLAIM), (f2, CLAIM)]);
+    assert_eq!(n.tip(), Some(CLAIM));
+    assert!(n.st.should_abstain(), "power 8 of 23 vouches for 96 >= 40 + 20");
+    let (claimants, weight, total) = n.evidence();
+    assert_eq!(claimants, vec![(f1, CLAIM, 4), (f2, CLAIM, 4)]);
+    assert_eq!((weight, total), (8, 23));
+    assert_eq!(n.st.claim_verify_failures_total, 6);
+    assert_eq!(n.queued(), 0, "every frame is outside the buffer window");
+
+    n.h.clear();
+    n.propose_timeout();
+    assert_eq!(n.h.count("SignVote"), 0, "R8: no SignVote requested");
+    assert_eq!(n.h.count("PublishConsensusMsg"), 0, "R8: nothing published");
+    assert_eq!(n.st.last_abstain_logged, Some(HkHeight::new(H)), "the R8 branch ran for 40");
+}
+
+/// A seat on the tip (no claims, so it votes) verifies every far-future frame and records no
+/// claim from a refused one: zero-signature frames for every other member, three each, claiming
+/// heights near u64::MAX, are verified and refused (no claim, no abstain). Five heights later,
+/// two founders' honest far-future votes are verified and recorded, and the node abstains.
+#[test]
+fn a_seat_on_the_tip_verifies_every_frame_and_records_later_honest_claims() {
+    let mut n = Node::testnet_at(H);
+    n.start_height(H);
+    n.h.clear();
+    let others: Vec<HkAddress> = n.addrs[1..].to_vec();
+    assert_eq!(others.len(), 10);
+
+    for i in 0..3u64 {
+        for &x in &others {
+            n.feed(Input::Vote(zero_vote(u64::MAX - i, x)));
+        }
+    }
+    assert_eq!(n.verifies(), 30, "every forged frame is verified");
+    assert!(n.claims().is_empty(), "no claim, however high the forged height");
+    assert_eq!(n.tip(), None);
+    assert!(!n.st.should_abstain(), "on the tip: the node votes");
+    assert_eq!(n.st.claim_verify_failures_total, 30);
+    assert_eq!(n.queued(), 0, "every frame is outside the buffer window");
+
+    n.start_height(H + 5);
+    assert_eq!(n.st.claim_warn_window_from, HkHeight::new(H), "45 < 40 + 20");
+    assert_eq!(n.failures().len(), 10, "every other member's failures are still counted");
+    n.h.clear();
+    let (f1, f2) = (n.addrs[1], n.addrs[2]);
+    n.feed(Input::Vote(honest_vote(CLAIM, f1)));
+    n.feed(Input::Vote(honest_vote(CLAIM, f2)));
+    assert_eq!(
+        n.h.details("VerifySignature"),
+        vec![
+            format!("vote h={CLAIM} addr={f1} sig=honest"),
+            format!("vote h={CLAIM} addr={f2} sig=honest"),
+        ]
+    );
+    assert_eq!(n.claims(), vec![(f1, CLAIM), (f2, CLAIM)]);
+    assert_eq!(n.tip(), Some(CLAIM));
+    assert!(n.st.should_abstain(), "power 8 of 23 vouches for 96 >= 45 + 20");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1691,4 +1978,781 @@ fn abstain_log_line_names_the_evidence() {
     // The same height again: no second line (once per height, not once per futile round).
     n.propose_timeout();
     assert_eq!(captured_log().matches(R8_LINE).count(), 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// v0.19.12: the value of a signature-verified proposal is handed to the host.
+// ---------------------------------------------------------------------------------------------
+//
+// In `proposal-and-parts` mode a proposal's value is taken from the signed proposal, which
+// carries the bytes under a signature the engine checks: `on_proposal` emits
+// `Effect::VerifiedProposal` for a current-height proposal that verified and has no value yet;
+// the engine hands the proposal's own value to the host, and the host's answer arrives as a
+// proposed value. These tests pin when the effect is emitted and when it is not. The host's
+// side (the id is recomputed from the bytes) is in hk-node (`state.rs` `admit_signed_value`
+// and its tests, `app.rs`).
+
+/// The whole path: an honest proposal for the round in progress
+/// verifies, is handed to the host exactly once, and no vote is cast before the value is held;
+/// the host's answer (the value built from the proposal's own bytes) completes the proposal and
+/// the node prevotes the value. Kill: remove the `perform!` in `on_proposal` and the first
+/// count is 0.
+#[test]
+fn verified_proposal_without_a_value_is_handed_to_the_host_and_then_voted() {
+    let mut n = Node::at(H);
+    n.start_height(H);
+    n.h.clear();
+    let p = n.proposer(H, 0);
+    assert_ne!(p, n.addrs[0], "round 0 at height 40 belongs to another seat");
+    let signed = honest_proposal(H, Round::new(0), p, b"batch");
+    let id = signed.message.value.id();
+
+    n.feed(Input::Proposal(signed));
+    assert_eq!(n.verifies(), 1);
+    assert_eq!(n.h.count("VerifiedProposal"), 1, "{:?}", n.h.kinds());
+    let d = n.h.first("VerifiedProposal").unwrap().detail.clone();
+    assert!(d.contains(&format!("h={H} r=0 ")), "{d}");
+    assert!(d.contains(&format!("addr={p}")), "{d}");
+    assert!(d.contains(&format!("value={id}")), "{d}");
+    assert!(d.contains("sig=honest"), "{d}");
+    assert_eq!(n.h.count("SignVote"), 0, "no vote before the value is held");
+    assert!(
+        n.st.full_proposal_at_round_and_proposer(&HkHeight::new(H), Round::new(0), &p).is_none(),
+        "the proposal is stored without a value"
+    );
+
+    n.feed(proposed_value(H, Round::new(0), p, b"batch"));
+    assert!(
+        n.st.full_proposal_at_round_and_proposer(&HkHeight::new(H), Round::new(0), &p).is_some(),
+        "the host's answer completes the proposal"
+    );
+    let votes = n.h.details("SignVote");
+    assert_eq!(votes.len(), 1, "{votes:?}");
+    assert!(votes[0].contains("Prevote") && votes[0].contains("Val("), "a prevote for the value: {}", votes[0]);
+    assert_eq!(n.h.count("VerifiedProposal"), 1, "the answer does not ask the host again");
+}
+
+/// A proposal no key signed is verified once, refused, and never handed to the host (nor
+/// written to the WAL); a proposal from a member the schedule does not name is refused before
+/// any verification, whatever its signature.
+#[test]
+fn forged_or_unscheduled_proposal_is_never_handed_to_the_host() {
+    let mut n = Node::at(H);
+    n.start_height(H);
+    n.h.clear();
+    let p = n.proposer(H, 0);
+    let other = n.other_member(p);
+
+    n.feed(Input::Proposal(zero_proposal(H, Round::new(0), p, b"forged")));
+    assert_eq!(n.verifies(), 1);
+    assert_eq!(n.h.count("VerifiedProposal"), 0, "{:?}", n.h.kinds());
+    assert_eq!(n.h.count("WalAppend"), 0);
+
+    n.feed(Input::Proposal(honest_proposal(H, Round::new(0), other, b"not scheduled")));
+    assert_eq!(n.verifies(), 1, "the proposer check runs before the signature check");
+    assert_eq!(n.h.count("VerifiedProposal"), 0, "{:?}", n.h.kinds());
+    assert_eq!(n.h.count("SignVote"), 0);
+}
+
+/// When the value is already held (the host returned it at round start, or the node built it
+/// itself), the proposal completes at once and the host is not asked.
+#[test]
+fn proposal_whose_value_is_already_held_is_not_handed_to_the_host() {
+    let mut n = Node::at(H);
+    n.start_height(H);
+    n.h.clear();
+    let p = n.proposer(H, 0);
+
+    n.feed(proposed_value(H, Round::new(0), p, b"batch"));
+    assert_eq!(n.h.count("SignVote"), 0, "a value without its proposal is not voted");
+
+    n.feed(Input::Proposal(honest_proposal(H, Round::new(0), p, b"batch")));
+    assert_eq!(n.h.count("VerifiedProposal"), 0, "{:?}", n.h.kinds());
+    assert_eq!(n.h.count("SignVote"), 1, "the proposal completed with the held value");
+}
+
+/// A proposer who signs two values for one round: both are handed to the host (it keeps both,
+/// up to its bound), so the node can follow whichever value the network locks on. The same
+/// proposal again, while it still has no value, is handed again: the host answers from its store.
+#[test]
+fn both_values_of_an_equivocating_proposer_are_handed_to_the_host() {
+    let mut n = Node::at(H);
+    n.start_height(H);
+    n.h.clear();
+    let p = n.proposer(H, 0);
+
+    n.feed(Input::Proposal(honest_proposal(H, Round::new(0), p, b"one")));
+    n.feed(Input::Proposal(honest_proposal(H, Round::new(0), p, b"two")));
+    let d = n.h.details("VerifiedProposal");
+    assert_eq!(d.len(), 2, "{d:?}");
+    assert_ne!(d[0], d[1], "two different values");
+
+    n.feed(Input::Proposal(honest_proposal(H, Round::new(0), p, b"one")));
+    assert_eq!(n.h.count("VerifiedProposal"), 3, "a republished proposal without a value asks again");
+    assert_eq!(n.h.count("SignVote"), 0);
+}
+
+/// A proposal that arrives ahead of its height is buffered (after one verification, as since
+/// v0.19.10) and handed to the host only when that height is the current one.
+#[test]
+fn buffered_proposal_is_handed_to_the_host_when_its_height_starts() {
+    let mut n = Node::at(H);
+    n.start_height(H);
+    n.h.clear();
+    // Round 0 at height 41 is this node's own; round 1 belongs to another seat.
+    let p = n.proposer(H + 1, 1);
+    assert_ne!(p, n.addrs[0]);
+
+    n.feed(Input::Proposal(honest_proposal(H + 1, Round::new(1), p, b"early")));
+    assert_eq!(n.queued(), 1, "buffered for its height");
+    assert_eq!(n.verifies(), 1);
+    assert_eq!(n.h.count("VerifiedProposal"), 0, "not while its height is ahead of ours");
+
+    n.start_height(H + 1);
+    let d = n.h.details("VerifiedProposal");
+    assert_eq!(d.len(), 1, "{:?}", n.h.kinds());
+    assert!(d[0].contains(&format!("h={} r=1 ", H + 1)), "{}", d[0]);
+    assert!(d[0].contains(&format!("addr={p}")), "{}", d[0]);
+}
+
+/// The effect belongs to `proposal-and-parts` mode only. In `proposal-only` mode the engine
+/// keeps the proposal's value itself; in `parts-only` mode proposals are synthesized from the
+/// parts.
+#[test]
+fn other_payload_modes_never_hand_a_proposal_to_the_host() {
+    for payload in [ValuePayload::ProposalOnly, ValuePayload::PartsOnly] {
+        let mut n = Node::at(H);
+        n.st.params.value_payload = payload;
+        n.start_height(H);
+        n.h.clear();
+        let p = n.proposer(H, 0);
+        n.feed(Input::Proposal(honest_proposal(H, Round::new(0), p, b"batch")));
+        assert_eq!(n.h.count("VerifiedProposal"), 0, "{payload:?}: {:?}", n.h.kinds());
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// v0.19.12: the value id, re-proposals, a round already left, and the WAL order.
+// ---------------------------------------------------------------------------------------------
+//
+// (1) A proposal whose value id is not the hash of the bytes it carries is refused where the
+// signature is checked; the round's proposal is the copy whose bytes hash to its id.
+// (2) Re-proposals: the host is asked only when the value of the earlier round is not held.
+// (3) A proposal for a round the node has left is still handed over.
+// (4) The value is written to the WAL at the moment it completes its proposal, once; a synced
+// value stays out of the WAL. (5) Fed in that order (proposal, value, votes, timeout), which is
+// the order a replay reads, the node rebuilds its lock.
+
+/// A proposal with a proof-of-lock round: a re-proposal.
+fn proposal_with_pol(
+    height: u64,
+    round: Round,
+    pol_round: Round,
+    addr: HkAddress,
+    txs: &[u8],
+) -> SignedProposal<HkContext> {
+    SignedMessage::new(
+        HkProposal::new(
+            HkHeight::new(height),
+            round,
+            HkValue::new(Bytes::copy_from_slice(txs)),
+            pol_round,
+            addr,
+        ),
+        sig(HONEST),
+    )
+}
+
+/// A proposal that carries the id of `id_of` over the bytes `txs`. Its signature marker is the
+/// honest one, so only the id check can refuse it.
+fn mismatched_proposal(
+    height: u64,
+    round: Round,
+    addr: HkAddress,
+    id_of: &[u8],
+    txs: &[u8],
+) -> SignedProposal<HkContext> {
+    let mut value = HkValue::new(Bytes::copy_from_slice(txs));
+    value.id = HkValue::new(Bytes::copy_from_slice(id_of)).id();
+    SignedMessage::new(
+        HkProposal::new(HkHeight::new(height), round, value, Round::Nil, addr),
+        sig(HONEST),
+    )
+}
+
+/// A proposed value with a proof-of-lock round and an origin.
+fn proposed_value_at(
+    height: u64,
+    round: Round,
+    valid_round: Round,
+    proposer: HkAddress,
+    txs: &[u8],
+    origin: ValueOrigin,
+) -> Input<HkContext> {
+    Input::ProposedValue(
+        ProposedValue {
+            height: HkHeight::new(height),
+            round,
+            valid_round,
+            proposer,
+            value: HkValue::new(Bytes::copy_from_slice(txs)),
+            validity: Validity::Valid,
+        },
+        origin,
+    )
+}
+
+/// An honest prevote for the value with these bytes.
+fn prevote_for(height: u64, round: u32, txs: &[u8], addr: HkAddress) -> SignedVote<HkContext> {
+    let id = HkValue::new(Bytes::copy_from_slice(txs)).id();
+    SignedMessage::new(
+        HkVote::new_prevote(HkHeight::new(height), Round::new(round), NilOrVal::Val(id), addr),
+        sig(HONEST),
+    )
+}
+
+/// How many VALUE entries the node has written to the WAL.
+fn wal_values(n: &Node) -> usize {
+    n.h.details("WalAppend").iter().filter(|d| d.ends_with(" value")).count()
+}
+
+/// A copy whose id is not the hash of its bytes arrives first and is refused at verification:
+/// nothing is written to the WAL, nothing is stored, the host is not asked. The matching copy
+/// that follows is then the proposal of its round: it is handed to the host, and the proposal
+/// the driver ends up with carries bytes that hash to its id. Kill: drop the id check from the
+/// verification and the first copy is not refused.
+#[test]
+fn proposal_value_id_must_match_its_bytes_and_the_matching_copy_is_kept() {
+    let mut n = Node::at(H);
+    n.start_height(H);
+    n.h.clear();
+    let p = n.proposer(H, 0);
+
+    n.feed(Input::Proposal(mismatched_proposal(H, Round::new(0), p, b"batch", b"other bytes")));
+    assert_eq!(n.verifies(), 1);
+    let d = n.h.details("VerifySignature");
+    assert!(d[0].ends_with("sig=honest id-mismatch"), "{d:?}");
+    assert_eq!(n.h.count("WalAppend"), 0, "not written to the WAL");
+    assert_eq!(n.h.count("VerifiedProposal"), 0, "not handed to the host");
+
+    n.feed(Input::Proposal(honest_proposal(H, Round::new(0), p, b"batch")));
+    assert_eq!(n.h.count("VerifiedProposal"), 1, "the matching copy is stored and handed over");
+    n.feed(proposed_value(H, Round::new(0), p, b"batch"));
+    assert_eq!(n.h.count("SignVote"), 1, "and voted");
+    let full = n
+        .st
+        .full_proposal_at_round_and_proposer(&HkHeight::new(H), Round::new(0), &p)
+        .expect("a full proposal");
+    let v = &full.proposal.message.value;
+    assert_eq!(v.txs.as_ref(), b"batch");
+    assert_eq!(HkValue::new(v.txs.clone()).id(), v.id(), "the driver's proposal carries bytes that hash to its id");
+}
+
+/// The same across a height start: a copy for a later height whose id is not the hash of its
+/// bytes is verified once, refused and not buffered; the matching copy is the one buffered.
+#[test]
+fn proposal_value_id_must_match_its_bytes_before_it_is_buffered() {
+    let mut n = Node::at(H);
+    n.start_height(H);
+    n.h.clear();
+    let p = n.proposer(H + 1, 1);
+
+    n.feed(Input::Proposal(mismatched_proposal(H + 1, Round::new(1), p, b"early", b"other bytes")));
+    assert_eq!(n.verifies(), 1);
+    assert_eq!(n.queued(), 0, "refused at verification: not buffered");
+    assert_eq!(n.dropped(), 1);
+
+    n.feed(Input::Proposal(honest_proposal(H + 1, Round::new(1), p, b"early")));
+    assert_eq!(n.verifies(), 2);
+    assert_eq!(n.queued(), 1, "the matching copy takes the place");
+    assert_eq!(n.dropped(), 1);
+}
+
+/// A re-proposal (round 1, proof-of-lock round 0) whose value this node never held: the host is
+/// asked once, and its answer completes the proposal of round 1.
+#[test]
+fn re_proposal_without_the_earlier_value_is_handed_to_the_host_and_completes() {
+    const HH: u64 = 42; // rounds 0 and 1 of 42 both belong to other seats
+    let mut n = Node::at(HH);
+    n.start_height(HH);
+    n.feed(Input::TimeoutElapsed(Timeout::precommit(Round::new(0))));
+    assert_eq!(n.st.round(), Round::new(1), "the node is in round 1");
+    n.h.clear();
+    let p1 = n.proposer(HH, 1);
+    assert_ne!(p1, n.addrs[0]);
+
+    n.feed(Input::Proposal(proposal_with_pol(HH, Round::new(1), Round::new(0), p1, b"locked")));
+    let d = n.h.details("VerifiedProposal");
+    assert_eq!(d.len(), 1, "{:?}", n.h.kinds());
+    assert!(d[0].contains(&format!("h={HH} r=1 pol=0 ")), "{}", d[0]);
+
+    n.feed(proposed_value_at(HH, Round::new(1), Round::new(0), p1, b"locked", ValueOrigin::Consensus));
+    assert!(
+        n.st.full_proposal_at_round_and_proposer(&HkHeight::new(HH), Round::new(1), &p1).is_some(),
+        "the answer completes the re-proposal"
+    );
+}
+
+/// A re-proposal of a value this node holds from the earlier round completes inside the engine:
+/// the host is not asked. (So the host holds that value under the earlier round only, which is
+/// why the node's restream looks a value up under every round of the height.)
+#[test]
+fn re_proposal_of_a_value_held_from_the_earlier_round_is_not_handed_to_the_host() {
+    const HH: u64 = 42;
+    let mut n = Node::at(HH);
+    n.start_height(HH);
+    let p0 = n.proposer(HH, 0);
+    let p1 = n.proposer(HH, 1);
+    n.feed(Input::Proposal(honest_proposal(HH, Round::new(0), p0, b"locked")));
+    n.feed(proposed_value(HH, Round::new(0), p0, b"locked"));
+    n.feed(Input::TimeoutElapsed(Timeout::precommit(Round::new(0))));
+    assert_eq!(n.st.round(), Round::new(1));
+    n.h.clear();
+
+    n.feed(Input::Proposal(proposal_with_pol(HH, Round::new(1), Round::new(0), p1, b"locked")));
+    assert_eq!(n.h.count("VerifiedProposal"), 0, "{:?}", n.h.kinds());
+    assert!(
+        n.st.full_proposal_at_round_and_proposer(&HkHeight::new(HH), Round::new(1), &p1).is_some(),
+        "completed from the value of round 0"
+    );
+}
+
+/// A proposal for a round the node has already left is still handed to the host: a decision can
+/// still come for that round (a commit quorum for it), and the commit needs the value. Kill:
+/// restrict the effect to the round in progress or later and this count is 0.
+#[test]
+fn proposal_for_a_round_already_left_is_still_handed_to_the_host() {
+    const HH: u64 = 42;
+    let mut n = Node::at(HH);
+    n.start_height(HH);
+    n.feed(Input::TimeoutElapsed(Timeout::precommit(Round::new(0))));
+    assert_eq!(n.st.round(), Round::new(1));
+    n.h.clear();
+    let p0 = n.proposer(HH, 0);
+
+    n.feed(Input::Proposal(honest_proposal(HH, Round::new(0), p0, b"late")));
+    assert_eq!(n.h.count("VerifiedProposal"), 1, "{:?}", n.h.kinds());
+}
+
+/// The value is written to the WAL at the moment it completes its proposal, right after the
+/// proposal's own entry, and only once: a second copy of the answer is neither written nor
+/// voted again. Kill: write no WAL entry for a value from consensus and the WAL never holds
+/// the value.
+#[test]
+fn the_value_is_written_to_the_wal_when_it_completes_its_proposal_and_only_once() {
+    let mut n = Node::at(H);
+    n.start_height(H);
+    n.h.clear();
+    let p = n.proposer(H, 0);
+
+    n.feed(Input::Proposal(honest_proposal(H, Round::new(0), p, b"batch")));
+    assert_eq!(n.h.details("WalAppend"), vec![format!("h={H} proposal")]);
+
+    n.feed(proposed_value(H, Round::new(0), p, b"batch"));
+    let wal = n.h.details("WalAppend");
+    assert!(wal.len() >= 2, "{wal:?}");
+    assert_eq!(wal[1], format!("h={H} value"), "the value follows its proposal: {wal:?}");
+    assert_eq!(wal_values(&n), 1);
+    assert_eq!(n.h.count("SignVote"), 1);
+
+    n.feed(proposed_value(H, Round::new(0), p, b"batch"));
+    assert_eq!(wal_values(&n), 1, "a second copy of the answer is not written again");
+    assert_eq!(n.h.count("SignVote"), 1, "and casts no second vote");
+}
+
+/// A value that arrives by sync stays out of the WAL, as before: the change of the WAL rule is
+/// confined to values from consensus.
+#[test]
+fn a_synced_value_stays_out_of_the_wal() {
+    let mut n = Node::at(H);
+    n.start_height(H);
+    n.h.clear();
+    let p = n.proposer(H, 0);
+
+    n.feed(proposed_value_at(H, Round::new(0), Round::Nil, p, b"synced", ValueOrigin::Sync));
+    assert_eq!(wal_values(&n), 0, "{:?}", n.h.details("WalAppend"));
+}
+
+/// The order a replay reads (proposal, its value, the votes, the timeout) rebuilds the lock:
+/// the node prevotes and precommits V in round 0, moves to round 1 on the precommit timeout, and
+/// prevotes NIL on a different value W there.
+#[test]
+fn proposal_then_value_in_wal_order_rebuilds_the_lock() {
+    const HH: u64 = 42;
+    let mut n = Node::at(HH);
+    n.start_height(HH);
+    n.h.clear();
+    let p0 = n.proposer(HH, 0);
+    let p1 = n.proposer(HH, 1);
+    let others: Vec<HkAddress> = n.addrs[1..].to_vec();
+
+    n.feed(Input::Proposal(honest_proposal(HH, Round::new(0), p0, b"V")));
+    n.feed(proposed_value(HH, Round::new(0), p0, b"V"));
+    for a in others {
+        n.feed(Input::Vote(prevote_for(HH, 0, b"V", a)));
+    }
+    let votes = n.h.details("SignVote");
+    assert_eq!(votes.len(), 2, "{votes:?}");
+    assert!(votes[0].contains("Prevote") && votes[0].contains("Val("), "{}", votes[0]);
+    assert!(votes[1].contains("Precommit") && votes[1].contains("Val("), "locked on V: {}", votes[1]);
+
+    n.feed(Input::TimeoutElapsed(Timeout::precommit(Round::new(0))));
+    assert_eq!(n.st.round(), Round::new(1));
+    n.feed(Input::Proposal(honest_proposal(HH, Round::new(1), p1, b"W")));
+    n.feed(proposed_value(HH, Round::new(1), p1, b"W"));
+    let votes = n.h.details("SignVote");
+    assert_eq!(votes.len(), 3, "{votes:?}");
+    assert!(
+        votes[2].contains("Prevote") && votes[2].contains("r=1") && votes[2].contains("Nil"),
+        "a node locked on V prevotes nil on W: {}",
+        votes[2]
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The vote keeper: one vote per validator per round and type, the first copy whose signature
+// verified. The recorder's signer returns a new signature on every call, and its certificate
+// checks answer as the engine's verifier does.
+// ---------------------------------------------------------------------------------------------
+
+/// An honest precommit for the value with these bytes.
+fn precommit_for(height: u64, round: u32, txs: &[u8], addr: HkAddress) -> SignedVote<HkContext> {
+    let id = HkValue::new(Bytes::copy_from_slice(txs)).id();
+    SignedMessage::new(
+        HkVote::new_precommit(HkHeight::new(height), Round::new(round), NilOrVal::Val(id), addr),
+        sig(HONEST),
+    )
+}
+
+/// The same vote under another valid signature (another one-time leaf); `k` picks which one. It
+/// differs from `sig(HONEST)` and from every signature the recorder's signer returns in a test.
+fn resigned(v: &SignedVote<HkContext>, k: u64) -> SignedVote<HkContext> {
+    SignedMessage::new(v.message.clone(), signed_sig(u64::MAX - k))
+}
+
+/// The same vote with a signature that does not verify.
+fn failing_copy(v: &SignedVote<HkContext>) -> SignedVote<HkContext> {
+    SignedMessage::new(v.message.clone(), sig(ZERO))
+}
+
+/// The votes of type `typ` from `addr` that the vote keeper holds for `round`, in stored order.
+fn held(n: &Node, round: u32, typ: VoteType, addr: HkAddress) -> Vec<SignedVote<HkContext>> {
+    n.st.driver
+        .votes()
+        .per_round(Round::new(round))
+        .map(|r| {
+            r.received_votes()
+                .iter()
+                .filter(|v| v.message.typ == typ && v.message.validator_address == addr)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A round certificate of `cert_type` for (height, round), built from these votes in this order.
+fn round_cert(
+    height: u64,
+    round: u32,
+    cert_type: RoundCertificateType,
+    votes: &[SignedVote<HkContext>],
+) -> Input<HkContext> {
+    Input::RoundCertificate(RoundCertificate::new_from_votes(
+        HkHeight::new(height),
+        Round::new(round),
+        cert_type,
+        votes.to_vec(),
+    ))
+}
+
+/// The addresses a commit certificate names, in order.
+fn named(c: &CommitCertificate<HkContext>) -> Vec<HkAddress> {
+    c.commit_signatures.iter().map(|s| s.address).collect()
+}
+
+/// True when no address appears twice.
+fn each_once(addrs: &[HkAddress]) -> bool {
+    let mut sorted = addrs.to_vec();
+    sorted.sort();
+    sorted.dedup();
+    sorted.len() == addrs.len()
+}
+
+/// How many VOTE entries the node has written to the WAL.
+fn wal_votes(n: &Node) -> usize {
+    n.h.details("WalAppend").iter().filter(|d| d.ends_with(" vote")).count()
+}
+
+/// B1 — a WAL replay inside a height: the WAL for (40, 0), which holds our prevote and precommit
+/// for V, is read back in the order it was written, our votes where they were cast (so our
+/// precommit, cast at the polka, comes before the others' precommits), and the driver derives
+/// and signs both votes again. Two WAL orders: the value before its proposal and the proposal
+/// before its value. Each own vote is held once, the copy that reached the keeper first; there
+/// is exactly one Decide; the commit and polka certificates name each validator once.
+#[test]
+fn wal_replay_inside_a_height_decides_once() {
+    for value_first in [true, false] {
+        let order = if value_first { "value first" } else { "proposal first" };
+        let mut n = Node::at(H);
+        n.start_height(H);
+        n.h.clear();
+        let me = n.addrs[0];
+        let p = n.proposer(H, 0);
+        assert_ne!(p, me, "round 0 at height 40 belongs to another seat");
+        let others: Vec<HkAddress> = n.addrs[1..].to_vec();
+        // Our two votes as the WAL holds them.
+        let own_prevote = prevote_for(H, 0, b"V", me);
+        let own_precommit = precommit_for(H, 0, b"V", me);
+
+        let mut wal: Vec<Input<HkContext>> = Vec::new();
+        if value_first {
+            wal.push(proposed_value(H, Round::new(0), p, b"V"));
+            wal.push(Input::Vote(own_prevote.clone()));
+            wal.push(Input::Proposal(honest_proposal(H, Round::new(0), p, b"V")));
+        } else {
+            wal.push(Input::Proposal(honest_proposal(H, Round::new(0), p, b"V")));
+            wal.push(proposed_value(H, Round::new(0), p, b"V"));
+            wal.push(Input::Vote(own_prevote.clone()));
+        }
+        wal.extend(others.iter().map(|x| Input::Vote(prevote_for(H, 0, b"V", *x))));
+        wal.push(Input::Vote(own_precommit.clone()));
+        wal.extend(others.iter().map(|x| Input::Vote(precommit_for(H, 0, b"V", *x))));
+
+        let errors: Vec<String> = wal
+            .into_iter()
+            .filter_map(|input| n.try_feed(input).err())
+            .map(|e| e.to_string())
+            .collect();
+        assert!(errors.is_empty(), "{order}: {errors:?}");
+
+        let signed = n.h.details("SignVote");
+        assert_eq!(signed.len(), 2, "{order}: our prevote and our precommit signed again: {signed:?}");
+        assert!(signed[0].starts_with("Prevote") && signed[1].starts_with("Precommit"), "{order}: {signed:?}");
+
+        let prevotes = held(&n, 0, VoteType::Prevote, me);
+        let precommits = held(&n, 0, VoteType::Precommit, me);
+        assert_eq!(prevotes.len(), 1, "{order}: our prevote is held once");
+        assert_eq!(precommits.len(), 1, "{order}: our precommit is held once");
+        // The copy kept is the one that reached the keeper first.
+        assert_eq!(
+            prevotes[0].signature == own_prevote.signature,
+            value_first,
+            "{order}: the WAL's prevote is first only when it comes before the proposal"
+        );
+        assert!(
+            precommits[0].signature != own_precommit.signature,
+            "{order}: our precommit signed again at the polka comes before the WAL's copy and stays"
+        );
+
+        assert_eq!(n.h.count("Decide"), 1, "{order}: {:?}", n.h.kinds());
+        let c = &n.h.decided[0];
+        let names = named(c);
+        assert!(each_once(&names), "{order}: the commit certificate names each validator once: {names:?}");
+        let mine = c.commit_signatures.iter().find(|s| s.address == me).expect("our precommit in the certificate");
+        assert!(mine.signature == precommits[0].signature, "{order}: with the copy held");
+
+        let polka = n.st.polka_certificate_at_round(Round::new(0)).expect("the polka certificate of round 0");
+        let polka_names: Vec<HkAddress> = polka.polka_signatures.iter().map(|s| s.address).collect();
+        assert!(each_once(&polka_names), "{order}: the polka certificate names each validator once: {polka_names:?}");
+    }
+}
+
+/// B2 — two valid signatures of one precommit (other bytes) arrive before the quorum is
+/// complete. Both are verified first; the second is neither written to the WAL nor stored nor
+/// counted; the next precommit completes the quorum, there is exactly one Decide, and its
+/// certificate names each validator once with the first copy.
+#[test]
+fn a_precommit_signed_twice_is_held_once() {
+    let mut n = Node::at(H);
+    n.start_height(H);
+    let p = n.proposer(H, 0);
+    let (a, b, c) = (n.addrs[1], n.addrs[2], n.addrs[3]);
+    n.feed(Input::Proposal(honest_proposal(H, Round::new(0), p, b"V")));
+    n.feed(proposed_value(H, Round::new(0), p, b"V"));
+    for x in [a, b, c] {
+        n.feed(Input::Vote(prevote_for(H, 0, b"V", x)));
+    }
+    assert_eq!(held(&n, 0, VoteType::Precommit, n.addrs[0]).len(), 1, "the polka: our precommit for V");
+    n.h.clear();
+
+    let first = precommit_for(H, 0, b"V", a);
+    let again = resigned(&first, 1);
+    assert!(first.signature != again.signature);
+    n.feed(Input::Vote(first.clone()));
+    n.feed(Input::Vote(again));
+    assert_eq!(n.verifies(), 2, "both copies are verified before anything else is asked of them");
+    assert_eq!(wal_votes(&n), 1, "the second copy is not written to the WAL");
+    let kept = held(&n, 0, VoteType::Precommit, a);
+    assert_eq!(kept.len(), 1, "one copy held");
+    assert!(kept[0].signature == first.signature, "the first");
+    assert!(n.st.driver.votes().evidence().is_empty(), "the same value twice is not equivocation");
+    assert_eq!(n.h.count("Decide"), 0, "two of four precommits: no quorum yet");
+
+    n.try_feed(Input::Vote(precommit_for(H, 0, b"V", b)))
+        .unwrap_or_else(|e| panic!("the vote is processed without error: {e}"));
+    assert_eq!(n.h.count("Decide"), 1, "{:?}", n.h.kinds());
+    let cert = &n.h.decided[0];
+    let names = named(cert);
+    assert!(each_once(&names), "{names:?}");
+    assert_eq!(names.len(), 3);
+    let from_a = cert.commit_signatures.iter().find(|s| s.address == a).expect("a's precommit");
+    assert!(from_a.signature == first.signature, "the certificate carries the copy held");
+}
+
+/// B3 — each vote of a round certificate is verified on its own before it is counted. Seven
+/// equal seats (quorum 5), a precommit round certificate after the polka: a vote in it that
+/// does not verify is not stored or counted; the validator's valid precommit that follows is
+/// stored and counted, and the one Decide names each validator once, valid signatures only.
+#[test]
+fn each_vote_of_a_precommit_certificate_is_verified_before_it_is_counted() {
+    let set = HkValidatorSet::new((0..7u8).map(|i| validator(i, 1)));
+    let me = set.iter().next().unwrap().address;
+    let mut n = Node::build(set, me, H, true);
+    n.start_height(H);
+    let p = n.proposer(H, 0);
+    assert_ne!(p, me);
+    let a: Vec<HkAddress> = n.addrs.clone(); // a[0] is this node
+    n.feed(Input::Proposal(honest_proposal(H, Round::new(0), p, b"V")));
+    n.feed(proposed_value(H, Round::new(0), p, b"V"));
+    for x in &a[1..5] {
+        n.feed(Input::Vote(prevote_for(H, 0, b"V", *x)));
+    }
+    assert_eq!(held(&n, 0, VoteType::Precommit, me).len(), 1, "the polka (5 of 7): our precommit for V");
+    n.h.clear();
+
+    let honest = precommit_for(H, 0, b"V", a[1]);
+    let nil = |x: HkAddress| vote(H, 0, VoteType::Precommit, x, HONEST);
+    let cert = round_cert(
+        H,
+        0,
+        RoundCertificateType::Precommit,
+        &[
+            failing_copy(&honest),
+            precommit_for(H, 0, b"V", a[2]),
+            precommit_for(H, 0, b"V", a[3]),
+            precommit_for(H, 0, b"V", a[4]),
+            nil(a[5]),
+            nil(a[6]),
+        ],
+    );
+    n.try_feed(cert).unwrap_or_else(|e| panic!("the certificate is processed without error: {e}"));
+    assert_eq!(n.h.details("VerifyRoundCertificate"), vec!["ok".to_string()]);
+    assert_eq!(n.verifies(), 6, "each vote of the certificate is verified on its own");
+    assert_eq!(n.h.details("VerifySignature")[0], format!("vote h={H} addr={} sig=zero", a[1]));
+    assert!(held(&n, 0, VoteType::Precommit, a[1]).is_empty(), "the failing copy is not stored");
+    let id = HkValue::new(Bytes::copy_from_slice(b"V")).id();
+    assert!(
+        !n.st.driver.votes().is_threshold_met(&Round::new(0), VoteType::Precommit, Threshold::Value(id)),
+        "nor counted: V has 4 of 7"
+    );
+    assert_eq!(n.h.count("Decide"), 0);
+
+    n.try_feed(Input::Vote(honest.clone()))
+        .unwrap_or_else(|e| panic!("the vote is processed without error: {e}"));
+    let kept = held(&n, 0, VoteType::Precommit, a[1]);
+    assert_eq!(kept.len(), 1);
+    assert!(kept[0].signature == honest.signature, "the honest precommit is stored");
+    assert_eq!(n.h.count("Decide"), 1, "and counted: it completes V's quorum");
+    let cert = &n.h.decided[0];
+    let names = named(cert);
+    assert!(each_once(&names), "{names:?}");
+    assert_eq!(names.len(), 5);
+    assert!(
+        cert.commit_signatures.iter().all(|s| harness_verifies(&s.signature.0)),
+        "valid signatures only"
+    );
+}
+
+/// B4 — a skip round certificate for round 2 with a vote that does not verify: that vote does
+/// not enter the keeper and is not counted, the node moves to round 2, and the validator's valid
+/// vote that follows is stored and counted.
+#[test]
+fn each_vote_of_a_skip_certificate_is_verified_before_it_is_counted() {
+    let mut n = Node::at(H);
+    n.start_height(H);
+    n.h.clear();
+    let (a, b, c) = (n.addrs[1], n.addrs[2], n.addrs[3]);
+    let honest = vote(H, 2, VoteType::Prevote, a, HONEST);
+    let nil_quorum = |n: &Node| {
+        n.st.driver.votes().is_threshold_met(&Round::new(2), VoteType::Prevote, Threshold::Nil)
+    };
+
+    let cert = round_cert(
+        H,
+        2,
+        RoundCertificateType::Skip,
+        &[
+            failing_copy(&honest),
+            vote(H, 2, VoteType::Prevote, b, HONEST),
+            vote(H, 2, VoteType::Prevote, c, HONEST),
+        ],
+    );
+    n.try_feed(cert).unwrap_or_else(|e| panic!("the certificate is processed without error: {e}"));
+    assert_eq!(n.h.details("VerifyRoundCertificate"), vec!["ok".to_string()]);
+    assert_eq!(n.verifies(), 3, "each vote of the certificate is verified on its own");
+    assert_eq!(n.st.round(), Round::new(2), "the node moves to round 2");
+    assert!(held(&n, 2, VoteType::Prevote, a).is_empty(), "the failing copy is not stored");
+    assert!(!nil_quorum(&n), "nor counted: two of four prevotes for nil");
+
+    n.feed(Input::Vote(honest.clone()));
+    let kept = held(&n, 2, VoteType::Prevote, a);
+    assert_eq!(kept.len(), 1);
+    assert!(kept[0].signature == honest.signature, "the honest vote is stored");
+    assert!(nil_quorum(&n), "and counted: three of four");
+}
+
+/// A — the vote keeper's rule: the same precommit with three valid signatures, two received on
+/// their own and the third inside a round certificate. One copy is stored, the first; no
+/// evidence; the certificate's other votes complete the precommit quorum (any value), whose
+/// output fires once, and the round certificate the node builds names each validator once. A
+/// precommit for another value from the same validator is still evidence and is not counted.
+#[test]
+fn one_vote_signed_three_times_is_held_once_and_another_value_is_evidence() {
+    let mut n = Node::at(H);
+    n.start_height(H);
+    n.h.clear();
+    let (a, b, c) = (n.addrs[1], n.addrs[2], n.addrs[3]);
+    let first = vote(H, 0, VoteType::Precommit, a, HONEST);
+    let (second, third) = (resigned(&first, 1), resigned(&first, 2));
+    let precommit_timeouts =
+        |n: &Node| n.h.details("ScheduleTimeout").iter().filter(|d| d.as_str() == "PrecommitTimeout(0)").count();
+
+    n.feed(Input::Vote(first.clone()));
+    n.feed(Input::Vote(second));
+    assert_eq!(n.verifies(), 2);
+    assert_eq!(wal_votes(&n), 1, "the second copy is not written to the WAL");
+    assert_eq!(held(&n, 0, VoteType::Precommit, a).len(), 1);
+
+    let cert = round_cert(
+        H,
+        0,
+        RoundCertificateType::Precommit,
+        &[third, vote(H, 0, VoteType::Precommit, b, HONEST), vote(H, 0, VoteType::Precommit, c, HONEST)],
+    );
+    n.try_feed(cert).unwrap_or_else(|e| panic!("the certificate is processed without error: {e}"));
+    let kept = held(&n, 0, VoteType::Precommit, a);
+    assert_eq!(kept.len(), 1, "one copy held");
+    assert!(kept[0].signature == first.signature, "the first");
+    assert!(n.st.driver.votes().evidence().is_empty(), "the same vote again is not equivocation");
+    assert_eq!(precommit_timeouts(&n), 1, "the precommit quorum (any value) fired once");
+    let built = n.st.driver.round_certificate().expect("the round certificate the node built");
+    let names: Vec<HkAddress> = built.certificate.round_signatures.iter().map(|s| s.address).collect();
+    assert!(each_once(&names), "{names:?}");
+    assert_eq!(names.len(), 3);
+
+    // Another value from the same validator: equivocation, kept as evidence, not counted.
+    let id = HkValue::new(Bytes::copy_from_slice(b"V")).id();
+    let other = SignedMessage::new(
+        HkVote::new_precommit(HkHeight::new(H), Round::new(0), NilOrVal::Val(id), a),
+        sig(HONEST),
+    );
+    n.feed(Input::Vote(other.clone()));
+    let evidence = n.st.driver.votes().evidence().get(&a).cloned().unwrap_or_default();
+    assert_eq!(evidence.len(), 1, "a different value still gives evidence");
+    assert_eq!(evidence[0].0.message, first.message);
+    assert_eq!(evidence[0].1.message, other.message);
+    let kept = held(&n, 0, VoteType::Precommit, a);
+    assert_eq!(kept.len(), 1);
+    assert!(kept[0].signature == first.signature, "and does not take the place of the first");
+    assert_eq!(precommit_timeouts(&n), 1, "nor does it fire anything again");
 }

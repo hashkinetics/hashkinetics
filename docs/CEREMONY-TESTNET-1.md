@@ -65,7 +65,7 @@ disk path serves everything else). Receipt: see CHANGELOG [0.13.0].
 
 | field | value |
 |---|---|
-| launched | 2026-09-02 ~15:25 UTC (21:00 IST) — first blocks within minutes of the start |
+| launched | 2026-09-02 ~15:25 UTC — first blocks within minutes of the start |
 | chain id | `hashkinetics-1-4e4ea68d` |
 | genesis digest | `4e4ea68d48cba1ad4cc7155c19e7768f1fa2cbc99ba0f2b47c58948ec9e971c7` (`chain_start_time` 1788362219) |
 | validators | 4 founder-operated seats at genesis, fresh keys — consensus addresses `F874765D…`, `42C00CD6…`, `E77F5F47…`, `F7D75524…`. Since V1 (v0.14.0) external seats are admitted on the running chain by certificate, no new genesis: seven admitted between 2026-09-05 and 2026-09-12 (#5–#11), eleven seats on 2026-09-14 (founding seats at power 4 since G1 at height 110,000; total power 23, quorum 16) — see `VALIDATOR-ONBOARDING.md` |

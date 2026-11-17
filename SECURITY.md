@@ -10,7 +10,7 @@ Do not open public issues for security-relevant findings.
 
 - Acknowledgement within **48 hours**, an assessment within **7 days**.
 - **Coordinated disclosure:** give us **90 days** (or agree a timeline with us) before
-  any public disclosure. We credit reporters in the release notes and the CHANGELOG (as for R15 — Eddy, an external operator; R16 — an independent researcher, named as soon as they say so; R17 — Alboy, with its M-1 and L-1 (the voting-power bound, the atomic write) also reported independently by Mansor; R18 — secwatch-hunt; RZ-1 — Reza; M-1, the prover trust model — Tuan Berdasi, the documents corrected 2026-10-23 and the circuit change pending; VZ-2, the unverified abstain evidence — VanSecQA (@0x123van), fixed in v0.19.10)
+  any public disclosure. We credit reporters in the release notes and the CHANGELOG (as for R15 — Eddy, an external operator; R16 — an independent researcher, named as soon as they say so; R17 — Alboy, with its M-1 and L-1 (the voting-power bound, the atomic write) also reported independently by Mansor; R18 — secwatch-hunt; RZ-1 — Reza; M-1, the prover trust model — Tuan Berdasi, the documents corrected 2026-10-23 and the circuit change pending; VZ-2, the unverified abstain evidence — VanSecQA (@0x123van), fixed in v0.19.10; HR-1, the aggregation door — mr-hrydarie, fixed in v0.19.11; HR-4, HR-7, HR-10 and the client-side parts of HR-2, HR-3, HR-5, HR-8 and HR-9 — mr-hrydarie, fixed in v0.19.12 (HR-7 also reported independently by Memet); Memet and Galkurta — issues reported privately and hardened in v0.19.12, the details once every seat has upgraded)
   unless you prefer anonymity.
 - Testnet findings are in scope and valued — that is what the testnet is *for*.
 

@@ -135,6 +135,41 @@
 //!     indexed here), and a bundle's sequential nonces pass because the scratch pool indexes
 //!     as it goes.
 //!
+//! v0.19.12 (client-side, no gate) adds the field and size rules a tx is judged by from
+//! its own bytes, inside [`Mempool::envelope_verdict`] after the stealth cap
+//! ([`Mempool::field_bounds`]):
+//!   * an `AssetRegister` whose `symbol` fails `hk_state::assets::valid_symbol` (`BadSymbol`)
+//!     and an `AssetBurn` whose `destination` is longer than
+//!     `hk_state::assets::MAX_BURN_DESTINATION` (`BurnDestinationTooLong`) — hk-state's own rule
+//!     and bound, called rather than copied, so admission applies the same field bounds as
+//!     apply;
+//!   * a tx whose block encoding ([`tx_encoded_len`]) is larger than [`MAX_TX_BYTES`]
+//!     (`TxTooLarge`) — the per-tx bound that covers proofs too (apply verifies a proof; this
+//!     bound sizes it).
+//! The pool holds a byte cap beside its count cap — [`MAX_POOL_BYTES`] in all and
+//! [`MAX_SENDER_PENDING_BYTES`] per sender, refused with "retry later" (`PoolBytesFull`,
+//! `SenderBytesFull`) — and keeps each pending tx's txid and encoded size beside it, so a running
+//! total follows every admission, prune and restore.
+//! Both restore paths drop a pending tx these rules or caps refuse
+//! ([`Mempool::restore_unchecked`] for the snapshot's pool, [`Mempool::restore_admitted`] for the
+//! WAL), and the proposer ends a block at `crate::batch::MAX_BATCH_TX_BYTES` (state.rs
+//! `select_batch_txs_sized`).
+//! Where every variable-length field of a `SignedTx` (hk-state `tx.rs`) is bounded:
+//!   * `lamport_pk` / `sig` — exactly `PK_LEN` / `SIG_LEN` (M-2, here; apply's verify agrees);
+//!   * `MintToPool.stealth_ct`, `ShieldedSpend.stealth_ct` / `stealth_ct2` — at most
+//!     [`MAX_STEALTH_CT_BYTES`] (HR-1, here and at the bundle door; consensus does not bound
+//!     the advisory field);
+//!   * `MintToPool.proof`, `ShieldedSpend.proof` — no field bound of their own: [`MAX_TX_BYTES`]
+//!     (here) bounds the whole tx, apply verifies the proof (or the block's aggregate
+//!     covers a proof-less one), and the RPC refuses a proof-less one outside a bundle
+//!     (rpc.rs `refuse_proof_less_pool_tx`);
+//!   * `AssetRegister.symbol` — `valid_symbol`: 1..=`MAX_SYMBOL_LEN` (16) bytes of
+//!     `[A-Za-z0-9._-]`, a letter first (apply and here);
+//!   * `AssetBurn.destination` — at most `MAX_BURN_DESTINATION` (64) bytes (apply and
+//!     here);
+//!   * every other field of every variant is fixed-size: 32-byte ids, integers, bools, an
+//!     `Option` of an id, the four-flag `AssetPolicy`.
+//!
 //! Lock discipline: callers that need both locks take `chain` BEFORE `mempool`
 //! (the commit path in state.rs already does; rpc.rs follows the same order).
 
@@ -142,6 +177,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use hk_crypto::lamport::{self, PK_LEN, SIG_LEN};
 use hk_primitives::{AccountId, H256};
+use hk_state::assets::{valid_symbol, MAX_BURN_DESTINATION, MAX_SYMBOL_LEN};
 use hk_state::tx::{signing_digest, SignedTx, Tx};
 use hk_state::{MAX_CHANNEL_STEPS, MAX_SETTLE_DELTA};
 
@@ -171,6 +207,55 @@ pub const NONCE_WINDOW: u64 = 64;
 /// scanners read it), so before this cap a tx could carry megabytes of it into every node's
 /// block log and pool-note index for the price of one envelope.
 pub const MAX_STEALTH_CT_BYTES: usize = 4096;
+
+/// v0.19.12: the most bytes one transaction may take in the block encoding
+/// ([`tx_encoded_len`]: bincode with the byte fields raw, exactly what the tx adds to
+/// `Batch::encode`), checked by the tx's own bytes in [`Mempool::envelope_verdict`] beside the
+/// field rules, and at both restore paths. It is the bound that sizes proofs, which apply
+/// verifies.
+///
+/// Why 4 MiB: no larger tx reaches a node through a JSON door today. `hk_submitTx` and
+/// `hk_gossipTxs` read at most 8,388,608 bytes of request (rpc.rs `handle_conn`, the header
+/// bytes counted too), and every byte field travels there as hex — two characters per byte,
+/// the Lamport key and signature (24,576 B) included — and a 32-byte id as a JSON array of at
+/// least 65 characters. The shortest `MintToPool` request is 49,583 characters plus two per
+/// proof byte, and the same tx is 24,764 B plus one per proof byte in the block encoding: at
+/// most 4,194,276 B, under this cap (`tests::byte_bounds_nest_under_the_proposal_frame`
+/// recomputes it from the serializers). So the cap refuses nothing those doors can carry
+/// within the field rules, which run first. The largest honest field in the tree is
+/// a pool tx's core-mode
+/// STARK, ≈ 2.7 MB (codec.rs, the p2p template in main.rs, hk-state `tx.rs`; a compressed or
+/// aggregate proof is ≈ 1.24 MB, rpc.rs `MAX_BUNDLE_AGG_BYTES`), so an honest pool tx is about
+/// 2.73 MB here — ≈ 1.5× headroom. Below `crate::batch::MAX_BATCH_TX_BYTES` (checked at
+/// compile time below), so every admitted tx fits an empty block's byte budget.
+pub const MAX_TX_BYTES: usize = 4 * 1024 * 1024;
+
+/// v0.19.12: the most encoded bytes ([`tx_encoded_len`]) the pool holds at once, beside
+/// its count cap (`DEFAULT_CAP`): the pool lives in memory and in the node's store, so
+/// its bytes are bounded as well as its txs. 256 MiB holds a full count
+/// of transparent txs (8,192 × ≈ 24.7 KB ≈ 203 MB) and about 90 pool txs carrying a core-mode
+/// proof. Override with `HK_MEMPOOL_BYTES`, as `HK_MEMPOOL_CAP` overrides the count. A tx past
+/// it is refused with "retry later" (`PoolBytesFull`): the pool drains as blocks commit.
+pub const MAX_POOL_BYTES: usize = 256 * 1024 * 1024;
+
+/// v0.19.12: the most encoded bytes one sender may have pending — four txs at
+/// [`MAX_TX_BYTES`]; a full `NONCE_WINDOW` of transparent txs (64 × ≈ 24.7 KB) takes ≈ 1.6 MB.
+/// A sender past it waits until some of its pending txs are included (`SenderBytesFull`, "retry
+/// later"), so no one account holds the pool's bytes.
+pub const MAX_SENDER_PENDING_BYTES: usize = 4 * MAX_TX_BYTES;
+
+// v0.19.12: every admissible tx fits an empty sender quota, and every quota an empty pool.
+const _: () = assert!(MAX_TX_BYTES <= MAX_SENDER_PENDING_BYTES && MAX_SENDER_PENDING_BYTES <= MAX_POOL_BYTES);
+
+// v0.19.12: the byte bounds nest. Every tx the door admits fits an empty block's byte
+// budget (so nothing admitted waits for ever), and a block at that budget plus the largest
+// aggregate the bundle door takes leaves the proposal frame `PROPOSAL_HEADROOM` for its
+// rotations, set changes and framing.
+const _: () = assert!(MAX_TX_BYTES < crate::batch::MAX_BATCH_TX_BYTES);
+const _: () = assert!(
+    crate::batch::MAX_BATCH_TX_BYTES + crate::rpc::MAX_BUNDLE_AGG_BYTES + crate::batch::PROPOSAL_HEADROOM
+        <= crate::state::MAX_PROPOSAL_BYTES
+);
 
 fn nonce_window() -> u64 {
     static W: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -231,6 +316,29 @@ pub enum AdmitError {
     /// [`MAX_STEALTH_CT_BYTES`] — refused by the tx's own bytes, before any hash, like
     /// `ChannelTooLong`. `len` is the offending field's length.
     StealthTooLarge { len: usize },
+    /// HR-2 (v0.19.12): a `ShieldedSpend` whose two output commitments are the same note.
+    /// The chain appends both leaves under one nullifier, so the second is unspendable for
+    /// good; this node's pool and proposals refuse the shape (the state machine does not —
+    /// a consensus rule for it is planned for a later consensus release).
+    DuplicateOutput,
+    /// v0.19.12: an `AssetRegister` whose `symbol` fails `hk_state::assets::valid_symbol`
+    /// — the rule apply refuses it by (`BadSymbol`) — refused by the tx's own bytes, before any
+    /// hash. `len` is the symbol's length in bytes.
+    BadSymbol { len: usize },
+    /// v0.19.12: an `AssetBurn` whose `destination` is longer than
+    /// `hk_state::assets::MAX_BURN_DESTINATION` — apply's `BurnDestinationTooLong` — refused by
+    /// the tx's own bytes, before any hash. `len` is the destination's length.
+    BurnDestinationTooLong { len: usize },
+    /// v0.19.12: a tx whose block encoding ([`tx_encoded_len`]) is larger than
+    /// [`MAX_TX_BYTES`], refused by its own bytes before any hash. `len` is that size.
+    TxTooLarge { len: usize },
+    /// v0.19.12: the pool's pending bytes plus this tx's would pass its byte cap
+    /// ([`MAX_POOL_BYTES`] unless overridden) — refused for now, not for good: the pool drains as
+    /// blocks commit.
+    PoolBytesFull { pending: usize, size: usize, max: usize },
+    /// v0.19.12: this sender's pending bytes plus this tx's would pass its quota
+    /// ([`MAX_SENDER_PENDING_BYTES`]) — refused until some of its pending txs are included.
+    SenderBytesFull { pending: usize, size: usize, max: usize },
 }
 
 impl AdmitError {
@@ -279,7 +387,36 @@ impl AdmitError {
             AdmitError::StealthTooLarge { len } => {
                 format!("stealth ciphertext too large ({len} B, max {MAX_STEALTH_CT_BYTES})")
             }
+            // HR-2: admission wording — the chain accepts the shape, this node does not carry it.
+            AdmitError::DuplicateOutput => {
+                "duplicate output commitment: both outputs of this spend are the same note — the second would be unspendable".into()
+            }
+            // Admission wording that opens as hk-state's receipt does ("bad asset symbol",
+            // "burn destination too long") and names the length and the bound; the bounds are
+            // hk-state's constants, not repeated here.
+            AdmitError::BadSymbol { len } => {
+                format!("bad asset symbol ({len} B; 1-{MAX_SYMBOL_LEN} of [A-Za-z0-9._-], letter first)")
+            }
+            AdmitError::BurnDestinationTooLong { len } => {
+                format!("burn destination too long ({len} B, max {MAX_BURN_DESTINATION})")
+            }
+            AdmitError::TxTooLarge { len } => {
+                format!("transaction too large ({len} B encoded, max {MAX_TX_BYTES})")
+            }
+            // Capacity, not the tx's fault — "retry later".
+            AdmitError::PoolBytesFull { pending, size, max } => {
+                format!("mempool full ({pending} B pending + {size} B, max {max} B) — retry later")
+            }
+            AdmitError::SenderBytesFull { pending, size, max } => {
+                format!("too many bytes pending for this sender ({pending} B pending + {size} B, max {max} B) — retry later, once some are included")
+            }
         }
+    }
+
+    /// v0.19.12: a refusal by the pool's capacity — its count cap, its byte cap or the
+    /// sender's pending bytes — rather than by anything in the tx itself.
+    pub fn is_capacity(&self) -> bool {
+        matches!(self, AdmitError::Full | AdmitError::PoolBytesFull { .. } | AdmitError::SenderBytesFull { .. })
     }
 }
 
@@ -290,20 +427,23 @@ impl AdmitError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnvelopeVerdict {
     /// `lamport::pk_commit(&tx.lamport_pk)` — `None` when the frame was refused before any
-    /// hash: wrong lengths (M-2 (a)) or an over-cap `ChannelOpen` (R18); `signature` then
-    /// carries which, and the consumer refuses exactly as `try_admit` does.
+    /// hash: wrong lengths (M-2 (a)), an over-cap `ChannelOpen` (R18), an over-cap stealth
+    /// ciphertext (HR-1) or a field or size rule; `signature` then carries which, and
+    /// the consumer refuses exactly as `try_admit` does.
     pk_commit: Option<[u8; 32]>,
     /// M-2 (b): `Ok` when `State::verify_envelope` accepted the signature over the tx's own
     /// bytes; `BadSignature`, or `BadEnvelope` when the signing digest cannot form. With
-    /// `pk_commit == None`: `BadEnvelope`, `ChannelTooLong` or (HR-1) `StealthTooLarge`, the
-    /// hash-free refusal.
+    /// `pk_commit == None`: `BadEnvelope`, `ChannelTooLong`, (HR-1) `StealthTooLarge` or
+    /// `BadSymbol` / `BurnDestinationTooLong` / `TxTooLarge`, the hash-free refusal.
     signature: Result<(), AdmitError>,
 }
 
 impl EnvelopeVerdict {
     /// HR-1 (v0.19.11): the refusal this verdict reached BEFORE any hash — wrong lengths
-    /// (`BadEnvelope`), an over-cap `ChannelOpen` (`ChannelTooLong`) or an over-cap stealth
-    /// ciphertext (`StealthTooLarge`) — or `None` when the two hashes ran. A `BadSignature`
+    /// (`BadEnvelope`), an over-cap `ChannelOpen` (`ChannelTooLong`), an over-cap stealth
+    /// ciphertext (`StealthTooLarge`) or, since v0.19.12, a field or size rule
+    /// (`BadSymbol`, `BurnDestinationTooLong`, `TxTooLarge`) — or `None` when the two hashes
+    /// ran. A `BadSignature`
     /// is deliberately not reported here: `try_admit_verified` judges it at its own position,
     /// after the account, nonce and key checks, so the bundle door (`rpc::submit_bundle`,
     /// which fails fast on this before taking the chain lock) keeps the one precedence of
@@ -317,36 +457,65 @@ impl EnvelopeVerdict {
     }
 }
 
+/// v0.19.12: one pending tx and what the pool keeps beside it — its txid, computed at admission
+/// or restore (the prunes and `hk_getMempool` read it), and its encoded size
+/// ([`tx_encoded_len`]), the unit of the byte caps.
+struct Pending {
+    tx: SignedTx,
+    id: [u8; 32],
+    size: usize,
+}
+
 pub struct Mempool {
-    q: VecDeque<SignedTx>,
+    q: VecDeque<Pending>,
     ids: HashSet<[u8; 32]>,
     /// (sender, nonce) → that pending tx's `next_auth`: the commitment the tx at
     /// nonce + 1 must open (M-2 binding walk). Membership alone is `DuplicateSlot`.
     keys: HashMap<(AccountId, u64), H256>,
     nullifiers: HashSet<[u8; 32]>,
+    /// Σ `size` over `q`, and the same per sender (an entry only while it has a tx pending).
+    bytes: usize,
+    sender_bytes: HashMap<AccountId, usize>,
     cap: usize,
+    /// The pool's byte cap ([`MAX_POOL_BYTES`] or `HK_MEMPOOL_BYTES`) and one sender's
+    /// ([`MAX_SENDER_PENDING_BYTES`]).
+    byte_cap: usize,
+    sender_cap: usize,
 }
 
 impl Default for Mempool {
     fn default() -> Self {
-        Self::new(
-            std::env::var("HK_MEMPOOL_CAP")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .filter(|n: &usize| *n > 0)
-                .unwrap_or(DEFAULT_CAP),
-        )
+        let cap = std::env::var("HK_MEMPOOL_CAP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|n: &usize| *n > 0)
+            .unwrap_or(DEFAULT_CAP);
+        let byte_cap = std::env::var("HK_MEMPOOL_BYTES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|n: &usize| *n > 0)
+            .unwrap_or(MAX_POOL_BYTES);
+        Self::with_caps(cap, byte_cap, MAX_SENDER_PENDING_BYTES)
     }
 }
 
 impl Mempool {
     pub fn new(cap: usize) -> Self {
+        Self::with_caps(cap, MAX_POOL_BYTES, MAX_SENDER_PENDING_BYTES)
+    }
+
+    /// v0.19.12: a pool with explicit byte caps — the pool's and one sender's.
+    pub fn with_caps(cap: usize, byte_cap: usize, sender_cap: usize) -> Self {
         Self {
             q: VecDeque::new(),
             ids: HashSet::new(),
             keys: HashMap::new(),
             nullifiers: HashSet::new(),
+            bytes: 0,
+            sender_bytes: HashMap::new(),
             cap,
+            byte_cap,
+            sender_cap,
         }
     }
 
@@ -359,9 +528,15 @@ impl Mempool {
         self.q.is_empty()
     }
 
-    /// FIFO view — proposal building (`take(room)`), snapshots, and `hk_getMempool`.
+    /// FIFO view — proposal building (`take(room)`), snapshots and the WAL rewrite.
     pub fn iter(&self) -> impl Iterator<Item = &SignedTx> {
-        self.q.iter()
+        self.q.iter().map(|p| &p.tx)
+    }
+
+    /// v0.19.12: the pending txs' txids in FIFO order, as stored at admission or restore
+    /// — `hk_getMempool` reads them.
+    pub fn pending_ids(&self) -> impl Iterator<Item = &[u8; 32]> {
+        self.q.iter().map(|p| &p.id)
     }
 
     /// C2.1 + M-2: the admission pre-check. Refuses what apply would certainly refuse
@@ -380,36 +555,58 @@ impl Mempool {
     ) -> Result<[u8; 32], AdmitError> {
         // Cheap-first: a cap-full pool, a duplicate, or (R18) a settle too far past the
         // chain's step costs no hash (the WAL replay loop and the tests come through here).
-        let id = self.gate(&tx)?;
+        let (id, size) = self.gate(&tx)?;
         Self::channel_settle_cap(&tx, chain)?;
         let verdict = Self::envelope_verdict(&tx);
-        self.admit_gated(tx, id, chain, &verdict)
+        self.admit_gated(tx, id, size, chain, &verdict)
     }
 
-    /// The three map checks every admission starts with (cap, exact duplicate, pending
-    /// slot) — O(1), no hashing beyond the txid. Returns the txid. The cap is read before
-    /// the hash: a full pool costs the WAL replay loop nothing.
-    fn gate(&self, tx: &SignedTx) -> Result<[u8; 32], AdmitError> {
+    /// The map checks every admission starts with — the count cap, the pool's byte cap, the
+    /// exact duplicate, the pending slot and the sender's pending bytes — O(1), no hash
+    /// beyond the txid. Returns the txid and the tx's encoded size. The count cap is read before
+    /// any work and the byte cap before the hash (the size is a walk, not a hash): a full pool
+    /// costs the WAL replay loop no hash.
+    fn gate(&self, tx: &SignedTx) -> Result<([u8; 32], usize), AdmitError> {
         if self.q.len() >= self.cap {
             return Err(AdmitError::Full);
         }
+        let size = tx_encoded_len(tx);
+        self.byte_room(size)?;
         let id = txid(tx);
-        self.gate_with_id(tx, &id)?;
-        Ok(id)
+        self.gate_with_id(tx, &id, size)?;
+        Ok((id, size))
     }
 
-    /// HR-1 (v0.19.11, review item S1): the same three checks on a txid the caller already
-    /// holds — `rpc::submit_bundle` hashes every bundle tx with no lock held and dry-runs it
-    /// on a scratch pool under the chain lock, so nothing is hashed there.
-    fn gate_with_id(&self, tx: &SignedTx, id: &[u8; 32]) -> Result<(), AdmitError> {
+    /// HR-1 (v0.19.11, review item S1): the same checks on a txid the caller already holds —
+    /// `rpc::submit_bundle` hashes every bundle tx with no lock held, so nothing is hashed
+    /// here. `size` is the tx's encoded size ([`tx_encoded_len`]).
+    fn gate_with_id(&self, tx: &SignedTx, id: &[u8; 32], size: usize) -> Result<(), AdmitError> {
         if self.q.len() >= self.cap {
             return Err(AdmitError::Full);
         }
+        self.byte_room(size)?;
         if self.ids.contains(id) {
             return Err(AdmitError::DuplicateTx);
         }
         if self.keys.contains_key(&(tx.sender, tx.nonce)) {
             return Err(AdmitError::DuplicateSlot { pending_nonce: tx.nonce });
+        }
+        self.sender_room(&tx.sender, size)
+    }
+
+    /// v0.19.12: the pool's byte cap, for a tx of `size` encoded bytes.
+    fn byte_room(&self, size: usize) -> Result<(), AdmitError> {
+        if self.bytes.saturating_add(size) > self.byte_cap {
+            return Err(AdmitError::PoolBytesFull { pending: self.bytes, size, max: self.byte_cap });
+        }
+        Ok(())
+    }
+
+    /// v0.19.12: `sender`'s pending-bytes quota, for a tx of `size` encoded bytes.
+    fn sender_room(&self, sender: &AccountId, size: usize) -> Result<(), AdmitError> {
+        let pending = self.sender_bytes.get(sender).copied().unwrap_or(0);
+        if pending.saturating_add(size) > self.sender_cap {
+            return Err(AdmitError::SenderBytesFull { pending, size, max: self.sender_cap });
         }
         Ok(())
     }
@@ -439,6 +636,11 @@ impl Mempool {
         if let Some(len) = stealth_ct_over_cap(tx) {
             return EnvelopeVerdict { pk_commit: None, signature: Err(AdmitError::StealthTooLarge { len }) };
         }
+        // The asset field rules and the per-tx byte cap, by the tx's own bytes as well —
+        // the same place, the same `None` (a few length compares and one size walk, no hash).
+        if let Err(e) = Self::field_bounds(tx) {
+            return EnvelopeVerdict { pk_commit: None, signature: Err(e) };
+        }
         let pk_commit = lamport::pk_commit(&tx.lamport_pk);
         let signature = if hk_state::State::verify_envelope(tx) {
             Ok(())
@@ -462,6 +664,34 @@ impl Mempool {
             }
             _ => Ok(()),
         }
+    }
+
+    /// v0.19.12, the state-free field and size rules: an `AssetRegister` whose `symbol`
+    /// fails `hk_state::assets::valid_symbol`, an `AssetBurn` whose `destination` is longer than
+    /// `hk_state::assets::MAX_BURN_DESTINATION`, and any tx whose block encoding is larger than
+    /// [`MAX_TX_BYTES`]. The two field rules are hk-state's own function and constant — the ones
+    /// `do_asset_register` / `do_asset_burn` refuse by — so admission applies the same field
+    /// bounds as apply.
+    /// Reads the tx only (the symbol rule stops at the length bound first; the size is
+    /// [`tx_encoded_len`], a walk that counts a byte field by its length), no hash.
+    /// `envelope_verdict` runs it after the stealth cap; the two restore paths run it on every
+    /// pending tx they put back ([`restore_unchecked`](Self::restore_unchecked),
+    /// [`restore_admitted`](Self::restore_admitted)).
+    pub fn field_bounds(tx: &SignedTx) -> Result<(), AdmitError> {
+        match &tx.payload {
+            Tx::AssetRegister { symbol, .. } if !valid_symbol(symbol) => {
+                return Err(AdmitError::BadSymbol { len: symbol.len() });
+            }
+            Tx::AssetBurn { destination, .. } if destination.len() > MAX_BURN_DESTINATION => {
+                return Err(AdmitError::BurnDestinationTooLong { len: destination.len() });
+            }
+            _ => {}
+        }
+        let len = tx_encoded_len(tx);
+        if len > MAX_TX_BYTES {
+            return Err(AdmitError::TxTooLarge { len });
+        }
+        Ok(())
     }
 
     /// R18, the state-dependent checks: a `ChannelSettle` may not advance its channel by
@@ -502,16 +732,19 @@ impl Mempool {
     /// binding of `verdict.pk_commit`, then `verdict.signature` — each refusal at the
     /// position `try_admit` gives it, so the two entry points can never disagree on a
     /// reason. `verdict` must have been computed from THIS `tx` (`envelope_verdict`); the
-    /// RPC computes it with no lock held.
+    /// RPC computes it with no lock held. (The RPC door uses
+    /// `try_admit_verified_with_id`, which takes a txid computed outside the locks; this
+    /// entry point serves the tests that compare the two doors.)
+    #[cfg(test)]
     pub fn try_admit_verified(
         &mut self,
         tx: SignedTx,
         chain: &hk_state::State,
         verdict: &EnvelopeVerdict,
     ) -> Result<[u8; 32], AdmitError> {
-        let id = self.gate(&tx)?;
+        let (id, size) = self.gate(&tx)?;
         Self::channel_settle_cap(&tx, chain)?;
-        self.admit_gated(tx, id, chain, verdict)
+        self.admit_gated(tx, id, size, chain, verdict)
     }
 
     /// HR-1 (v0.19.11, review item S1): `try_admit_verified` on a txid the caller already
@@ -527,9 +760,10 @@ impl Mempool {
         verdict: &EnvelopeVerdict,
     ) -> Result<[u8; 32], AdmitError> {
         debug_assert_eq!(id, txid(&tx), "try_admit_verified_with_id: `id` is not this tx's txid");
-        self.gate_with_id(&tx, &id)?;
+        let size = tx_encoded_len(&tx);
+        self.gate_with_id(&tx, &id, size)?;
         Self::channel_settle_cap(&tx, chain)?;
-        self.admit_gated(tx, id, chain, verdict)
+        self.admit_gated(tx, id, size, chain, verdict)
     }
 
     /// Everything after the gate and the settle cap, shared by both entry points (each
@@ -538,6 +772,7 @@ impl Mempool {
         &mut self,
         tx: SignedTx,
         id: [u8; 32],
+        size: usize,
         chain: &hk_state::State,
         verdict: &EnvelopeVerdict,
     ) -> Result<[u8; 32], AdmitError> {
@@ -559,7 +794,14 @@ impl Mempool {
             return Err(AdmitError::FutureNonce { current, got: tx.nonce });
         }
         // Pool preconditions (set lookups — still cheap, so still before the hashes).
-        if let Tx::ShieldedSpend { anchor, nullifier, .. } = &tx.payload {
+        if let Tx::ShieldedSpend { anchor, nullifier, out_commitment, out2_commitment, .. } = &tx.payload {
+            // HR-2 (v0.19.12, this node's pool and proposals only — the chain still accepts
+            // the shape): two identical output commitments are two leaves under ONE
+            // nullifier, so the second can never be spent; an honest wallet never builds
+            // it, and this node will not carry it. One compare, before the lookups.
+            if out_commitment == out2_commitment {
+                return Err(AdmitError::DuplicateOutput);
+            }
             // P6: the pool is the one whose recent anchors carry `anchor` (the state
             // machine routes the same way); no pool knows it → unknown anchor.
             let pool = match chain.pool_key_of_anchor(anchor).and_then(|k| chain.pool_ref(k)) {
@@ -594,36 +836,113 @@ impl Mempool {
         // Same function as the commit path (state.rs `par_bools(.., verify_envelope)`),
         // so a tx admitted here cannot fail the signature at apply, and vice versa.
         verdict.signature.clone()?;
-        self.index(&tx, id);
-        self.q.push_back(tx);
+        self.push(tx, id, size);
         Ok(id)
     }
 
-    /// Restore path (snapshots / WAL replay): insert WITHOUT chain checks but WITH
-    /// index maintenance and duplicate suppression. Returns false if suppressed.
+    /// Tests: [`insert_restored`](Self::insert_restored) as a yes/no — false if suppressed (a
+    /// duplicate) or refused by a cap.
+    #[cfg(test)]
     pub fn insert_unchecked(&mut self, tx: SignedTx) -> bool {
-        let id = txid(&tx);
-        if self.ids.contains(&id) || self.q.len() >= self.cap {
-            return false;
-        }
-        self.index(&tx, id);
-        self.q.push_back(tx);
-        true
+        matches!(self.insert_restored(tx), Ok(true))
     }
 
-    fn index(&mut self, tx: &SignedTx, id: [u8; 32]) {
+    /// Restore path (the snapshot's pool): insert WITHOUT chain checks but WITH index maintenance,
+    /// duplicate suppression and (v0.19.12) the caps admission applies — the count, the
+    /// pool's bytes and the sender's pending bytes. `Ok(true)` inserted, `Ok(false)` a duplicate
+    /// (suppressed), `Err` the cap that refused it.
+    fn insert_restored(&mut self, tx: SignedTx) -> Result<bool, AdmitError> {
+        if self.q.len() >= self.cap {
+            return Err(AdmitError::Full);
+        }
+        let size = tx_encoded_len(&tx);
+        self.byte_room(size)?;
+        let id = txid(&tx);
+        if self.ids.contains(&id) {
+            return Ok(false);
+        }
+        self.sender_room(&tx.sender, size)?;
+        self.push(tx, id, size);
+        Ok(true)
+    }
+
+    /// v0.19.12: the snapshot's pending txs at start (state.rs `restore_from_store`).
+    /// Each goes back through [`insert_restored`](Self::insert_restored) — no chain checks — unless
+    /// [`field_bounds`](Self::field_bounds) refuses it (a pending tx saved by an earlier version is
+    /// judged by this version's field and size rules) or one of admission's caps does (the count,
+    /// the pool's bytes, the sender's pending bytes). Returns (restored, dropped by those rules
+    /// and caps); a suppressed duplicate counts as neither.
+    pub fn restore_unchecked(&mut self, txs: impl IntoIterator<Item = SignedTx>) -> (usize, usize) {
+        let (mut restored, mut dropped) = (0usize, 0usize);
+        for tx in txs {
+            if Self::field_bounds(&tx).is_err() {
+                dropped += 1;
+                continue;
+            }
+            match self.insert_restored(tx) {
+                Ok(true) => restored += 1,
+                Ok(false) => {}
+                Err(_) => dropped += 1,
+            }
+        }
+        (restored, dropped)
+    }
+
+    /// v0.19.12: the WAL replay at start (state.rs `restore_from_store`). Each frame goes
+    /// through [`try_admit`](Self::try_admit) against the restored chain — the WAL replays
+    /// through the live door — after [`field_bounds`](Self::field_bounds), which `try_admit` also
+    /// applies. The frames those rules or one of the pool's caps refuse
+    /// ([`AdmitError::is_capacity`]) are counted apart from the routine refusals (a stale nonce,
+    /// a duplicate), so the caller reports them once. Returns (restored, dropped by those rules
+    /// and caps).
+    pub fn restore_admitted(
+        &mut self,
+        txs: impl IntoIterator<Item = SignedTx>,
+        chain: &hk_state::State,
+    ) -> (usize, usize) {
+        let (mut restored, mut dropped) = (0usize, 0usize);
+        for tx in txs {
+            if Self::field_bounds(&tx).is_err() {
+                dropped += 1;
+                continue;
+            }
+            match self.try_admit(tx, chain) {
+                Ok(_) => restored += 1,
+                Err(e) if e.is_capacity() => dropped += 1,
+                Err(_) => {}
+            }
+        }
+        (restored, dropped)
+    }
+
+    /// Index and queue an admitted or restored tx, with its txid and encoded size; the byte
+    /// totals grow by `size`.
+    fn push(&mut self, tx: SignedTx, id: [u8; 32], size: usize) {
         self.ids.insert(id);
         self.keys.insert((tx.sender, tx.nonce), tx.next_auth);
         if let Tx::ShieldedSpend { nullifier, .. } = &tx.payload {
             self.nullifiers.insert(nullifier.0);
         }
+        self.bytes = self.bytes.saturating_add(size);
+        let sender = self.sender_bytes.entry(tx.sender).or_insert(0);
+        *sender = sender.saturating_add(size);
+        self.q.push_back(Pending { tx, id, size });
     }
 
-    fn unindex(&mut self, tx: &SignedTx) {
-        self.ids.remove(&txid(tx));
-        self.keys.remove(&(tx.sender, tx.nonce));
-        if let Tx::ShieldedSpend { nullifier, .. } = &tx.payload {
+    /// Unindex a tx leaving the queue: its stored txid and size; the byte totals shrink
+    /// by its size, and a sender with nothing left pending leaves the per-sender map.
+    fn unindex(&mut self, p: &Pending) {
+        self.ids.remove(&p.id);
+        self.keys.remove(&(p.tx.sender, p.tx.nonce));
+        if let Tx::ShieldedSpend { nullifier, .. } = &p.tx.payload {
             self.nullifiers.remove(&nullifier.0);
+        }
+        self.bytes = self.bytes.saturating_sub(p.size);
+        if let Some(sender) = self.sender_bytes.get_mut(&p.tx.sender) {
+            *sender = sender.saturating_sub(p.size);
+            if *sender == 0 {
+                self.sender_bytes.remove(&p.tx.sender);
+            }
         }
     }
 
@@ -636,11 +955,11 @@ impl Mempool {
         let gone: HashSet<(AccountId, u64)> = included.iter().copied().collect();
         let before = self.q.len();
         let mut kept = VecDeque::with_capacity(before);
-        for tx in std::mem::take(&mut self.q) {
-            if gone.contains(&(tx.sender, tx.nonce)) {
-                self.unindex(&tx);
+        for p in std::mem::take(&mut self.q) {
+            if gone.contains(&(p.tx.sender, p.tx.nonce)) {
+                self.unindex(&p);
             } else {
-                kept.push_back(tx);
+                kept.push_back(p);
             }
         }
         self.q = kept;
@@ -656,9 +975,9 @@ impl Mempool {
     /// pending tx at the same slot may still apply and stays). Correctness, hash-free:
     /// `ids.contains(id)` means the identical tx is pending here; the sender and the nonce are
     /// inside the txid preimage and one tx occupies a slot (`DuplicateSlot`), so pruning that
-    /// slot removes exactly it — no queued tx's txid is recomputed to find it; the only hash
-    /// left is `unindex`'s one per REMOVED tx (as before), and the common case — nothing
-    /// refused is pending — costs no hash and no pass. Before v0.19.11 the commit path pruned
+    /// slot removes exactly it — no queued tx's txid is recomputed to find it, and `unindex`
+    /// reads each removed tx's stored txid; the common case — nothing refused is pending —
+    /// costs no pass either. Before v0.19.11 the commit path pruned
     /// every block tx's slot whatever its receipt, so a refused bundle tx naming a victim's
     /// pending (account, nonce) evicted the victim's honest tx on every node that committed
     /// the block (HR-1, the eviction axis). Returns the removed count.
@@ -681,6 +1000,18 @@ pub fn stealth_ct_over_cap(tx: &SignedTx) -> Option<usize> {
         _ => &[],
     };
     fields.iter().map(|f| f.len()).find(|len| *len > MAX_STEALTH_CT_BYTES)
+}
+
+/// v0.19.12: the bytes `tx` takes in a block. `Batch::encode` writes every tx with
+/// `bincode::serialize` (the fixed-int options) and the format-aware byte fields of
+/// `hk_state::tx` go out raw, so a batch's transaction list is 8 B (its length) plus the sum
+/// of these (`tests::encoded_len_is_what_a_tx_adds_to_a_block`). `bincode::serialized_size`
+/// walks the same `Serialize` impl with the same options and only counts — a byte field adds
+/// its length without being read or copied — so the cost is a few hundred steps per tx
+/// whatever its proof weighs, and no copy of the tx is made. The walk does not fail for these
+/// types; if it ever did, the size counts as `usize::MAX`, i.e. too large for every bound.
+pub fn tx_encoded_len(tx: &SignedTx) -> usize {
+    bincode::serialized_size(tx).ok().and_then(|n| usize::try_from(n).ok()).unwrap_or(usize::MAX)
 }
 
 /// HR-1 (v0.19.11, review item M6): the ONE chain-and-signer fixture the hk-node test modules
@@ -839,6 +1170,9 @@ mod tests {
     fn assert_nothing_indexed(mp: &Mempool) {
         assert_eq!(mp.len(), 0);
         assert!(mp.ids.is_empty() && mp.keys.is_empty() && mp.nullifiers.is_empty());
+        // and no pending bytes, in all or per sender
+        assert_eq!(mp.bytes, 0);
+        assert!(mp.sender_bytes.is_empty());
     }
 
     #[test]
@@ -911,6 +1245,46 @@ mod tests {
             mp.try_admit(spend(1, 1, 0x22, H256([0xAA; 32])), &chain),
             Err(AdmitError::UnknownAnchor)
         );
+    }
+
+    /// HR-2 (v0.19.12): a spend whose two outputs are the same commitment is refused at the
+    /// door — through `try_admit` (hk_submitTx / gossip) and through the bundle dry run's
+    /// `try_admit_verified_with_id` alike — before any pool lookup; an ordinary spend admits.
+    /// KILL: drop the `out_commitment == out2_commitment` compare from `admit_gated` and both
+    /// doors admit the duplicate (the chain would then append two leaves under one nullifier).
+    #[test]
+    fn hr2_duplicate_output_commitments_are_refused_at_both_doors() {
+        let chain = mini_chain(2);
+        let mut mp = Mempool::new(16);
+        let anchor = genesis_anchor(&chain);
+        let dup_payload = |anchor: H256, nf: u8| Tx::ShieldedSpend {
+            anchor,
+            nullifier: H256([nf; 32]),
+            out_commitment: H256([3; 32]),
+            out2_commitment: H256([3; 32]),
+            fee: 0,
+            credit: None,
+            mandate: None,
+            proof: vec![],
+            stealth_ct: vec![],
+            stealth_ct2: vec![],
+        };
+        let dup = sign_at(1, 0, dup_payload(anchor, 0x41));
+        assert_eq!(mp.try_admit(dup.clone(), &chain), Err(AdmitError::DuplicateOutput));
+        assert_eq!(
+            AdmitError::DuplicateOutput.as_str(),
+            "duplicate output commitment: both outputs of this spend are the same note — the second would be unspendable"
+        );
+        // the bundle door: hashed outside the locks, judged inside — the same refusal
+        let verdict = Mempool::envelope_verdict(&dup);
+        assert_eq!(mp.try_admit_verified_with_id(dup.clone(), txid(&dup), &chain, &verdict), Err(AdmitError::DuplicateOutput));
+        assert_nothing_indexed(&mp);
+        // the compare comes before the anchor lookup: a duplicate on a bogus anchor is still
+        // named for what it is
+        assert_eq!(mp.try_admit(sign_at(1, 0, dup_payload(H256([0xAA; 32]), 0x42)), &chain), Err(AdmitError::DuplicateOutput));
+        // distinct outputs: admits
+        mp.try_admit(spend(1, 0, 0x43, anchor), &chain).expect("an ordinary spend admits");
+        assert_eq!(mp.len(), 1);
     }
 
     #[test]
@@ -1588,5 +1962,386 @@ mod tests {
         assert_eq!(stealth_ct_over_cap(&sign_at(1, 2, mint_payload(sealed.stealth_ct))), None);
         assert_eq!(stealth_ct_over_cap(&transfer(1, 2)), None);
         assert_eq!(mp.len(), 2);
+    }
+
+    // ---- v0.19.12: the field and size rules, at the door and at restore ----
+
+    /// The asset field rules at the door are apply's own. For every symbol and destination
+    /// below, the state-free verdict refuses iff hk-state's rule does, through both doors
+    /// (`try_admit` end to end, and the hoisted `try_admit_verified`) with nothing indexed, and
+    /// the same signed frame in a block is refused by apply for that field iff the door refused
+    /// it. KILL: drop the `field_bounds` call from `envelope_verdict` (every refused frame
+    /// admits), or replace `valid_symbol` with a length check (the leading-digit and the
+    /// non-ASCII symbols admit).
+    #[test]
+    fn admission_field_rules_mirror_apply() {
+        let mib = 1024 * 1024;
+        let symbols: Vec<String> = vec![
+            String::new(),                  // empty
+            "A".into(),                     // one letter
+            "Long_Symbol-16ch".into(),      // 16 bytes, every class the rule allows
+            "A".repeat(MAX_SYMBOL_LEN + 1), // 17 letters
+            "1USDC".into(),                 // a leading digit
+            "USD\u{e9}".into(),             // a non-ASCII byte (é is two bytes)
+            "A".repeat(mib),                // 1 MiB
+        ];
+        let bad_symbol = Err(hk_state::StateError::BadSymbol.to_string());
+        for sym in &symbols {
+            let tx = sign_at(1, 0, Tx::AssetRegister {
+                asset: hk_state::assets::derive_asset_id(&acct(1), sym),
+                symbol: sym.clone(),
+                decimals: 6,
+                policy: hk_state::assets::AssetPolicy::default(),
+            });
+            let valid = valid_symbol(sym);
+            let want = (!valid).then(|| AdmitError::BadSymbol { len: sym.len() });
+            assert_eq!(Mempool::envelope_verdict(&tx).hash_free_refusal(), want, "symbol of {} B", sym.len());
+            let mut chain = mini_chain(1);
+            let mut direct = Mempool::new(4);
+            let mut hoisted = Mempool::new(4);
+            let a = direct.try_admit(tx.clone(), &chain);
+            let b = hoisted.try_admit_verified(tx.clone(), &chain, &Mempool::envelope_verdict(&tx));
+            assert_eq!(a, b, "symbol of {} B", sym.len());
+            match &want {
+                Some(e) => {
+                    assert_eq!(a, Err(e.clone()));
+                    assert_nothing_indexed(&direct);
+                }
+                None => assert_eq!(a, Ok(txid(&tx))),
+            }
+            // apply, on the same fresh chain: the registration lands iff the door admitted it
+            let r = chain.apply_block(1, 0, &[tx]).expect("block applies");
+            if valid {
+                assert!(r[0].result.is_ok(), "symbol {sym:?}: {:?}", r[0].result);
+            } else {
+                assert_eq!(r[0].result, bad_symbol, "symbol of {} B", sym.len());
+            }
+        }
+        let too_long = Err(hk_state::StateError::BurnDestinationTooLong.to_string());
+        for len in [0, MAX_BURN_DESTINATION, MAX_BURN_DESTINATION + 1, mib] {
+            let tx = sign_at(1, 0, Tx::AssetBurn { asset: ASSET, amount: 1, destination: vec![0xD5; len] });
+            let over = len > MAX_BURN_DESTINATION;
+            let want = over.then(|| AdmitError::BurnDestinationTooLong { len });
+            assert_eq!(Mempool::envelope_verdict(&tx).hash_free_refusal(), want, "destination of {len} B");
+            let mut chain = mini_chain(1);
+            let mut mp = Mempool::new(4);
+            match &want {
+                Some(e) => {
+                    assert_eq!(mp.try_admit(tx.clone(), &chain), Err(e.clone()));
+                    assert_nothing_indexed(&mp);
+                }
+                None => {
+                    mp.try_admit(tx.clone(), &chain).expect("a destination inside the bound admits");
+                }
+            }
+            // apply refuses for the destination iff the door did (inside the bound the burn
+            // reaches the asset check — `ASSET` is unregistered — and is refused for that)
+            let r = chain.apply_block(1, 0, &[tx]).expect("block applies");
+            assert_eq!(r[0].result == too_long, over, "destination of {len} B: {:?}", r[0].result);
+        }
+        // the precedence: the lengths check first (an unsigned frame is BadEnvelope), the field
+        // rules before the account walk (an unknown sender's long destination names the field)
+        let mut unsigned = unsigned_transfer(1, 0);
+        unsigned.payload = Tx::AssetRegister { asset: ASSET, symbol: "1BAD".into(), decimals: 0, policy: Default::default() };
+        assert_eq!(Mempool::new(4).try_admit(unsigned, &mini_chain(1)), Err(AdmitError::BadEnvelope));
+        let stranger = sign_at(9, 0, Tx::AssetBurn { asset: ASSET, amount: 1, destination: vec![0; MAX_BURN_DESTINATION + 1] });
+        assert_eq!(
+            Mempool::new(4).try_admit(stranger, &mini_chain(1)),
+            Err(AdmitError::BurnDestinationTooLong { len: MAX_BURN_DESTINATION + 1 })
+        );
+        // the reasons a wallet reads (admission wording: hk-state's opening words, the length,
+        // the bound)
+        assert_eq!(
+            AdmitError::BadSymbol { len: 17 }.as_str(),
+            "bad asset symbol (17 B; 1-16 of [A-Za-z0-9._-], letter first)"
+        );
+        assert_eq!(AdmitError::BurnDestinationTooLong { len: 65 }.as_str(), "burn destination too long (65 B, max 64)");
+    }
+
+    /// The per-tx byte cap. A shield one byte over `MAX_TX_BYTES` in the block encoding is
+    /// refused by its own bytes with `TxTooLarge`, through both doors, nothing indexed; one
+    /// exactly at the cap admits, and the proposer picks it on an empty block; an honest pool tx
+    /// — a core-mode proof of 2.7 MiB (the tree's ≈ 2.7 MB figure, rounded up) with a sealed
+    /// note — admits with more than a quarter of the cap to spare. KILL: drop the size check
+    /// from `field_bounds` (the over-cap shield admits), or size the JSON form instead of the
+    /// block encoding (the at-cap shield, ≈ 8 MiB as JSON, is refused).
+    #[test]
+    fn a_tx_over_the_byte_cap_is_refused_and_an_honest_pool_tx_admits() {
+        let chain = mini_chain(1);
+        let shield = |proof_len: usize| Tx::MintToPool {
+            asset: ASSET,
+            value: 1,
+            commitment: H256([0x5a; 32]),
+            proof: vec![0xA5; proof_len],
+            stealth_ct: vec![0x5c; LEGIT_CT],
+        };
+        // every field but the proof is fixed-size, so the size is linear in the proof
+        let fixed = tx_encoded_len(&sign_at(1, 0, shield(0)));
+        let over = sign_at(1, 0, shield(MAX_TX_BYTES + 1 - fixed));
+        assert_eq!(tx_encoded_len(&over), MAX_TX_BYTES + 1);
+        let want: Result<[u8; 32], AdmitError> = Err(AdmitError::TxTooLarge { len: MAX_TX_BYTES + 1 });
+        assert_eq!(
+            Mempool::envelope_verdict(&over).hash_free_refusal(),
+            Some(AdmitError::TxTooLarge { len: MAX_TX_BYTES + 1 })
+        );
+        let mut mp = Mempool::new(4);
+        assert_eq!(mp.try_admit(over.clone(), &chain), want);
+        assert_eq!(mp.try_admit_verified(over.clone(), &chain, &Mempool::envelope_verdict(&over)), want);
+        assert_nothing_indexed(&mp);
+        // exactly at the cap: admitted, and an empty block's byte budget takes it
+        let at = sign_at(1, 0, shield(MAX_TX_BYTES - fixed));
+        assert_eq!(tx_encoded_len(&at), MAX_TX_BYTES);
+        mp.try_admit(at.clone(), &chain).expect("a tx at the cap admits");
+        let (picked, held) = crate::state::select_batch_txs(&chain, [at].iter(), 1, 0);
+        assert_eq!((picked.len(), held), (1, 0), "admitted but not proposable");
+        // an honest pool tx, queued behind it
+        let honest = sign_at(1, 1, shield(2_831_156));
+        assert!(tx_encoded_len(&honest) * 4 < MAX_TX_BYTES * 3, "{} B", tx_encoded_len(&honest));
+        mp.try_admit(honest, &chain).expect("an honest pool tx admits");
+        assert_eq!(mp.len(), 2);
+        // the reason a wallet reads
+        assert_eq!(
+            AdmitError::TxTooLarge { len: MAX_TX_BYTES + 1 }.as_str(),
+            format!("transaction too large ({} B encoded, max {MAX_TX_BYTES})", MAX_TX_BYTES + 1)
+        );
+    }
+
+    /// `tx_encoded_len` is exactly what a tx adds to `Batch::encode` — the number both
+    /// the per-tx cap and the block budget are taken in — for every shape the door sees, signed
+    /// or not. KILL: return the JSON length, or size the payload alone.
+    #[test]
+    fn encoded_len_is_what_a_tx_adds_to_a_block() {
+        let chain = mini_chain(2);
+        let anchor = genesis_anchor(&chain);
+        let txs = vec![
+            transfer(1, 0),
+            sign_at(1, 1, proven_mint_payload(vec![0x5c; LEGIT_CT])),
+            sign_at(2, 0, sealed_spend_payload(anchor, 0x31, vec![1; 100], vec![2; 7])),
+            sign_at(2, 1, Tx::AssetBurn { asset: ASSET, amount: 1, destination: vec![9; MAX_BURN_DESTINATION] }),
+            sign_at(2, 2, Tx::AssetRegister { asset: H256([3; 32]), symbol: "USDC".into(), decimals: 6, policy: Default::default() }),
+            unsigned_transfer(1, 3),
+        ];
+        for t in &txs {
+            assert_eq!(tx_encoded_len(t), bincode::serialize(t).unwrap().len());
+        }
+        let sum: usize = txs.iter().map(tx_encoded_len).sum();
+        let batch = crate::batch::Batch {
+            parent_app_hash: [0; 32],
+            txs,
+            rotations: vec![],
+            agg_proof: vec![0xE0; 1000],
+            set_changes: vec![],
+        };
+        // the v1 framing: the parent hash, the tx list's length, the txs, the (empty) rotation
+        // list's length, the aggregate's length and bytes
+        assert_eq!(batch.encode().len(), 32 + 8 + sum + 8 + 8 + 1000);
+    }
+
+    /// Both restore paths drop a pending tx the field and size rules refuse and keep the
+    /// good ones — the snapshot's pool through `restore_unchecked` (no chain checks, as before)
+    /// and the WAL, written and read back by a real `NodeStore`, through `restore_admitted` (the
+    /// live door, as before). KILL: drop the `field_bounds` call from either and the refused
+    /// frames come back into the pool.
+    #[test]
+    fn restore_drops_pending_txs_the_rules_refuse() {
+        let chain = mini_chain(2);
+        let good = transfer(1, 0);
+        let next = transfer(1, 1);
+        let bad_symbol = sign_at(2, 0, Tx::AssetRegister {
+            asset: H256([3; 32]),
+            symbol: "1BAD".into(),
+            decimals: 6,
+            policy: Default::default(),
+        });
+        let long_destination = sign_at(2, 1, Tx::AssetBurn {
+            asset: ASSET,
+            amount: 1,
+            destination: vec![0; MAX_BURN_DESTINATION + 1],
+        });
+        let mut oversize = unsigned_transfer(2, 2);
+        oversize.payload = Tx::MintToPool {
+            asset: ASSET,
+            value: 1,
+            commitment: H256([6; 32]),
+            proof: vec![0; MAX_TX_BYTES],
+            stealth_ct: vec![],
+        };
+        assert!(tx_encoded_len(&oversize) > MAX_TX_BYTES);
+        // the snapshot path: the good tx inserted unchecked, the three others dropped and counted
+        let mut mp = Mempool::new(16);
+        let image = vec![bad_symbol.clone(), good.clone(), long_destination.clone(), oversize];
+        assert_eq!(mp.restore_unchecked(image), (1, 3));
+        assert_eq!(mp.len(), 1);
+        assert!(mp.ids.contains(&txid(&good)));
+        // a duplicate is still suppressed, and counted as neither
+        assert_eq!(mp.restore_unchecked(vec![good.clone()]), (0, 0));
+        // the WAL path: the frames as `wal_append` wrote them, replayed through the door
+        let home = std::env::temp_dir().join(format!(
+            "hk-wal-restore-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let store = crate::store::NodeStore::open(&home).expect("store opens");
+        for t in [&bad_symbol, &good, &long_destination, &next] {
+            store.wal_append(t).expect("WAL append");
+        }
+        let mut mp = Mempool::new(16);
+        assert_eq!(mp.restore_admitted(store.wal_load(), &chain), (2, 2));
+        assert_eq!(mp.iter().map(|t| (t.sender, t.nonce)).collect::<Vec<_>>(), vec![(acct(1), 0), (acct(1), 1)]);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The byte bounds nest, and the reasoning behind `MAX_TX_BYTES` holds against the
+    /// serializers themselves. The shortest `hk_submitTx` request for a shield (32-byte ids of
+    /// zero bytes, zero numbers, the empty stealth field left out — the door accepts that)
+    /// grows two characters per proof byte while its block encoding grows one, so the largest
+    /// shield an 8,388,608-byte request can carry is 4,194,276 B, under the cap. KILL: raise
+    /// `MAX_TX_BYTES` to the block budget, the budget past the frame, or the cap's reasoning
+    /// past what the door carries.
+    #[test]
+    fn byte_bounds_nest_under_the_proposal_frame() {
+        use crate::batch::{MAX_BATCH_TX_BYTES, MAX_TXS_PER_BLOCK, PROPOSAL_HEADROOM};
+        assert!(MAX_TX_BYTES < MAX_BATCH_TX_BYTES);
+        assert!(
+            MAX_BATCH_TX_BYTES + crate::rpc::MAX_BUNDLE_AGG_BYTES + PROPOSAL_HEADROOM <= crate::state::MAX_PROPOSAL_BYTES
+        );
+        // a block of `MAX_TXS_PER_BLOCK` signed transfers fits the budget: the count binds first
+        let t = transfer(1, 0);
+        assert_eq!(tx_encoded_len(&t), 24_748);
+        assert!(MAX_TXS_PER_BLOCK * tx_encoded_len(&t) <= MAX_BATCH_TX_BYTES);
+        // the largest shield the JSON door carries
+        let shield = |proof_len: usize| SignedTx {
+            sender: H256([0; 32]),
+            nonce: 0,
+            payload: Tx::MintToPool {
+                asset: H256([0; 32]),
+                value: 0,
+                commitment: H256([0; 32]),
+                proof: vec![0; proof_len],
+                stealth_ct: vec![],
+            },
+            next_auth: H256([0; 32]),
+            lamport_pk: vec![0; PK_LEN],
+            sig: vec![0; SIG_LEN],
+        };
+        let shortest = |t: &SignedTx| serde_json::to_string(t).unwrap().replace(",\"stealth_ct\":\"\"", "");
+        let empty = shield(0);
+        let back: SignedTx =
+            serde_json::from_str(&shortest(&empty)).expect("the door takes a shield without its empty stealth field");
+        assert_eq!(tx_encoded_len(&back), tx_encoded_len(&empty));
+        // `{"method":"hk_submitTx","params":{"tx":` + the tx + `}}`
+        let request = |t: &SignedTx| 41 + shortest(t).len();
+        assert_eq!(request(&shield(10)), request(&empty) + 20, "two characters per proof byte");
+        assert_eq!(tx_encoded_len(&shield(10)), tx_encoded_len(&empty) + 10, "one byte per proof byte");
+        let carried = (8_388_608 - request(&empty)) / 2;
+        assert_eq!(tx_encoded_len(&empty) + carried, 4_194_276);
+        assert!(tx_encoded_len(&empty) + carried <= MAX_TX_BYTES);
+    }
+
+    /// v0.19.12: the pool's byte caps. The running totals follow every way a tx
+    /// enters or leaves the pool — admission through each door, the commit prunes (applied and
+    /// refused) — and admission past the pool's byte cap or the sender's quota is refused with
+    /// "retry later", nothing indexed; both restore paths stop at the same caps and count those
+    /// drops. KILL: drop `byte_room` or `sender_room` from `gate_with_id` (the over-cap tx
+    /// admits), subtract nothing in `unindex` (the totals stay up after the prunes and the next
+    /// admission is refused), or let `insert_restored` skip a cap (the snapshot restore keeps a
+    /// fourth tx).
+    #[test]
+    fn the_pool_holds_its_byte_caps_through_admission_prune_and_restore() {
+        let chain = mini_chain(3);
+        let size = tx_encoded_len(&transfer(1, 0));
+        // room for three transfers in the pool and two per sender
+        let caps = || Mempool::with_caps(16, 3 * size, 2 * size);
+        let totals = |mp: &Mempool| {
+            let mut per: HashMap<AccountId, usize> = HashMap::new();
+            for t in mp.iter() {
+                *per.entry(t.sender).or_insert(0) += tx_encoded_len(t);
+            }
+            (mp.iter().map(tx_encoded_len).sum::<usize>(), per)
+        };
+        let mut mp = caps();
+        mp.try_admit(transfer(1, 0), &chain).unwrap();
+        mp.try_admit(transfer(1, 1), &chain).unwrap();
+        // the sender's quota: a third pending tx of account 1 waits
+        assert_eq!(
+            mp.try_admit(transfer(1, 2), &chain),
+            Err(AdmitError::SenderBytesFull { pending: 2 * size, size, max: 2 * size })
+        );
+        mp.try_admit(transfer(2, 0), &chain).unwrap();
+        assert_eq!((mp.bytes, mp.sender_bytes.clone()), totals(&mp));
+        assert_eq!(mp.bytes, 3 * size);
+        // the pool's byte cap: a sender with nothing pending waits too, through every door
+        let t = transfer(3, 0);
+        let want: Result<[u8; 32], AdmitError> =
+            Err(AdmitError::PoolBytesFull { pending: 3 * size, size, max: 3 * size });
+        assert_eq!(mp.try_admit(t.clone(), &chain), want);
+        assert_eq!(mp.try_admit_verified(t.clone(), &chain, &Mempool::envelope_verdict(&t)), want);
+        assert_eq!(mp.try_admit_verified_with_id(t.clone(), txid(&t), &chain, &Mempool::envelope_verdict(&t)), want);
+        assert_eq!(mp.len(), 3);
+        assert!(!mp.keys.contains_key(&(acct(3), 0)));
+        // the reasons a wallet reads, and their kind
+        let pool_full = AdmitError::PoolBytesFull { pending: 3 * size, size, max: 3 * size };
+        assert_eq!(
+            pool_full.as_str(),
+            format!("mempool full ({} B pending + {size} B, max {} B) — retry later", 3 * size, 3 * size)
+        );
+        assert!(AdmitError::SenderBytesFull { pending: 0, size: 1, max: 0 }.as_str().contains("retry later"));
+        assert!(pool_full.is_capacity() && AdmitError::Full.is_capacity());
+        assert!(!AdmitError::TxTooLarge { len: 1 }.is_capacity() && !AdmitError::DuplicateTx.is_capacity());
+        // the prunes give the bytes back: an applied slot …
+        assert_eq!(mp.remove_included(&[(acct(1), 0)]), 1);
+        assert_eq!((mp.bytes, mp.sender_bytes.clone()), totals(&mp));
+        assert_eq!(mp.bytes, 2 * size);
+        mp.try_admit(t, &chain).expect("room again once a tx left");
+        // … and a refused tx's identical copy
+        let two = transfer(2, 0);
+        assert_eq!(mp.remove_refused(&[((acct(2), 0), txid(&two))]), 1);
+        assert_eq!((mp.bytes, mp.sender_bytes.clone()), totals(&mp));
+        // everything out: no bytes, no per-sender entry left
+        assert_eq!(mp.remove_included(&[(acct(1), 1), (acct(3), 0)]), 2);
+        assert_eq!((mp.len(), mp.bytes), (0, 0));
+        assert!(mp.sender_bytes.is_empty());
+        assert_nothing_indexed(&mp);
+        // both restore paths stop at the same caps and count those drops: account 1's third tx
+        // (its quota) and account 3's (the pool's bytes)
+        let frames = vec![transfer(1, 0), transfer(1, 1), transfer(1, 2), transfer(2, 0), transfer(3, 0)];
+        let mut snap = caps();
+        assert_eq!(snap.restore_unchecked(frames.clone()), (3, 2));
+        assert_eq!((snap.bytes, snap.sender_bytes.clone()), totals(&snap));
+        assert_eq!(snap.bytes, 3 * size);
+        let mut wal = caps();
+        assert_eq!(wal.restore_admitted(frames, &chain), (3, 2));
+        assert_eq!(
+            wal.iter().map(|t| (t.sender, t.nonce)).collect::<Vec<_>>(),
+            vec![(acct(1), 0), (acct(1), 1), (acct(2), 0)]
+        );
+        assert_eq!((wal.bytes, wal.sender_bytes.clone()), totals(&wal));
+        // the live defaults
+        assert_eq!((Mempool::new(4).byte_cap, Mempool::new(4).sender_cap), (MAX_POOL_BYTES, MAX_SENDER_PENDING_BYTES));
+        assert_eq!(MAX_SENDER_PENDING_BYTES, 4 * MAX_TX_BYTES);
+        assert_eq!(MAX_POOL_BYTES, 256 * 1024 * 1024);
+    }
+
+    /// v0.19.12: each pending tx's txid is stored when it enters the pool, through
+    /// any door or the restore path, in pool order — `pending_ids`, what `hk_getMempool` reads,
+    /// equals hashing every pending tx, also after a prune. KILL: store any other id, or keep the
+    /// ids apart from the queue's order.
+    #[test]
+    fn pending_ids_are_the_txids_in_pool_order() {
+        let chain = mini_chain(3);
+        let mut mp = Mempool::new(16);
+        let a = transfer(1, 0);
+        mp.try_admit(a.clone(), &chain).unwrap();
+        let b = transfer(1, 1);
+        mp.try_admit_verified(b.clone(), &chain, &Mempool::envelope_verdict(&b)).unwrap();
+        let c = transfer(2, 0);
+        mp.try_admit_verified_with_id(c.clone(), txid(&c), &chain, &Mempool::envelope_verdict(&c)).unwrap();
+        assert_eq!(mp.restore_unchecked(vec![unsigned_transfer(3, 0)]), (1, 0));
+        let hashed = |mp: &Mempool| mp.iter().map(txid).collect::<Vec<_>>();
+        assert_eq!(mp.pending_ids().copied().collect::<Vec<_>>(), hashed(&mp));
+        assert_eq!(mp.pending_ids().next(), Some(&txid(&a)));
+        assert_eq!(mp.remove_included(&[(acct(1), 0)]), 1);
+        assert_eq!(mp.pending_ids().copied().collect::<Vec<_>>(), hashed(&mp));
+        assert_eq!(mp.len(), 3);
     }
 }

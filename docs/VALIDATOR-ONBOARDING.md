@@ -1,6 +1,6 @@
 # HashKinetics — Validator Onboarding (public testnet)
 
-**v0.19.6 · testnet-1.** Run **v0.19.6** (the current release, 2026-10-06, security — R17: nine findings fixed; v0.19.6 carries a consensus rule from height 1,872,500 — be on it before then; restart once, with a gap; previously v0.19.4, 2026-09-22, client-only, security — R16: the signer's state write is durable; restart once, with a gap; before it v0.19.3, 2026-09-13, client-only: the gossipsub subscription re-announce — a restarted seat always learns its peers' topic subscriptions, `docs/INCIDENTS.md` #12; `hk_getPeers` shows `reconnects` and `last_connection_secs`; no activation height) — **v0.19.0 remains the consensus minimum since height 190,000** (2026-09-09 — **a consensus change with an activation by height: every node must run ≥ v0.19.0 from testnet-1 height 190,000** — P6, one shielded pool per asset, `docs/P6-MULTI-ASSET-POOL.md`; a node still on ≤ v0.18.2 follows the chain past the height and islands at the first second-asset shield, §8b) — v0.18.2 (2026-09-08, client-only) made every consensus signature cost 179 µs instead of ~450 ms and paces blocks to a 1 s floor — **every node must run ≥ v0.18.1 since testnet-1 height 110,000** (v0.18.0, which named height 200,000, is withdrawn — never run it), the G1 bootstrap-governance activation: at that height the four genesis seats are re-weighted to voting power 4 by rule (§8a); a node still on ≤ v0.17 stops following there, loudly; since v0.17.0 the node verifies STARKs with a verify-only client — no proving engine at start-up, so a restart costs seconds, not minutes, and the resident set is tens of MiB (measured on the founding seats 2026-09-06: 54–59 MiB, start → RPC 6–16 s; any node reports its own in `hk_chainInfo.process`); the kit ships the verifying keys, so your node never depends on our prover; since v0.15.2 your node advertises its version to its peers and appears on the public roll call, `hk_getPeers` / [hashkinetics.org/network#live](https://www.hashkinetics.org/network#live), the moment it connects). Minimum to *sync* **testnet-1** (`hashkinetics-1-4e4ea68d`) is v0.13.0 — the fee policy lives in its genesis, so older nodes cannot decode it — but the network activates appended transaction kinds by height: the first validator-set change (v0.14.0), the first issued-asset transaction (v0.15.0) and the G1 activation at height 110,000 (v0.18.1) each make their release the minimum for every node from that block on (an older node halts there, loudly, by design). A node that wants a seat must run the current release before it is admitted. (staging-1 is retired and archived: `networks/staging-1/`.) How an external operator joins a HashKinetics network: generate a key,
+**v0.19.12 · testnet-1.** Run **v0.19.12** (the current release, 2026-11-16, security, client-only — proposal handling, transaction admission and block reads hardened against issues reported privately, the details once every seat has upgraded; a damaged signer state file retires its tree (§5); sealed key files open only within the KDF bounds (§5a); a validator restarted in the middle of a height finishes it — a node stuck that way on an older release recovers when restarted on this one; no consensus rule, no activation height, your peer id does not change if you run v0.19.10 or later (from an older release it changes once, as at v0.19.10); restart once, with a gap. Before it, newest first: v0.19.11, 2026-11-08, security, client-only — the aggregation door `hk_submitBundle` is closed by default; v0.19.10, 2026-11-03, security, client-only — the abstain-while-behind evidence counts only signature-verified votes, and every node's peer id changed once; v0.19.9, 2026-10-22, security, client-only — a malformed consensus signature is refused, never a panic; v0.19.8, 2026-10-09, security — PayWord settlement bounded, a consensus rule active since height 2,038,500, so **every node must run ≥ v0.19.8 from there**; v0.19.7 was built and never released — its activation height passed before any seat ran it, and v0.19.8 renamed the height; v0.19.6, 2026-10-06, security — R17: nine findings fixed, a consensus rule active since height 1,872,500; previously v0.19.4, 2026-09-22, client-only, security — R16: the signer's state write is durable; restart once, with a gap; before it v0.19.3, 2026-09-13, client-only: the gossipsub subscription re-announce — a restarted seat always learns its peers' topic subscriptions, `docs/INCIDENTS.md` #12; `hk_getPeers` shows `reconnects` and `last_connection_secs`; no activation height) — **v0.19.0 became the consensus minimum at height 190,000** (2026-09-09 — **a consensus change with an activation by height: every node must run ≥ v0.19.0 from testnet-1 height 190,000** — P6, one shielded pool per asset, `docs/P6-MULTI-ASSET-POOL.md`; a node still on ≤ v0.18.2 follows the chain past the height and islands at the first second-asset shield, §8b) — v0.18.2 (2026-09-08, client-only) made every consensus signature cost 179 µs instead of ~450 ms and paces blocks to a 1 s floor — **every node must run ≥ v0.18.1 since testnet-1 height 110,000** (v0.18.0, which named height 200,000, is withdrawn — never run it), the G1 bootstrap-governance activation: at that height the four genesis seats are re-weighted to voting power 4 by rule (§8a); a node still on ≤ v0.17 stops following there, loudly; since v0.17.0 the node verifies STARKs with a verify-only client — no proving engine at start-up, so a restart costs seconds, not minutes, and the resident set is tens of MiB (measured on the founding seats 2026-09-06: 54–59 MiB, start → RPC 6–16 s; any node reports its own in `hk_chainInfo.process`); the kit ships the verifying keys, so your node never depends on our prover; since v0.15.2 your node advertises its version to its peers and appears on the public roll call, `hk_getPeers` / [hashkinetics.org/network#live](https://www.hashkinetics.org/network#live), the moment it connects). Minimum to *sync* **testnet-1** (`hashkinetics-1-4e4ea68d`) is v0.13.0 — the fee policy lives in its genesis, so older nodes cannot decode it — but the network activates appended transaction kinds by height: the first validator-set change (v0.14.0), the first issued-asset transaction (v0.15.0) and the G1 activation at height 110,000 (v0.18.1) each make their release the minimum for every node from that block on (an older node halts there, loudly, by design). A node that wants a seat must run the current release before it is admitted. (staging-1 is retired and archived: `networks/staging-1/`.) How an external operator joins a HashKinetics network: generate a key,
 send one public JSON blob, receive genesis, start. Every consensus signature you will ever
 produce is hash-based (LMS/HSS over SHAKE-256 under a stateless SLH-DSA-192s root) — you are
 operating post-quantum BFT.
@@ -14,7 +14,7 @@ operating post-quantum BFT.
   through v0.16.1 the node held ~6.7 GB because it built the proof-system's *proving* engine just
   to verify. Check any node yourself: `hk_chainInfo.process.rss_bytes`),
   20 GB+ disk (the node is durable: per-height block log + snapshots — plan for growth).
-- **CPU matters — fixed in v0.18.2; run the current release, v0.19.6 (learned from seat #1, 2026-09-08 — thanks to Eddy's
+- **CPU matters — fixed in v0.18.2; run the current release, v0.19.12 (learned from seat #1, 2026-09-08 — thanks to Eddy's
   measurements).** Every proposal, prevote and precommit is a hash-based HSS signature. In v0.18.1 each one
   cost ~0.45 s median on a typical server core (447.7 ms median, 787 ms p95 measured on the sources): the
   vendored signature crate rejected the node's authentication-path cache on every call and rebuilt the
@@ -148,6 +148,19 @@ node and tell us on Discord before it signs again. Keep the state file on the sa
 log, on storage that honours fsync (a cloud persistent disk, a real SSD — not a VM with write-back
 caching that ignores flushes), and never restore it from a backup or snapshot.
 
+**A damaged signer state file retires its tree (v0.19.12).** If a `consensus_state*.bin` your node
+finds at start or at a key rotation cannot be read, is truncated or has the wrong length, claims more
+leaves than its tree holds, or belongs to another key, the node neither resumes from it nor refuses
+to start. It keeps the bytes beside the file as `<file name>.damaged-<unix seconds>` (when it can read them), rewrites the
+file as a used-up tree and logs one error line naming the file and the defect (`consensus signer
+state file … is damaged or not this key's`). That tree never signs again. If it held your current
+key, `hk_chainInfo.signer.remaining` reads 0, and within about a minute your node issues its own
+rotation certificate and pushes it to its gossip peers (`[hk_rpc] gossip_peers`); with none
+configured, run `hk-node issue-rotation` and submit the certificate through another live
+validator's firewalled RPC (§7). When the certificate commits, the node votes on a fresh tree with
+no restart. Keep any `.damaged-…` copy and tell us on Discord. Never restore a signer state file
+from a backup or snapshot, and never copy one between machines.
+
 ### 5a · Keys at rest (v0.16.0, optional but recommended)
 
 `priv_validator_key.json` is the SLH-DSA root seed — everything (votes, rotations,
@@ -179,8 +192,17 @@ card manages tens of guesses per second, not billions — and the passphrase is 
 trusted: `key-seal` refuses fewer than 12 characters (unless it is a 4+-word phrase), common
 words with decoration, keyboard walks and repeats. `hk-node passphrase-new` prints seven
 random words (63 bits): at this KDF cost that is millions of GPU-years. `HK_SEAL_M_KIB` /
-`HK_SEAL_T` raise or lower the profile for a new seal (floor 64 MiB / t=3; a small host can
-use 128–256 MiB); a file always opens with the parameters it was sealed with. The KDF runs
+`HK_SEAL_T` raise or lower the profile for a new seal (floor 64 MiB / t=3, ceiling 2 GiB /
+t=64 since v0.19.12 — a small host can use 128–256 MiB); a file opens with its own
+parameters only within the floor and ceiling (64 MiB … 2 GiB, t 3 … 64, p 1 … 16, and
+m ≥ 8·p; HR-10, v0.19.12 — a swapped envelope can neither cheapen a guess nor make the node
+spend more than the ceiling before it has authenticated anything), and a save never adopts a file this
+process did not open (every re-seal the node or the CLI writes verifies the file it replaces
+first). The default profile (512 MiB, t=4, p=4) is inside the bounds. **Before you upgrade:**
+a `priv_validator_key.json` sealed above 2 GiB of Argon2id memory by v0.16.0–v0.19.11 (only
+possible with `HK_SEAL_M_KIB` above 2097152) is refused by name by v0.19.12, so the node does
+not start on it — unseal it with the binary that sealed it (`hk-node key-unseal <HOME>`)
+before upgrading, then re-seal it with v0.19.12 (`hk-node key-seal <HOME>`). The KDF runs
 once per process — the node derives at start and never again.
 
 **Second factor (optional, recommended for seats):** `hk-node keyfile-new /etc/hk/seat.key`
@@ -250,9 +272,10 @@ matches other validators'. On restarts you'll also see
   optional arguments are for a chain past its rotation-v2 height (v0.19.6, R17 L-2 —
   testnet-1's is not named yet): `VALID_FROM_HEIGHT` = `hk_chainInfo.height + 1` read
   on the node you will submit to, and the chain id; a node behind the one you read the
-  tip from refuses the certificate as "past its activation height". Submit through
-  YOUR OWN node or a validator you trust over a firewalled RPC, never the public
-  endpoint (which refuses them with 403 since 2026-11-08): `hk_submitRotation` / `hk_submitSetChange` allow two root-signature
+  tip from refuses the certificate as "past its activation height". Submit it through
+  a live validator's firewalled RPC: the certificate rides that node's next proposal,
+  so your own node only while its tree can still sign, otherwise a validator you trust.
+  Never the public endpoint, which refuses it (HTTP 403 since 2026-11-08): `hk_submitRotation` / `hk_submitSetChange` allow two root-signature
   verifies in flight per node and answer `busy` past that, which a flood on a public
   endpoint can hold indefinitely (`docs/RPC.md` "Limits and refusals").
 - **Syncing across rotation history works (v0.10.7):** commit certificates are
@@ -309,7 +332,7 @@ certificate, one seat per change with a receipt — with at least four external 
 
 ## 8 · From observer to seat (v0.14.0; run the current release)
 
-A seat is admitted on the running chain by a `SetChangeCert` approved by more than ⅔ of the current seats' root keys; it takes effect one height after it commits and your node starts voting with no restart. Preconditions: your observer runs the current release (v0.19.6; ≥ v0.19.0 is the consensus minimum since height 190,000 and ≥ v0.19.6 from height 1,872,500 — the admission certificate rides a v2-framed block, and issued-asset transactions follow), is at the tip with the canonical `app_hash`, ran with `HK_PROVER_URL` from the first block (a node on this genesis refuses to start without the verifier since v0.14.0), and you sent `validator.json` (public halves only) to validators@hashkinetics.org. Procedure and receipts: `docs/V1-VALIDATOR-SET-CHANGES.md`.
+A seat is admitted on the running chain by a `SetChangeCert` approved by more than ⅔ of the current seats' root keys; it takes effect one height after it commits and your node starts voting with no restart. Preconditions: your observer runs the current release (v0.19.12; ≥ v0.19.0 is the consensus minimum since height 190,000, ≥ v0.19.6 from height 1,872,500 and ≥ v0.19.8 from height 2,038,500 — the admission certificate rides a v2-framed block, and issued-asset transactions follow), is at the tip with the canonical `app_hash`, ran with `HK_PROVER_URL` from the first block (a node on this genesis refuses to start without the verifier since v0.14.0), and you sent `validator.json` (public halves only) to validators@hashkinetics.org. Procedure and receipts: `docs/V1-VALIDATOR-SET-CHANGES.md`.
 
 **One key, one home (learned from seat #7, 2026-09-07).** The node you START must be the home whose `validator.json` was seated — the file `keygen` wrote next to that home's `priv_validator_key.json`. The kit's example key is named `my-observer`; if you ran `keygen` a second time to produce the `validator.json` you sent, the node running under the observer key holds a seat it cannot sign for: `hk_chainInfo.signer.remaining` sits at 32,768 forever and your proposer slot times out every seventh height. Check the start line — `journalctl -u hk-node | grep -m1 "Starting HashKinetics node"` prints `address=…`, which must equal the address in `hk_getValidators`. Fix: stop, move the observer's `consensus_state*.bin` aside (a key that never signed spent no leaf), put the seated `priv_validator_key.json` in the running home, keep `blocks/`, `snapshot*.bin`, `index3.bin`, `config` and `genesis`, start. There is no "activate the signer" step: a node whose key is in the set signs by itself once it is within 20 heights of the tip (R8 abstain-while-behind keeps a lagging hash-based signer silent on purpose).
 

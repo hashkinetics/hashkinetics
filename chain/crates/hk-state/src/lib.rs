@@ -1014,7 +1014,11 @@ impl State {
             self.mandates.insert(node)?;
         }
         if parent.is_none() {
-            // Root: the creator is the funding account for the whole tree.
+            // Root: the creator is the funding account for the whole tree, and `holder` is
+            // whatever the payload named — the two are not checked against each other
+            // (HR-5). A root held by another account is authorized by that holder alone;
+            // the funder has no verb over it until a funder-side revoke lands as a
+            // consensus change. `hk_getMandate` shows both.
             self.root_funding.insert(id, *sender);
         }
         Ok(vec![Event::MandateCreated { id }])
@@ -1627,6 +1631,43 @@ impl State {
             issued = issued.saturating_sub(self.fees_burned);
         }
         Some((held, issued))
+    }
+
+    /// HR-4 (v0.19.12): [`asset_conservation`](Self::asset_conservation) for EVERY registered
+    /// asset in one pass — one walk of `balances`, one walk of `channels`, then the pool and
+    /// supply terms per asset — so a registry read costs O(assets + balances + channels)
+    /// instead of O(assets × (balances + channels)). Each pair is byte-identical to the
+    /// per-asset view: the same terms in the same order, the same saturating arithmetic,
+    /// unregistered ids skipped exactly as `asset_conservation` returns `None` for them. A
+    /// read-only view — nothing here enters the commitment or the snapshot.
+    pub fn asset_conservation_all(&self) -> BTreeMap<AssetId, (Amount, Amount)> {
+        let mut out: BTreeMap<AssetId, (Amount, Amount)> = self.assets.keys().map(|id| (*id, (0, 0))).collect();
+        for ((_, a), amt) in &self.balances {
+            if let Some((held, _)) = out.get_mut(a) {
+                *held = held.saturating_add(*amt);
+            }
+        }
+        for ch in self.channels.values() {
+            if let Some((held, _)) = out.get_mut(&ch.state.asset) {
+                *held = held.saturating_add(ch.escrow_remaining);
+            }
+        }
+        for (id, (held, issued)) in out.iter_mut() {
+            if self.pool.asset == Some(*id) {
+                *held = held.saturating_add(self.pool.total_shielded);
+            }
+            if let Some(p) = self.pools.get(id) {
+                *held = held.saturating_add(p.total_shielded);
+            }
+            if let Some(info) = self.assets.get(id) {
+                let mut iss = info.supply.saturating_sub(info.burned);
+                if *id == self.fee_asset {
+                    iss = iss.saturating_sub(self.fees_burned);
+                }
+                *issued = iss;
+            }
+        }
+        out
     }
 
     /// The registry entry for an asset, by (issuer, symbol) — the runtime id rule.

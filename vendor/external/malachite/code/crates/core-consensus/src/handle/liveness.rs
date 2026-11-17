@@ -1,4 +1,5 @@
 use crate::handle::driver::apply_driver_input;
+use crate::handle::vote::verify_signed_vote;
 use crate::prelude::*;
 
 use super::signature::{verify_polka_certificate, verify_round_certificate};
@@ -185,6 +186,21 @@ where
             };
             SignedVote::new(vote_msg, signature.signature)
         };
+
+        // v0.19.12 (HK): verify each vote before it is applied, and skip the ones that fail.
+        // `verify_signed_vote` looks the signer up in the current validator set, checks
+        // the vote's signature under that validator's key and then the vote's extension
+        // when a precommit for a value carries one, and answers `false` when the signer
+        // is unknown or a check fails (each of these failures logs a warn line there).
+        // It also asserts that the vote is for the current height: the certificate's
+        // height is asserted equal to ours above, and every vote here is built from that
+        // height, so the assertion holds. A vote that passes is applied below as a
+        // `DriverInput::Vote`; a vote that fails is not applied. The rebroadcast timeout
+        // of the certificate's round is cancelled after the loop, whatever the votes were
+        // (the `perform!` below).
+        if !verify_signed_vote(co, state, &vote).await? {
+            continue;
+        }
 
         apply_driver_input(co, state, metrics, DriverInput::Vote(vote)).await?;
     }

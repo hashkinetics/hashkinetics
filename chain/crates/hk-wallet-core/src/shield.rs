@@ -344,7 +344,7 @@ impl Wallet {
         let i = f.next_ots_index;
         if i >= OTS_CAPACITY {
             return Err(WalletError::msg(format!(
-                "spend-tree exhausted ({i}/{OTS_CAPACITY} one-time leaves used) — unshield everything, then move shield.json aside to start a fresh shield master"
+                "spend-tree exhausted ({i}/{OTS_CAPACITY} one-time leaves used): the notes still in the pool under this shield master cannot be spent from it any more — keep shield.json as the record of what it held. Every unshield or pay takes one leaf, reserved before its proof is made (a failed proof or a refused submit takes one too), so rotate while more leaves remain than you hold unspent notes: unshield each note first (one leaf per note), then move shield.json aside (keep it) and shield again under a fresh master"
             )));
         }
         f.next_ots_index += 1;

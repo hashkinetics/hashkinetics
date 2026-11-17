@@ -126,6 +126,26 @@ where
         resume::Continue,
     ),
 
+    /// HK (v0.19.12): notifies the application that consensus holds a proposal for the
+    /// current height whose signature VERIFIED under the scheduled proposer's key, and that it
+    /// has no value for that proposal yet.
+    ///
+    /// Emitted in `proposal-and-parts` mode only, and meant for a context whose `Proposal`
+    /// message carries the whole value (HashKinetics: the batch bytes, which the proposal's
+    /// signature covers). The application may answer, through the host, with the
+    /// `ProposedValue` it builds from the proposal's own value (after recomputing the
+    /// value's id from its bytes); that answer reaches consensus as any other proposed
+    /// value does. No answer leaves the proposal stored without a value, as it is when
+    /// the effect is emitted.
+    ///
+    /// Resume with: [`resume::Continue`]
+    VerifiedProposal(
+        /// The proposal, its signature already verified
+        SignedProposal<Ctx>,
+        /// For resumption
+        resume::Continue,
+    ),
+
     /// Notifies the application that consensus has received a valid sync value response.
     ///
     /// Resume with: [`resume::Continue`]

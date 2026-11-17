@@ -1158,6 +1158,238 @@ fn x1_gates_reach_mandates_channels_and_the_pool() {
     org.rollback();
 }
 
+/// HR-8 (v0.19.12, documentation + this pin; no rule changed): an issuer freeze closes only
+/// the FROZEN party's own channel exit — `ChannelSettle` gates the payee, `ChannelRefund`
+/// gates the payer — for as long as the freeze lasts, and a pause closes both. Pinned here,
+/// with conservation after every step: (1) a frozen payee cannot settle, the payer's
+/// post-expiry refund still runs and returns the unsettled steps whole, after which
+/// settlement is closed for good even once the payee is unfrozen; (2) a frozen payer cannot
+/// refund, the payee still settles, and the refund runs again once the freeze is lifted;
+/// (3) a freeze of the ROOT funder reaches neither exit of a channel already open (the funder
+/// is not a channel party); (4) a channel can be opened TO an already-frozen payee (the open
+/// gates the funder only); (5) a PAUSE closes both exits — the payee's settle and the payer's
+/// refund past expiry — while it lasts, nothing leaves the escrow meanwhile, and both exits
+/// run once the asset is unpaused.
+/// KILL: gate `do_channel_settle` on the payer too, or `do_channel_refund` on the payee,
+/// and the refund of step (1) or the settle of step (2) is refused; drop either gate and the
+/// refusal that opens step (1) or step (2) passes; let either exit through a pause (a
+/// freeze-only check there) and the matching refusal of step (5) passes.
+#[test]
+fn hr8_a_freeze_closes_only_the_frozen_partys_exit() {
+    use crate::assets::derive_asset_id;
+    const M: Amount = 1_000_000;
+    let usd = h(9);
+    let mut issuer = Keychain::new(b"hr8-issuer");
+    let mut org = Keychain::new(b"hr8-org");
+    let mut agent = Keychain::new(b"hr8-agent");
+    let mut merchant = Keychain::new(b"hr8-merchant");
+    let genesis = Genesis {
+        time: 1_000,
+        accounts: vec![issuer.genesis(), org.genesis(), agent.genesis(), merchant.genesis()],
+        alloc: vec![(org.id, usd, 10 * M)],
+        fee: None,
+        assets: vec![],
+    };
+    let mut st = State::from_genesis(&genesis).unwrap();
+    let usdc = derive_asset_id(&issuer.id, "USDC.t");
+    // One tx per block, `dt` seconds after the previous one — the exits depend on expiry.
+    // `clock` = (height, time).
+    fn at(st: &mut State, clock: &mut (u64, u64), dt: u64, tx: SignedTx) -> Result<(), String> {
+        clock.0 += 1;
+        clock.1 += dt;
+        let r = st.apply_block(clock.0, clock.1, &[tx]).unwrap();
+        r.into_iter().next().unwrap().result.map(|_| ())
+    }
+    // A channel of 10 steps at 1,000 micro from `agent` to `payee` under leaf `ma`,
+    // expiring `life` seconds after its open; conservation checked once it is open.
+    #[allow(clippy::too_many_arguments)]
+    fn open(st: &mut State, clock: &mut (u64, u64), agent: &mut Keychain, payee: H256, ma: H256, usdc: H256, tip: H256, life: u64) -> H256 {
+        let nonce = st.accounts[&agent.id].nonce;
+        let id = State::derive_channel_id(&agent.id, &payee, &tip, nonce);
+        let expiry = st.time + 1 + life;
+        let tx = agent.sign(Tx::ChannelOpen { id, mandate: ma, payee, asset: usdc, tip, unit_price: 1_000, max_steps: 10, expiry });
+        assert!(at(st, clock, 1, tx).is_ok());
+        x1_held_equals_issued(st, &usdc);
+        id
+    }
+    let mut clock = (0u64, 1_000u64);
+    let reg = issuer.sign(Tx::AssetRegister { asset: usdc, symbol: "USDC.t".into(), decimals: 6, policy: x1_policy("mfp") });
+    assert!(at(&mut st, &mut clock, 1, reg).is_ok());
+    assert!(at(&mut st, &mut clock, 1, issuer.sign(Tx::AssetMint { asset: usdc, to: org.id, amount: 10 * M })).is_ok());
+    // The tree: the org funds, the agent holds the leaf and opens channels to the merchant.
+    let (m0, ma) = (h(0xC0), h(0xC1));
+    let mk = |id, parent, holder| Tx::MandateCreate {
+        id, parent, holder, asset: usdc, rate_per_sec: 0, buffer_max: 5 * M, per_tx_max: 5 * M,
+        initial_buffer: 5 * M, expiry: 10_000_000, tier: 1,
+    };
+    assert!(at(&mut st, &mut clock, 1, org.sign(mk(m0, None, org.id))).is_ok());
+    assert!(at(&mut st, &mut clock, 1, org.sign(mk(ma, Some(m0), agent.id))).is_ok());
+    let chain = PaywordChain::mint(b"hr8-payword", b"hr8-session", 10);
+    let tip = H256(chain.tip());
+    let payee = merchant.id;
+    let freeze = |issuer: &mut Keychain, who: H256, frozen: bool| issuer.sign(Tx::AssetFreeze { asset: usdc, account: who, frozen });
+    let settle = |merchant: &mut Keychain, id: H256, step: u32| {
+        merchant.sign(Tx::ChannelSettle { id, word: H256(chain.pay(step).unwrap()), step })
+    };
+
+    // (1) A frozen PAYEE: its exit (settle) is closed; the payer's refund at expiry is not —
+    //     and it sweeps the unsettled steps whole, after which settlement is closed for good.
+    let a = open(&mut st, &mut clock, &mut agent, payee, ma, usdc, tip, 100);
+    assert!(at(&mut st, &mut clock, 1, freeze(&mut issuer, merchant.id, true)).is_ok());
+    assert_eq!(at(&mut st, &mut clock, 1, settle(&mut merchant, a, 3)).unwrap_err(), "frozen by issuer");
+    merchant.rollback();
+    x1_held_equals_issued(&st, &usdc);
+    let agent_before = st.balance(&agent.id, &usdc);
+    assert!(at(&mut st, &mut clock, 200, agent.sign(Tx::ChannelRefund { id: a })).is_ok(), "the payer's exit is open");
+    assert_eq!(st.balance(&agent.id, &usdc), agent_before + 10 * 1_000, "the whole escrow, earned steps included");
+    x1_held_equals_issued(&st, &usdc);
+    assert!(at(&mut st, &mut clock, 1, freeze(&mut issuer, merchant.id, false)).is_ok());
+    assert_eq!(at(&mut st, &mut clock, 1, settle(&mut merchant, a, 3)).unwrap_err(), "channel already refunded");
+    merchant.rollback();
+    x1_held_equals_issued(&st, &usdc);
+
+    // (2) A frozen PAYER: its exit (refund) is closed even past expiry; the payee still
+    //     settles; the refund runs once the freeze is lifted.
+    let b = open(&mut st, &mut clock, &mut agent, payee, ma, usdc, tip, 100);
+    assert!(at(&mut st, &mut clock, 1, freeze(&mut issuer, agent.id, true)).is_ok());
+    assert_eq!(at(&mut st, &mut clock, 200, agent.sign(Tx::ChannelRefund { id: b })).unwrap_err(), "frozen by issuer");
+    agent.rollback();
+    x1_held_equals_issued(&st, &usdc);
+    let merchant_before = st.balance(&merchant.id, &usdc);
+    assert!(at(&mut st, &mut clock, 1, settle(&mut merchant, b, 4)).is_ok(), "the payee's exit is open");
+    assert_eq!(st.balance(&merchant.id, &usdc), merchant_before + 4 * 1_000);
+    x1_held_equals_issued(&st, &usdc);
+    assert!(at(&mut st, &mut clock, 1, freeze(&mut issuer, agent.id, false)).is_ok());
+    let agent_before = st.balance(&agent.id, &usdc);
+    assert!(at(&mut st, &mut clock, 1, agent.sign(Tx::ChannelRefund { id: b })).is_ok());
+    assert_eq!(st.balance(&agent.id, &usdc), agent_before + 6 * 1_000, "the unsettled steps come back");
+    x1_held_equals_issued(&st, &usdc);
+
+    // (3) A frozen ROOT FUNDER: neither exit of an already-open channel is touched (the
+    //     funder is not a channel party — the refund credits the payer, not the funder).
+    let c = open(&mut st, &mut clock, &mut agent, payee, ma, usdc, tip, 100);
+    assert!(at(&mut st, &mut clock, 1, freeze(&mut issuer, org.id, true)).is_ok());
+    assert!(at(&mut st, &mut clock, 1, settle(&mut merchant, c, 2)).is_ok());
+    assert!(at(&mut st, &mut clock, 200, agent.sign(Tx::ChannelRefund { id: c })).is_ok(), "the funder's freeze does not reach the channel");
+    x1_held_equals_issued(&st, &usdc);
+    assert!(at(&mut st, &mut clock, 1, freeze(&mut issuer, org.id, false)).is_ok());
+
+    // (4) The open gates the funder only: a channel can be opened TO a frozen payee, and is
+    //     closed on the payee's side from its first block.
+    assert!(at(&mut st, &mut clock, 1, freeze(&mut issuer, merchant.id, true)).is_ok());
+    let d = open(&mut st, &mut clock, &mut agent, payee, ma, usdc, tip, 100);
+    assert_eq!(at(&mut st, &mut clock, 1, settle(&mut merchant, d, 1)).unwrap_err(), "frozen by issuer");
+    merchant.rollback();
+    assert!(at(&mut st, &mut clock, 1, freeze(&mut issuer, merchant.id, false)).is_ok());
+    assert!(at(&mut st, &mut clock, 1, settle(&mut merchant, d, 1)).is_ok());
+    x1_held_equals_issued(&st, &usdc);
+
+    // (5) A PAUSE closes both exits, with nobody frozen: the payee's settle and the payer's
+    //     refund past expiry are both refused while it lasts, and the escrow stays whole —
+    //     once unpaused, the settle pays 5 steps and the refund returns the other 5.
+    let e = open(&mut st, &mut clock, &mut agent, payee, ma, usdc, tip, 100);
+    assert!(at(&mut st, &mut clock, 1, issuer.sign(Tx::AssetPause { asset: usdc, paused: true })).is_ok());
+    assert_eq!(at(&mut st, &mut clock, 1, settle(&mut merchant, e, 5)).unwrap_err(), "asset paused", "the payee's exit is closed");
+    merchant.rollback();
+    assert_eq!(at(&mut st, &mut clock, 200, agent.sign(Tx::ChannelRefund { id: e })).unwrap_err(), "asset paused", "the payer's exit is closed");
+    agent.rollback();
+    x1_held_equals_issued(&st, &usdc);
+    assert!(at(&mut st, &mut clock, 1, issuer.sign(Tx::AssetPause { asset: usdc, paused: false })).is_ok());
+    let merchant_before = st.balance(&merchant.id, &usdc);
+    assert!(at(&mut st, &mut clock, 1, settle(&mut merchant, e, 5)).is_ok(), "the payee's exit reopens");
+    assert_eq!(st.balance(&merchant.id, &usdc), merchant_before + 5 * 1_000);
+    let agent_before = st.balance(&agent.id, &usdc);
+    assert!(at(&mut st, &mut clock, 1, agent.sign(Tx::ChannelRefund { id: e })).is_ok(), "the payer's exit reopens");
+    assert_eq!(st.balance(&agent.id, &usdc), agent_before + 5 * 1_000, "the unsettled steps come back whole");
+    x1_held_equals_issued(&st, &usdc);
+}
+
+/// HR-4 (v0.19.12): the one-pass registry view `asset_conservation_all` is the per-asset
+/// view `asset_conservation`, pair for pair, on a state that exercises every term — four
+/// registered assets (one of them the fee asset, registered at genesis, with fees burned),
+/// balances in several assets, a burn, an open channel, the legacy pool pinned to a
+/// registered asset and a second per-asset pool — and it lists exactly the registry.
+/// KILL: drop any one term from `asset_conservation_all` (the channel walk, the legacy
+/// pool, the per-asset pool, the burn or the fee burn) or change its arithmetic, and one of
+/// the four pairs disagrees with `asset_conservation`.
+#[test]
+fn hr4_asset_conservation_all_matches_the_per_asset_view() {
+    use crate::assets::{derive_asset_id, AssetPolicy};
+    const M: Amount = 1_000_000;
+    let hkn = h(9); // the fee asset's id, registered at genesis as the native asset
+    let mut issuer = Keychain::new(b"hr4-issuer");
+    let mut org = Keychain::new(b"hr4-org");
+    let mut agent = Keychain::new(b"hr4-agent");
+    let merchant = Keychain::new(b"hr4-merchant");
+    let native = crate::GenesisAsset { id: hkn, symbol: "HKN".into(), decimals: 6, issuer: issuer.id, policy: AssetPolicy::default() };
+    let genesis = Genesis {
+        time: 1_000,
+        accounts: vec![issuer.genesis(), org.genesis(), agent.genesis(), merchant.genesis()],
+        alloc: vec![(org.id, hkn, 50 * M), (issuer.id, hkn, 10 * M), (agent.id, hkn, 10 * M), (merchant.id, hkn, 10 * M)],
+        fee: Some(GenesisFee { micro: 100, from_height: 1, asset: None }),
+        assets: vec![native],
+    };
+    let mut st = State::from_genesis(&genesis).unwrap();
+    st.verifier = Arc::new(JsonEchoVerifier);
+    st.multi_pool_from = 0; // a devnet: additional pools from genesis
+    let usdc = derive_asset_id(&issuer.id, "USDC.t");
+    let eur = derive_asset_id(&issuer.id, "EUR.t");
+    let fixed = derive_asset_id(&issuer.id, "FIXED");
+    let mut height = 0u64;
+    let mut next = || { height += 1; height };
+
+    // Three runtime registrations beside the genesis one, with balances in each of them.
+    for (asset, sym, flags) in [(usdc, "USDC.t", "mfps"), (eur, "EUR.t", "mfps"), (fixed, "FIXED", "m")] {
+        let reg = issuer.sign(Tx::AssetRegister { asset, symbol: sym.into(), decimals: 6, policy: x1_policy(flags) });
+        assert!(x1_apply(&mut st, next(), reg).is_ok());
+        for (to, amount) in [(org.id, 10 * M), (agent.id, 3 * M), (merchant.id, M)] {
+            let mint = issuer.sign(Tx::AssetMint { asset, to, amount });
+            assert!(x1_apply(&mut st, next(), mint).is_ok());
+        }
+    }
+    // A burn; the fee burns ride every envelope above (the fee asset is registered).
+    assert!(x1_apply(&mut st, next(), agent.sign(Tx::AssetBurn { asset: eur, amount: M, destination: vec![] })).is_ok());
+    assert!(st.fees_burned > 0 && st.assets[&eur].burned == M);
+    // An open channel in USDC.t under a tree the org funds.
+    let (m0, ma) = (h(0xD0), h(0xD1));
+    let mk = |id, parent, holder| Tx::MandateCreate {
+        id, parent, holder, asset: usdc, rate_per_sec: 0, buffer_max: 5 * M, per_tx_max: 5 * M,
+        initial_buffer: 5 * M, expiry: 1_000_000, tier: 1,
+    };
+    assert!(x1_apply(&mut st, next(), org.sign(mk(m0, None, org.id))).is_ok());
+    assert!(x1_apply(&mut st, next(), org.sign(mk(ma, Some(m0), agent.id))).is_ok());
+    let tip = h(0x7A);
+    let nonce = st.accounts[&agent.id].nonce;
+    let ch = State::derive_channel_id(&agent.id, &merchant.id, &tip, nonce);
+    let open = agent.sign(Tx::ChannelOpen { id: ch, mandate: ma, payee: merchant.id, asset: usdc, tip, unit_price: 1_000, max_steps: 10, expiry: 1_000_000 });
+    assert!(x1_apply(&mut st, next(), open).is_ok());
+    assert_eq!(st.channels[&ch].escrow_remaining, 10_000);
+    // The legacy pool pins the first asset shielded (USDC.t); EUR.t gets its own pool.
+    let (_, _, usdc_shield) = p6_shield(usdc, 2 * M, b"hr4-master-usdc", 0x41);
+    assert!(x1_apply(&mut st, next(), org.sign(usdc_shield)).is_ok());
+    let (_, _, eur_shield) = p6_shield(eur, M, b"hr4-master-eur", 0x42);
+    assert!(x1_apply(&mut st, next(), org.sign(eur_shield)).is_ok());
+    assert_eq!(st.pool.asset, Some(usdc));
+    assert!(st.pools.contains_key(&eur) && !st.pools.contains_key(&usdc));
+
+    let all = st.asset_conservation_all();
+    assert_eq!(all.len(), 4);
+    assert_eq!(all.keys().copied().collect::<Vec<_>>(), st.assets.keys().copied().collect::<Vec<_>>(), "exactly the registry");
+    for (id, pair) in &all {
+        assert_eq!(Some(*pair), st.asset_conservation(id), "asset {}", hex::encode(id.0));
+        assert_eq!(pair.0, pair.1, "I5' holds for {}", hex::encode(id.0));
+    }
+    // Every term left a mark: the fee burn (issued below the allocation), the burn, the
+    // escrow and both pools are inside the matching pairs.
+    assert_eq!(all[&hkn].1, 80 * M - st.fees_burned);
+    assert_eq!(all[&eur].1, 14 * M - M);
+    assert_eq!(all[&usdc].0, st.balance(&org.id, &usdc) + st.balance(&agent.id, &usdc) + st.balance(&merchant.id, &usdc) + 10_000 + 2 * M);
+    assert_eq!(st.shielded_of(&eur), M);
+    // An unregistered asset is in neither view.
+    let unregistered = h(0x9A);
+    assert!(!all.contains_key(&unregistered) && st.asset_conservation(&unregistered).is_none());
+}
+
 // ---------------------------------------------------------------------------------
 // P6 — one shielded pool per asset (docs/P6-MULTI-ASSET-POOL.md)
 // ---------------------------------------------------------------------------------

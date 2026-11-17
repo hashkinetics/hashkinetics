@@ -64,6 +64,11 @@ impl HkSigningProvider {
     }
 }
 
+/// v0.19.12: is the id a proposal carries the hash of the bytes it carries?
+fn value_id_is_hash_of_bytes(proposal: &HkProposal) -> bool {
+    crate::context::HkValue::new(proposal.value.txs.clone()).id() == proposal.value.id()
+}
+
 #[async_trait]
 impl SigningProvider<HkContext> for HkSigningProvider {
     async fn sign_vote(&self, vote: HkVote) -> Result<SignedVote<HkContext>, Error> {
@@ -85,6 +90,17 @@ impl SigningProvider<HkContext> for HkSigningProvider {
     }
 
     async fn sign_proposal(&self, proposal: HkProposal) -> Result<SignedProposal<HkContext>, Error> {
+        // v0.19.12: never sign a proposal whose value id is not the hash of the bytes
+        // it carries (see `verify_signed_proposal`). No path of this node builds one; if one
+        // ever reached here, not proposing is the safe outcome and no leaf is spent on it.
+        if !value_id_is_hash_of_bytes(&proposal) {
+            tracing::error!(
+                height = %proposal.height,
+                round = %proposal.round,
+                "refusing to sign a proposal whose value id is not the hash of its bytes"
+            );
+            return Err(Error::new());
+        }
         let signature = self.sign(&proposal.to_sign_bytes())?;
         Ok(SignedProposal::new(proposal, signature))
     }
@@ -95,6 +111,23 @@ impl SigningProvider<HkContext> for HkSigningProvider {
         signature: &HkSig,
         public_key: &HkPub,
     ) -> Result<VerificationResult, Error> {
+        // v0.19.12: a proposal whose value id is not the hash of the bytes it carries is not a
+        // valid proposal. The bytes inside the proposal ARE the value, so the binding is checked
+        // here, where every proposal is verified (from the network, from the future-height
+        // buffer, from the WAL). A proposal is answered as valid only when both hold: the id
+        // is the hash of the bytes, and the signature over the sign-bytes verifies under
+        // `public_key`. `sign_proposal` above refuses to sign a proposal whose id fails the
+        // same check. An honest proposer builds its value with `HkValue::new`, which makes
+        // the id that hash.
+        if !value_id_is_hash_of_bytes(proposal) {
+            tracing::warn!(
+                height = %proposal.height,
+                round = %proposal.round,
+                proposer = %proposal.validator_address,
+                "proposal refused: its value id is not the hash of its bytes"
+            );
+            return Ok(VerificationResult::from_bool(false));
+        }
         Ok(VerificationResult::from_bool(hashsig_scheme::verify(
             &proposal.to_sign_bytes(),
             signature,
@@ -312,6 +345,58 @@ mod tests {
             assert!(out_rx.recv().unwrap(), "the task is alive and verifies the next good vote");
             tx.send(None).unwrap();
             worker.join().expect("the verifying task ended without a panic");
+        });
+    }
+
+    /// v0.19.12: a proposal whose value id is not the hash of the bytes it carries is refused
+    /// at verification even when the proposer's own key signed exactly those sign-bytes, and
+    /// this node refuses to sign one. The honest proposal over the same id verifies.
+    /// Kill: remove the id check from `verify_signed_proposal` and the mismatched proposal
+    /// verifies.
+    #[test]
+    fn a_proposal_whose_id_is_not_the_hash_of_its_bytes_is_invalid_and_is_not_signed() {
+        on_big_stack(|| {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            rt.block_on(async {
+                let sk = HkPriv::from_seed([25u8; 32]);
+                let pk = sk.public();
+                let addr = address_of(&pk);
+                let provider = HkSigningProvider::new(sk);
+
+                let honest = HkProposal::new(
+                    HkHeight::new(7),
+                    Round::new(0),
+                    crate::HkValue::new(Bytes::from_static(b"the bytes")),
+                    Round::Nil,
+                    addr,
+                );
+                let mut mismatched_value = crate::HkValue::new(Bytes::from_static(b"other bytes"));
+                mismatched_value.id = honest.value.id();
+                let mismatched =
+                    HkProposal::new(HkHeight::new(7), Round::new(0), mismatched_value, Round::Nil, addr);
+
+                // Signed with the proposer's own key over these sign-bytes.
+                let sig = provider.sign(&mismatched.to_sign_bytes()).expect("sign");
+                assert!(
+                    hashsig_scheme::verify(&mismatched.to_sign_bytes(), &sig, &pk),
+                    "the raw signature verifies"
+                );
+                assert!(
+                    !provider.verify_signed_proposal(&mismatched, &sig, &pk).await.unwrap().is_valid(),
+                    "the proposal does not"
+                );
+                assert!(
+                    provider.sign_proposal(mismatched.clone()).await.is_err(),
+                    "and this node does not sign one"
+                );
+
+                let signed = provider.sign_proposal(honest.clone()).await.expect("sign the honest one");
+                assert!(provider
+                    .verify_signed_proposal(&honest, &signed.signature, &pk)
+                    .await
+                    .unwrap()
+                    .is_valid());
+            });
         });
     }
 }

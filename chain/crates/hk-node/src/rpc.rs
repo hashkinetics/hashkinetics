@@ -20,12 +20,28 @@
 //!                                                 L-2: judged by the rule at tip + 1 — domain +
 //!                                                 valid_from_height window — exactly as commit will)
 //!   hk_getAccount   {id}                      -> {found, nonce, auth_commit, balances[]}
+//!                                                 (HR-9, v0.19.12: `balances[]` is answered for an
+//!                                                 id with NO account too — found false, nonce and
+//!                                                 auth_commit null — so a credit to a never-created
+//!                                                 id is visible instead of hidden)
 //!   hk_getAsset     {asset | issuer+symbol}   -> {found, asset: {symbol, issuer, policy,
 //!                                                 supply, burned, circulating, held, conserved,
 //!                                                 paused, frozen_count}}            (X1)
-//!   hk_getAssets                              -> {count, fee_asset, assets[]}      (X1)
+//!   hk_getAssets    {from?, limit?<=1000}     -> {count, total, from, limit, next, fee_asset,
+//!                                                 assets[]}   (X1; HR-4, v0.19.12: PAGED —
+//!                                                 `count` = `total` = the whole registry, `assets[]`
+//!                                                 the page, `next` the following page's `from` or
+//!                                                 null; the conservation receipts of a page come
+//!                                                 from ONE pass over balances and channels, and one
+//!                                                 call runs at a time per node — "busy — retry")
 //!   hk_balance      {id, asset}               -> {amount}            (u128 as string)
 //!   hk_mandateAvailable {leaf, at?}           -> {available}         (string | null)
+//!   hk_getMandate   {id}                      -> {found, id, parent, root, holder, funder, asset,
+//!                                                 rate_per_sec, buffer_max, per_tx_max, buffer,
+//!                                                 last_accrual, expiry, tier, revoked}
+//!                                                 (HR-5, v0.19.12: `holder` spends and delegates;
+//!                                                 `funder` = the root's funding account, which
+//!                                                 pays — the two can differ)
 //!   hk_submitTx     {tx}                       -> {accepted, txid}
 //!   hk_getReceipt   {txid}                     -> {found, detail}
 //!   hk_getPoolInfo  {asset?}                   -> {legacy, version, asset?, root, latest_anchor,
@@ -43,7 +59,9 @@
 //! P3.0b explorer surface (store-backed — reads the durable block log, no app locks):
 //!   hk_getBlock     {height}                   -> full block: txs (public summaries) +
 //!                                                 per-tx receipts + aggregate verdict + cert
-//!   hk_getBlocks    {before?, limit?<=50}      -> newest-first block list
+//!   hk_getBlocks    {before?, limit?<=50}      -> newest-first block list (v0.19.12: plus
+//!                                                 truncated + next_before when the call's byte
+//!                                                 budget ended the page)
 //!   hk_getValidators                           -> the live validator set + power (+ queued set changes)
 //!   hk_getPeers                                -> this node's live p2p peer table (N1, v0.15.2):
 //!                                                 {self, count, inbound, outbound, public_addr,
@@ -141,6 +159,52 @@
 //!     refused tx prunes only its identical pending copy.
 //! Not in this release: verifying the aggregate at submit, a per-block byte budget in
 //! `build_batch`, any change to the state machine, the batch encoding, consensus or the store.
+//!
+//! v0.19.12 (HR-4, HR-5, HR-9; client-side, no gate, no consensus change): `hk_getAssets` is
+//! paged and computes a page's conservation receipts in ONE pass over balances and channels
+//! under the chain lock, one call in flight per node (`get_assets`, `ASSET_SCAN`);
+//! `hk_getMandate` is new (a node's holder AND funder — the two can differ for a root);
+//! `hk_getAccount` answers `balances[]` for an id with no account (a credit to a never-created
+//! id is visible); `hk_getAccountTxs` also lists a `MandateCreate` under the holder it names
+//! (HR-5: the node-local index records the holder as a counterparty — blocks indexed by this
+//! version). Nothing else on this surface changes for these three; the other changes follow.
+//!
+//! v0.19.12 (client-side, no gate, no consensus change):
+//!   * `hk_submitTx` / `hk_gossipTxs` refuse, by the tx's own bytes and before any hash
+//!     (mempool.rs `Mempool::field_bounds`), an `AssetRegister` whose symbol
+//!     fails hk-state's symbol rule — `bad asset symbol (N B; 1-16 of [A-Za-z0-9._-], letter
+//!     first)` — an `AssetBurn` whose destination is longer than 64 bytes — `burn destination too
+//!     long (N B, max 64)` — and a tx larger than `mempool::MAX_TX_BYTES` in the block encoding —
+//!     `transaction too large (N B encoded, max 4194304)`; `hk_submitBundle` also refuses a
+//!     bundle whose txs exceed one block's transaction budget (`batch::MAX_BATCH_TX_BYTES`).
+//!   * The pool holds a byte cap beside its count cap: `hk_submitTx` / `hk_gossipTxs` answer
+//!     `mempool full (P B pending + N B, max M B) — retry later` past the pool's bytes
+//!     (`mempool::MAX_POOL_BYTES`, `HK_MEMPOOL_BYTES`) and `too many bytes pending for this
+//!     sender (P B pending + N B, max M B) — retry later, once some are included` past one
+//!     sender's (`mempool::MAX_SENDER_PENDING_BYTES`).
+//!   * `hk_getBlock`, `hk_getTx` and `hk_getBlocks` share `BLOCK_READ_SLOTS` permits, taken
+//!     before any block is loaded; past them a call answers `busy: 2 block reads already in
+//!     flight — retry in a moment`.
+//!   * A tx summary (`hk_getBlock` `txs[]`, `hk_getTx` `summary`) shows at most
+//!     `SUMMARY_SYMBOL_SHOWN` (64) bytes of an asset symbol and `SUMMARY_DESTINATION_SHOWN`
+//!     (128) bytes of a burn destination (hex); when it cuts one it adds `symbol_len` /
+//!     `destination_len` (the real length) and `truncated: true` in `fields`. A value inside
+//!     the bounds — every value the chain accepts — is shown exactly as before, with no new key.
+//!   * `hk_getBlock` reuses each tx's txid for its summary and its receipt; the answer is
+//!     otherwise unchanged.
+//!   * `hk_getBlocks` stops once a call has loaded `BLOCKS_READ_BUDGET` (64 MiB) of stored
+//!     blocks and then adds `truncated: true` and `next_before` (the `before` of the call that
+//!     continues); a page inside the budget has the earlier shape.
+//!   * `hk_submitTx` / `hk_gossipTxs` answer a refusal decided by the tx's own bytes first
+//!     (`admit_one`); for a tx those checks pass, the other refusals keep their wording and
+//!     their order, with the two byte caps above and HR-2's duplicate-output refusal added.
+//!   * `hk_getAsset` holds the `ASSET_SCAN` slot `hk_getAssets` holds (its conservation scan
+//!     runs under the chain lock): past it, `busy: an asset registry scan is already in flight
+//!     — retry in a moment`.
+//!   * `hk_getAccountTxs` selects its page in one pass over the account's rows
+//!     (`get_account_txs`); the answer is unchanged, row for row.
+//!   * `hk_getMempool` answers from the txids the pool stored when each tx entered it
+//!     (`get_mempool`); the response is unchanged.
 
 use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
@@ -157,12 +221,12 @@ use hk_consensus::rotation::RotationRules;
 use hk_consensus::{HkAddress, HkValidatorSet, RotationCert, SetChange, SetChangeCert};
 use hk_crypto::lamport::{PK_LEN, SIG_LEN};
 use hk_crypto::slhdsa_adapter::{ROOT_PK_LEN, ROOT_SIG_LEN};
-use hk_primitives::{AccountId, AssetId, H256};
+use hk_primitives::{AccountId, Amount, AssetId, H256};
 use hk_state::tx::{SignedTx, Tx};
 use hk_state::PoolKey;
 
-use crate::batch::{txid, Batch, MAX_TXS_PER_BLOCK};
-use crate::mempool::{stealth_ct_over_cap, Mempool, MAX_STEALTH_CT_BYTES};
+use crate::batch::{txid, Batch, MAX_BATCH_TX_BYTES, MAX_TXS_PER_BLOCK};
+use crate::mempool::{stealth_ct_over_cap, tx_encoded_len, Mempool, MAX_STEALTH_CT_BYTES};
 use crate::state::SharedHandles;
 
 /// H1 (v0.13.2): a request must arrive within this window, headers and body — a
@@ -199,6 +263,46 @@ static BUNDLE_ADMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(
 /// wallet needs one path per spend; two slots are plenty.
 const POOL_PATH_SLOTS: usize = 2;
 static POOL_PATH: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(POOL_PATH_SLOTS);
+
+/// HR-4 (v0.19.12): `hk_getAssets` is paged — at most this
+/// many registry entries per call (`limit`, the default and the cap; `from` is the index of
+/// the first — `asset_page`). A page's conservation receipts come from one pass over the
+/// registry and every balance and channel (`asset_conservation_all`); the page bounds the
+/// entries and the JSON a call returns.
+pub(crate) const ASSET_PAGE_MAX: usize = 1_000;
+
+/// HR-4: at most ONE registry scan (`hk_getAssets`: one `asset_conservation_all` pass under the
+/// chain lock plus a page of JSON) runs at once per node, `try_acquire` like `POOL_PATH` — the
+/// rest answer "busy — retry" and never queue on the lock the commit path needs. The pass is
+/// O(assets + balances + channels) for the whole page instead of O(page × (balances +
+/// channels)); the slot keeps a flood of callers from stacking even that.
+static ASSET_SCAN: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// v0.19.12: at most this many block reads — `hk_getBlock`, `hk_getTx`, `hk_getBlocks`
+/// together — run at once per node, each holding one permit of `BLOCK_READ` from before its
+/// first block is loaded until its summaries are built (`try_acquire` like `POOL_PATH`; past them a
+/// call answers "busy — retry", `block_read_busy`, and loads nothing). Every call gives its
+/// permit back when it ends (pinned by the tests below), and the busy answer names the
+/// limit and asks the client to retry in a moment. The explorer polls one at a time, so
+/// two are plenty.
+const BLOCK_READ_SLOTS: usize = 2;
+static BLOCK_READ: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(BLOCK_READ_SLOTS);
+
+/// v0.19.12: the stored-block bytes (`StoredBlock::value_bytes`) one `hk_getBlocks` call
+/// loads before it stops and names where to continue (`truncated`, `next_before`). The check
+/// runs before each load, so a call loads at most this plus one block.
+const BLOCKS_READ_BUDGET: usize = 64 * 1024 * 1024;
+
+/// v0.19.12: the most bytes of an asset symbol `tx_summary` shows (cut on a character
+/// boundary). The chain accepts 16 (`hk_state::assets::MAX_SYMBOL_LEN`), so every registered
+/// symbol is shown whole.
+const SUMMARY_SYMBOL_SHOWN: usize = 64;
+
+/// v0.19.12: the most bytes of a burn destination `tx_summary` shows (as hex, so up to
+/// 256 characters). The chain accepts 64 (`hk_state::assets::MAX_BURN_DESTINATION`), so every
+/// accepted burn's destination is shown whole — the bridge attestor compares it in full
+/// (attest.rs).
+const SUMMARY_DESTINATION_SHOWN: usize = 128;
 
 /// L-6: `hk_submitSetChange` refuses, before verifying, a certificate whose window opens
 /// more than this many blocks past the tip. A queued cert sits in RAM until its window
@@ -279,13 +383,30 @@ fn bundles_open(h: &SharedHandles) -> bool {
 /// HR-1 (v0.19.11, E3): a proof-less pool tx is refused first of all — by its payload, before
 /// the hashes and outside the mempool's verdict (`refuse_proof_less_pool_tx`): its only
 /// legitimate carrier is a bundle, and uncovered it would ride a block and die at apply.
+///
+/// v0.19.12: the asset field rules (symbol, burn destination) and the per-tx byte cap
+/// (`mempool::MAX_TX_BYTES`) ride inside `envelope_verdict` too — refused by the tx's own bytes,
+/// before the hashes (mempool.rs `Mempool::field_bounds`). A refusal the verdict reached by
+/// the tx's own bytes (`hash_free_refusal`: lengths, the R18 open cap, the stealth cap, the
+/// field and size rules) is answered first; then the txid is computed and handed to the
+/// pool's checks (`try_admit_verified_with_id`). For any tx the verdict passes (every honest
+/// one) those checks run in this order: the count cap, the pool's bytes, the duplicate, the
+/// slot, the sender's pending bytes (the two byte caps are new in v0.19.12), the R18 settle
+/// checks, then the account walk; the older reasons keep their wording. A frame that fails
+/// both a hash-free check and one of the pool checks (full, a byte cap, duplicate, slot
+/// taken, an R18 settle cap) hears the hash-free one, the first the verdict reached; a bad
+/// signature is still judged at the end of the account walk.
 fn admit_one(h: &SharedHandles, tx: &SignedTx) -> Result<[u8; 32], String> {
     refuse_proof_less_pool_tx(tx)?;
     let verdict = Mempool::envelope_verdict(tx);
+    if let Some(e) = verdict.hash_free_refusal() {
+        return Err(e.as_str());
+    }
+    let id = txid(tx);
     let admitted = {
         let chain = h.chain.lock().unwrap_or_else(|e| e.into_inner());
         let mut mp = h.mempool.lock().unwrap_or_else(|e| e.into_inner());
-        mp.try_admit_verified(tx.clone(), &chain, &verdict)
+        mp.try_admit_verified_with_id(tx.clone(), id, &chain, &verdict)
     };
     match admitted {
         Ok(id) => {
@@ -372,8 +493,10 @@ const GOSSIP_MAX_TXS: usize = 1_024;
 /// only bound was the 8 MiB body cap, and a garbage aggregate rode whole into every node's
 /// block log once the proposer picked the bundle (≈ 4 MiB per pre-empted block in the report).
 /// Re-pin on an SP1 upgrade that changes the compressed-proof size; the error names the
-/// legitimate size so a real aggregator that outgrows it knows what to ask for.
-const MAX_BUNDLE_AGG_BYTES: usize = 2 * 1024 * 1024;
+/// legitimate size so a real aggregator that outgrows it knows what to ask for. `pub(crate)`
+/// (v0.19.12): mempool.rs checks at compile time that a block at
+/// `batch::MAX_BATCH_TX_BYTES` plus this aggregate fits the proposal frame.
+pub(crate) const MAX_BUNDLE_AGG_BYTES: usize = 2 * 1024 * 1024;
 
 /// HR-1: the one shape a `MintToPool` / `ShieldedSpend` has when its truth is a block
 /// aggregate's — an EMPTY `proof` (P2.3). `bundle_shape_verdict` requires it of every bundle
@@ -421,6 +544,10 @@ fn refuse_proof_less_pool_tx(tx: &SignedTx) -> Result<(), String> {
 /// any other), and every stealth ciphertext must be inside `MAX_STEALTH_CT_BYTES` (one number
 /// for both doors, mempool.rs). Whether each tx would APPLY — sender, nonce, key, anchor,
 /// nullifier, signature — is `submit_bundle`'s dry run, after this.
+///
+/// v0.19.12: and the bundle's txs must fit one block's transaction budget —
+/// `batch::MAX_BATCH_TX_BYTES` over `mempool::tx_encoded_len` — because `build_batch` rides a
+/// bundle whole or not at all (a size walk per tx, no hash).
 pub(crate) fn bundle_shape_verdict(txs: &[SignedTx]) -> Result<(), String> {
     if txs.len() > MAX_TXS_PER_BLOCK {
         return Err(format!("bad txs: a bundle may carry at most {MAX_TXS_PER_BLOCK} txs (one block)"));
@@ -441,6 +568,12 @@ pub(crate) fn bundle_shape_verdict(txs: &[SignedTx]) -> Result<(), String> {
         if let Some(n) = stealth_ct_over_cap(t) {
             return Err(format!("bad txs: tx {i} carries a {n}-byte stealth ciphertext (max {MAX_STEALTH_CT_BYTES})"));
         }
+    }
+    let bytes = txs.iter().map(tx_encoded_len).fold(0usize, usize::saturating_add);
+    if bytes > MAX_BATCH_TX_BYTES {
+        return Err(format!(
+            "bad txs: the bundle's txs take {bytes} B in a block (max {MAX_BATCH_TX_BYTES}, one block's transaction budget)"
+        ));
     }
     Ok(())
 }
@@ -566,8 +699,9 @@ fn submit_bundle(
         let id = txid(t);
         let v = Mempool::envelope_verdict(t);
         // unreachable after `bundle_shape_verdict` (the lengths and the stealth cap are its
-        // rules, and a bundle tx is never a `ChannelOpen`); kept so a future shape change
-        // cannot hash past a `BadEnvelope`.
+        // rules, a bundle tx is never a `ChannelOpen`, an `AssetRegister` or an `AssetBurn`, and
+        // its shape keeps it far under `mempool::MAX_TX_BYTES`); kept so a future shape
+        // change cannot hash past a `BadEnvelope`.
         if let Some(e) = v.hash_free_refusal() {
             return json!({"error": format!("bad txs: tx {i} would not apply: {}", e.as_str())});
         }
@@ -698,59 +832,15 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
             },
             None => json!({"error": "params.cert required (output of `hk-node issue-rotation`)"}),
         },
-        "hk_getAccount" => match param_h256(params, "id") {
-            Some(id) => {
-                let chain = h.chain.lock().unwrap_or_else(|e| e.into_inner());
-                match chain.accounts.get(&id) {
-                    Some(acc) => {
-                        // X1: every transparent balance this account holds, by asset
-                        // (a wallet must show two balances once issued assets exist).
-                        let balances: Vec<Value> = chain
-                            .balances
-                            .range((id, H256([0u8; 32]))..=(id, H256([0xffu8; 32])))
-                            .filter(|(_, amt)| **amt > 0)
-                            .map(|((_, asset), amt)| json!({
-                                "asset": hex::encode(asset.0),
-                                "symbol": chain.assets.get(asset).map(|i| i.symbol.clone()),
-                                "amount": amt.to_string(),
-                                "frozen": chain.assets.get(asset).map(|i| i.frozen.contains(&id)).unwrap_or(false),
-                            }))
-                            .collect();
-                        json!({"result": {
-                            "found": true,
-                            "nonce": acc.nonce,
-                            "auth_commit": hex::encode(acc.auth_commit.0),
-                            "balances": balances,
-                        }})
-                    }
-                    None => json!({"result": {"found": false}}),
-                }
-            }
-            None => json!({"error": "id must be 64-char hex"}),
-        },
+        // HR-9 (v0.19.12): the body is `get_account` — it answers the id's balances whether
+        // or not an account exists at it, so a credit to a never-created id is visible.
+        "hk_getAccount" => get_account(&h.chain, params),
         // X1: the issued-asset registry. `asset` (hex) OR `issuer` + `symbol` (the id rule).
-        "hk_getAsset" => {
-            let chain = h.chain.lock().unwrap_or_else(|e| e.into_inner());
-            let id = match param_h256(params, "asset") {
-                Some(a) => Some(a),
-                None => match (param_h256(params, "issuer"), params.get("symbol").and_then(|v| v.as_str())) {
-                    (Some(issuer), Some(sym)) => Some(hk_state::assets::derive_asset_id(&issuer, sym)),
-                    _ => None,
-                },
-            };
-            match id {
-                Some(id) => match chain.assets.get(&id) {
-                    Some(info) => json!({"result": {"found": true, "asset": asset_json(&id, info, &chain)}}),
-                    None => json!({"result": {"found": false, "asset_id": hex::encode(id.0)}}),
-                },
-                None => json!({"error": "asset (64-char hex) or issuer (64-char hex) + symbol required"}),
-            }
-        }
-        "hk_getAssets" => {
-            let chain = h.chain.lock().unwrap_or_else(|e| e.into_inner());
-            let list: Vec<Value> = chain.assets.iter().map(|(id, info)| asset_json(id, info, &chain)).collect();
-            json!({"result": {"count": list.len(), "fee_asset": hex::encode(chain.fee_asset.0), "assets": list}})
-        }
+        // One entry, one conservation scan: the per-asset view stays linear. v0.19.12 (HR-4
+        // review): the scan holds the `ASSET_SCAN` slot `hk_getAssets` holds — `get_asset`.
+        "hk_getAsset" => get_asset(&h.chain, &ASSET_SCAN, params),
+        // HR-4 (v0.19.12): paged, one conservation pass, one scan in flight — `get_assets`.
+        "hk_getAssets" => get_assets(&h.chain, &ASSET_SCAN, params),
         "hk_balance" => match (param_h256(params, "id"), param_h256(params, "asset")) {
             (Some(id), Some(asset)) => {
                 let chain = h.chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -770,6 +860,8 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
             }
             None => json!({"error": "leaf must be 64-char hex"}),
         },
+        // HR-5 (v0.19.12): one mandate node, holder AND funder — `get_mandate`.
+        "hk_getMandate" => get_mandate(&h.chain, params),
         "hk_submitTx" => {
             let tx_val = params.get("tx").cloned().unwrap_or(Value::Null);
             match serde_json::from_value::<SignedTx>(tx_val) {
@@ -934,71 +1026,12 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
 
         // ---- v0.11.2 search surface (node-local indexes; see state.rs::index_txs) ----
         // A txid resolves to its block + full summary — the receipt ring may evict old
-        // entries, but the index + block log answer forever.
-        "hk_getTx" => match param_h256(params, "txid") {
-            Some(id) => {
-                let hit = h.tx_index.lock().unwrap_or_else(|e| e.into_inner()).get(&id.0).copied();
-                match hit {
-                    Some((height, idx)) => {
-                        let summary = h
-                            .store
-                            .as_ref()
-                            .and_then(|s| s.load_block(height).ok().flatten())
-                            .and_then(|sb| crate::batch::Batch::decode(&sb.value_bytes))
-                            .and_then(|b| b.txs.get(idx as usize).map(tx_summary));
-                        let receipt = h
-                            .receipts
-                            .lock()
-                            .unwrap()
-                            .get(&id.0)
-                            .cloned();
-                        json!({"result": {
-                            "found": true,
-                            "txid": hex::encode(id.0),
-                            "height": height,
-                            "index": idx,
-                            "summary": summary,
-                            "receipt": receipt,
-                        }})
-                    }
-                    None => json!({"result": {"found": false}}),
-                }
-            }
-            None => json!({"error": "txid must be 64-char hex"}),
-        },
-        // An account's transaction history (sender or counterparty), newest first.
-        "hk_getAccountTxs" => match param_h256(params, "id") {
-            Some(id) => {
-                let limit = params
-                    .get("limit")
-                    .and_then(|l| l.as_u64())
-                    .unwrap_or(25)
-                    .min(100) as usize;
-                let ai = h.acct_index.lock().unwrap_or_else(|e| e.into_inner());
-                let (total, txs): (usize, Vec<Value>) = match ai.get(&id) {
-                    Some(v) => {
-                        // R10 v2: the background history pass appends OLD heights
-                        // after live commits already landed — order by height, not
-                        // by insertion, so "newest first" stays true mid-pass.
-                        let mut sorted: Vec<&([u8; 32], u64, &'static str)> = v.iter().collect();
-                        sorted.sort_by(|a, b| b.1.cmp(&a.1));
-                        (
-                            v.len(),
-                            sorted
-                                .into_iter()
-                                .take(limit)
-                                .map(|(t, ht, kind)| {
-                                    json!({"txid": hex::encode(t), "height": ht, "kind": kind})
-                                })
-                                .collect(),
-                        )
-                    }
-                    None => (0, Vec::new()),
-                };
-                json!({"result": {"id": hex::encode(id.0), "total": total, "txs": txs}})
-            }
-            None => json!({"error": "id must be 64-char hex"}),
-        },
+        // entries, but the index + block log answer forever. v0.19.12: the body is
+        // `get_tx`, under the shared block-read slot.
+        "hk_getTx" => get_tx(h.store.as_deref(), &h.tx_index, &h.receipts, &BLOCK_READ, params),
+        // An account's transaction history (sender or counterparty), newest first. v0.19.12:
+        // the body is `get_account_txs` — one pass selects the page.
+        "hk_getAccountTxs" => get_account_txs(&h.acct_index, params),
 
         // ---- P3.0b explorer surface ----
         "hk_nullifierSpent" => match param_h256(params, "nullifier") {
@@ -1145,139 +1178,343 @@ fn dispatch(method: &str, params: &Value, h: &SharedHandles) -> Value {
             },
             None => json!({"error": "params.cert required (output of `hk-node set-change assemble`)"}),
         },
-        "hk_getMempool" => {
-            let mp = h.mempool.lock().unwrap_or_else(|e| e.into_inner());
-            json!({"result": {
-                "count": mp.len(),
-                "txids": mp.iter().take(100).map(|t| hex::encode(txid(t))).collect::<Vec<_>>(),
-            }})
-        }
-        "hk_getBlock" => {
-            let Some(store) = &h.store else {
-                return json!({"error": "persistence disabled on this node (HK_NO_PERSIST)"});
-            };
-            match params.get("height").and_then(|v| v.as_u64()) {
-                Some(height) => match store.load_block(height) {
-                    Ok(Some(sb)) => {
-                        let batch = Batch::decode(&sb.value_bytes);
-                        let rlog = h.receipts.lock().unwrap_or_else(|e| e.into_inner());
-                        let txs: Vec<Value> = batch
-                            .as_ref()
-                            .map(|b| {
-                                b.txs
-                                    .iter()
-                                    .map(|stx| {
-                                        let mut v = tx_summary(stx);
-                                        let rec = rlog
-                                            .get(&txid(stx))
-                                            .map(|d| json!({
-                                                "found": true,
-                                                "ok": d.starts_with("ok"),
-                                                "detail": d,
-                                            }))
-                                            .unwrap_or_else(|| json!({"found": false}));
-                                        v["receipt"] = rec;
-                                        v
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        json!({"result": {
-                            "found": true,
-                            "height": sb.height,
-                            "time": h.chain_start_time + sb.height,
-                            "parent_app_hash": batch.as_ref().map(|b| hex::encode(b.parent_app_hash)),
-                            "tx_count": txs.len(),
-                            "txs": txs,
-                            "aggregate": {
-                                "present": batch.as_ref().map(|b| !b.agg_proof.is_empty()).unwrap_or(false),
-                                "verified": sb.agg_valid,
-                            },
-                            "rotations": batch.as_ref().map(|b| b.rotations.len()).unwrap_or(0),
-                            // v0.15.2: validator-set change certificates carried by this block
-                            // (V1) — the explorer surface could not show the block that seated
-                            // testnet-1's first external validator (72219) until this existed.
-                            "set_changes": batch.as_ref().map(|b| b.set_changes.iter().map(|c| {
-                                let (kind, root_pk, power) = match &c.body.change {
-                                    hk_consensus::SetChange::Admit { root_pk, voting_power, .. } =>
-                                        ("admit", hex::encode(root_pk), Some(*voting_power)),
-                                    hk_consensus::SetChange::Remove { root_pk } =>
-                                        ("remove", hex::encode(root_pk), None),
-                                    hk_consensus::SetChange::SetPower { root_pk, voting_power } =>
-                                        ("set_power", hex::encode(root_pk), Some(*voting_power)),
-                                };
-                                json!({"change": kind, "root_pk": root_pk, "voting_power": power,
-                                       "approvals": c.approvals.len(),
-                                       "not_before": c.body.not_before, "not_after": c.body.not_after})
-                            }).collect::<Vec<_>>()).unwrap_or_default(),
-                            "certificate": {
-                                "round": sb.certificate.round.as_i64(),
-                                "value_id": hex::encode(sb.certificate.value_id.as_bytes()),
-                                "signatures": sb.certificate.commit_signatures.len(),
-                            },
-                        }})
-                    }
-                    Ok(None) => json!({"result": {"found": false}}),
-                    Err(e) => {
-                        warn!(height, %e, "block load failed");
-                        json!({"error": "block load failed (see node log)"})
-                    }
-                },
-                None => json!({"error": "height (number) required"}),
-            }
-        }
+        // v0.19.12: the body is `get_mempool` — the txids the pool stored.
+        "hk_getMempool" => get_mempool(&h.mempool),
+        // v0.19.12: the two block reads below and `hk_getTx` share the block-read slot;
+        // the bodies are `get_block` / `get_blocks`.
+        "hk_getBlock" => get_block(h.store.as_deref(), &h.receipts, h.chain_start_time, &BLOCK_READ, params),
         "hk_getBlocks" => {
-            let Some(store) = &h.store else {
-                return json!({"error": "persistence disabled on this node (HK_NO_PERSIST)"});
-            };
-            let before = params.get("before").and_then(|v| v.as_u64()).unwrap_or(u64::MAX);
-            let limit = params
-                .get("limit")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(20)
-                .min(50) as usize;
-            // R10 v2: walk DOWN from the chain tip over the gap-free disk suffix —
-            // no per-call directory listing (that was a 100k-entry scan on every
-            // explorer poll). `earliest` is the suffix floor restore measured.
-            let latest = h.chain.lock().unwrap_or_else(|e| e.into_inner()).height;
-            let earliest = store.disk_min();
-            let (earliest_v, latest_v) = if earliest == 0 || earliest > latest {
-                (Value::Null, Value::Null)
-            } else {
-                (json!(earliest), json!(latest))
-            };
-            let mut blocks = Vec::with_capacity(limit);
-            let mut hgt = before.saturating_sub(1).min(latest);
-            let floor = earliest.max(1);
-            while blocks.len() < limit && earliest != 0 && hgt >= floor {
-                if let Ok(Some(sb)) = store.load_block(hgt) {
-                    let batch = Batch::decode(&sb.value_bytes);
-                    blocks.push(json!({
-                        "height": sb.height,
-                        "time": h.chain_start_time + sb.height,
-                        "tx_count": batch.as_ref().map(|b| b.txs.len()).unwrap_or(0),
-                        "aggregate": batch.as_ref().map(|b| !b.agg_proof.is_empty()).unwrap_or(false),
-                        "rotations": batch.as_ref().map(|b| b.rotations.len()).unwrap_or(0),
-                        "set_changes": batch.as_ref().map(|b| b.set_changes.len()).unwrap_or(0),
-                        "value_id": hex::encode(&sb.certificate.value_id.as_bytes()[..8]),
-                    }));
-                }
-                if hgt == 0 {
-                    break;
-                }
-                hgt -= 1;
-            }
-            json!({"result": {"blocks": blocks, "earliest": earliest_v, "latest": latest_v}})
+            get_blocks(h.store.as_deref(), &h.chain, h.chain_start_time, &BLOCK_READ, params, BLOCKS_READ_BUDGET)
         }
 
         other => json!({"error": format!("unknown method: {other}")}),
     }
 }
 
+/// `hk_getMempool`: the pending count and the first 100 txids in pool order. v0.19.12: the
+/// txids are the ones the pool stored when each tx entered it
+/// (`Mempool::pending_ids`); the call copies at most 100 of them and writes them as hex.
+/// Same response as before.
+fn get_mempool(mempool: &Mutex<Mempool>) -> Value {
+    let (count, ids): (usize, Vec<[u8; 32]>) = {
+        let mp = mempool.lock().unwrap_or_else(|e| e.into_inner());
+        (mp.len(), mp.pending_ids().take(100).copied().collect())
+    };
+    json!({"result": {
+        "count": count,
+        "txids": ids.iter().map(hex::encode).collect::<Vec<_>>(),
+    }})
+}
+
+/// v0.19.12: the answer past the `BLOCK_READ_SLOTS` permits — the `POOL_PATH` wording.
+fn block_read_busy() -> Value {
+    json!({"error": format!("busy: {BLOCK_READ_SLOTS} block reads already in flight — retry in a moment")})
+}
+
+/// `hk_getTx` (v0.11.2; v0.19.12): a txid → its block, index, public summary and
+/// receipt, from the node-local index and the block log. The block load and decode hold one
+/// `BLOCK_READ_SLOTS` permit (`slots`; "busy — retry" past them), taken only when there is a
+/// block to load — an unindexed txid, or a node without a store, answers without one. The block
+/// is still decoded whole: bincode cannot skip the txs ahead of the one asked for without
+/// decoding them. The summary is built from the tx and its own txid; the receipt is looked
+/// up by the txid asked for. Takes the handles it touches so the tests drive it without a node.
+fn get_tx(
+    store: Option<&crate::store::NodeStore>,
+    tx_index: &Mutex<std::collections::HashMap<[u8; 32], (u64, u32)>>,
+    receipts: &Mutex<crate::state::ReceiptLog>,
+    slots: &tokio::sync::Semaphore,
+    params: &Value,
+) -> Value {
+    let Some(id) = param_h256(params, "txid") else {
+        return json!({"error": "txid must be 64-char hex"});
+    };
+    let hit = tx_index.lock().unwrap_or_else(|e| e.into_inner()).get(&id.0).copied();
+    let Some((height, idx)) = hit else {
+        return json!({"result": {"found": false}});
+    };
+    let summary = match store {
+        Some(store) => {
+            let Ok(_permit) = slots.try_acquire() else {
+                return block_read_busy();
+            };
+            store
+                .load_block(height)
+                .ok()
+                .flatten()
+                .and_then(|sb| Batch::decode(&sb.value_bytes))
+                .and_then(|b| b.txs.get(idx as usize).map(|t| tx_summary(t, &txid(t))))
+        }
+        None => None,
+    };
+    let receipt = receipts.lock().unwrap_or_else(|e| e.into_inner()).get(&id.0).cloned();
+    json!({"result": {
+        "found": true,
+        "txid": hex::encode(id.0),
+        "height": height,
+        "index": idx,
+        "summary": summary,
+        "receipt": receipt,
+    }})
+}
+
+/// One row of the node-local account index: (txid, height, kind) — state.rs `index_txs_into`.
+type AcctRow = ([u8; 32], u64, &'static str);
+
+/// `hk_getAccountTxs` (v0.11.2; v0.19.12): an account's history — as sender or
+/// counterparty, and since v0.19.12 as the holder a `MandateCreate` names (HR-5) — newest
+/// first, `limit` rows (default 25, at most 100) of `total`. One pass over the account's rows
+/// keeps the page's rows in a heap of at most `limit` keys (`newest_rows`); the page is then
+/// ordered and the JSON built. The answer equals a stable newest-first sort of the whole list
+/// cut to `limit`, row for row.
+/// Takes the handle it touches so the tests drive it
+/// without a node.
+fn get_account_txs(
+    acct_index: &Mutex<std::collections::HashMap<AccountId, Vec<AcctRow>>>,
+    params: &Value,
+) -> Value {
+    let Some(id) = param_h256(params, "id") else {
+        return json!({"error": "id must be 64-char hex"});
+    };
+    let limit = params
+        .get("limit")
+        .and_then(|l| l.as_u64())
+        .unwrap_or(25)
+        .min(100) as usize;
+    let (total, mut page) = {
+        let ai = acct_index.lock().unwrap_or_else(|e| e.into_inner());
+        match ai.get(&id) {
+            Some(v) => (v.len(), newest_rows(v, limit)),
+            None => (0, Vec::new()),
+        }
+    };
+    // Newest first, and among equal heights in index order — the stable sort's order.
+    page.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    let txs: Vec<Value> = page
+        .into_iter()
+        .map(|(_, (t, ht, kind))| json!({"txid": hex::encode(t), "height": ht, "kind": kind}))
+        .collect();
+    json!({"result": {"id": hex::encode(id.0), "total": total, "txs": txs}})
+}
+
+/// The `limit` newest rows of an account's index list, in no particular order, each with its
+/// rank key `(height, Reverse(position))`: a higher height ranks first, and among equal heights
+/// the row indexed earlier — exactly the order of a stable newest-first sort by height (R10 v2:
+/// the background history pass appends OLD heights after live commits, so the list itself is
+/// not in height order). One pass from the end of the list, where live commits append in
+/// height order — so the page usually fills from the last `limit` rows and every earlier row
+/// costs one compare — keeping at most `limit` keys in a heap; nothing else is copied.
+fn newest_rows(rows: &[AcctRow], limit: usize) -> Vec<((u64, std::cmp::Reverse<usize>), AcctRow)> {
+    use std::cmp::Reverse;
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut heap: std::collections::BinaryHeap<Reverse<(u64, Reverse<usize>)>> =
+        std::collections::BinaryHeap::with_capacity(limit.saturating_add(1));
+    for (i, row) in rows.iter().enumerate().rev() {
+        let key = (row.1, Reverse(i));
+        if heap.len() < limit {
+            heap.push(Reverse(key));
+        } else if heap.peek().is_some_and(|Reverse(min)| key > *min) {
+            heap.pop();
+            heap.push(Reverse(key));
+        }
+    }
+    heap.into_iter().map(|Reverse(key)| (key, rows[(key.1).0])).collect()
+}
+
+/// `hk_getBlock` (P3.0b; v0.19.12): one stored block with its txs' public summaries and
+/// receipts. The load, the decode and the answer hold one `BLOCK_READ_SLOTS` permit (`slots`;
+/// "busy — retry" past them). Each tx's txid serves both its summary and its receipt
+/// lookup; the receipts are looked up in one pass, before any JSON is built.
+/// Takes the handles it touches so the tests drive it
+/// without a node.
+fn get_block(
+    store: Option<&crate::store::NodeStore>,
+    receipts: &Mutex<crate::state::ReceiptLog>,
+    chain_start_time: u64,
+    slots: &tokio::sync::Semaphore,
+    params: &Value,
+) -> Value {
+    let Some(store) = store else {
+        return json!({"error": "persistence disabled on this node (HK_NO_PERSIST)"});
+    };
+    let Some(height) = params.get("height").and_then(|v| v.as_u64()) else {
+        return json!({"error": "height (number) required"});
+    };
+    let Ok(_permit) = slots.try_acquire() else {
+        return block_read_busy();
+    };
+    let sb = match store.load_block(height) {
+        Ok(Some(sb)) => sb,
+        Ok(None) => return json!({"result": {"found": false}}),
+        Err(e) => {
+            warn!(height, %e, "block load failed");
+            return json!({"error": "block load failed (see node log)"});
+        }
+    };
+    let batch = Batch::decode(&sb.value_bytes);
+    let block_txs: &[SignedTx] = batch.as_ref().map(|b| b.txs.as_slice()).unwrap_or(&[]);
+    // every txid once …
+    let ids: Vec<[u8; 32]> = block_txs.iter().map(txid).collect();
+    // … each receipt looked up by it …
+    let found: Vec<Option<String>> = {
+        let rlog = receipts.lock().unwrap_or_else(|e| e.into_inner());
+        ids.iter().map(|id| rlog.get(id).cloned()).collect()
+    };
+    // … and the JSON built from both.
+    let txs: Vec<Value> = block_txs
+        .iter()
+        .zip(ids.iter().zip(found))
+        .map(|(stx, (id, receipt))| {
+            let mut v = tx_summary(stx, id);
+            v["receipt"] = match receipt {
+                Some(d) => {
+                    let ok = d.starts_with("ok");
+                    json!({"found": true, "ok": ok, "detail": d})
+                }
+                None => json!({"found": false}),
+            };
+            v
+        })
+        .collect();
+    json!({"result": {
+        "found": true,
+        "height": sb.height,
+        "time": chain_start_time + sb.height,
+        "parent_app_hash": batch.as_ref().map(|b| hex::encode(b.parent_app_hash)),
+        "tx_count": txs.len(),
+        "txs": txs,
+        "aggregate": {
+            "present": batch.as_ref().map(|b| !b.agg_proof.is_empty()).unwrap_or(false),
+            "verified": sb.agg_valid,
+        },
+        "rotations": batch.as_ref().map(|b| b.rotations.len()).unwrap_or(0),
+        // v0.15.2: validator-set change certificates carried by this block
+        // (V1) — the explorer surface could not show the block that seated
+        // testnet-1's first external validator (72219) until this existed.
+        "set_changes": batch.as_ref().map(|b| b.set_changes.iter().map(|c| {
+            let (kind, root_pk, power) = match &c.body.change {
+                hk_consensus::SetChange::Admit { root_pk, voting_power, .. } =>
+                    ("admit", hex::encode(root_pk), Some(*voting_power)),
+                hk_consensus::SetChange::Remove { root_pk } =>
+                    ("remove", hex::encode(root_pk), None),
+                hk_consensus::SetChange::SetPower { root_pk, voting_power } =>
+                    ("set_power", hex::encode(root_pk), Some(*voting_power)),
+            };
+            json!({"change": kind, "root_pk": root_pk, "voting_power": power,
+                   "approvals": c.approvals.len(),
+                   "not_before": c.body.not_before, "not_after": c.body.not_after})
+        }).collect::<Vec<_>>()).unwrap_or_default(),
+        "certificate": {
+            "round": sb.certificate.round.as_i64(),
+            "value_id": hex::encode(sb.certificate.value_id.as_bytes()),
+            "signatures": sb.certificate.commit_signatures.len(),
+        },
+    }})
+}
+
+/// `hk_getBlocks` (P3.0b, R10 v2; v0.19.12): newest-first block summaries, walking down
+/// from `before − 1` (default: the tip) over the gap-free disk suffix, at most `limit` (≤ 50).
+/// The walk holds one `BLOCK_READ_SLOTS` permit (`slots`; "busy — retry" past them) and stops
+/// once it has loaded `budget` bytes of stored blocks (`BLOCKS_READ_BUDGET` from `dispatch`;
+/// checked before each load, so at most that plus one block). The answer then adds
+/// `truncated: true` and `next_before` — the `before` of the call that continues, the same
+/// value a caller paging by the lowest height it received computes. A page inside the budget
+/// has the pre-v0.19.12 shape exactly. Takes the handles it touches so the tests drive it
+/// without a node.
+fn get_blocks(
+    store: Option<&crate::store::NodeStore>,
+    chain: &Mutex<hk_state::State>,
+    chain_start_time: u64,
+    slots: &tokio::sync::Semaphore,
+    params: &Value,
+    budget: usize,
+) -> Value {
+    let Some(store) = store else {
+        return json!({"error": "persistence disabled on this node (HK_NO_PERSIST)"});
+    };
+    let before = params.get("before").and_then(|v| v.as_u64()).unwrap_or(u64::MAX);
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(20)
+        .min(50) as usize;
+    let Ok(_permit) = slots.try_acquire() else {
+        return block_read_busy();
+    };
+    // R10 v2: walk DOWN from the chain tip over the gap-free disk suffix —
+    // no per-call directory listing (that was a 100k-entry scan on every
+    // explorer poll). `earliest` is the suffix floor restore measured.
+    let latest = chain.lock().unwrap_or_else(|e| e.into_inner()).height;
+    let earliest = store.disk_min();
+    let (earliest_v, latest_v) = if earliest == 0 || earliest > latest {
+        (Value::Null, Value::Null)
+    } else {
+        (json!(earliest), json!(latest))
+    };
+    let mut blocks = Vec::with_capacity(limit);
+    let mut loaded: usize = 0;
+    let mut next_before: Option<u64> = None;
+    let mut hgt = before.saturating_sub(1).min(latest);
+    let floor = earliest.max(1);
+    while blocks.len() < limit && earliest != 0 && hgt >= floor {
+        // The byte budget, before the next load.
+        if loaded >= budget {
+            next_before = Some(hgt.saturating_add(1));
+            break;
+        }
+        if let Ok(Some(sb)) = store.load_block(hgt) {
+            loaded = loaded.saturating_add(sb.value_bytes.len());
+            let batch = Batch::decode(&sb.value_bytes);
+            blocks.push(json!({
+                "height": sb.height,
+                "time": chain_start_time + sb.height,
+                "tx_count": batch.as_ref().map(|b| b.txs.len()).unwrap_or(0),
+                "aggregate": batch.as_ref().map(|b| !b.agg_proof.is_empty()).unwrap_or(false),
+                "rotations": batch.as_ref().map(|b| b.rotations.len()).unwrap_or(0),
+                "set_changes": batch.as_ref().map(|b| b.set_changes.len()).unwrap_or(0),
+                "value_id": hex::encode(&sb.certificate.value_id.as_bytes()[..8]),
+            }));
+        }
+        if hgt == 0 {
+            break;
+        }
+        hgt -= 1;
+    }
+    let mut result = json!({"blocks": blocks, "earliest": earliest_v, "latest": latest_v});
+    if let Some(next) = next_before {
+        result["truncated"] = json!(true);
+        result["next_before"] = json!(next);
+    }
+    json!({"result": result})
+}
+
+/// v0.19.12: `s` cut to at most `max` bytes, on a character boundary.
+fn str_prefix(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Public per-tx summary for the explorer: kind + the tx's PUBLIC fields only. What's
 /// listed here is already on-chain in the clear (the transparent skeleton); shielded
 /// txs surface commitments/nullifiers/fee — NEVER amounts, senders, or recipients.
-fn tx_summary(stx: &SignedTx) -> Value {
+///
+/// v0.19.12: `id` is the tx's txid, passed in by the caller (`get_block` looks the tx's
+/// receipt up by the same id). The two variable-length fields shown —
+/// `AssetRegister.symbol` and `AssetBurn.destination` — are cut to `SUMMARY_SYMBOL_SHOWN` /
+/// `SUMMARY_DESTINATION_SHOWN` bytes, and a cut one is followed by `symbol_len` /
+/// `destination_len` (the real length) and `truncated: true`. A value inside its bound —
+/// every value the chain accepts — is shown exactly as before, with no new key, so the
+/// explorer and the bridge attestor (attest.rs reads `fields.destination`) see no change for
+/// an accepted tx. No other field shown here has a variable length (proofs and stealth
+/// ciphertexts are not shown).
+fn tx_summary(stx: &SignedTx, id: &[u8; 32]) -> Value {
     use hk_state::tx::Tx;
     let (kind, fields) = match &stx.payload {
         Tx::Transfer { to, asset, amount } => ("transfer", json!({
@@ -1321,17 +1558,32 @@ fn tx_summary(stx: &SignedTx) -> Value {
             "id": hex::encode(id.0), "asset": hex::encode(asset.0), "amount": amount.to_string(),
         })),
         // X1: issued assets — the five issuer verbs, all public by construction.
-        Tx::AssetRegister { asset, symbol, decimals, policy } => ("asset_register", json!({
-            "asset": hex::encode(asset.0), "symbol": symbol, "decimals": decimals,
-            "policy": policy.flags(),
-        })),
+        Tx::AssetRegister { asset, symbol, decimals, policy } => {
+            let mut f = json!({
+                "asset": hex::encode(asset.0), "symbol": str_prefix(symbol, SUMMARY_SYMBOL_SHOWN),
+                "decimals": decimals, "policy": policy.flags(),
+            });
+            if symbol.len() > SUMMARY_SYMBOL_SHOWN {
+                f["symbol_len"] = json!(symbol.len());
+                f["truncated"] = json!(true);
+            }
+            ("asset_register", f)
+        }
         Tx::AssetMint { asset, to, amount } => ("asset_mint", json!({
             "asset": hex::encode(asset.0), "to": hex::encode(to.0), "amount": amount.to_string(),
         })),
-        Tx::AssetBurn { asset, amount, destination } => ("asset_burn", json!({
-            "asset": hex::encode(asset.0), "amount": amount.to_string(),
-            "destination": hex::encode(destination),
-        })),
+        Tx::AssetBurn { asset, amount, destination } => {
+            let shown = &destination[..destination.len().min(SUMMARY_DESTINATION_SHOWN)];
+            let mut f = json!({
+                "asset": hex::encode(asset.0), "amount": amount.to_string(),
+                "destination": hex::encode(shown),
+            });
+            if destination.len() > SUMMARY_DESTINATION_SHOWN {
+                f["destination_len"] = json!(destination.len());
+                f["truncated"] = json!(true);
+            }
+            ("asset_burn", f)
+        }
         Tx::AssetFreeze { asset, account, frozen } => ("asset_freeze", json!({
             "asset": hex::encode(asset.0), "account": hex::encode(account.0), "frozen": frozen,
         })),
@@ -1340,7 +1592,7 @@ fn tx_summary(stx: &SignedTx) -> Value {
         })),
     };
     json!({
-        "txid": hex::encode(txid(stx)),
+        "txid": hex::encode(id),
         "sender": hex::encode(stx.sender.0),
         "nonce": stx.nonce,
         "kind": kind,
@@ -1349,9 +1601,11 @@ fn tx_summary(stx: &SignedTx) -> Value {
 }
 
 /// X1: one registry entry as the explorer/wallet sees it, with the conservation
-/// receipt (`held` must equal `issued` on every honest node — invariant I5').
-fn asset_json(id: &H256, info: &hk_state::assets::AssetInfo, chain: &hk_state::State) -> Value {
-    let (held, issued) = chain.asset_conservation(id).unwrap_or((0, 0));
+/// receipt (`held` must equal `issued` on every honest node — invariant I5'). HR-4
+/// (v0.19.12): the `(held, issued)` pair is the caller's — `hk_getAsset` computes one,
+/// `hk_getAssets` takes a page's worth from a single `asset_conservation_all` pass.
+fn asset_json(id: &H256, info: &hk_state::assets::AssetInfo, chain: &hk_state::State, conserved: (Amount, Amount)) -> Value {
+    let (held, issued) = conserved;
     json!({
         "asset": hex::encode(id.0),
         "symbol": info.symbol,
@@ -1375,6 +1629,173 @@ fn asset_json(id: &H256, info: &hk_state::assets::AssetInfo, chain: &hk_state::S
         // P6: this asset's shielded ledger across every pool that denominates it.
         "shielded": chain.shielded_of(id).to_string(),
     })
+}
+
+/// `(from, to, limit, next)` for a page of the asset registry (HR-4, v0.19.12): `from`
+/// clamped to `total`, `limit` defaulted and capped at `ASSET_PAGE_MAX` (never zero), `next`
+/// the index after this page or `None` once the page reached the end — the H3 paging
+/// contract of the pool feed, with the effective `limit` echoed.
+fn asset_page(params: &Value, total: usize) -> (usize, usize, usize, Option<usize>) {
+    let from = params.get("from").and_then(|v| v.as_u64()).unwrap_or(0).min(total as u64) as usize;
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|l| usize::try_from(l).unwrap_or(ASSET_PAGE_MAX).clamp(1, ASSET_PAGE_MAX))
+        .unwrap_or(ASSET_PAGE_MAX);
+    let to = from.saturating_add(limit).min(total);
+    let next = (to < total).then_some(to);
+    (from, to, limit, next)
+}
+
+/// `hk_getAsset` (X1; v0.19.12, HR-4 review): one registry entry with its conservation receipt.
+/// The receipt is a scan of every balance and every channel under the chain lock — the lock the
+/// commit path needs — so the call holds the one `ASSET_SCAN` slot `hk_getAssets` holds
+/// (`try_acquire`; a caller past it is told to retry, in `get_assets`' words, and never queues on
+/// the lock). The id is parsed (and, for `issuer` + `symbol`, derived — one SHAKE) before the
+/// slot and the lock; a missing id needs neither. Same response as before. Takes the handles it
+/// touches so the tests drive it without a node.
+fn get_asset(chain: &Mutex<hk_state::State>, slots: &tokio::sync::Semaphore, params: &Value) -> Value {
+    let id = match param_h256(params, "asset") {
+        Some(a) => Some(a),
+        None => match (param_h256(params, "issuer"), params.get("symbol").and_then(|v| v.as_str())) {
+            (Some(issuer), Some(sym)) => Some(hk_state::assets::derive_asset_id(&issuer, sym)),
+            _ => None,
+        },
+    };
+    let Some(id) = id else {
+        return json!({"error": "asset (64-char hex) or issuer (64-char hex) + symbol required"});
+    };
+    let Ok(_permit) = slots.try_acquire() else {
+        return json!({"error": "busy: an asset registry scan is already in flight — retry in a moment"});
+    };
+    let chain = chain.lock().unwrap_or_else(|e| e.into_inner());
+    match chain.assets.get(&id) {
+        Some(info) => {
+            let conserved = chain.asset_conservation(&id).unwrap_or((0, 0));
+            json!({"result": {"found": true, "asset": asset_json(&id, info, &chain, conserved)}})
+        }
+        None => json!({"result": {"found": false, "asset_id": hex::encode(id.0)}}),
+    }
+}
+
+/// `hk_getAssets` (HR-4, v0.19.12): one page of the registry. The call holds the one
+/// `ASSET_SCAN` slot (`try_acquire` — a caller past it is told to retry and never queues on
+/// the chain lock), takes the chain lock once, computes the conservation receipts of the
+/// WHOLE registry in one pass (`asset_conservation_all`: a walk of balances and a walk of
+/// channels, not one per asset) and renders the page. `count` stays the whole registry's
+/// size — the field the gates and the explorer read — alongside `total`; `assets[]` is the
+/// page. A registry under the cap answers in one page, shape as before plus the paging
+/// fields. Takes the handles it touches so the tests can drive it without a node.
+fn get_assets(chain: &Mutex<hk_state::State>, slots: &tokio::sync::Semaphore, params: &Value) -> Value {
+    let Ok(_permit) = slots.try_acquire() else {
+        return json!({"error": "busy: an asset registry scan is already in flight — retry in a moment"});
+    };
+    let chain = chain.lock().unwrap_or_else(|e| e.into_inner());
+    let total = chain.assets.len();
+    let (from, to, limit, next) = asset_page(params, total);
+    let conserved = if to > from { chain.asset_conservation_all() } else { BTreeMap::new() };
+    let list: Vec<Value> = chain
+        .assets
+        .iter()
+        .skip(from)
+        .take(to - from)
+        .map(|(id, info)| asset_json(id, info, &chain, conserved.get(id).copied().unwrap_or((0, 0))))
+        .collect();
+    json!({"result": {
+        "count": total,
+        "total": total,
+        "from": from,
+        "limit": limit,
+        "next": next,
+        "fee_asset": hex::encode(chain.fee_asset.0),
+        "assets": list,
+    }})
+}
+
+/// X1: every non-zero transparent balance `id` holds, by asset, with the asset's symbol
+/// (when registered) and whether the issuer froze this account in it.
+fn account_balances_json(chain: &hk_state::State, id: &H256) -> Vec<Value> {
+    chain
+        .balances
+        .range((*id, H256([0u8; 32]))..=(*id, H256([0xffu8; 32])))
+        .filter(|(_, amt)| **amt > 0)
+        .map(|((_, asset), amt)| {
+            json!({
+                "asset": hex::encode(asset.0),
+                "symbol": chain.assets.get(asset).map(|i| i.symbol.clone()),
+                "amount": amt.to_string(),
+                "frozen": chain.assets.get(asset).map(|i| i.frozen.contains(id)).unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+/// `hk_getAccount`. HR-9 (v0.19.12): the chain credits any 32-byte id — `Transfer`,
+/// `AssetMint`, `MandateSpend`, an unshield and a channel's payee never check that an
+/// account exists — so a credit to a never-created id sits as a balance nobody can spend until
+/// an `AccountCreate` with the auth commitment the id derives from binds it (never, for a
+/// mistyped id). This method answers `balances[]` for the id either way, so such a balance is
+/// visible (`found`, `nonce` and
+/// `auth_commit` keep their meaning: `false` / `null` when no account exists). Takes the
+/// chain handle so the tests can drive it without a node.
+fn get_account(chain: &Mutex<hk_state::State>, params: &Value) -> Value {
+    let Some(id) = param_h256(params, "id") else {
+        return json!({"error": "id must be 64-char hex"});
+    };
+    let chain = chain.lock().unwrap_or_else(|e| e.into_inner());
+    // X1: every transparent balance this id holds, by asset (a wallet must show two
+    // balances once issued assets exist).
+    let balances = account_balances_json(&chain, &id);
+    match chain.accounts.get(&id) {
+        Some(acc) => json!({"result": {
+            "found": true,
+            "nonce": acc.nonce,
+            "auth_commit": hex::encode(acc.auth_commit.0),
+            "balances": balances,
+        }}),
+        None => json!({"result": {
+            "found": false,
+            "nonce": Value::Null,
+            "auth_commit": Value::Null,
+            "balances": balances,
+        }}),
+    }
+}
+
+/// `hk_getMandate` (HR-5, v0.19.12): one mandate node as the chain holds it. `holder` spends
+/// from the node, opens channels and creates children under it, and revokes its children (a
+/// root's holder also revokes the root); `funder` is `root_funding` of the node's root — the
+/// account the spends draw on. For a root the two need not be the same account: a root's
+/// holder is whatever its `MandateCreate` named, the sender became the funder, and the funder
+/// has no verb over such a root (a funder-side revoke is a planned consensus change) — this
+/// view shows both so a funder can see what it signed. Lookups only, under the chain lock.
+/// Takes the chain handle so the tests can drive it without a node.
+fn get_mandate(chain: &Mutex<hk_state::State>, params: &Value) -> Value {
+    let Some(id) = param_h256(params, "id") else {
+        return json!({"error": "id must be 64-char hex"});
+    };
+    let chain = chain.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(node) = chain.mandates.get(&id) else {
+        return json!({"result": {"found": false}});
+    };
+    let root = chain.mandates.root_of(&id).unwrap_or(id);
+    json!({"result": {
+        "found": true,
+        "id": hex::encode(id.0),
+        "parent": node.parent.map(|p| hex::encode(p.0)),
+        "root": hex::encode(root.0),
+        "holder": hex::encode(&node.holder_key),
+        "funder": chain.root_funding.get(&root).map(|f| hex::encode(f.0)),
+        "asset": hex::encode(node.asset.0),
+        "rate_per_sec": node.rate_per_sec.to_string(),
+        "buffer_max": node.buffer_max.to_string(),
+        "per_tx_max": node.per_tx_max.to_string(),
+        "buffer": node.buffer.to_string(),
+        "last_accrual": node.last_accrual,
+        "expiry": node.expiry,
+        "tier": node.tier,
+        "revoked": node.revoked,
+    }})
 }
 
 /// P6: the pool an RPC call addresses — `asset` (64-hex) names a per-asset pool, or the
@@ -2001,6 +2422,37 @@ mod r18_tests {
         );
         assert_eq!(bundle_shape_verdict(&too_long[..MAX_TXS_PER_BLOCK]), Ok(()));
     }
+
+    /// v0.19.12: a bundle whose txs exceed one block's transaction budget is refused at
+    /// the door — `build_batch` rides a bundle whole or not at all. Spends with the largest
+    /// stealth fields the door takes: as many as the budget holds pass, one more is refused (and
+    /// the byte budget binds before the count). KILL: drop the byte check from
+    /// `bundle_shape_verdict` and the over-budget bundle passes — no block could carry it.
+    #[test]
+    fn a_bundle_over_one_blocks_transaction_budget_is_refused() {
+        use crate::batch::MAX_BATCH_TX_BYTES;
+        use crate::mempool::{tx_encoded_len, MAX_STEALTH_CT_BYTES};
+        let fat = || {
+            let mut t = spend(vec![]);
+            if let Tx::ShieldedSpend { stealth_ct, stealth_ct2, .. } = &mut t.payload {
+                *stealth_ct = vec![0x5c; MAX_STEALTH_CT_BYTES];
+                *stealth_ct2 = vec![0x5c; MAX_STEALTH_CT_BYTES];
+            }
+            t
+        };
+        let size = tx_encoded_len(&fat());
+        let fit = MAX_BATCH_TX_BYTES / size;
+        assert!(fit < MAX_TXS_PER_BLOCK, "{fit} txs of {size} B: the byte budget binds before the count");
+        let txs: Vec<SignedTx> = (0..=fit).map(|_| fat()).collect();
+        assert_eq!(bundle_shape_verdict(&txs[..fit]), Ok(()));
+        assert_eq!(
+            bundle_shape_verdict(&txs).unwrap_err(),
+            format!(
+                "bad txs: the bundle's txs take {} B in a block (max {MAX_BATCH_TX_BYTES}, one block's transaction budget)",
+                (fit + 1) * size
+            )
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2024,6 +2476,627 @@ mod h3_tests {
         // limit is capped, never zero
         assert_eq!(pool_page(&json!({"limit": 0}), 7), (0, 1, Some(1)));
         assert_eq!(pool_page(&json!({"limit": 1_000_000}), 3 * POOL_PAGE_MAX), (0, POOL_PAGE_MAX, Some(POOL_PAGE_MAX)));
+    }
+}
+
+/// v0.19.12 (HR-4, HR-5, HR-9): the read methods the
+/// release paged, added or widened, driven over the handles their bodies take (`SharedHandles`
+/// needs a genesis and a signer, as `r17_tests` notes) on the shared fixture: a chain with
+/// three registered assets, balances in several of them, a mandate tree with a designated
+/// holder, an open channel and a credit to an id that has no account.
+#[cfg(test)]
+mod v0_19_12_tests {
+    use super::*;
+    use crate::mempool::test_fixtures::*;
+    use hk_state::assets::{derive_asset_id, AssetPolicy};
+    use tokio::sync::Semaphore;
+
+    /// A root held by its funder (account 1) …
+    const ROOT: H256 = H256([0xA0; 32]);
+    /// … its child, held by account 2 …
+    const LEAF: H256 = H256([0xA1; 32]);
+    /// … and a second root account 1 funds but account 3 holds (a designated holder).
+    const ROOT_FOREIGN: H256 = H256([0xA2; 32]);
+    /// An id nobody ever created an account for.
+    const GHOST: u8 = 99;
+
+    /// Three assets registered by account 1 (`A`, `B`, `C`; 1,800 / 700 / 9 minted) with
+    /// balances in accounts 1–3; the mandate tree above in `A`; a channel from account 2 to
+    /// account 3 in `A` (escrow 50, drawn from the funder through the whole chain); a 5-unit
+    /// transfer from account 3 to the never-created id 99. Returns the chain and `[A, B, C]`.
+    fn fixture() -> (hk_state::State, [H256; 3]) {
+        let mut chain = mini_chain(3);
+        let a = derive_asset_id(&acct(1), "A");
+        let b = derive_asset_id(&acct(1), "B");
+        let c = derive_asset_id(&acct(1), "C");
+        let mut height = 0u64;
+        let mut apply = |chain: &mut hk_state::State, tx: SignedTx| {
+            height += 1;
+            let r = chain.apply_block(height, 10 + height, &[tx]).expect("block applies");
+            assert!(r[0].result.is_ok(), "height {height}: {:?}", r[0].result);
+        };
+        let mut n1 = 0u64;
+        let mut sign1 = |payload: Tx| {
+            let tx = sign_at(1, n1, payload);
+            n1 += 1;
+            tx
+        };
+        for (asset, sym) in [(a, "A"), (b, "B"), (c, "C")] {
+            apply(&mut chain, sign1(Tx::AssetRegister { asset, symbol: sym.into(), decimals: 6, policy: AssetPolicy::from_flags("mf").unwrap() }));
+        }
+        for (asset, to, amount) in [(a, 1, 300), (a, 2, 1_000), (a, 3, 500), (b, 2, 700), (c, 3, 9)] {
+            apply(&mut chain, sign1(Tx::AssetMint { asset, to: acct(to), amount }));
+        }
+        let mk = |id, parent, holder| Tx::MandateCreate {
+            id, parent, holder, asset: a, rate_per_sec: 0, buffer_max: 1_000, per_tx_max: 1_000,
+            initial_buffer: 1_000, expiry: 1_000_000, tier: 1,
+        };
+        apply(&mut chain, sign1(mk(ROOT, None, acct(1))));
+        apply(&mut chain, sign1(mk(LEAF, Some(ROOT), acct(2))));
+        apply(&mut chain, sign1(mk(ROOT_FOREIGN, None, acct(3))));
+        // account 2 (the leaf's holder) opens a 5 × 10 channel to account 3: escrow 50 leaves
+        // the funder (account 1) and the mandate chain's buffers drop to 950
+        let tip = H256([0x77; 32]);
+        let ch = hk_state::State::derive_channel_id(&acct(2), &acct(3), &tip, 0);
+        apply(&mut chain, sign_at(2, 0, Tx::ChannelOpen { id: ch, mandate: LEAF, payee: acct(3), asset: a, tip, unit_price: 10, max_steps: 5, expiry: 1_000_000 }));
+        // account 3 credits an id that has no account
+        apply(&mut chain, sign_at(3, 0, Tx::Transfer { to: acct(GHOST), asset: ASSET, amount: 5 }));
+        assert_eq!(chain.channels.len(), 1);
+        (chain, [a, b, c])
+    }
+
+    fn id_of(entry: &Value) -> H256 {
+        H256(hex::decode(entry["asset"].as_str().unwrap()).unwrap().try_into().unwrap())
+    }
+
+    /// HR-4: the registry page arithmetic — `pool_page`'s contract with the effective limit
+    /// echoed. KILL: drop the `.clamp(1, ASSET_PAGE_MAX)` (the 1,000,000 and 0 cases) or the
+    /// `.min(total)` on `from` (the 99 case).
+    #[test]
+    fn hr4_asset_pages_are_bounded_and_chain_to_the_end() {
+        assert_eq!(asset_page(&json!({}), 0), (0, 0, ASSET_PAGE_MAX, None));
+        assert_eq!(asset_page(&json!({}), 7), (0, 7, ASSET_PAGE_MAX, None));
+        assert_eq!(asset_page(&json!({"limit": 3}), 7), (0, 3, 3, Some(3)));
+        assert_eq!(asset_page(&json!({"from": 3, "limit": 3}), 7), (3, 6, 3, Some(6)));
+        assert_eq!(asset_page(&json!({"from": 6, "limit": 3}), 7), (6, 7, 3, None));
+        assert_eq!(asset_page(&json!({"from": 7}), 7), (7, 7, ASSET_PAGE_MAX, None));
+        assert_eq!(asset_page(&json!({"from": 99}), 7), (7, 7, ASSET_PAGE_MAX, None));
+        assert_eq!(asset_page(&json!({"from": u64::MAX}), 7), (7, 7, ASSET_PAGE_MAX, None));
+        assert_eq!(asset_page(&json!({"limit": 0}), 7), (0, 1, 1, Some(1)));
+        assert_eq!(asset_page(&json!({"limit": 1_000_000}), 3 * ASSET_PAGE_MAX), (0, ASSET_PAGE_MAX, ASSET_PAGE_MAX, Some(ASSET_PAGE_MAX)));
+        assert_eq!(asset_page(&json!({"limit": u64::MAX}), 2), (0, 2, ASSET_PAGE_MAX, None));
+    }
+
+    /// HR-4: `hk_getAssets` answers the whole registry's `count` with a page of entries whose
+    /// conservation receipts equal the per-asset view's, pages chain to the end, and a caller
+    /// past the one scan slot is told to retry. KILL: drop `try_acquire` from `get_assets`
+    /// (the busy case), make `asset_json` fall back to `chain.asset_conservation` (every entry
+    /// still agrees — the KILL for the one-pass view is hk-state's
+    /// `hr4_asset_conservation_all_matches_the_per_asset_view`), or answer `count` as the
+    /// page's length (the `{"limit": 2}` case: `count` must stay 3 — `gate-x1.sh` reads it).
+    #[test]
+    fn hr4_get_assets_pages_the_registry_and_holds_one_scan_slot() {
+        let (chain, [a, _, _]) = fixture();
+        let chain = Mutex::new(chain);
+        let slots = Semaphore::new(1);
+        let all = get_assets(&chain, &slots, &json!({}));
+        let res = &all["result"];
+        assert_eq!(res["count"], json!(3), "{all}");
+        assert_eq!(res["total"], json!(3));
+        assert_eq!(res["from"], json!(0));
+        assert_eq!(res["limit"], json!(ASSET_PAGE_MAX));
+        assert_eq!(res["next"], Value::Null);
+        let entries = res["assets"].as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+        {
+            let st = chain.lock().unwrap();
+            assert_eq!(res["fee_asset"], json!(hex::encode(st.fee_asset.0)));
+            assert_eq!(entries.iter().map(id_of).collect::<Vec<_>>(), st.assets.keys().copied().collect::<Vec<_>>(), "registry order");
+            for entry in entries {
+                let (held, issued) = st.asset_conservation(&id_of(entry)).expect("registered");
+                assert_eq!(entry["held"], json!(held.to_string()), "{entry}");
+                assert_eq!(entry["circulating"], json!(issued.to_string()), "{entry}");
+                assert_eq!(entry["conserved"], json!(true), "{entry}");
+            }
+            // asset A: balances 250 + 1,000 + 500 plus the channel's 50 of escrow = 1,800 minted
+            assert_eq!(st.asset_conservation(&a), Some((1_800, 1_800)));
+            assert_eq!(st.balance(&acct(1), &a), 250);
+        }
+        assert_eq!(slots.available_permits(), 1, "the slot comes back");
+        // pages chain: 2 + 1, `count` the whole registry throughout
+        let ids = |v: &Value| v["result"]["assets"].as_array().unwrap().iter().map(id_of).collect::<Vec<_>>();
+        let p1 = get_assets(&chain, &slots, &json!({"limit": 2}));
+        assert_eq!((ids(&p1).len(), p1["result"]["next"].clone(), p1["result"]["count"].clone(), p1["result"]["limit"].clone()), (2, json!(2), json!(3), json!(2)));
+        let p2 = get_assets(&chain, &slots, &json!({"from": 2, "limit": 2}));
+        assert_eq!((ids(&p2).len(), p2["result"]["next"].clone(), p2["result"]["from"].clone()), (1, Value::Null, json!(2)));
+        let mut chained = ids(&p1);
+        chained.extend(ids(&p2));
+        assert_eq!(chained, ids(&all));
+        // past the end: an empty page, the count unchanged, no next
+        let p3 = get_assets(&chain, &slots, &json!({"from": 99}));
+        assert_eq!((ids(&p3).len(), p3["result"]["count"].clone(), p3["result"]["next"].clone()), (0, json!(3), Value::Null));
+        // the slot is held: told to retry — nothing locked, nothing answered
+        let held = Semaphore::new(1);
+        let permit = held.try_acquire().unwrap();
+        let busy = get_assets(&chain, &held, &json!({}));
+        assert_eq!(busy["error"], json!("busy: an asset registry scan is already in flight — retry in a moment"), "{busy}");
+        drop(permit);
+        assert_eq!(get_assets(&chain, &held, &json!({}))["result"]["count"], json!(3));
+        assert_eq!(held.available_permits(), 1);
+    }
+
+    /// HR-9: `hk_getAccount` on an id with no account answers its balances — the ghost credit
+    /// is discoverable — with `found: false`, `nonce: null`, `auth_commit: null`; an existing
+    /// account keeps its shape. KILL: answer `{found: false}` alone for a missing account (the
+    /// pre-v0.19.12 arm) and the ghost's `balances[]` is gone.
+    #[test]
+    fn hr9_get_account_shows_a_ghost_balance_without_an_account() {
+        let (chain, [a, _, _]) = fixture();
+        let chain = Mutex::new(chain);
+        let ghost = get_account(&chain, &json!({"id": hex::encode(acct(GHOST).0)}));
+        let res = &ghost["result"];
+        assert_eq!(res["found"], json!(false), "{ghost}");
+        assert_eq!(res["nonce"], Value::Null);
+        assert_eq!(res["auth_commit"], Value::Null);
+        let bal = res["balances"].as_array().unwrap();
+        assert_eq!(bal.len(), 1, "{ghost}");
+        assert_eq!(bal[0]["asset"], json!(hex::encode(ASSET.0)));
+        assert_eq!(bal[0]["amount"], json!("5"));
+        assert_eq!(bal[0]["symbol"], Value::Null, "an unregistered asset has no symbol");
+        assert_eq!(bal[0]["frozen"], json!(false));
+        // an existing account: the shape as before, every balance by asset
+        let two = get_account(&chain, &json!({"id": hex::encode(acct(2).0)}));
+        assert_eq!(two["result"]["found"], json!(true));
+        assert_eq!(two["result"]["nonce"], json!(1));
+        assert_eq!(two["result"]["auth_commit"].as_str().unwrap().len(), 64);
+        let bal = two["result"]["balances"].as_array().unwrap();
+        assert!(bal.iter().any(|e| e["asset"] == json!(hex::encode(a.0)) && e["amount"] == json!("1000") && e["symbol"] == json!("A")), "{two}");
+        assert!(bal.iter().any(|e| e["asset"] == json!(hex::encode(ASSET.0)) && e["amount"] == json!("1000")), "{two}");
+        // an id nobody ever credited: found false, no balances; a bad id: the error
+        let none = get_account(&chain, &json!({"id": hex::encode([0xEE; 32])}));
+        assert_eq!(none["result"]["found"], json!(false));
+        assert!(none["result"]["balances"].as_array().unwrap().is_empty());
+        assert_eq!(get_account(&chain, &json!({"id": "zz"}))["error"], json!("id must be 64-char hex"));
+    }
+
+    /// HR-5: `hk_getMandate` shows a node's holder AND its funder, for a root held by its
+    /// funder, a child held by another account, and a root whose designated holder is not its
+    /// funder — the shape the funder has no verb over. KILL: answer `funder` from the node's
+    /// own `holder_key` instead of `root_funding` and the child's and the foreign root's
+    /// `funder` assertions fail.
+    #[test]
+    fn hr5_get_mandate_shows_holder_and_funder_for_root_child_and_designated_holder() {
+        let (chain, [a, _, _]) = fixture();
+        let chain = Mutex::new(chain);
+        let one = json!(hex::encode(acct(1).0));
+        let root = get_mandate(&chain, &json!({"id": hex::encode(ROOT.0)}));
+        let r = &root["result"];
+        assert_eq!(r["found"], json!(true), "{root}");
+        assert_eq!(r["id"], json!(hex::encode(ROOT.0)));
+        assert_eq!(r["parent"], Value::Null);
+        assert_eq!(r["root"], json!(hex::encode(ROOT.0)));
+        assert_eq!(r["holder"], one);
+        assert_eq!(r["funder"], one);
+        assert_eq!(r["asset"], json!(hex::encode(a.0)));
+        assert_eq!((r["rate_per_sec"].clone(), r["buffer_max"].clone(), r["per_tx_max"].clone()), (json!("0"), json!("1000"), json!("1000")));
+        assert_eq!(r["buffer"], json!("950"), "the channel's escrow was drawn through the whole chain");
+        assert_eq!((r["expiry"].clone(), r["tier"].clone(), r["revoked"].clone()), (json!(1_000_000), json!(1), json!(false)));
+        assert!(r["last_accrual"].as_u64().is_some());
+        // the child: held by account 2, funded by account 1 through its root
+        let leaf = get_mandate(&chain, &json!({"id": hex::encode(LEAF.0)}));
+        let l = &leaf["result"];
+        assert_eq!(l["holder"], json!(hex::encode(acct(2).0)), "the designated holder");
+        assert_eq!(l["funder"], one, "the root's funder pays");
+        assert_eq!(l["parent"], json!(hex::encode(ROOT.0)));
+        assert_eq!(l["root"], json!(hex::encode(ROOT.0)));
+        assert_eq!(l["buffer"], json!("950"));
+        // a root whose holder is not its funder: both named, so the funder can see what it signed
+        let foreign = get_mandate(&chain, &json!({"id": hex::encode(ROOT_FOREIGN.0)}));
+        let f = &foreign["result"];
+        assert_eq!(f["holder"], json!(hex::encode(acct(3).0)));
+        assert_eq!(f["funder"], one);
+        assert_eq!(f["parent"], Value::Null);
+        assert_eq!(f["buffer"], json!("1000"));
+        // unknown and malformed ids
+        assert_eq!(get_mandate(&chain, &json!({"id": hex::encode([0xEE; 32])}))["result"]["found"], json!(false));
+        assert_eq!(get_mandate(&chain, &json!({}))["error"], json!("id must be 64-char hex"));
+    }
+
+    // ---- v0.19.12: block reads and transaction summaries ----
+
+    /// A block store in a fresh temp dir holding `blocks` (height → txs) as `save_block` writes
+    /// them, under a stand-in certificate; the disk floor set to 1, as restore would.
+    fn store_with(tag: &str, blocks: &[(u64, Vec<SignedTx>)]) -> (std::path::PathBuf, crate::store::NodeStore) {
+        let home = std::env::temp_dir().join(format!(
+            "hk-block-reads-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let store = crate::store::NodeStore::open(&home).expect("store opens");
+        for (height, txs) in blocks {
+            let batch = Batch {
+                parent_app_hash: [0x11; 32],
+                txs: txs.clone(),
+                rotations: vec![],
+                agg_proof: vec![],
+                set_changes: vec![],
+            };
+            store
+                .save_block(&crate::store::StoredBlock {
+                    height: *height,
+                    value_bytes: batch.encode(),
+                    certificate: crate::codec::RawCommitCertificate {
+                        height: hk_consensus::HkHeight::new(*height),
+                        round: malachitebft_app_channel::app::types::core::Round::ZERO,
+                        value_id: hk_consensus::HkValueId::new([0xAB; 32]),
+                        commit_signatures: vec![],
+                    },
+                    agg_valid: false,
+                })
+                .expect("block saved");
+        }
+        store.set_disk_min(1);
+        (home, store)
+    }
+
+    /// The three block reads share `BLOCK_READ_SLOTS` permits, taken before a block is
+    /// loaded: with both held each answers "busy — retry" (a free refusal still answers, and an
+    /// unindexed txid needs no permit), and every call gives its permit back. `hk_getBlock`
+    /// reports each tx's receipt under the txid it computed; `hk_getTx` gives the same
+    /// summary and the bare receipt string. KILL: drop the `try_acquire` from any of the three
+    /// (its busy assertion fails), or look a receipt up by another id (the receipt assertions).
+    #[test]
+    fn block_reads_share_a_slot_and_answer_busy_past_it() {
+        let t0 = transfer(1, 0);
+        let t1 = transfer(2, 0);
+        let (home, store) = store_with("slots", &[(1, vec![t0.clone(), t1.clone()]), (2, vec![])]);
+        let receipts = Mutex::new(crate::state::ReceiptLog::new(16));
+        receipts.lock().unwrap().restore(vec![
+            (txid(&t0), "ok: 1 event(s)".to_string()),
+            (txid(&t1), "rejected: bad nonce".to_string()),
+        ]);
+        let tx_index = Mutex::new(std::collections::HashMap::from([(txid(&t1), (1u64, 1u32))]));
+        let mut st = hk_state::State::default();
+        st.height = 2;
+        let chain = Mutex::new(st);
+        let slots = Semaphore::new(BLOCK_READ_SLOTS);
+        let busy = json!(format!("busy: {BLOCK_READ_SLOTS} block reads already in flight — retry in a moment"));
+        let t1_hex = hex::encode(txid(&t1));
+        {
+            let _held = (slots.try_acquire().unwrap(), slots.try_acquire().unwrap());
+            assert_eq!(get_block(Some(&store), &receipts, 0, &slots, &json!({"height": 1}))["error"], busy);
+            assert_eq!(get_tx(Some(&store), &tx_index, &receipts, &slots, &json!({"txid": t1_hex}))["error"], busy);
+            assert_eq!(get_blocks(Some(&store), &chain, 0, &slots, &json!({}), BLOCKS_READ_BUDGET)["error"], busy);
+            // the free answers need no permit
+            assert_eq!(
+                get_block(Some(&store), &receipts, 0, &slots, &json!({}))["error"],
+                json!("height (number) required")
+            );
+            assert_eq!(
+                get_block(None, &receipts, 0, &slots, &json!({"height": 1}))["error"],
+                json!("persistence disabled on this node (HK_NO_PERSIST)")
+            );
+            let unindexed = json!({"txid": hex::encode([0xEE; 32])});
+            assert_eq!(get_tx(Some(&store), &tx_index, &receipts, &slots, &unindexed)["result"]["found"], json!(false));
+        }
+        assert_eq!(slots.available_permits(), BLOCK_READ_SLOTS);
+        // a permit free: the block, every txid once, each receipt under its own txid
+        let block = get_block(Some(&store), &receipts, 0, &slots, &json!({"height": 1}));
+        let txs = block["result"]["txs"].as_array().unwrap();
+        assert_eq!(txs.len(), 2);
+        assert_eq!(block["result"]["tx_count"], json!(2));
+        assert_eq!(txs[0]["txid"], json!(hex::encode(txid(&t0))));
+        assert_eq!(txs[1]["txid"], json!(t1_hex));
+        assert_eq!(txs[0]["receipt"], json!({"found": true, "ok": true, "detail": "ok: 1 event(s)"}));
+        assert_eq!(txs[1]["receipt"], json!({"found": true, "ok": false, "detail": "rejected: bad nonce"}));
+        assert_eq!(get_block(Some(&store), &receipts, 0, &slots, &json!({"height": 9}))["result"]["found"], json!(false));
+        // `hk_getTx`: the same summary (without the block's receipt key) and the bare receipt
+        let one = get_tx(Some(&store), &tx_index, &receipts, &slots, &json!({"txid": t1_hex}));
+        assert_eq!(one["result"]["summary"], tx_summary(&t1, &txid(&t1)));
+        assert_eq!(one["result"]["receipt"], json!("rejected: bad nonce"));
+        assert_eq!((one["result"]["height"].clone(), one["result"]["index"].clone()), (json!(1), json!(1)));
+        // `hk_getBlocks`: newest first
+        let page = get_blocks(Some(&store), &chain, 0, &slots, &json!({}), BLOCKS_READ_BUDGET);
+        let heights: Vec<u64> =
+            page["result"]["blocks"].as_array().unwrap().iter().map(|b| b["height"].as_u64().unwrap()).collect();
+        assert_eq!(heights, vec![2, 1]);
+        assert_eq!(slots.available_permits(), BLOCK_READ_SLOTS, "every call gave its permit back");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// `hk_getBlocks` stops loading once a call has loaded its byte budget and names where
+    /// to continue (`truncated`, `next_before`); the follow-up call walks on from there with no
+    /// gap and no repeat; a page inside the budget keeps the pre-v0.19.12 shape (no new key).
+    /// KILL: drop the budget check (all three blocks load in the first call), or name the wrong
+    /// cursor (the follow-up repeats or skips a height).
+    #[test]
+    fn get_blocks_stops_at_its_byte_budget_and_names_where_to_continue() {
+        let blocks: Vec<(u64, Vec<SignedTx>)> = (1..=3u64).map(|h| (h, vec![transfer(1, h)])).collect();
+        let (home, store) = store_with("budget", &blocks);
+        let mut st = hk_state::State::default();
+        st.height = 3;
+        let chain = Mutex::new(st);
+        let slots = Semaphore::new(BLOCK_READ_SLOTS);
+        let heights = |v: &Value| -> Vec<u64> {
+            v["result"]["blocks"].as_array().unwrap().iter().map(|b| b["height"].as_u64().unwrap()).collect()
+        };
+        let one_block = store.load_block(3).unwrap().unwrap().value_bytes.len();
+        // a budget one block wide: the first load reaches it, the walk stops before the second
+        let page = get_blocks(Some(&store), &chain, 0, &slots, &json!({"limit": 10}), one_block);
+        assert_eq!(heights(&page), vec![3]);
+        assert_eq!(page["result"]["truncated"], json!(true));
+        assert_eq!(page["result"]["next_before"], json!(3));
+        // the caller continues from the cursor and walks the rest
+        let rest = get_blocks(Some(&store), &chain, 0, &slots, &json!({"limit": 10, "before": 3}), 10 * one_block);
+        assert_eq!(heights(&rest), vec![2, 1]);
+        assert!(rest["result"].get("truncated").is_none() && rest["result"].get("next_before").is_none());
+        // a page inside the budget: the pre-v0.19.12 shape, key for key
+        let full = get_blocks(Some(&store), &chain, 0, &slots, &json!({}), BLOCKS_READ_BUDGET);
+        assert_eq!(heights(&full), vec![3, 2, 1]);
+        let mut keys: Vec<&str> = full["result"].as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["blocks", "earliest", "latest"]);
+        assert_eq!((full["result"]["earliest"].clone(), full["result"]["latest"].clone()), (json!(1), json!(3)));
+        assert_eq!(slots.available_permits(), BLOCK_READ_SLOTS);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// `tx_summary` shows at most `SUMMARY_SYMBOL_SHOWN` bytes of a symbol and
+    /// `SUMMARY_DESTINATION_SHOWN` of a destination, names the real length and `truncated: true`
+    /// when it cut, cuts a symbol on a character boundary, and leaves every value inside the
+    /// bounds — every value the chain accepts — byte for byte as before. KILL: drop either cut
+    /// (the long symbol or destination comes back whole), or add the length keys always (the
+    /// byte-identical assertions fail).
+    #[test]
+    fn tx_summary_cuts_long_fields_and_keeps_accepted_ones_byte_identical() {
+        let id = [0x42; 32];
+        let a = H256([0xA5; 32]);
+        let frame = |payload: Tx| SignedTx {
+            sender: acct(1),
+            nonce: 7,
+            payload,
+            next_auth: H256([0; 32]),
+            lamport_pk: vec![],
+            sig: vec![],
+        };
+        // the summary as v0.19.11 built it
+        let before = |stx: &SignedTx, kind: &str, fields: Value| {
+            json!({
+                "txid": hex::encode(id),
+                "sender": hex::encode(stx.sender.0),
+                "nonce": stx.nonce,
+                "kind": kind,
+                "fields": fields,
+            })
+        };
+        let same = |got: Value, want: Value| {
+            assert_eq!(serde_json::to_string(&got).unwrap(), serde_json::to_string(&want).unwrap());
+        };
+        // accepted values: byte for byte as before
+        let reg = frame(Tx::AssetRegister {
+            asset: a,
+            symbol: "USDC.t".into(),
+            decimals: 6,
+            policy: AssetPolicy::from_flags("mf").unwrap(),
+        });
+        same(
+            tx_summary(&reg, &id),
+            before(&reg, "asset_register", json!({"asset": hex::encode(a.0), "symbol": "USDC.t", "decimals": 6, "policy": "mf"})),
+        );
+        let burn = frame(Tx::AssetBurn { asset: a, amount: 5, destination: vec![0x7e; 64] });
+        same(
+            tx_summary(&burn, &id),
+            before(&burn, "asset_burn", json!({"asset": hex::encode(a.0), "amount": "5", "destination": hex::encode([0x7e; 64])})),
+        );
+        let pay = frame(Tx::Transfer { to: acct(2), asset: a, amount: 9 });
+        same(
+            tx_summary(&pay, &id),
+            before(&pay, "transfer", json!({"to": hex::encode(acct(2).0), "asset": hex::encode(a.0), "amount": "9"})),
+        );
+        // at the bounds: whole, no new key
+        let at = frame(Tx::AssetRegister {
+            asset: a,
+            symbol: "S".repeat(SUMMARY_SYMBOL_SHOWN),
+            decimals: 0,
+            policy: AssetPolicy::default(),
+        });
+        let f = tx_summary(&at, &id)["fields"].clone();
+        assert_eq!(f["symbol"], json!("S".repeat(SUMMARY_SYMBOL_SHOWN)));
+        assert!(f.get("symbol_len").is_none() && f.get("truncated").is_none(), "{f}");
+        let at = frame(Tx::AssetBurn { asset: a, amount: 1, destination: vec![1; SUMMARY_DESTINATION_SHOWN] });
+        let f = tx_summary(&at, &id)["fields"].clone();
+        assert_eq!(f["destination"], json!(hex::encode([1u8; SUMMARY_DESTINATION_SHOWN])));
+        assert!(f.get("destination_len").is_none() && f.get("truncated").is_none(), "{f}");
+        // past them: cut, the real length beside it, `truncated`
+        let big = "A".repeat(1024 * 1024);
+        let reg = frame(Tx::AssetRegister { asset: a, symbol: big.clone(), decimals: 0, policy: AssetPolicy::default() });
+        let f = tx_summary(&reg, &id)["fields"].clone();
+        assert_eq!(f["symbol"], json!(&big[..SUMMARY_SYMBOL_SHOWN]));
+        assert_eq!(f["symbol_len"], json!(big.len()));
+        assert_eq!(f["truncated"], json!(true));
+        // a cut never splits a character: a two-byte 'é' straddling the bound is left out whole
+        let straddle = format!("{}\u{e9}tail", "B".repeat(SUMMARY_SYMBOL_SHOWN - 1));
+        let reg = frame(Tx::AssetRegister { asset: a, symbol: straddle.clone(), decimals: 0, policy: AssetPolicy::default() });
+        let f = tx_summary(&reg, &id)["fields"].clone();
+        assert_eq!(f["symbol"], json!("B".repeat(SUMMARY_SYMBOL_SHOWN - 1)));
+        assert_eq!(f["symbol_len"], json!(straddle.len()));
+        let dest = vec![0xC3u8; 1000];
+        let f = tx_summary(&frame(Tx::AssetBurn { asset: a, amount: 1, destination: dest.clone() }), &id)["fields"].clone();
+        assert_eq!(f["destination"], json!(hex::encode(&dest[..SUMMARY_DESTINATION_SHOWN])));
+        assert_eq!(f["destination_len"], json!(1000));
+        assert_eq!(f["truncated"], json!(true));
+        let over = frame(Tx::AssetBurn { asset: a, amount: 1, destination: vec![1; SUMMARY_DESTINATION_SHOWN + 1] });
+        let f = tx_summary(&over, &id)["fields"].clone();
+        assert_eq!(f["destination_len"], json!(SUMMARY_DESTINATION_SHOWN + 1));
+        assert_eq!(f["truncated"], json!(true));
+    }
+
+    /// HR-4 review (v0.19.12): `hk_getAsset` runs its conservation scan under the `ASSET_SCAN`
+    /// slot, like `hk_getAssets`: with the slot held it answers "busy — retry" (the missing-id
+    /// refusal still answers, needing neither slot nor lock); free, it answers as before — the
+    /// entry with its receipt, by id or by issuer + symbol, `found: false` for an unknown id —
+    /// and gives the slot back. KILL: drop the `try_acquire` from `get_asset`.
+    #[test]
+    fn hr4_get_asset_holds_the_scan_slot() {
+        let (chain, [a, _, _]) = fixture();
+        let chain = Mutex::new(chain);
+        let slots = Semaphore::new(1);
+        let by_id = json!({"asset": hex::encode(a.0)});
+        {
+            let _in_flight = slots.try_acquire().unwrap();
+            assert_eq!(
+                get_asset(&chain, &slots, &by_id)["error"],
+                json!("busy: an asset registry scan is already in flight — retry in a moment")
+            );
+            assert_eq!(
+                get_asset(&chain, &slots, &json!({}))["error"],
+                json!("asset (64-char hex) or issuer (64-char hex) + symbol required")
+            );
+        }
+        let one = get_asset(&chain, &slots, &by_id);
+        assert_eq!(one["result"]["found"], json!(true), "{one}");
+        let (held, issued) = chain.lock().unwrap().asset_conservation(&a).expect("registered");
+        assert_eq!(one["result"]["asset"]["held"], json!(held.to_string()));
+        assert_eq!(one["result"]["asset"]["circulating"], json!(issued.to_string()));
+        assert_eq!(one["result"]["asset"]["conserved"], json!(true));
+        assert_eq!(one["result"]["asset"]["symbol"], json!("A"));
+        // by issuer + symbol: the same entry
+        assert_eq!(get_asset(&chain, &slots, &json!({"issuer": hex::encode(acct(1).0), "symbol": "A"})), one);
+        let unknown = H256([0xEE; 32]);
+        assert_eq!(
+            get_asset(&chain, &slots, &json!({"asset": hex::encode(unknown.0)}))["result"],
+            json!({"found": false, "asset_id": hex::encode(unknown.0)})
+        );
+        assert_eq!(slots.available_permits(), 1, "the slot comes back");
+    }
+
+    /// `admit_one` answers a refusal the tx's own bytes decide — a shield over the byte cap and
+    /// a bad symbol here — while the chain lock is held elsewhere: the answers come, in the
+    /// mempool's words, and nothing is indexed. An honest tx is then admitted under `txid`'s
+    /// id, and its duplicate is refused with the same reason as before. KILL: take the locks
+    /// before `hash_free_refusal` (the call waits on the held lock and the receive times out).
+    #[test]
+    fn admit_one_answers_a_refusal_by_the_txs_own_bytes_without_the_locks() {
+        use crate::mempool::{AdmitError, MAX_TX_BYTES};
+        let h = crate::state::SharedHandles::for_tests(mini_chain(1));
+        // right-length envelopes (the lengths check passes); the signatures are never reached
+        let mut oversize = sign_at(1, 0, transfer_payload(1));
+        oversize.payload =
+            Tx::MintToPool { asset: ASSET, value: 1, commitment: H256([6; 32]), proof: vec![0; MAX_TX_BYTES], stealth_ct: vec![] };
+        let mut bad_symbol = sign_at(1, 0, transfer_payload(1));
+        bad_symbol.payload =
+            Tx::AssetRegister { asset: H256([3; 32]), symbol: "1BAD".into(), decimals: 6, policy: AssetPolicy::default() };
+        let want = vec![
+            Err(AdmitError::TxTooLarge { len: tx_encoded_len(&oversize) }.as_str()),
+            Err(AdmitError::BadSymbol { len: 4 }.as_str()),
+        ];
+        let held = h.chain.lock().unwrap();
+        let (send, recv) = std::sync::mpsc::channel();
+        let worker = {
+            let h = h.clone();
+            let frames = vec![oversize, bad_symbol];
+            std::thread::spawn(move || {
+                for t in frames {
+                    let _ = send.send(admit_one(&h, &t));
+                }
+            })
+        };
+        let wait = std::time::Duration::from_secs(10);
+        let got: Vec<Result<[u8; 32], String>> = (0..2)
+            .map(|_| recv.recv_timeout(wait).expect("answered without waiting for the chain lock"))
+            .collect();
+        drop(held);
+        worker.join().unwrap();
+        assert_eq!(got, want);
+        assert_eq!(h.mempool.lock().unwrap().len(), 0);
+        // an honest tx through the locked path: the id `txid` gives, then the duplicate's reason
+        let good = transfer(1, 0);
+        assert_eq!(admit_one(&h, &good), Ok(txid(&good)));
+        assert_eq!(admit_one(&h, &good), Err(AdmitError::DuplicateTx.as_str()));
+        assert_eq!(h.mempool.lock().unwrap().len(), 1);
+    }
+
+    /// v0.19.12: `hk_getAccountTxs` selects its page in one pass (`newest_rows`) and answers
+    /// what a stable newest-first sort of the whole list cut to the limit gives, row for row: an
+    /// index whose heights are out of insertion order (the background history pass appends old
+    /// heights after live commits), ties at every height, every limit up to the cap. KILL: break
+    /// the tie order in `newest_rows` (a tie across the page edge picks the later-indexed row), or
+    /// rank by position instead of height (the history rows come first).
+    #[test]
+    fn account_txs_page_matches_the_full_stable_sort() {
+        let me = acct(7);
+        let mut rows: Vec<AcctRow> = Vec::new();
+        let row = |n: usize, height: u64, kind: &'static str| {
+            let mut t = [0u8; 32];
+            t[..8].copy_from_slice(&(n as u64).to_le_bytes());
+            (t, height, kind)
+        };
+        // live commits at heights 100..140, two rows each, then the history pass's 1..=30 —
+        // with a third row at 139 and at 120 appended late, out of order
+        for height in 100..140u64 {
+            rows.push(row(rows.len(), height, "transfer"));
+            rows.push(row(rows.len(), height, "shield"));
+        }
+        for height in 1..=30u64 {
+            rows.push(row(rows.len(), height, "mandate_create"));
+        }
+        rows.push(row(rows.len(), 139, "asset_burn"));
+        rows.push(row(rows.len(), 120, "asset_mint"));
+        let index = Mutex::new(std::collections::HashMap::from([(me, rows.clone())]));
+        // the reference: the whole list, stable-sorted newest first, then cut
+        let reference = |limit: usize| -> Vec<Value> {
+            let mut sorted: Vec<&AcctRow> = rows.iter().collect();
+            sorted.sort_by(|a, b| b.1.cmp(&a.1));
+            sorted
+                .into_iter()
+                .take(limit)
+                .map(|(t, ht, kind)| json!({"txid": hex::encode(t), "height": ht, "kind": kind}))
+                .collect()
+        };
+        let id = hex::encode(me.0);
+        for limit in [0usize, 1, 2, 3, 4, 25, 80, 81, 82, 100, 112, 1_000] {
+            let got = get_account_txs(&index, &json!({"id": id, "limit": limit}));
+            assert_eq!(got["result"]["total"], json!(rows.len()), "limit {limit}");
+            assert_eq!(got["result"]["txs"], json!(reference(limit.min(100))), "limit {limit}");
+        }
+        assert_eq!(get_account_txs(&index, &json!({"id": id}))["result"]["txs"], json!(reference(25)), "the default");
+        let nobody = hex::encode([0xEE; 32]);
+        assert_eq!(
+            get_account_txs(&index, &json!({"id": nobody}))["result"],
+            json!({"id": nobody, "total": 0, "txs": []})
+        );
+        assert_eq!(get_account_txs(&index, &json!({}))["error"], json!("id must be 64-char hex"));
+    }
+
+    /// v0.19.12: `hk_getMempool` answers from the txids the pool stored, with the
+    /// response it always had — the whole pool's `count` and the first 100 txids in pool order,
+    /// each the hash of its tx. KILL: answer from anything but the pool's own order or ids (the
+    /// comparison with hashing the pool fails), or cut `txids` elsewhere than at 100.
+    #[test]
+    fn get_mempool_answers_from_the_stored_ids() {
+        let mempool = Mutex::new(Mempool::new(1_024));
+        // 120 frames from two senders through the restore path (no chain checks)
+        let frames: Vec<SignedTx> = (0..120u64)
+            .map(|n| SignedTx {
+                sender: acct(1 + (n % 2) as u8),
+                nonce: n,
+                payload: Tx::Transfer { to: acct(9), asset: ASSET, amount: 1 },
+                next_auth: H256([0; 32]),
+                lamport_pk: vec![],
+                sig: vec![],
+            })
+            .collect();
+        assert_eq!(mempool.lock().unwrap().restore_unchecked(frames), (120, 0));
+        let got = get_mempool(&mempool);
+        // the reference: the txids of the pool's first 100 txs, in pool order
+        let want: Vec<String> = mempool.lock().unwrap().iter().take(100).map(|t| hex::encode(txid(t))).collect();
+        assert_eq!(got, json!({"result": {"count": 120, "txids": want}}));
+        // a small pool: every id, in order
+        let small = Mutex::new(Mempool::new(16));
+        let one = transfer(1, 0);
+        small.lock().unwrap().try_admit(one.clone(), &mini_chain(1)).unwrap();
+        assert_eq!(get_mempool(&small), json!({"result": {"count": 1, "txids": [hex::encode(txid(&one))]}}));
+        assert_eq!(get_mempool(&Mutex::new(Mempool::new(4))), json!({"result": {"count": 0, "txids": []}}));
     }
 }
 

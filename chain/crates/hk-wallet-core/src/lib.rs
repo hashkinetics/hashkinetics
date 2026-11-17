@@ -352,6 +352,9 @@ impl Wallet {
         self.vault.lock().unwrap_or_else(|e| e.into_inner()).set_new_passphrase(&passphrase)?;
         match self.write_secret_files(&files) {
             Ok(n) => {
+                // HR-10 (v0.19.12): every file is now sealed under the new key, so the old
+                // generation's keys (kept only to prove the old files were ours) are dropped.
+                self.vault.lock().unwrap_or_else(|e| e.into_inner()).forget_retired();
                 self.log("ok", format!("Protected: {n} file(s) sealed on disk."), None);
                 Ok(n)
             }

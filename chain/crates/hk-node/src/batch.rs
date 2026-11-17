@@ -19,6 +19,30 @@ pub const DOM_TXID: &str = "hk/v1/txid";
 /// any public-testnet bump: see docs/CAPACITY-SHEET.md.
 pub const MAX_TXS_PER_BLOCK: usize = 1024;
 
+/// v0.19.12: the most transaction bytes one block this node proposes may carry — the
+/// sum of `crate::mempool::tx_encoded_len` over its txs, the P2.3 bundle that rides
+/// ahead of the pool included (state.rs `build_batch`, `select_batch_txs_sized`).
+/// Proposer-side, like `MAX_TXS_PER_BLOCK`: the signed proposal carries the whole
+/// batch in one pubsub frame (`state::MAX_PROPOSAL_BYTES`, 32 MiB), and this budget,
+/// with the aggregate and [`PROPOSAL_HEADROOM`] beside it, keeps every block this
+/// node proposes inside that frame.
+/// The arithmetic, checked at compile time in mempool.rs: 25 MiB of txs + the
+/// largest aggregate the bundle door takes (`rpc::MAX_BUNDLE_AGG_BYTES`, 2 MiB) +
+/// [`PROPOSAL_HEADROOM`] (4 MiB) ≤ 32 MiB. 25 MiB rather than 24: a transparent tx is
+/// 24,748 B in this encoding (the Lamport key and signature are 24,576 B of it), so 1,024 of
+/// them — `MAX_TXS_PER_BLOCK`, the C2.4 capacity — take 25,341,952 B and still fit one block,
+/// the count binding first exactly as before; nine pool txs carrying a core-mode proof
+/// (≈ 2.7 MB each, the largest proof in the tree) fit one block.
+pub const MAX_BATCH_TX_BYTES: usize = 25 * 1024 * 1024;
+
+/// v0.19.12: what a proposal's frame keeps beside its transactions and its aggregate —
+/// the rotation certificates (at most one per seated root, ≈ 16.4 KB each: the 16,224-byte
+/// root signature), the set-change certificates (≈ 16.3 KB per approval; only a supermajority
+/// of the seats can produce one), the batch framing (≤ 72 B) and the signed proposal's own (a
+/// 9,140-byte consensus signature and the ids). An allowance, not a cap: the compile-time
+/// check in mempool.rs keeps it free under `state::MAX_PROPOSAL_BYTES`.
+pub const PROPOSAL_HEADROOM: usize = 4 * 1024 * 1024;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Batch {
     /// State commitment the proposer built on (must equal each committer's own

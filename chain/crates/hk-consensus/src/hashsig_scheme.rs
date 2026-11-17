@@ -63,11 +63,11 @@ impl HkPriv {
 
     /// Attach a durable state file to this key's signer and adopt any state already on
     /// disk (reserve-then-sign; survives restarts without leaf reuse). Call once, on the
-    /// single signer that advances this tree — the consensus engine's provider.
+    /// single signer that advances this tree — the consensus engine's provider. A damaged or
+    /// foreign file retires the tree as used up with one `error!` line while the node keeps
+    /// running (HR-7, v0.19.12; `attach_state_file`).
     pub fn into_persistent(self, path: std::path::PathBuf) -> Self {
-        if let Err(e) = self.signer.lock().unwrap().attach_persistence(path) {
-            panic!("consensus key persistence attach failed: {e}");
-        }
+        attach_state_file(&mut self.signer.lock().unwrap(), path);
         self
     }
 
@@ -79,6 +79,13 @@ impl HkPriv {
     /// Signatures remaining before this tree is exhausted (rotate via the root then).
     pub fn remaining(&self) -> u64 {
         self.signer.lock().unwrap().remaining()
+    }
+
+    /// Signatures this tree has already produced — the leaf position it resumed at plus
+    /// everything signed since, or the capacity for a tree attached used up (HR-7, v0.19.12:
+    /// the node logs it right after the attach).
+    pub fn used(&self) -> u64 {
+        self.signer.lock().unwrap().used()
     }
 
     /// Sign, advancing state. Persist-before-release lives inside `HashSigner::sign`.
@@ -93,14 +100,31 @@ impl HkPriv {
     /// operational public key (which must equal the one in the applied `RotationCert`).
     /// Call exactly at the height the validator set swaps this validator's key, so votes
     /// verify against the matching key. (The cached `pubkey` field is intentionally left
-    /// as the genesis key; it is not used for signing after startup.)
+    /// as the genesis key; it is not used for signing after startup.) The new epoch's state
+    /// file is attached like any other (`attach_state_file`): a damaged or foreign one retires
+    /// the new tree as used up with one `error!` line instead of a panic inside commit (HR-7,
+    /// v0.19.12), and the leaf-budget trigger then moves on to the next epoch.
     pub fn rotate_to(&self, new_seed: [u8; 32], persist_path: std::path::PathBuf) -> HkPub {
         let (mut signer, pk) = hashsig::generate_consensus(&new_seed);
-        if let Err(e) = signer.attach_persistence(persist_path) {
-            panic!("rotation persistence attach failed: {e}");
-        }
+        attach_state_file(&mut signer, persist_path);
         *self.signer.lock().unwrap() = signer;
         HkPub(pk.0)
+    }
+}
+
+/// Attach `path` to a consensus signer and log what the attach retired (HR-7, v0.19.12).
+/// The attach answers every state-file condition itself (a damaged or foreign file is
+/// retired as used up, its bytes kept beside it when they can be read; a good one resumes)
+/// and returns `Ok` for all of them, so no state file can panic the start
+/// (`into_persistent`) or a live rotation (`rotate_to`, inside commit, where a panic would
+/// recur at every restart). No `Err` can occur; the `expect` only fails closed should the
+/// attach ever grow one. A retired file's account is the one `error!` line logged here.
+fn attach_state_file(signer: &mut HashSigner, path: std::path::PathBuf) {
+    signer
+        .attach_persistence(path)
+        .expect("HashSigner::attach_persistence answers Ok for every state file");
+    if let Some(report) = signer.take_damage_report() {
+        tracing::error!("{}", report);
     }
 }
 
@@ -265,6 +289,43 @@ mod tests {
             assert_eq!(address_of(&a.public()), address_of(&b.public()));
             let c = HkPriv::from_seed([10u8; 32]);
             assert_ne!(a.public(), c.public());
+        });
+    }
+
+    /// HR-7 (v0.19.12): a damaged state file panics neither the start (`into_persistent`) nor
+    /// the live rotation path (`rotate_to`, which runs inside commit): the tree attaches used
+    /// up and signs nothing, and a rotation onto the next epoch's (missing) file signs
+    /// normally — the way out of a retired tree.
+    /// KILL: restore the refusing attach with the panicking callers and `into_persistent`
+    /// panics on the 3-byte file (and `rotate_to` on the 7-byte one).
+    #[test]
+    fn hr7_a_damaged_state_file_retires_the_tree_and_rotation_moves_on() {
+        on_big_stack(|| {
+            let dir = std::env::temp_dir().join(format!("hk_hr7_scheme_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let master = [31u8; 32];
+            let e0 = dir.join("consensus_state.bin");
+            std::fs::write(&e0, [1u8, 2, 3]).unwrap();
+            let sk = HkPriv::from_seed(master).into_persistent(e0.clone());
+            assert_eq!(sk.remaining(), 0, "attached used up");
+            assert_eq!(sk.used(), hashsig::CONSENSUS_CAPACITY);
+            assert!(sk.sign(b"h=1 vote").is_none(), "a retired tree signs nothing");
+            // The live rotation path onto a damaged file: used up again, no panic.
+            let e1 = dir.join("consensus_state_e1.bin");
+            std::fs::write(&e1, [0u8; 7]).unwrap();
+            sk.rotate_to(op_seed(&master, 1), e1.clone());
+            assert_eq!(sk.remaining(), 0);
+            assert!(sk.sign(b"h=2 vote").is_none());
+            // The next epoch's file is missing: a fresh tree, and it signs.
+            let e2 = dir.join("consensus_state_e2.bin");
+            let pk2 = sk.rotate_to(op_seed(&master, 2), e2.clone());
+            assert_eq!(sk.remaining(), hashsig::CONSENSUS_CAPACITY);
+            let sig = sk.sign(b"h=3 vote").expect("the rotated tree signs");
+            assert!(verify(b"h=3 vote", &sig, &pk2));
+            let record = std::fs::read(&e2).unwrap();
+            assert_eq!(u64::from_le_bytes(record[..8].try_into().unwrap()), 1, "the first record of the new tree");
+            let _ = std::fs::remove_dir_all(&dir);
         });
     }
 }

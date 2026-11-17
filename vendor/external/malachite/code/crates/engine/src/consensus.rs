@@ -1205,6 +1205,35 @@ where
                 Ok(r.resume_with(()))
             }
 
+            // HK (v0.19.12): a proposal for the current height whose signature verified
+            // and whose value consensus does not hold yet. Its own value goes to the host; the
+            // host's answer comes back as `Msg::ReceivedProposedValue` with origin `Consensus`.
+            // If the host refuses the value it does not answer,
+            // and the proposal stays stored without a value. This also runs while the WAL is
+            // replayed: the host's store lives in memory and needs the value again after a
+            // restart (the engine itself gets it from the WAL, in order).
+            Effect::VerifiedProposal(proposal, r) => {
+                self.host
+                    .call_and_forward(
+                        |reply_to| HostMsg::ReceivedVerifiedProposal {
+                            height: proposal.height(),
+                            round: proposal.round(),
+                            valid_round: proposal.pol_round(),
+                            proposer: proposal.validator_address().clone(),
+                            value: proposal.value().clone(),
+                            reply_to,
+                        },
+                        myself,
+                        |value| Msg::<Ctx>::ReceivedProposedValue(value, ValueOrigin::Consensus),
+                        None,
+                    )
+                    .map_err(|e| {
+                        eyre!("Error when forwarding a verified proposal to host: {e}")
+                    })?;
+
+                Ok(r.resume_with(()))
+            }
+
             Effect::Decide(certificate, extensions, r) => {
                 assert!(!certificate.commit_signatures.is_empty());
 

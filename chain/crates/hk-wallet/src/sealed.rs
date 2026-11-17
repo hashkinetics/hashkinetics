@@ -23,11 +23,14 @@
 //! spends on both:
 //! - **One guess is expensive and memory-hard.** Default Argon2id 512 MiB, t=4, p=4
 //!   (≈1 s on a laptop, the QE-Vault profile brought to a size a validator host can
-//!   afford; `HK_SEAL_M_KIB` / `HK_SEAL_T` raise or lower it, never below 64 MiB / t=3).
-//!   Memory-hardness is the lever against GPUs: a 24 GB card fits ~48 guesses of 512 MiB
-//!   at a time, and each is memory-bound, so a card manages tens of guesses per second,
-//!   not billions. The parameters ride in the envelope; a file always opens with the
-//!   parameters it was sealed with.
+//!   afford; `HK_SEAL_M_KIB` / `HK_SEAL_T` raise or lower it, never below 64 MiB / t=3 and
+//!   never above 2 GiB / t=64). Memory-hardness is the lever against GPUs: a 24 GB card
+//!   fits ~48 guesses of 512 MiB at a time, and each is memory-bound, so a card manages tens
+//!   of guesses per second, not billions. The parameters ride in the envelope; a file opens
+//!   with its own parameters within the floor and the ceiling ([`Kdf::validate`], HR-10,
+//!   v0.19.12 — a presented envelope can neither make a guess cheap nor make the opener spend
+//!   more than the ceiling before authenticating), and a save never adopts an envelope this
+//!   process did not open (the node's and the wallet core's write paths verify-then-adopt).
 //! - **The KDF runs once per unlock, not once per save.** [`SealKey`] keeps the derived
 //!   key (same salt) so reserve-then-sign re-seals in microseconds with a fresh nonce.
 //!   That is what makes a heavy KDF affordable.
@@ -67,9 +70,22 @@ const AAD: &[u8] = b"hk/v1/sealed";
 pub const DEFAULT_M_KIB: u32 = 524_288;
 pub const DEFAULT_T: u32 = 4;
 pub const DEFAULT_P: u32 = 4;
-/// Floors: nothing this module writes goes below the v0.16.0-rc profile.
+/// Floors: nothing this module writes goes below the v0.16.0-rc profile — and, since
+/// HR-10 (v0.19.12), nothing it OPENS either: an envelope presented with weaker parameters
+/// is refused before any key derivation ([`Kdf::validate`]).
 pub const MIN_M_KIB: u32 = 65_536;
 pub const MIN_T: u32 = 3;
+/// Ceilings (HR-10, v0.19.12): the most Argon2 work an envelope can make a process do
+/// before it has authenticated anything — 2 GiB of memory, 64 passes, 16 lanes. Every
+/// profile this project writes (512 MiB default, 256 MiB mobile, 128 MiB small hosts, the
+/// 64 MiB floor the tests use) sits inside. A file sealed above the memory ceiling by an
+/// older binary (v0.16.0–v0.19.11 clamped `HK_SEAL_M_KIB` only from below) is refused by
+/// name — [`SealError::OverCeiling`] gives the value, the ceiling and the way back: unseal it
+/// with that binary, re-seal it with this one. Until v0.19.12 the read side had ceilings (8 GiB,
+/// t 64, p 16) and m ≥ 8·p, no floor; a swapped envelope could demand 8 GiB at every open or save.
+pub const MAX_M_KIB: u32 = 2_097_152;
+pub const MAX_T: u32 = 64;
+pub const MAX_P: u32 = 16;
 const KEYFILE_LEN: usize = 32;
 
 /// The on-disk envelope.
@@ -98,14 +114,57 @@ pub struct Kdf {
 
 impl Kdf {
     /// The profile new envelopes are written with: the defaults, unless
-    /// `HK_SEAL_M_KIB` / `HK_SEAL_T` say otherwise (clamped to the floors).
+    /// `HK_SEAL_M_KIB` / `HK_SEAL_T` say otherwise (clamped to the floors AND the ceilings —
+    /// HR-10, v0.19.12 — so an operator cannot write an envelope this module refuses to open).
+    /// The two variables' values go through [`Kdf::profile_from`].
     pub fn default_profile() -> Self {
-        let env_u32 = |k: &str| std::env::var(k).ok().and_then(|s| s.trim().parse::<u32>().ok());
+        let m_kib = std::env::var("HK_SEAL_M_KIB").ok();
+        let t = std::env::var("HK_SEAL_T").ok();
+        Self::profile_from(m_kib.as_deref(), t.as_deref())
+    }
+
+    /// The profile for the raw values of `HK_SEAL_M_KIB` and `HK_SEAL_T` (`None` = unset): each
+    /// trimmed and parsed as a `u32` — absent or unparsable means the default — then clamped to
+    /// the floor and the ceiling; the lanes stay `DEFAULT_P`. No environment is read here, so
+    /// the clamps are tested without touching the process-wide environment.
+    pub fn profile_from(m_kib: Option<&str>, t: Option<&str>) -> Self {
+        let parse = |v: Option<&str>| v.and_then(|s| s.trim().parse::<u32>().ok());
         Kdf {
-            m_kib: env_u32("HK_SEAL_M_KIB").unwrap_or(DEFAULT_M_KIB).max(MIN_M_KIB),
-            t: env_u32("HK_SEAL_T").unwrap_or(DEFAULT_T).max(MIN_T),
+            m_kib: parse(m_kib).unwrap_or(DEFAULT_M_KIB).clamp(MIN_M_KIB, MAX_M_KIB),
+            t: parse(t).unwrap_or(DEFAULT_T).clamp(MIN_T, MAX_T),
             p: DEFAULT_P,
         }
+    }
+
+    /// HR-10 (v0.19.12): the one bound every key derivation passes, on both sides —
+    /// `MIN_M_KIB ≤ m_kib ≤ MAX_M_KIB`, `MIN_T ≤ t ≤ MAX_T`, `1 ≤ p ≤ MAX_P`, and Argon2's own
+    /// `m_kib ≥ 8·p`. [`derive_key`] calls it first, so [`SealKey::new`] (a profile this
+    /// process chose) and [`SealKey::for_envelope`] (parameters read from a file) are both
+    /// covered: a presented envelope can neither make a guess cheap (below the floor) nor
+    /// make this process burn gigabytes before it has authenticated anything (above the
+    /// ceiling). The error names the bound that failed. An envelope's memory above the
+    /// ceiling is refused earlier, by name, in [`SealKey::for_envelope`]
+    /// ([`SealError::OverCeiling`]); a profile this process chose gets the error below.
+    pub fn validate(&self) -> Result<(), SealError> {
+        let Kdf { m_kib, t, p } = *self;
+        let out_of_range = |what: String| SealError::Format(format!("kdf parameters out of range: {what}"));
+        if !(MIN_M_KIB..=MAX_M_KIB).contains(&m_kib) {
+            return Err(out_of_range(format!(
+                "m_kib {m_kib} (allowed {MIN_M_KIB}..={MAX_M_KIB}, i.e. 64 MiB..=2 GiB)"
+            )));
+        }
+        if !(MIN_T..=MAX_T).contains(&t) {
+            return Err(out_of_range(format!("t {t} (allowed {MIN_T}..={MAX_T})")));
+        }
+        if !(1..=MAX_P).contains(&p) {
+            return Err(out_of_range(format!("p {p} (allowed 1..={MAX_P})")));
+        }
+        // Argon2's own rule. It cannot fail while the bounds above hold (m_kib ≥ 65,536 and
+        // p ≤ 16 give 8 × p ≤ 128); it stays so the check is complete if a bound changes.
+        if m_kib < 8 * p {
+            return Err(out_of_range(format!("m_kib {m_kib} below 8 × p = {}", 8 * p)));
+        }
+        Ok(())
     }
 }
 
@@ -118,6 +177,16 @@ pub enum SealError {
     /// The envelope was sealed with a key file this process does not have.
     NoKeyfile(String),
     WeakPassphrase(String),
+    /// HR-10 (v0.19.12): a save found an envelope at the path that this process's key does
+    /// not open — not the file this process read (another run re-sealed it under a different
+    /// passphrase, or it was replaced) — and nothing is ever re-sealed under a key derived for
+    /// a file that was not opened (the swapped-envelope downgrade path).
+    NotOpened,
+    /// HR-10 (v0.19.12): an envelope's Argon2id memory (KiB) is above [`MAX_M_KIB`]. This
+    /// binary never seals above it; v0.16.0–v0.19.11 did when `HK_SEAL_M_KIB` asked for more,
+    /// so the refusal names the value, the ceiling and the way back instead of calling the
+    /// file malformed. No key derivation runs.
+    OverCeiling(u32),
 }
 
 impl std::fmt::Display for SealError {
@@ -129,6 +198,15 @@ impl std::fmt::Display for SealError {
             SealError::NoPassphrase(hint) => write!(f, "this file is sealed — {hint}"),
             SealError::NoKeyfile(id) => write!(f, "this file is sealed with key file {id} — set the *_KEYFILE path to it"),
             SealError::WeakPassphrase(why) => write!(f, "passphrase refused: {why}"),
+            SealError::NotOpened => write!(
+                f,
+                "the file on disk is not the sealed file this process opened — re-sealed by another run or replaced; refusing to overwrite it"
+            ),
+            SealError::OverCeiling(m_kib) => write!(
+                f,
+                "this file asks for {m_kib} KiB ({} MiB) of Argon2id memory, above the {MAX_M_KIB} KiB (2 GiB) ceiling this binary opens (HR-10, v0.19.12): it was sealed by an older binary (v0.16.0–v0.19.11 allowed more) — unseal it with that binary (`hk-node key-unseal <HOME>` or `hk-node account-unseal <DIR>`; in a wallet app, remove the passphrase), then re-seal it with this one (`hk-node key-seal <HOME>` or `hk-node account-seal <DIR>`; in a wallet app, set the passphrase again)",
+                (u64::from(*m_kib) + 1023) / 1024
+            ),
         }
     }
 }
@@ -146,7 +224,10 @@ pub fn parse(content: &str) -> Result<Sealed, SealError> {
     serde_json::from_str(content).map_err(|e| SealError::Format(e.to_string()))
 }
 
+/// The one place the KDF runs. HR-10 (v0.19.12): the parameters are bounded first
+/// ([`Kdf::validate`]) — whoever chose them, this process or a file.
 fn derive_key(passphrase: &str, salt: &[u8], kdf: Kdf) -> Result<[u8; 32], SealError> {
+    kdf.validate()?;
     let params = Params::new(kdf.m_kib, kdf.t, kdf.p, Some(32)).map_err(|e| SealError::Kdf(e.to_string()))?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut key = [0u8; 32];
@@ -226,13 +307,24 @@ impl SealKey {
     }
 
     /// Derive for an existing envelope: its salt and parameters (an unlock).
+    ///
+    /// HR-10 (v0.19.12): the parameters are bounded on BOTH sides first (`Kdf::validate`,
+    /// before the key-file and salt checks, before any derivation), and every cheap shape
+    /// check — the salt, the 24-byte nonce, the hex of nonce and ciphertext — runs before
+    /// the KDF, so a malformed envelope costs nothing and a presented one costs at most the
+    /// ceiling. Until v0.19.12 only the ceilings (8 GiB, t 64, p 16) and m ≥ 8·p were tested here;
+    /// the writer's floor was never applied to a file being opened. Memory above the ceiling is
+    /// refused first and by name ([`SealError::OverCeiling`]): such a file can be the owner's
+    /// own, sealed by an older binary, and the error says how to bring it inside the bounds.
     pub fn for_envelope(sealed: &Sealed, passphrase: &str, keyfile: Option<&[u8]>) -> Result<Self, SealError> {
         if sealed.hke != 1 || sealed.kdf != "argon2id" {
             return Err(SealError::Format(format!("unsupported envelope hke={} kdf={}", sealed.hke, sealed.kdf)));
         }
-        if sealed.m_kib > 8 * 1_048_576 || sealed.t > 64 || sealed.p > 16 || sealed.m_kib < 8 * sealed.p {
-            return Err(SealError::Format("kdf parameters out of range".into()));
+        let kdf = Kdf { m_kib: sealed.m_kib, t: sealed.t, p: sealed.p };
+        if kdf.m_kib > MAX_M_KIB {
+            return Err(SealError::OverCeiling(kdf.m_kib));
         }
+        kdf.validate()?;
         if let Some(want) = &sealed.kf {
             match keyfile {
                 None => return Err(SealError::NoKeyfile(want.clone())),
@@ -249,7 +341,7 @@ impl SealKey {
         if salt.len() < 8 {
             return Err(SealError::Format("salt too short".into()));
         }
-        let kdf = Kdf { m_kib: sealed.m_kib, t: sealed.t, p: sealed.p };
+        decode_body(sealed)?;
         let key = derive_key(passphrase, &salt, kdf)?;
         Ok(Self::finish(key, salt, kdf, keyfile))
     }
@@ -304,16 +396,28 @@ impl SealKey {
         if !self.fits(sealed) {
             return Err(SealError::Format("this key was derived for a different envelope (salt/params/key file)".into()));
         }
-        let nonce = hex::decode(&sealed.nonce).map_err(|e| SealError::Format(e.to_string()))?;
-        let ct = hex::decode(&sealed.ct).map_err(|e| SealError::Format(e.to_string()))?;
-        if nonce.len() != 24 {
-            return Err(SealError::Format("nonce must be 24 bytes".into()));
-        }
+        let (nonce, ct) = decode_body(sealed)?;
         let cipher = XChaCha20Poly1305::new(Key::from_slice(&self.key));
         cipher
             .decrypt(XNonce::from_slice(&nonce), Payload { msg: &ct, aad: AAD })
             .map_err(|_| SealError::Cipher)
     }
+}
+
+/// The envelope's nonce and ciphertext as bytes — the cheap shape checks (hex, a 24-byte
+/// nonce, a ciphertext that at least holds its 16-byte tag). HR-10 (v0.19.12): run by
+/// `for_envelope` BEFORE the KDF as well as by `open`, so a malformed file never costs a
+/// derivation.
+fn decode_body(sealed: &Sealed) -> Result<(Vec<u8>, Vec<u8>), SealError> {
+    let nonce = hex::decode(&sealed.nonce).map_err(|e| SealError::Format(e.to_string()))?;
+    let ct = hex::decode(&sealed.ct).map_err(|e| SealError::Format(e.to_string()))?;
+    if nonce.len() != 24 {
+        return Err(SealError::Format("nonce must be 24 bytes".into()));
+    }
+    if ct.len() < 16 {
+        return Err(SealError::Format("ciphertext shorter than its authentication tag".into()));
+    }
+    Ok((nonce, ct))
 }
 
 // ---- one-shot conveniences (derive every time; the CLI's seal/unseal commands, tests) ----
@@ -575,7 +679,8 @@ mod tests {
     use super::*;
 
     /// Tests use the floor profile so the suite stays fast; the defaults are exercised by
-    /// `kdf_default_profile_honours_floors`.
+    /// `kdf_default_profile_clamps_to_the_floor_and_the_ceiling` and
+    /// `hr10_default_and_mobile_profiles_round_trip`.
     fn fast() -> Kdf {
         Kdf { m_kib: MIN_M_KIB, t: MIN_T, p: 1 }
     }
@@ -589,7 +694,9 @@ mod tests {
         assert_eq!(open(&s, "correct horse battery staple").unwrap(), b"{\"seed\":\"00\"}");
         assert!(matches!(open(&s, "wrong").unwrap_err(), SealError::Cipher));
         let mut t = s.clone();
-        t.ct = t.ct.replacen('0', "1", 1);
+        let mut ct = hex::decode(&t.ct).unwrap();
+        ct[0] ^= 0x01;
+        t.ct = hex::encode(ct);
         assert!(matches!(open(&t, "correct horse battery staple").unwrap_err(), SealError::Cipher), "tampering fails the tag");
         assert!(open(&s, "").is_err());
         // cached key: a re-seal keeps the salt, changes the nonce, opens with a fresh derivation
@@ -671,15 +778,154 @@ mod tests {
         assert!(a.split(' ').all(|w| WORDS.contains(&w)));
     }
 
+    /// HR-10 (v0.19.12): the knobs are clamped on BOTH sides — tested on the pure
+    /// `Kdf::profile_from` that `default_profile` feeds, so no test sets the process-wide
+    /// environment (a 4 GiB knob set there would turn every parallel test's `default_profile()`
+    /// into a 2 GiB derivation, and a failed assert would leave it set). KILL: put `.max(MIN_*)`
+    /// back in `profile_from` (no ceiling) and the 4 GiB / t 65 knobs come back unclamped — an
+    /// envelope this module would then refuse to open.
     #[test]
-    fn kdf_default_profile_honours_floors() {
-        std::env::set_var("HK_SEAL_M_KIB", "1024");
-        std::env::set_var("HK_SEAL_T", "1");
-        let k = Kdf::default_profile();
+    fn kdf_default_profile_clamps_to_the_floor_and_the_ceiling() {
+        let k = Kdf::profile_from(Some("1024"), Some("1"));
         assert_eq!((k.m_kib, k.t, k.p), (MIN_M_KIB, MIN_T, DEFAULT_P));
-        std::env::remove_var("HK_SEAL_M_KIB");
-        std::env::remove_var("HK_SEAL_T");
-        let d = Kdf::default_profile();
+        let k = Kdf::profile_from(Some("4194304"), Some("65")); // 4 GiB
+        assert_eq!((k.m_kib, k.t, k.p), (MAX_M_KIB, MAX_T, DEFAULT_P));
+        assert!(k.validate().is_ok(), "whatever the knobs say, the profile written is one the module opens");
+        let d = Kdf::profile_from(None, None);
         assert_eq!((d.m_kib, d.t, d.p), (DEFAULT_M_KIB, DEFAULT_T, DEFAULT_P));
+        assert!(d.validate().is_ok());
+        // an unparsable knob means the default; surrounding whitespace is trimmed
+        let u = Kdf::profile_from(Some("lots"), Some(" 5 "));
+        assert_eq!((u.m_kib, u.t, u.p), (DEFAULT_M_KIB, 5, DEFAULT_P));
+    }
+
+    /// An envelope whose body is a fresh seal under `k`, re-labelled with `kdf` — what an
+    /// attacker who can place bytes at a secret path presents.
+    fn relabelled(k: &SealKey, kdf: Kdf) -> Sealed {
+        let mut s = k.seal(b"{\"seed\":\"00\"}").unwrap();
+        s.m_kib = kdf.m_kib;
+        s.t = kdf.t;
+        s.p = kdf.p;
+        s
+    }
+
+    /// HR-10 (v0.19.12): parameters below the floor or above the ceiling are refused on the
+    /// READ side as well as the write side, before any derivation. KILL: drop the floor half
+    /// of `Kdf::validate` (the pre-v0.19.12 read path) and the 8 / 1 / 1 and 65,535 / 2 / 4
+    /// envelopes derive a key — the owner's passphrase under an attacker's cheap profile.
+    #[test]
+    fn hr10_kdf_bounds_refuse_sub_floor_and_over_ceiling_parameters() {
+        let k = SealKey::new("correct horse battery staple", None, fast()).unwrap();
+        let refused = |kdf: Kdf| {
+            // the profile itself …
+            let e = kdf.validate().unwrap_err().to_string();
+            assert!(e.contains("kdf parameters out of range"), "{kdf:?}: {e}");
+            // … a NEW key under it …
+            assert!(matches!(SealKey::new("correct horse battery staple", None, kdf), Err(SealError::Format(_))), "{kdf:?}");
+            // … and an envelope presenting it: refused as malformed, never as a wrong
+            // passphrase (which is what a derivation that ran would say)
+            let s = relabelled(&k, kdf);
+            match open(&s, "correct horse battery staple") {
+                Err(SealError::Format(why)) => assert!(why.contains("kdf parameters out of range"), "{kdf:?}: {why}"),
+                other => panic!("{kdf:?} must be refused before the KDF, got {other:?}"),
+            }
+        };
+        // below the floor: the reporter's 8 KiB / t1 / p1, one step under each floor, t = 2
+        refused(Kdf { m_kib: 8, t: 1, p: 1 });
+        refused(Kdf { m_kib: 65_535, t: 2, p: 4 });
+        refused(Kdf { m_kib: MIN_M_KIB, t: 2, p: 1 });
+        refused(Kdf { m_kib: MIN_M_KIB - 1, t: MIN_T, p: 1 });
+        // above the ceiling: memory one KiB over is out of range as a profile and for a new
+        // key, and an envelope presenting it gets its own refusal, still before the KDF
+        // (`hr10_over_ceiling_memory_is_refused_by_name_with_the_way_back`)
+        let over = Kdf { m_kib: MAX_M_KIB + 1, t: MIN_T, p: 1 };
+        assert!(over.validate().unwrap_err().to_string().contains("kdf parameters out of range"));
+        assert!(matches!(SealKey::new("correct horse battery staple", None, over), Err(SealError::Format(_))));
+        match open(&relabelled(&k, over), "correct horse battery staple") {
+            Err(SealError::OverCeiling(m)) => assert_eq!(m, MAX_M_KIB + 1),
+            other => panic!("{over:?} must be refused by name before the KDF, got {other:?}"),
+        }
+        refused(Kdf { m_kib: MIN_M_KIB, t: MAX_T + 1, p: 1 });
+        refused(Kdf { m_kib: MIN_M_KIB, t: MIN_T, p: MAX_P + 1 });
+        refused(Kdf { m_kib: MIN_M_KIB, t: MIN_T, p: 0 });
+        // the floor itself and the ceiling itself are inside the bounds
+        assert!(Kdf { m_kib: MIN_M_KIB, t: MIN_T, p: 1 }.validate().is_ok());
+        assert!(Kdf { m_kib: MAX_M_KIB, t: MAX_T, p: MAX_P }.validate().is_ok());
+    }
+
+    /// HR-10 (v0.19.12): the floor-exact profile opens, and the cheap shape checks run before
+    /// the KDF — an envelope at the CEILING with a bad nonce is refused in microseconds (a
+    /// 2 GiB / t 3 derivation would take seconds and 2 GiB). KILL: move `decode_body` back
+    /// behind `derive_key` in `for_envelope` and the timing assertion fails (and the process
+    /// allocates 2 GiB to find out).
+    #[test]
+    fn hr10_floor_exact_opens_and_shape_checks_come_before_the_kdf() {
+        let floor = Kdf { m_kib: 65_536, t: 3, p: 1 };
+        let k = SealKey::new("correct horse battery staple", None, floor).unwrap();
+        let s = k.seal(b"{\"seed\":\"00\"}").unwrap();
+        assert_eq!((s.m_kib, s.t, s.p), (65_536, 3, 1));
+        assert_eq!(open(&s, "correct horse battery staple").unwrap(), b"{\"seed\":\"00\"}");
+        // shape before work: a ceiling-priced envelope with a 23-byte nonce, a non-hex
+        // ciphertext, a ciphertext shorter than its tag, a short salt
+        let at_ceiling = relabelled(&k, Kdf { m_kib: MAX_M_KIB, t: MIN_T, p: 1 });
+        let cases: Vec<(&str, Sealed)> = vec![
+            ("nonce must be 24 bytes", { let mut e = at_ceiling.clone(); e.nonce = "00".repeat(23); e }),
+            ("Invalid character", { let mut e = at_ceiling.clone(); e.ct = "zz".into(); e }),
+            ("shorter than its authentication tag", { let mut e = at_ceiling.clone(); e.ct = "00".repeat(15); e }),
+            ("salt too short", { let mut e = at_ceiling.clone(); e.salt = "0011".into(); e }),
+        ];
+        for (expect, env) in cases {
+            let t = std::time::Instant::now();
+            match SealKey::for_envelope(&env, "correct horse battery staple", None) {
+                Err(SealError::Format(why)) => assert!(why.contains(expect), "expected {expect:?}, got {why:?}"),
+                other => panic!("expected a shape refusal ({expect}), got {other:?}"),
+            }
+            assert!(t.elapsed() < std::time::Duration::from_secs(2), "{expect}: the refusal must come before the KDF");
+        }
+    }
+
+    /// HR-10 (v0.19.12): the two profiles the project writes — the desktop default (512 MiB /
+    /// t 4 / p 4) and the phone's (256 MiB / t 3 / p 4) — pass the bounds and round-trip through
+    /// a real derivation. KILL: lower `MAX_M_KIB` below 524,288 (or raise `MIN_T` above 3) and
+    /// one of the two is refused.
+    #[test]
+    fn hr10_default_and_mobile_profiles_round_trip() {
+        for kdf in [Kdf { m_kib: DEFAULT_M_KIB, t: DEFAULT_T, p: DEFAULT_P }, Kdf { m_kib: 262_144, t: 3, p: 4 }] {
+            assert!(kdf.validate().is_ok(), "{kdf:?}");
+            let k = SealKey::new("correct horse battery staple", None, kdf).unwrap();
+            let s = k.seal(b"{\"seed\":\"00\"}").unwrap();
+            assert_eq!((s.m_kib, s.t, s.p), (kdf.m_kib, kdf.t, kdf.p));
+            assert_eq!(open(&s, "correct horse battery staple").unwrap(), b"{\"seed\":\"00\"}", "{kdf:?}");
+        }
+    }
+
+    /// HR-10 (v0.19.12): an envelope labelled 3 GiB — what v0.16.0–v0.19.11 wrote when
+    /// `HK_SEAL_M_KIB` asked for it — is refused by name from the header alone (no key
+    /// derivation runs: a 3 GiB / t 3 one would take seconds and 3 GiB), and the message
+    /// carries the value, the ceiling and the way back: unseal with the older binary
+    /// (`key-unseal` / `account-unseal`), re-seal with this one. KILL: drop the `OverCeiling`
+    /// check in `for_envelope` and the envelope comes back as `Format` ("sealed file is
+    /// malformed: kdf parameters out of range …"), which names no way back.
+    #[test]
+    fn hr10_over_ceiling_memory_is_refused_by_name_with_the_way_back() {
+        let k = SealKey::new("correct horse battery staple", None, fast()).unwrap();
+        let three_gib = Kdf { m_kib: 3 * 1_048_576, t: MIN_T, p: 1 };
+        let s = relabelled(&k, three_gib);
+        match SealKey::for_envelope(&s, "correct horse battery staple", None) {
+            Err(SealError::OverCeiling(m)) => assert_eq!(m, 3_145_728),
+            other => panic!("a 3 GiB envelope must be refused by name before the KDF, got {other:?}"),
+        }
+        let msg = match open(&s, "correct horse battery staple") {
+            Err(e @ SealError::OverCeiling(_)) => e.to_string(),
+            other => panic!("a 3 GiB envelope must be refused by name before the KDF, got {other:?}"),
+        };
+        for want in ["3145728 KiB", "2097152 KiB", "older binary", "hk-node key-unseal", "hk-node account-unseal", "re-seal"] {
+            assert!(msg.contains(want), "{want:?} missing from: {msg}");
+        }
+        assert!(!msg.contains("malformed"), "{msg}");
+        // the wallet core maps unlock errors by these words; this refusal must pass through as is
+        for word in ["key file", "wrong", "aead", "decrypt"] {
+            assert!(!msg.contains(word), "{word:?} in: {msg}");
+        }
     }
 }

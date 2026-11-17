@@ -91,7 +91,24 @@ where
     }
 
     // If this is the first time we see this value, append it to the WAL, so it can be used for recovery.
-    if !state.value_exists(&proposed_value) {
+    //
+    // HK (v0.19.12): in `proposal-and-parts` mode a value from consensus counts as seen only
+    // when the VALUE is held (`value_exists` is also true when only the proposal for this id
+    // is held). The value of another node arrives after its proposal (it is the host's answer
+    // to `Effect::VerifiedProposal`), so the WAL records the moment the value completes the
+    // proposal: a replay then feeds proposal and value in the order they were processed and
+    // rebuilds the vote, the lock and the valid value that proposal led to.
+    // Synced values and the other modes keep the upstream rule.
+    let seen_before = if !origin.is_sync()
+        && state.params.value_payload.include_proposal()
+        && state.params.value_payload.include_parts()
+    {
+        state.full_proposal_keeper.value_held(&proposed_value)
+    } else {
+        state.value_exists(&proposed_value)
+    };
+
+    if !seen_before {
         perform!(
             co,
             Effect::WalAppend(

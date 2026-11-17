@@ -168,6 +168,30 @@ where
         )
         .await?;
     } else {
+        // HK (v0.19.12): hand the value of this VERIFIED proposal to the host.
+        //
+        // The HashKinetics proposal message carries the whole value (the batch bytes) and the
+        // signature just checked covers it (the same verification refuses a proposal whose
+        // id is not the hash of those bytes). In `proposal-and-parts` mode the value of a
+        // verified proposal is handed to the host from here, as `Effect::VerifiedProposal`
+        // below. If the host keeps the value, it answers with a proposed value, which
+        // arrives through `on_proposed_value`, the same handler a reassembled stream's
+        // value goes through; if not, it does not answer. That handler writes the value
+        // to the WAL when it completes this proposal, so a replay feeds the proposal and
+        // its value in the order they were processed.
+        //
+        // Only when no value is held for the proposal (our own proposals and re-proposals of
+        // a value already held form a full proposal above), and never in `proposal-only` mode
+        // (handled above) or `parts-only` mode (its proposals are synthesized, not signed).
+        if state.params.value_payload.include_proposal()
+            && state.params.value_payload.include_parts()
+        {
+            perform!(
+                co,
+                Effect::VerifiedProposal(signed_proposal.clone(), Default::default())
+            );
+        }
+
         debug!(
             proposal.height = %proposal_height,
             proposal.round = %proposal_round,

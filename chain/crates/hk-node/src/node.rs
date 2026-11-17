@@ -18,6 +18,36 @@ use crate::config::{load_config, Config};
 use crate::genesis::HkGenesis;
 use crate::state::HkApp;
 
+/// HR-7 (v0.19.12): one line per attach naming the state file and where its tree stands —
+/// the position the file carried, leaf 0 of a fresh tree when no file existed, or used up (a
+/// file at the end of its tree, or a damaged or foreign file the attach retired, which `HkPriv`
+/// also logs as one `error!` line; `hk_crypto::hashsig::HashSigner::attach_persistence_with_floor`).
+/// Both call sites attach `consensus_state.bin`, the master seed's epoch-0 tree; a validator
+/// whose key has rotated moves to its epoch's file once the chain state is restored
+/// (`HkApp::adopt_epoch_signer`), so the line says which tree it describes.
+fn log_signer_attached(sk: &HkPriv, state_file: &std::path::Path, state_file_existed: bool) {
+    let file = state_file
+        .file_name()
+        .map_or_else(|| state_file.display().to_string(), |n| n.to_string_lossy().into_owned());
+    let exhausted = sk.remaining() == 0;
+    let stands = if exhausted {
+        "used up: this tree will not sign again".to_string()
+    } else if state_file_existed {
+        format!("resuming at leaf {} (position read from the file)", sk.used())
+    } else {
+        "no file: a fresh tree starts at leaf 0".to_string()
+    };
+    info!(
+        state_file = file.as_str(),
+        used = sk.used(),
+        remaining = sk.remaining(),
+        exhausted,
+        "consensus signer attached to {} (the master seed's epoch-0 tree; a rotated key moves to its epoch's file once the chain state is restored) — {}",
+        file,
+        stands
+    );
+}
+
 #[derive(Clone)]
 pub struct App {
     pub home_dir: PathBuf,
@@ -124,7 +154,13 @@ impl Node for App {
         // rotation). Fall back to building one if ever called first (keeps the trait total).
         // Either way the signer owns the durable state file (reserve-then-sign).
         let sk = self.rotation_slot.lock().unwrap().clone().unwrap_or_else(|| {
-            private_key.into_persistent(self.home_dir.join("consensus_state.bin"))
+            let path = self.home_dir.join("consensus_state.bin");
+            // The directory entry itself, as the attach decides it (`Path::exists` answers
+            // false on any metadata error and for a dangling link).
+            let state_file_existed = std::fs::symlink_metadata(&path).is_ok();
+            let sk = private_key.into_persistent(path.clone());
+            log_signer_attached(&sk, &path, state_file_existed);
+            sk
         });
         HkSigningProvider::new(sk)
     }
@@ -147,8 +183,10 @@ impl Node for App {
         // engine's provider (via get_signing_provider) and HkApp then advance the SAME tree
         // — single writer, plus a handle HkApp uses to rotate the live key. HkApp signs no
         // consensus messages itself; it only swaps the tree when a RotationCert commits.
-        let op_handle =
-            private_key.into_persistent(self.home_dir.join("consensus_state.bin"));
+        let state_path = self.home_dir.join("consensus_state.bin");
+        let state_file_existed = std::fs::symlink_metadata(&state_path).is_ok();
+        let op_handle = private_key.into_persistent(state_path.clone());
+        log_signer_attached(&op_handle, &state_path, state_file_existed);
         *self.rotation_slot.lock().unwrap() = Some(op_handle.clone());
         // HK-R6: shared validator-set history. HkApp maintains it (genesis seed,
         // snapshot reseed, append per committed rotation); the engine reads it via

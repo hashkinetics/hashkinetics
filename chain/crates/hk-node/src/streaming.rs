@@ -1,4 +1,13 @@
 //! Proposal-part stream reassembly — adapted from the engine example's streaming.rs.
+//!
+//! v0.19.12: not used by the node. A received proposal's value is taken from the signed
+//! proposal (`state.rs::admit_signed_value`), and `app.rs` drops every received part on
+//! arrival.
+//! Sending does not use this file either (`state.rs::proposal_stream` builds the frames). The
+//! file is compiled for tests only, so the reassembly cannot be wired back into the node
+//! unnoticed; it stays, with its tests, as the record of the v0.19.10 gate until the stream
+//! path is removed for good.
+#![cfg(test)]
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashSet};
@@ -35,7 +44,9 @@ impl PartialOrd for MinSeq {
 /// fleet's config template (32 MiB); an honest proposal is one frame, so one tx-batch part.
 /// Until v0.19.10 a stream concatenated any number of parts of any size for ANY height and the
 /// host kept the result until the chain passed that height: a keyless memory lever.
-pub const MAX_PROPOSAL_BYTES: usize = 32 * 1024 * 1024;
+/// (v0.19.12: the constant lives in `state.rs`, where it now bounds the value of a signed
+/// proposal.)
+use crate::state::MAX_PROPOSAL_BYTES;
 
 /// v0.19.10: at most this many INCOMPLETE part streams are kept, in arrival order; the oldest
 /// is evicted first. Honest traffic has one or two in flight (one proposer per round).
@@ -43,6 +54,8 @@ pub const MAX_INCOMPLETE_STREAMS: usize = 8;
 
 /// v0.19.10: a reassembled proposal is accepted only for `current height ..= current height +
 /// this` (the engine's `BUFFER_HEIGHT_WINDOW`): a node further behind decides by certificate.
+/// (v0.19.12: nothing applies it. This file is compiled for tests only, see the top of the
+/// file, and no code here reads it except one test below, which pins its value.)
 pub const PROPOSAL_HEIGHT_WINDOW: u64 = 4;
 
 #[derive(Default)]
@@ -216,8 +229,9 @@ impl PartStreamsMap {
 /// hash of the bytes, within the 32 MiB frame cap, and refuses everything else (dropped, never
 /// handed on as "invalid"); `PartStreamsMap` keeps at most `MAX_INCOMPLETE_STREAMS` incomplete
 /// streams (oldest evicted), ignores duplicate sequences, and drops a stream whole once its
-/// tx-batch bytes pass `MAX_PROPOSAL_BYTES`. The height / round / proposer / slot checks live in
-/// `state.rs::received_proposal_part` (needs a full node state; not tested here).
+/// tx-batch bytes pass `MAX_PROPOSAL_BYTES`. The node itself does not use this code (see
+/// the top of the file): what it keeps of a received proposal is decided by
+/// `state.rs::admit_signed_value`, which is tested there.
 ///
 /// Run: `cargo test --offline -p hk-node stream_gate -- --nocapture`
 #[cfg(test)]

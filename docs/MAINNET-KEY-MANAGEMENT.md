@@ -149,6 +149,24 @@ Backups of this file are therefore poison; only forward motion is legal.
 `sign()` before returning; the node's consensus signer loads it from
 `<home>/consensus_state.bin` on start. A restarted validator has no reuse under any failure that preserves the last durable write (the directory entry is fsynced too since v0.19.4 — R16); a floor from the node's own evidence and a reservation window are the follow-ups.
 
+**A state file that is not this key's is retired, never resumed (HR-7, v0.19.12).** Resuming
+is safe only from this key's own state, so a present `consensus_state*.bin` is judged before the
+signer resumes from it: the file must be readable, hold the 8-byte header and a key state of this
+key's length, count no more leaves than the tree holds, and — while leaves remain — carry the
+parameter and seed bytes this key's seed derives. A file that fails any of that is not resumed
+from, and the node does not refuse to start either: a node that cannot start cannot sync the
+rotation certificate that revives it, a refusal at a live rotation would recur inside commit at
+every restart, and the remedies a refusal could name — a backup, an older copy — are exactly the
+ones that re-sign leaves. The tree is retired instead: the file's bytes, when they can be read,
+are kept beside it as `<file name>.damaged-<unix seconds>` (owner-only on Unix), the file is
+rewritten with the record a
+tree's last signature leaves (`used = capacity`, the wiped key — every release reads it as used
+up, so no binary signs from it again), the tree signs nothing, and one error line names the
+file, the defect, the copy and the remedy. A retired tree is a liveness fault of one key: the
+node keeps running and moves to a fresh epoch under its root — by itself within about a minute
+(the leaf-budget tick issues the certificate and pushes it to its gossip peers), or by
+`hk-node issue-rotation` submitted through another live validator.
+
 ---
 
 ## Mainnet safety rule #2 — one key, one signer
@@ -206,9 +224,15 @@ spend circuit) are the same ones gate 2 is already benchmarking.
 - **Keys at rest — shipped.** `priv_validator_key.json` (root seed), `account.json`,
   `wallet.json` and the GUI's `shield.json` can be sealed on disk: the `HKE1` envelope
   (`hk-wallet/src/sealed.rs`) — Argon2id 512 MiB/t=4/p=4 by default (parameters ride in
-  the envelope; `HK_SEAL_M_KIB`/`HK_SEAL_T`, floor 64 MiB/t=3) → XChaCha20-Poly1305, AAD
-  `hk/v1/sealed`, one salt per key, a fresh nonce per write; the derived key is cached so
-  the KDF runs once per unlock. Passphrase strength is enforced (`check_strength`), a
+  the envelope; `HK_SEAL_M_KIB`/`HK_SEAL_T`, floor 64 MiB/t=3, ceiling 2 GiB/t=64; HR-10:
+  since node v0.19.12 the node and the CLI open `priv_validator_key.json`, `account.json`
+  and `wallet.json` with their own parameters only within that floor and ceiling, p 1–16
+  and m ≥ 8·p — a file sealed above the memory ceiling by an older binary is refused by
+  name, with the way back: unseal it with that binary, re-seal it with this one — and a save
+  never adopts or overwrites a sealed file the process did not open; the wallets, which write
+  the GUI's `shield.json` and their own `account.json`, follow the same rules from their next
+  rebuild) → XChaCha20-Poly1305, AAD `hk/v1/sealed`, one salt per key, a fresh nonce per
+  write; the derived key is cached so the KDF runs once per unlock. Passphrase strength is enforced (`check_strength`), a
   7-word generator exists (`passphrase-new`), and an optional key file (`keyfile-new`,
   `*_KEYFILE`) is a second factor the backup never carries. Passphrase sources: env, file,
   systemd `LoadCredential=`, prompt. Commands: `hk-node key-seal|key-unseal HOME`,

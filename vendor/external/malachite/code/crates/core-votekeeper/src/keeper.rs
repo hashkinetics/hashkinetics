@@ -69,6 +69,12 @@ where
         /// The conflicting vote.
         conflicting: SignedVote<Ctx>,
     },
+
+    /// v0.19.12 (HK): a vote of this type for the same value from this validator is already
+    /// recorded for this round. It is not recorded again: one vote per validator per round and
+    /// type, the first copy recorded.
+    #[error("Duplicate vote")]
+    DuplicateVote,
 }
 
 impl<Ctx> PerRound<Ctx>
@@ -90,6 +96,18 @@ where
     }
 
     /// Add a vote to the round, checking for conflicts.
+    ///
+    /// v0.19.12 (HK): one vote per validator per round and type is recorded, the first copy
+    /// added. A later vote of the same type from the same validator is neither tallied nor
+    /// stored: for another value it is equivocation (`ConflictingVote`, kept as evidence by the
+    /// caller), for the same value it is a duplicate (`DuplicateVote`). With a stateful
+    /// signature scheme a second valid signature of the same vote has different bytes (every
+    /// signature uses another one-time key), so two copies of one vote can both verify and
+    /// still differ; only the first copy is kept, and `get_vote` returns that copy. This
+    /// holds per round and vote type: the same validator's prevote and precommit are kept
+    /// apart, because `get_vote` matches on the vote type as well as on the address. A vote
+    /// that is refused is answered with one of the errors above and leaves the round's tally
+    /// and its recorded votes as they were.
     pub fn add(
         &mut self,
         vote: SignedVote<Ctx>,
@@ -103,6 +121,9 @@ where
                     conflicting: vote,
                 });
             }
+
+            // The same vote again, possibly with other signature bytes: keep the first copy.
+            return Err(RecordVoteError::DuplicateVote);
         }
 
         // Tally this vote
@@ -220,10 +241,17 @@ where
     }
 
     /// Check if we have already seen a vote.
+    ///
+    /// v0.19.12 (HK): compares the vote message, not the signed vote with its signature bytes:
+    /// a stateful signature scheme gives a second valid signature of the same vote different
+    /// bytes, and that copy is still the vote already held.
     pub fn has_vote(&self, vote: &SignedVote<Ctx>) -> bool {
-        self.per_round
-            .get(&vote.round())
-            .is_some_and(|per_round| per_round.received_votes().contains(vote))
+        self.per_round.get(&vote.round()).is_some_and(|per_round| {
+            per_round
+                .received_votes()
+                .iter()
+                .any(|v| v.message == vote.message)
+        })
     }
 
     /// Apply a vote with a given weight, potentially triggering an output.
@@ -256,6 +284,9 @@ where
                 //panic!("Equivocating vote {:?}, existing {:?}", &vote, &existing);
                 return None;
             }
+            // v0.19.12 (HK): a copy of a vote already recorded adds no weight, so no threshold
+            // can be newly reached by it: nothing is stored and nothing is output.
+            Err(RecordVoteError::DuplicateVote) => return None,
         }
 
         if vote.round() > round {

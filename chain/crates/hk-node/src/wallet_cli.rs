@@ -8,7 +8,7 @@
 //!   hk-node wallet status   <DIR> [RPC]
 //!   hk-node wallet address  <DIR> [RPC]
 //!   hk-node wallet scan     <DIR> [RPC]
-//!   hk-node wallet transfer <DIR> <TO(name|hex64)> <USD> [RPC]
+//!   hk-node wallet transfer <DIR> <TO(name|hex64)> <USD> [RPC] [--allow-new-recipient]
 //!   hk-node wallet shield   <DIR> <USD> [RPC] [PROVER]
 //!   hk-node wallet unshield <DIR> <USD> [RPC] [PROVER]
 //!   hk-node wallet pay      <DIR> <HKADDR> <USD> [MEMO] [RPC] [PROVER]
@@ -23,7 +23,10 @@
 //!   consolidate by paying yourself.
 //! - The OTS spend-tree index and note tags are persisted **reserve-then-advance**
 //!   (written BEFORE use — a crash can waste an index, never reuse one). Capacity 64
-//!   spends per address at the default h=6; rotate the shield master after that.
+//!   spends per address at the default h=6, and every unshield or pay costs one — reserved
+//!   before its proof is made, so a failed proof or a refused submit costs one too — so rotate
+//!   the shield master while more leaves remain than unspent notes: at 64/64 the notes still
+//!   in the pool cannot be spent from that master (HR-3 wording, v0.19.12).
 //! - Randomness for coins/entropy is OS-CSPRNG (`rand`), unlike the deterministic demos.
 
 use std::path::{Path, PathBuf};
@@ -91,8 +94,16 @@ fn keys(w: &WalletFile) -> Result<WalletKeys> {
 fn reserve_ots(dir: &Path, w: &mut WalletFile) -> Result<u32> {
     let i = w.next_ots_index;
     if i >= 64 {
+        // HR-3 (v0.19.12, wording): every unshield or pay consumes ONE leaf, so a sweep of N
+        // notes needs N leaves — at 64/64 the notes still in the pool cannot be spent from
+        // this master. The leaf is reserved here, before the proof is made, so a prover
+        // failure or a refused submit consumes one as well: as many leaves as unspent notes
+        // is the floor for a rotation, not a margin.
         return Err(eyre!(
-            "spend-tree exhausted ({i}/64 one-time leaves used) — rotate the shield master (new wallet dir), sweep funds over"
+            "spend-tree exhausted ({i}/64 one-time leaves used): the notes still in the pool cannot be spent from this master — \
+             every unshield or pay takes one leaf, reserved before its proof is made, so a failed proof or a refused submit takes one too; \
+             rotate the shield master (a new wallet dir) while more leaves remain than you hold unspent notes (one per note is the minimum, not a margin), \
+             and sweep each note over before the last leaf goes"
         ));
     }
     w.next_ots_index += 1;
@@ -294,10 +305,26 @@ fn dummy_note() -> Note {
 // Commands
 // ---------------------------------------------------------------------------
 
+/// HR-9 (v0.19.12): `--allow-new-recipient` is `transfer`'s recipient pre-flight override and
+/// may sit anywhere in a transfer line (before the subcommand too). No other subcommand
+/// pre-flights, so their arguments are left exactly as given: a `pay` MEMO may be any text,
+/// the flag's spelling included, and stripping it there would shift the RPC into the MEMO.
+fn take_transfer_override(args: Vec<String>) -> (bool, Vec<String>) {
+    let cmd = args.iter().map(String::as_str).find(|a| *a != "--allow-new-recipient");
+    if cmd == Some("transfer") {
+        crate::account::take_allow_new_recipient(&args)
+    } else {
+        (false, args)
+    }
+}
+
 pub fn run(args: &[String]) -> Result<()> {
     let (asset, args) = take_asset(args)?;
+    // HR-9 (v0.19.12): `transfer`'s recipient pre-flight override — stripped from a transfer
+    // line only.
+    let (allow_new_recipient, args) = take_transfer_override(args);
     let args = &args[..];
-    let usage = "usage: hk-node wallet <init DIR ACCOUNT-DIR|demo-name [RPC] | status DIR [RPC] | address DIR [RPC] | scan DIR [RPC] | transfer DIR TO USD [RPC] | shield DIR USD [RPC] [PROVER] | unshield DIR USD [RPC] [PROVER] | pay DIR HKADDR USD [MEMO] [RPC] [PROVER] | disclose DIR COMMITMENT OUT.json [RPC]>";
+    let usage = "usage: hk-node wallet <init DIR ACCOUNT-DIR|demo-name [RPC] | status DIR [RPC] | address DIR [RPC] | scan DIR [RPC] | transfer DIR TO USD [RPC] [--allow-new-recipient] | shield DIR USD [RPC] [PROVER] | unshield DIR USD [RPC] [PROVER] | pay DIR HKADDR USD [MEMO] [RPC] [PROVER] | disclose DIR COMMITMENT OUT.json [RPC]>";
     let cmd = args.first().map(String::as_str).ok_or_else(|| eyre!(usage))?;
     let dir = PathBuf::from(args.get(1).ok_or_else(|| eyre!(usage))?);
     match cmd {
@@ -389,6 +416,9 @@ pub fn run(args: &[String]) -> Result<()> {
             } else {
                 account_id(to_s)
             };
+            // HR-9 (v0.19.12): a credit to an id with no account is a balance nobody can
+            // spend until that account is created — refused unless the flag says otherwise.
+            crate::account::check_recipient(&base, &to, allow_new_recipient)?;
             let before = balance_of(&base, &to, &asset);
             let txid = submit_signed(&w, &base, &mut s, Tx::Transfer { to, asset, amount: amt })?;
             let ok = crate::demo::wait_tx(&base, "transfer committed", &txid, || balance_of(&base, &to, &asset) == before + amt);
@@ -573,5 +603,37 @@ pub fn run(args: &[String]) -> Result<()> {
             Ok(())
         }
         other => Err(eyre!("unknown wallet command '{other}'\n{usage}")),
+    }
+}
+
+#[cfg(test)]
+mod hr9_tests {
+    use super::take_transfer_override;
+
+    fn v(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| a.to_string()).collect()
+    }
+
+    /// HR-9 (v0.19.12): only `transfer` pre-flights, so only a transfer line gives up
+    /// `--allow-new-recipient` (anywhere in it, before the subcommand too); every other
+    /// subcommand keeps its arguments exactly as given — a `pay` MEMO that reads
+    /// `--allow-new-recipient` stays the MEMO, and the RPC after it stays the RPC. KILL: strip
+    /// the flag from every subcommand again and the `pay` line loses its MEMO; stop stripping
+    /// it from a transfer line and the flag stays behind as a positional.
+    #[test]
+    fn hr9_only_a_transfer_line_gives_up_the_override_flag() {
+        let pay = v(&["pay", "DIR", "hkaddr:00", "1", "--allow-new-recipient", "http://rpc", "http://prover"]);
+        assert_eq!(take_transfer_override(pay.clone()), (false, pay));
+        let init = v(&["init", "DIR", "--allow-new-recipient"]);
+        assert_eq!(take_transfer_override(init.clone()), (false, init));
+        let (allow, rest) = take_transfer_override(v(&["transfer", "DIR", "TO", "1", "--allow-new-recipient", "http://rpc"]));
+        assert!(allow);
+        assert_eq!(rest, v(&["transfer", "DIR", "TO", "1", "http://rpc"]));
+        let (allow, rest) = take_transfer_override(v(&["--allow-new-recipient", "transfer", "DIR", "TO", "1"]));
+        assert!(allow);
+        assert_eq!(rest, v(&["transfer", "DIR", "TO", "1"]));
+        let (allow, rest) = take_transfer_override(v(&["transfer", "DIR", "TO", "1"]));
+        assert!(!allow);
+        assert_eq!(rest, v(&["transfer", "DIR", "TO", "1"]));
     }
 }

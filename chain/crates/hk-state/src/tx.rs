@@ -12,8 +12,12 @@ use serde::{Deserialize, Serialize};
 pub enum Tx {
     /// Move own balance.
     Transfer { to: AccountId, asset: AssetId, amount: Amount },
-    /// Create a mandate node. Root (parent=None): sender becomes holder + funding
-    /// account. Child: sender must be the PARENT's holder; `holder` is the child agent.
+    /// Create a mandate node. Root (parent=None): `holder` is whatever the payload names
+    /// and the SENDER becomes the tree's funding account (`root_funding`) — nothing requires
+    /// the two to be the same account, and a funder who names another holder keeps no verb
+    /// over that root: every later authorization (spend, revoke, child creation, channel
+    /// open) is the HOLDER's (a funder-side revoke is a planned consensus change; HR-5).
+    /// Child: sender must be the PARENT's holder; `holder` is the child agent.
     MandateCreate {
         id: MandateId,
         parent: Option<MandateId>,
@@ -29,7 +33,8 @@ pub enum Tx {
     /// Spend under a mandate leaf (sender must be leaf holder). Funds move from the
     /// ROOT's funding account — the org pays, the agent authorizes: that's the product.
     MandateSpend { leaf: MandateId, to: AccountId, amount: Amount },
-    /// Revoke a node (sender must hold the node's parent; for roots, the root itself).
+    /// Revoke a node (sender must hold the node's parent; for roots, the root itself —
+    /// the root's HOLDER, which is not necessarily the account that funds it; HR-5).
     /// Cascade is implicit: every descendant spend walks through the revoked ancestor.
     MandateRevoke { target: MandateId },
     /// Open a PayWord channel under a mandate leaf (sender = leaf holder).

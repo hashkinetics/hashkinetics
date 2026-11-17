@@ -423,8 +423,51 @@ fn hk_account_exists(rpc: &str, id: &H256) -> bool {
     demo::account_nonce(rpc, id).is_some()
 }
 
-fn hk_asset_supply_minus_burned(rpc: &str, asset: &H256) -> Option<u128> {
+/// v0.19.12: the node runs `hk_getAsset`'s conservation scan under its one registry-scan slot and
+/// answers a call past it "busy — retry". At startup the issuer check asks again, up to this many
+/// calls in all …
+const ASSET_BUSY_TRIES: usize = 10;
+/// … this far apart. `reconcile` does not wait: it skips the round, and the next round asks again.
+const ASSET_BUSY_PAUSE: Duration = Duration::from_millis(500);
+
+/// Whether an RPC answer is a "busy — retry" refusal: a node slot is taken (`busy: …`, HTTP 400)
+/// or its connection table is full (`rpc busy — try again`, HTTP 503) — the text test of
+/// account.rs and hk-wallet-core (`answer_is_busy` there). `demo::rpc` hands both bodies back.
+fn answer_is_busy(answer: &Value) -> bool {
+    answer
+        .get("error")
+        .and_then(|e| e.as_str())
+        .is_some_and(|s| s.starts_with("busy") || s.starts_with("rpc busy"))
+}
+
+/// `fetch()` again while it answers "busy", at most `tries` calls in all, `pause` apart. Returns
+/// the last answer — still "busy" if every call was.
+fn retry_busy(mut fetch: impl FnMut() -> Value, tries: usize, pause: Duration) -> Value {
+    let mut answer = fetch();
+    let mut calls = 1;
+    while answer_is_busy(&answer) && calls < tries {
+        std::thread::sleep(pause);
+        answer = fetch();
+        calls += 1;
+    }
+    answer
+}
+
+/// The node answered `hk_getAsset` "busy": no reading at all — not a missing one.
+struct AssetBusy;
+
+/// supply − burned of `asset` from `hk_getAsset`: `Err(AssetBusy)` when the node answered "busy"
+/// (ask again later), `Ok(None)` for any other answer that does not carry both numbers.
+fn hk_asset_supply_minus_burned(rpc: &str, asset: &H256) -> Result<Option<u128>, AssetBusy> {
     let v = demo::rpc(rpc, "hk_getAsset", json!({"asset": hex::encode(asset.0)}));
+    if answer_is_busy(&v) {
+        return Err(AssetBusy);
+    }
+    Ok(supply_minus_burned(&v))
+}
+
+/// supply − burned from an `hk_getAsset` answer, or `None` when it does not carry both numbers.
+fn supply_minus_burned(v: &Value) -> Option<u128> {
     let a = v.get("result")?.get("asset")?;
     let supply: u128 = a.get("supply")?.as_str()?.parse().ok()?;
     let burned: u128 = a.get("burned")?.as_str()?.parse().ok()?;
@@ -578,8 +621,19 @@ pub(crate) fn cmd_serve(cfg_path: &Path) -> eyre::Result<()> {
         .and_then(|a| a.as_str())
         .and_then(|s| parse_h256(s).ok())
         .unwrap_or(H256([9u8; 32]));
-    // the issuer must be the asset's issuer, or every mint is refused
-    let a = demo::rpc(&cfg.hk.rpc, "hk_getAsset", json!({"asset": hex::encode(usdc.0)}));
+    // the issuer must be the asset's issuer, or every mint is refused. v0.19.12: a "busy" answer
+    // (the node's registry-scan slot) is no answer — asked again, bounded, and never read as
+    // "not the issuer".
+    let a = retry_busy(
+        || demo::rpc(&cfg.hk.rpc, "hk_getAsset", json!({"asset": hex::encode(usdc.0)})),
+        ASSET_BUSY_TRIES,
+        ASSET_BUSY_PAUSE,
+    );
+    if answer_is_busy(&a) {
+        return Err(eyre::eyre!(
+            "hk: the node answered hk_getAsset busy {ASSET_BUSY_TRIES} times — the issuer of usdc_asset is unchecked; refusing to start"
+        ));
+    }
     let issuer_on_chain = a.get("result").and_then(|r| r.get("asset")).and_then(|x| x.get("issuer")).and_then(|s| s.as_str()).unwrap_or("");
     if issuer_on_chain != hex::encode(issuer_id.0) {
         return Err(eyre::eyre!("hk: {} is not the issuer of usdc_asset (issuer on chain: {issuer_on_chain}) — refusing to start", hex::encode(issuer_id.0)));
@@ -933,7 +987,15 @@ impl Svc {
     /// other side does not know about — alert, never "fix".
     fn reconcile(&mut self) {
         let reserves = self.eth.eth_call(&self.vault, &eth::encode_view("reserves()")).ok().and_then(|b| eth::decode_word_u(&b).ok());
-        let smb = hk_asset_supply_minus_burned(&self.cfg.hk.rpc, &self.usdc);
+        // v0.19.12: "busy" (the node's registry-scan slot) is no reading — this round is skipped
+        // and the last reconciliation stands; the next round asks again.
+        let smb = match hk_asset_supply_minus_burned(&self.cfg.hk.rpc, &self.usdc) {
+            Ok(smb) => smb,
+            Err(AssetBusy) => {
+                eprintln!("hk-attest: reconciliation skipped this round: the node's asset registry scan is busy — the next round asks again");
+                return;
+            }
+        };
         let fee = demo::balance_of(&self.cfg.hk.rpc, &self.issuer_id, &self.fee_asset);
         let mut h = self.health.lock().unwrap_or_else(|e| e.into_inner());
         h.issuer_fee_micro = fee;
@@ -1243,5 +1305,57 @@ from_block = 10
         assert_eq!(c.service.poll_secs, 5);
         assert_eq!(c.service.listen, "127.0.0.1:9933");
         assert!(c.eth.cosigners.is_empty());
+    }
+
+    /// v0.19.12: a "busy" answer — the node's registry-scan slot or its full connection table —
+    /// is asked again, at most `tries` calls in all, and handed back as busy if it never clears
+    /// (the caller then says "busy", never "not the issuer" or a missing reading); any other
+    /// answer is taken at once. KILL: drop the retry (the first busy answer comes back as the
+    /// answer) or its bound (the always-busy fetch never stops — the call count fails).
+    #[test]
+    fn a_busy_asset_answer_is_asked_again_within_a_bound() {
+        let busy = json!({"error": "busy: an asset registry scan is already in flight — retry in a moment"});
+        let full = json!({"error": "rpc busy — try again"});
+        let entry = json!({"result": {"found": true, "asset": {"issuer": "11", "supply": "1000", "burned": "300"}}});
+        let other = json!({"error": "asset (64-char hex) or issuer (64-char hex) + symbol required"});
+        assert!(answer_is_busy(&busy) && answer_is_busy(&full));
+        assert!(!answer_is_busy(&entry) && !answer_is_busy(&other));
+        // busy twice, then the entry: three calls, the entry's numbers
+        let mut calls = 0;
+        let got = retry_busy(
+            || {
+                calls += 1;
+                if calls <= 2 { busy.clone() } else { entry.clone() }
+            },
+            ASSET_BUSY_TRIES,
+            Duration::ZERO,
+        );
+        assert_eq!((got.clone(), calls), (entry.clone(), 3));
+        assert_eq!(supply_minus_burned(&got), Some(700));
+        // busy on every call: stops at the bound and hands the busy answer back
+        let mut calls = 0;
+        let got = retry_busy(
+            || {
+                calls += 1;
+                full.clone()
+            },
+            ASSET_BUSY_TRIES,
+            Duration::ZERO,
+        );
+        assert_eq!(calls, ASSET_BUSY_TRIES);
+        assert!(answer_is_busy(&got));
+        // any other answer is taken at once — an error is not retried, and carries no reading
+        let mut calls = 0;
+        let got = retry_busy(
+            || {
+                calls += 1;
+                other.clone()
+            },
+            ASSET_BUSY_TRIES,
+            Duration::ZERO,
+        );
+        assert_eq!((got.clone(), calls), (other, 1));
+        assert_eq!(supply_minus_burned(&got), None);
+        assert_eq!(supply_minus_burned(&busy), None, "the reader alone cannot tell busy from missing");
     }
 }

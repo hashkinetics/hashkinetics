@@ -2,7 +2,7 @@ use crate::handle::driver::apply_driver_input;
 use crate::handle::signature::verify_signature;
 use crate::input::Input;
 use crate::prelude::*;
-use crate::state::BufferAdmission;
+use crate::state::{BufferAdmission, CLAIM_FAILURE_WARNS_PER_WINDOW};
 use crate::types::{ConsensusMsg, SignedConsensusMsg, WalEntry};
 use crate::util::pretty::PrettyVote;
 
@@ -60,22 +60,25 @@ where
             "Received vote for higher height, queuing for later"
         );
 
-        // HK-R8 (v0.19.10, VZ-2): a vote above our height is peer evidence that the
-        // network is ahead ONLY if it really comes from the validator it names. Until
-        // v0.19.10 the claim was recorded here from the frame's address field before
-        // any check, so a peer with no key could silence every seat with two public
-        // addresses and a zero signature. Now: a set of free filters first decides
-        // whether this frame can matter at all and whether the named address still
-        // has verify budget (`State::future_claim_wants_verify`), then the signature
-        // is verified under the named member's CURRENT operational key through
-        // `verify_signature` — never `verify_signed_vote`, which asserts the current
-        // height and would panic the consensus actor on a future-height message —
-        // and only a verified vote records a claim. A failed verification is charged
-        // to the address (a forgery, or a key rotated after our height: the two are
-        // indistinguishable here, so the peer is not penalised). Buffering is a
-        // separate decision (`buffer_vote` below): a claim-path vote lies far above
-        // the buffer window and is never buffered; a vote within the window is
-        // buffered only after its own verification there.
+        // HK-R8 (v0.19.10, VZ-2): a vote above our height is peer
+        // evidence that the network is ahead ONLY if it really comes from the
+        // validator it names. Until v0.19.10 the claim was recorded here from the
+        // frame's address field before any check, so a peer with no key could silence
+        // every seat with two public addresses and a zero signature. Now: a set of
+        // free filters first decides whether this frame can matter at all
+        // (`State::future_claim_wants_verify`), then the signature is verified under
+        // the named member's CURRENT operational key through `verify_signature` —
+        // never `verify_signed_vote`, which asserts the current height and would
+        // panic the consensus actor on a future-height message — and only a verified
+        // vote records a claim. A failed verification is counted (a forgery, or a key
+        // rotated after our height: the two are indistinguishable here, so the peer
+        // is not penalised) and warned about at most `CLAIM_FAILURE_WARNS_PER_WINDOW`
+        // times per address per window (`note_future_claim_failure`). Buffering
+        // is a separate decision (`buffer_vote` below): with HK's default gap (20) a
+        // claim-path vote lies far above the buffer window and is never buffered;
+        // a vote within the window is buffered only after its own verification
+        // there, and one that fails it is dropped and counted (`note_buffer_drop`)
+        // instead of being buffered.
         if state.future_claim_wants_verify(validator_address, vote_height) {
             let validator = state
                 .validator_set()
@@ -87,7 +90,7 @@ where
                     state.note_future_height_claim(validator_address, vote_height);
                 } else {
                     let in_window = state.note_future_claim_failure(validator_address);
-                    if in_window == 1 {
+                    if in_window <= CLAIM_FAILURE_WARNS_PER_WINDOW {
                         warn!(
                             consensus.height = %consensus_height,
                             vote.height = %vote_height,
