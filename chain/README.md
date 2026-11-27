@@ -40,7 +40,7 @@ Paid search (RAG-as-a-merchant): `cargo build --release -p hk-facilitator` then 
 # terminal C: the stealth storyline ~/hk-target-chain/release/hk-node demo-shielded \
 #                                     http://127.0.0.1:26000 http://127.0.0.1:9911
 ```
-Shield $5 (mint proof ≈1.2 s) → pay Bob $2 **fully shielded** (fee 0 — zero transparent trace) → **Bob's wallet DISCOVERS the note by trial-decap scanning** (a third wallet sees nothing) → Bob spends it, unshielding $1 → double-spend + forged proof refused with receipts. Protocol: `../docs/SHIELDED-POOL-SPEC.md` · ops detail: `../docs/RUNBOOK-DEVNET.md`.
+Shield $5 (mint proof ≈1.2 s) → pay Bob $2 **fully shielded** (fee 0 — no amount, recipient or memo on the chain) → **Bob's wallet DISCOVERS the note by trial-decap scanning** (a third wallet sees nothing) → Bob spends it, unshielding $1 → double-spend + forged proof refused with receipts. Protocol: `../docs/SHIELDED-POOL-SPEC.md` · ops detail: `../docs/RUNBOOK-DEVNET.md`.
 
 ## Crates
 

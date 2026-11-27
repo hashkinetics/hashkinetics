@@ -488,9 +488,15 @@ impl ConnectionHandler for Handler {
                     handler.inbound_substream_attempts += 1;
 
                     if handler.inbound_substream_attempts == MAX_SUBSTREAM_ATTEMPTS {
-                        tracing::warn!(
-                            "The maximum number of inbound substreams attempts has been exceeded"
-                        );
+                        // HK v0.19.13: written at most once per interval.
+                        static INBOUND_ATTEMPTS: crate::types::LogLimit =
+                            crate::types::LogLimit::new();
+                        if let Some(held_back) = INBOUND_ATTEMPTS.admit() {
+                            tracing::warn!(
+                                held_back,
+                                "The maximum number of inbound substreams attempts has been exceeded"
+                            );
+                        }
                         *self = Handler::Disabled(DisabledHandler::MaxSubstreamAttempts);
                         return;
                     }
@@ -502,9 +508,15 @@ impl ConnectionHandler for Handler {
                     handler.outbound_substream_attempts += 1;
 
                     if handler.outbound_substream_attempts == MAX_SUBSTREAM_ATTEMPTS {
-                        tracing::warn!(
-                            "The maximum number of outbound substream attempts has been exceeded"
-                        );
+                        // HK v0.19.13: written at most once per interval.
+                        static OUTBOUND_ATTEMPTS: crate::types::LogLimit =
+                            crate::types::LogLimit::new();
+                        if let Some(held_back) = OUTBOUND_ATTEMPTS.admit() {
+                            tracing::warn!(
+                                held_back,
+                                "The maximum number of outbound substream attempts has been exceeded"
+                            );
+                        }
                         *self = Handler::Disabled(DisabledHandler::MaxSubstreamAttempts);
                         return;
                     }

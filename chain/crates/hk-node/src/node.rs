@@ -174,6 +174,13 @@ impl Node for App {
         let config = self.load_config()?;
         let span = tracing::error_span!("node", moniker = %config.moniker);
         let _enter = span.enter();
+        // v0.19.13: the value-sync response budget in effect (`config::load_config` holds the
+        // configured number to the request-response frame).
+        tracing::info!(
+            sync_response_bytes = config.value_sync.max_response_size.0,
+            rpc_frame_bytes = config.consensus.p2p.rpc_max_size.0,
+            "Value-sync response budget in effect"
+        );
 
         let private_key_file = self.load_private_key_file()?;
         let private_key = self.load_private_key(private_key_file);

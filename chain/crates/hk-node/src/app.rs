@@ -100,6 +100,10 @@ pub async fn run(state: &mut HkApp, channels: &mut Channels<HkContext>) -> eyre:
                 // proposer's key (the signature, and that the id is the hash of the bytes) and
                 // has no value for it yet. The proposal carries the whole batch and the
                 // signature covers it. The engine writes the answer to its WAL.
+                // v0.19.13: the answer is a value the host votes for, or `None`. A value the
+                // host keeps but does not vote for is answered `None` like one it does not keep
+                // (state.rs `received_verified_proposal`): the engine is handed no value for
+                // that proposal, and the line below is written only for a value it is handed.
                 let proposed_value =
                     state.received_verified_proposal(height, round, valid_round, proposer, value);
                 if let Some(v) = &proposed_value {
@@ -118,6 +122,10 @@ pub async fn run(state: &mut HkApp, channels: &mut Channels<HkContext>) -> eyre:
                     "Consensus decided — committing to the chain"
                 );
 
+                // v0.19.13: named here, before the certificate moves into `commit`.
+                let decided_height = certificate.height;
+                let decided_value = certificate.value_id;
+
                 match state.commit(certificate, extensions) {
                     Ok(()) => {
                         state.note_decided();
@@ -130,7 +138,25 @@ pub async fn run(state: &mut HkApp, channels: &mut Channels<HkContext>) -> eyre:
                     }
                     Err(e) => {
                         let height = state.current_height;
-                        error!(%e, %height, "Commit failed — restarting height");
+                        // v0.19.13: the decided value did not commit. A value the store holds
+                        // is remembered as refused for this height (the host does not hand it
+                        // to the engine again when a round starts or when its proposal
+                        // arrives, and does not serve the stored copy as its own proposal),
+                        // and the height restarts after a wait that grows with each
+                        // consecutive failure at this height, up to a cap
+                        // (`state::restart_wait`). The restart itself is unchanged: the node
+                        // stays in consensus, gets the value again through the sync arm if the
+                        // network holds to it, and tries the commit again.
+                        let (failures, wait) = state.note_commit_failed(decided_height, decided_value);
+                        error!(
+                            %e,
+                            %height,
+                            value = %decided_value,
+                            failures,
+                            wait_ms = wait.as_millis() as u64,
+                            "Commit failed — restarting height after the wait"
+                        );
+                        tokio::time::sleep(wait).await;
                         if reply
                             .send(Next::Restart(height, state.validator_set()))
                             .is_err()

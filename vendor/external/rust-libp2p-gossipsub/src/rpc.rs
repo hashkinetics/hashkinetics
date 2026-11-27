@@ -32,12 +32,27 @@ use futures::{stream::Peekable, Stream, StreamExt};
 
 use crate::types::RpcOut;
 
+// HK v0.19.13: at most this many GRAFT, PRUNE, SUBSCRIBE and UNSUBSCRIBE messages wait for one
+// peer at a time. A peer that takes its messages has a handful waiting. At the bound a further
+// one is not queued, as with a full queue.
+pub(crate) const MAX_PENDING_CONTROL: usize = 1_024;
+
+/// HK v0.19.13: the numbers of messages that wait in the priority queue of one peer. A number
+/// is raised when a message is queued and lowered when a connection handler takes it.
+#[derive(Debug, Default)]
+pub(crate) struct PriorityQueueLen {
+    /// `Publish` messages.
+    publish: AtomicUsize,
+    /// GRAFT, PRUNE, SUBSCRIBE and UNSUBSCRIBE messages.
+    control: AtomicUsize,
+}
+
 /// `RpcOut` sender that is priority aware.
 #[derive(Debug)]
 pub(crate) struct Sender {
     /// Capacity of the priority channel for `Publish` messages.
     priority_cap: usize,
-    len: Arc<AtomicUsize>,
+    len: Arc<PriorityQueueLen>,
     pub(crate) priority_sender: async_channel::Sender<RpcOut>,
     pub(crate) non_priority_sender: async_channel::Sender<RpcOut>,
     priority_receiver: async_channel::Receiver<RpcOut>,
@@ -51,9 +66,11 @@ impl Sender {
         // such as `GRAFT`, `PRUNE`, `SUBSCRIBE`, and `UNSUBSCRIBE`.
         // That's also why we define `cap` and divide it by two,
         // to ensure there is capacity for both priority and non_priority messages.
+        // HK v0.19.13: `send_message` counts the control messages that wait and holds their
+        // number at `MAX_PENDING_CONTROL`.
         let (priority_sender, priority_receiver) = async_channel::unbounded();
         let (non_priority_sender, non_priority_receiver) = async_channel::bounded(cap / 2);
-        let len = Arc::new(AtomicUsize::new(0));
+        let len = Arc::new(PriorityQueueLen::default());
         Sender {
             priority_cap: cap / 2,
             len,
@@ -77,11 +94,24 @@ impl Sender {
     pub(crate) fn send_message(&self, rpc: RpcOut) -> Result<(), RpcOut> {
         if let RpcOut::Publish { .. } = rpc {
             // Update number of publish message in queue.
-            let len = self.len.load(Ordering::Relaxed);
+            let len = self.len.publish.load(Ordering::Relaxed);
             if len >= self.priority_cap {
                 return Err(rpc);
             }
-            self.len.store(len + 1, Ordering::Relaxed);
+            // HK v0.19.13: counted with one atomic step, so a message a handler takes at the
+            // same moment is not lost from the count.
+            self.len.publish.fetch_add(1, Ordering::Relaxed);
+        }
+        // HK v0.19.13: at most `MAX_PENDING_CONTROL` control messages wait for the peer.
+        if matches!(
+            rpc,
+            RpcOut::Graft(_) | RpcOut::Prune(_) | RpcOut::Subscribe(_) | RpcOut::Unsubscribe(_)
+        ) {
+            let pending = self.len.control.load(Ordering::Relaxed);
+            if pending >= MAX_PENDING_CONTROL {
+                return Err(rpc);
+            }
+            self.len.control.fetch_add(1, Ordering::Relaxed);
         }
         let sender = match rpc {
             RpcOut::Publish { .. }
@@ -99,21 +129,29 @@ impl Sender {
     /// Returns the current size of the priority queue.
     #[cfg(feature = "metrics")]
     pub(crate) fn priority_queue_len(&self) -> usize {
-        self.len.load(Ordering::Relaxed)
+        self.len.publish.load(Ordering::Relaxed)
     }
 
     /// Returns the current size of the non-priority queue.
-    #[cfg(feature = "metrics")]
+    // HK v0.19.13: also read before an IHAVE is answered, so it is built without the metrics
+    // feature too.
     pub(crate) fn non_priority_queue_len(&self) -> usize {
         self.non_priority_sender.len()
+    }
+
+    /// HK v0.19.13: the number of control messages that wait for the peer.
+    #[cfg(test)]
+    pub(crate) fn pending_control(&self) -> usize {
+        self.len.control.load(Ordering::Relaxed)
     }
 }
 
 /// `RpcOut` sender that is priority aware.
 #[derive(Debug)]
 pub struct Receiver {
-    /// The maximum length of the priority queue.
-    pub(crate) priority_queue_len: Arc<AtomicUsize>,
+    /// HK v0.19.13: the numbers of messages that wait in the priority queue, shared with the
+    /// `Sender`.
+    pub(crate) priority_queue_len: Arc<PriorityQueueLen>,
     /// The priority queue receiver.
     pub(crate) priority: Pin<Box<Peekable<async_channel::Receiver<RpcOut>>>>,
     /// The non priority queue receiver.
@@ -134,6 +172,12 @@ impl Receiver {
                     // Return the message.
                     let dropped = futures::ready!(self.priority.poll_next_unpin(cx))
                         .expect("There should be a message");
+                    // HK v0.19.13: the publish count follows the queue. A published message
+                    // that is taken out of the queue here, past its timeout, no longer counts
+                    // as waiting, like one that a handler takes in `poll_next`.
+                    self.priority_queue_len
+                        .publish
+                        .fetch_sub(1, Ordering::Relaxed);
                     return Poll::Ready(Some(dropped));
                 }
                 Poll::Ready(None)
@@ -184,12 +228,93 @@ impl Stream for Receiver {
     ) -> std::task::Poll<Option<Self::Item>> {
         // The priority queue is first polled.
         if let Poll::Ready(rpc) = Pin::new(&mut self.priority).poll_next(cx) {
-            if let Some(RpcOut::Publish { .. }) = rpc {
-                self.priority_queue_len.fetch_sub(1, Ordering::Relaxed);
+            match rpc {
+                Some(RpcOut::Publish { .. }) => {
+                    self.priority_queue_len
+                        .publish
+                        .fetch_sub(1, Ordering::Relaxed);
+                }
+                // HK v0.19.13: a control message that a handler takes no longer waits.
+                Some(
+                    RpcOut::Graft(_)
+                    | RpcOut::Prune(_)
+                    | RpcOut::Subscribe(_)
+                    | RpcOut::Unsubscribe(_),
+                ) => {
+                    let _ = self.priority_queue_len.control.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |pending| pending.checked_sub(1),
+                    );
+                }
+                _ => {}
             }
             return Poll::Ready(rpc);
         }
         // Then we poll the non priority.
         Pin::new(&mut self.non_priority).poll_next(cx)
+    }
+}
+
+// HK v0.19.13: a test of the publish count.
+#[cfg(test)]
+mod hk_tests {
+    use std::time::Duration;
+
+    use futures::FutureExt;
+    use futures_timer::Delay;
+
+    use super::*;
+    use crate::{types::RawMessage, TopicHash};
+
+    /// The publish count follows the queue: a published message that waits past its timeout and
+    /// is taken out of the queue no longer counts, and a further one is queued again.
+    #[test]
+    fn hk_publish_count_follows_messages_dropped_as_stale() {
+        let sender = Sender::new(4);
+        let mut receiver = sender.new_receiver();
+        let publish = || RpcOut::Publish {
+            message: RawMessage {
+                source: None,
+                data: vec![1, 2, 3],
+                sequence_number: None,
+                topic: TopicHash::from_raw("test"),
+                signature: None,
+                key: None,
+                validated: true,
+            },
+            timeout: Delay::new(Duration::from_nanos(1)),
+        };
+        let waiting = |sender: &Sender| sender.len.publish.load(Ordering::Relaxed);
+
+        // The queue takes as many published messages as its bound, and no more.
+        let bound = sender.priority_cap;
+        assert!(bound > 1);
+        for _ in 0..bound {
+            assert!(sender.send_message(publish()).is_ok());
+        }
+        assert!(sender.send_message(publish()).is_err());
+        assert_eq!(waiting(&sender), bound);
+
+        // Their timeouts have passed; the timer takes a moment to say so.
+        let mut dropped = 0;
+        for _ in 0..2_000 {
+            if dropped == bound {
+                break;
+            }
+            match std::future::poll_fn(|cx| receiver.poll_stale(cx)).now_or_never() {
+                Some(Some(RpcOut::Publish { .. })) => dropped += 1,
+                _ => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
+        assert_eq!(
+            dropped, bound,
+            "every message past its timeout is taken out of the queue"
+        );
+
+        // The count is back at zero and a published message is queued again.
+        assert_eq!(waiting(&sender), 0);
+        assert!(sender.send_message(publish()).is_ok());
+        assert_eq!(waiting(&sender), 1);
     }
 }

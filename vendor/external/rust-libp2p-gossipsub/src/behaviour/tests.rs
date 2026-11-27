@@ -6787,3 +6787,621 @@ fn test_validation_message_size_within_topic_specific() {
         _ => panic!("Unexpected event"),
     }
 }
+
+// ------------------------------------------------------------------------------------------
+// HK v0.19.13: tests of the HK patches (v0.19.3 re-announce; v0.19.13 backoffs, promises,
+// control bound, IHAVE gate, log limit).
+// ------------------------------------------------------------------------------------------
+
+use crate::{
+    backoff::MAX_BACKOFF_ENTRIES,
+    gossip_promises::{MAX_GOSSIP_PROMISES, MAX_GOSSIP_PROMISES_PER_PEER},
+    rpc::MAX_PENDING_CONTROL,
+    types::LOG_LIMIT_INTERVAL,
+};
+
+/// A PRUNE acts only on a topic this node has joined: for any other topic it records no backoff
+/// and starts no peer exchange, while the same PRUNE for a joined topic does both.
+#[test]
+fn hk_prune_for_unjoined_topics_records_no_backoff() {
+    // With peer exchange on: a PRUNE with peer records for a joined topic dials those peers.
+    let config = ConfigBuilder::default()
+        .prune_peers(16)
+        .build()
+        .unwrap();
+    let (mut gs, peers, _, topics) = inject_nodes1()
+        .peer_no(1)
+        .topics(vec!["test".into()])
+        .to_subscribe(true)
+        .gs_config(config)
+        .create_network();
+    gs.mesh.get_mut(&topics[0]).unwrap().insert(peers[0]);
+    gs.events.clear();
+    assert_eq!(gs.backoffs.len(), 0);
+    let exchange = || -> Vec<PeerInfo> {
+        (0..3)
+            .map(|_| PeerInfo {
+                peer_id: Some(PeerId::random()),
+            })
+            .collect()
+    };
+
+    let prunes: Vec<_> = (0..1000)
+        .map(|i| {
+            (
+                TopicHash::from_raw(format!("unjoined-{i}")),
+                exchange(),
+                Some(MAX_REMOTE_PRUNE_BACKOFF_SECONDS),
+            )
+        })
+        .collect();
+    gs.handle_prune(&peers[0], prunes);
+
+    assert_eq!(
+        gs.backoffs.len(),
+        0,
+        "no backoff is recorded for a topic that is not joined"
+    );
+    let dials = gs
+        .events
+        .iter()
+        .filter(|e| matches!(e, ToSwarm::Dial { .. }))
+        .count();
+    assert_eq!(
+        dials, 0,
+        "no peer exchange is started for a topic that is not joined"
+    );
+    assert!(
+        gs.mesh.get(&topics[0]).unwrap().contains(&peers[0]),
+        "the mesh of the joined topic is as before"
+    );
+
+    // The same PRUNE for the joined topic records a backoff and starts the peer exchange.
+    gs.handle_prune(
+        &peers[0],
+        vec![(
+            topics[0].clone(),
+            exchange(),
+            Some(MAX_REMOTE_PRUNE_BACKOFF_SECONDS),
+        )],
+    );
+    assert_eq!(gs.backoffs.len(), 1);
+    let dials = gs
+        .events
+        .iter()
+        .filter(|e| matches!(e, ToSwarm::Dial { .. }))
+        .count();
+    assert_eq!(dials, 3, "the peers of a joined topic are dialled");
+    assert!(!gs.mesh.get(&topics[0]).unwrap().contains(&peers[0]));
+}
+
+/// The backoff asked by a peer outside the mesh of a joined topic is recorded, and is never
+/// longer than the local prune backoff.
+#[test]
+fn hk_prune_from_peer_outside_the_mesh_is_bounded_by_the_local_backoff() {
+    let (mut gs, peers, _, topics) = inject_nodes1()
+        .peer_no(2)
+        .topics(vec!["test".into()])
+        .to_subscribe(true)
+        .create_network();
+    for peer in &peers {
+        gs.mesh.get_mut(&topics[0]).unwrap().remove(peer);
+    }
+    assert_eq!(gs.backoffs.len(), 0);
+    let local = gs.config.prune_backoff();
+    assert!(local < Duration::from_secs(MAX_REMOTE_PRUNE_BACKOFF_SECONDS));
+    assert!(local > Duration::from_secs(1));
+
+    // A longer backoff than the local one is recorded as the local one.
+    let earliest = Instant::now() + local;
+    gs.handle_prune(
+        &peers[0],
+        vec![(
+            topics[0].clone(),
+            Vec::new(),
+            Some(MAX_REMOTE_PRUNE_BACKOFF_SECONDS),
+        )],
+    );
+    let latest = Instant::now() + local;
+    assert_eq!(gs.backoffs.len(), 1);
+    let until = gs
+        .backoffs
+        .get_backoff_time(&topics[0], &peers[0])
+        .expect("a backoff is recorded for a joined topic");
+    assert!(
+        until >= earliest,
+        "the backoff is as long as the local prune backoff"
+    );
+    assert!(
+        until <= latest,
+        "the backoff is not longer than the local prune backoff"
+    );
+
+    // A shorter backoff than the local one is recorded as asked.
+    let asked = Duration::from_secs(1);
+    let earliest = Instant::now() + asked;
+    gs.handle_prune(
+        &peers[1],
+        vec![(topics[0].clone(), Vec::new(), Some(asked.as_secs()))],
+    );
+    let latest = Instant::now() + asked;
+    assert_eq!(gs.backoffs.len(), 2);
+    let until = gs
+        .backoffs
+        .get_backoff_time(&topics[0], &peers[1])
+        .expect("a backoff is recorded for a joined topic");
+    assert!(until >= earliest, "the backoff is as long as asked");
+    assert!(until <= latest, "the backoff is not longer than asked");
+}
+
+/// The backoff asked by a peer of our mesh is recorded as asked, up to the largest backoff a
+/// peer may ask for.
+#[test]
+fn hk_prune_from_mesh_peer_keeps_the_requested_backoff() {
+    let (mut gs, peers, _, topics) = inject_nodes1()
+        .peer_no(2)
+        .topics(vec!["test".into()])
+        .to_subscribe(true)
+        .create_network();
+    for peer in &peers {
+        gs.mesh.get_mut(&topics[0]).unwrap().insert(*peer);
+    }
+    assert_eq!(gs.backoffs.len(), 0);
+    let largest = Duration::from_secs(MAX_REMOTE_PRUNE_BACKOFF_SECONDS);
+    assert!(gs.config.prune_backoff() < largest);
+
+    let earliest = Instant::now() + largest;
+    gs.handle_prune(
+        &peers[0],
+        vec![(topics[0].clone(), Vec::new(), Some(largest.as_secs()))],
+    );
+    assert!(
+        !gs.mesh.get(&topics[0]).unwrap().contains(&peers[0]),
+        "the peer is removed from the mesh"
+    );
+    let until = gs
+        .backoffs
+        .get_backoff_time(&topics[0], &peers[0])
+        .expect("a backoff is recorded");
+    assert!(until >= earliest, "the backoff is recorded as asked");
+
+    // More than the largest backoff a peer may ask for is recorded as that largest backoff.
+    gs.handle_prune(
+        &peers[1],
+        vec![(topics[0].clone(), Vec::new(), Some(100 * largest.as_secs()))],
+    );
+    let latest = Instant::now() + largest;
+    let until = gs
+        .backoffs
+        .get_backoff_time(&topics[0], &peers[1])
+        .expect("a backoff is recorded");
+    assert!(until <= latest);
+    assert_eq!(gs.backoffs.len(), 2);
+}
+
+/// The backoff store holds at most `MAX_BACKOFF_ENTRIES` entries. At the bound a new pair is
+/// not recorded and a pair already held is still updated.
+#[test]
+fn hk_backoff_store_holds_at_most_its_bound() {
+    let mut store = BackoffStorage::new(&Duration::from_secs(60), Duration::from_secs(1), 1);
+    let topic = TopicHash::from_raw("test");
+    let first = PeerId::random();
+    store.update_backoff(&topic, &first, Duration::from_secs(1));
+    for _ in 0..MAX_BACKOFF_ENTRIES + 100 {
+        store.update_backoff(&topic, &PeerId::random(), Duration::from_secs(60));
+    }
+    assert_eq!(store.len(), MAX_BACKOFF_ENTRIES);
+
+    let late = PeerId::random();
+    store.update_backoff(&topic, &late, Duration::from_secs(60));
+    assert!(!store.is_backoff_with_slack(&topic, &late));
+    let other_topic = TopicHash::from_raw("other");
+    store.update_backoff(&other_topic, &late, Duration::from_secs(60));
+    assert!(!store.is_backoff_with_slack(&other_topic, &late));
+    assert_eq!(store.len(), MAX_BACKOFF_ENTRIES);
+
+    let before = store
+        .get_backoff_time(&topic, &first)
+        .expect("the first pair is held");
+    store.update_backoff(&topic, &first, Duration::from_secs(600));
+    let after = store
+        .get_backoff_time(&topic, &first)
+        .expect("the first pair is held");
+    assert!(after > before, "a pair already held is still updated");
+    assert_eq!(store.len(), MAX_BACKOFF_ENTRIES);
+}
+
+/// The count of the backoff store follows the entries that expire.
+#[test]
+fn hk_backoff_store_count_follows_expiry() {
+    let mut store = BackoffStorage::new(&Duration::from_millis(1), Duration::from_millis(1), 1);
+    let topic = TopicHash::from_raw("test");
+    for _ in 0..10 {
+        store.update_backoff(&topic, &PeerId::random(), Duration::from_millis(1));
+    }
+    assert_eq!(store.len(), 10);
+
+    sleep(Duration::from_millis(20));
+    // More heartbeats than the store has slots: every expired entry is visited.
+    for _ in 0..8 {
+        store.heartbeat();
+    }
+    assert_eq!(store.len(), 0);
+
+    let peer = PeerId::random();
+    store.update_backoff(&topic, &peer, Duration::from_secs(60));
+    assert!(store.is_backoff_with_slack(&topic, &peer));
+    assert_eq!(store.len(), 1);
+}
+
+/// A promise that is not met in time is dropped at the next heartbeat, also without peer
+/// scoring.
+#[test]
+fn hk_promises_expire_at_heartbeat_without_peer_scoring() {
+    let config = ConfigBuilder::default()
+        .iwant_followup_time(Duration::from_millis(10))
+        .build()
+        .unwrap();
+    let (mut gs, peers, _, topics) = inject_nodes1()
+        .peer_no(1)
+        .topics(vec!["test".into()])
+        .to_subscribe(true)
+        .gs_config(config)
+        .create_network();
+    assert!(!matches!(gs.peer_score, PeerScoreState::Active(_)));
+
+    gs.handle_ihave(
+        &peers[0],
+        vec![(topics[0].clone(), vec![MessageId::new(b"not yet seen")])],
+    );
+    assert_eq!(gs.gossip_promises.tracked(), 1);
+
+    sleep(Duration::from_millis(30));
+    gs.heartbeat();
+    assert_eq!(gs.gossip_promises.tracked(), 0);
+}
+
+/// `n` message ids, all different, that start with `prefix`.
+fn hk_message_ids(prefix: &str, n: usize) -> Vec<MessageId> {
+    (0..n)
+        .map(|i| MessageId::new(format!("{prefix} {i}").as_bytes()))
+        .collect()
+}
+
+/// The number of messages requested from each peer with the IWANT messages that wait.
+fn hk_requested(receivers: HashMap<PeerId, Receiver>) -> HashMap<PeerId, usize> {
+    let mut requested = HashMap::new();
+    count_control_msgs(receivers, |peer, m| match m {
+        RpcOut::IWant(IWant { message_ids }) => {
+            *requested.entry(*peer).or_insert(0) += message_ids.len();
+            true
+        }
+        _ => false,
+    });
+    requested
+}
+
+/// The topics announced to `peer` with the SUBSCRIBE messages that wait, in order.
+fn hk_announced(receivers: HashMap<PeerId, Receiver>, peer: &PeerId) -> Vec<TopicHash> {
+    let mut announced = Vec::new();
+    count_control_msgs(receivers, |to, m| match m {
+        RpcOut::Subscribe(topic) if to == peer => {
+            announced.push(topic.clone());
+            true
+        }
+        _ => false,
+    });
+    announced.sort();
+    announced
+}
+
+/// An IHAVE is answered with an IWANT also when no further promise can be tracked: a bound of
+/// the tracked promises never stops a request.
+#[test]
+fn hk_ihave_is_answered_when_no_further_promise_is_tracked() {
+    let (mut gs, peers, receivers, topics) = inject_nodes1()
+        .peer_no(1)
+        .topics(vec!["test".into()])
+        .to_subscribe(true)
+        .create_network();
+
+    // Other peers hold every promise that can be tracked.
+    let expires = Instant::now() + Duration::from_secs(60);
+    for holder in 0..MAX_GOSSIP_PROMISES / MAX_GOSSIP_PROMISES_PER_PEER {
+        let ids = hk_message_ids(&format!("held by {holder}"), MAX_GOSSIP_PROMISES_PER_PEER);
+        gs.gossip_promises
+            .add_promise(PeerId::random(), &ids, expires);
+    }
+    assert_eq!(gs.gossip_promises.tracked(), MAX_GOSSIP_PROMISES);
+
+    let receivers = flush_events(&mut gs, receivers);
+    gs.handle_ihave(
+        &peers[0],
+        vec![(topics[0].clone(), hk_message_ids("not yet seen", 10))],
+    );
+
+    let requested = hk_requested(receivers);
+    assert_eq!(
+        requested.get(&peers[0]),
+        Some(&10),
+        "every message is requested"
+    );
+    assert_eq!(gs.gossip_promises.tracked(), MAX_GOSSIP_PROMISES);
+    assert_eq!(gs.gossip_promises.tracked_for(&peers[0]), 0);
+}
+
+/// Promises are tracked for at most `MAX_GOSSIP_PROMISES_PER_PEER` messages requested from one
+/// peer. The messages beyond are requested all the same, and the promises of another peer are
+/// still tracked.
+#[test]
+fn hk_one_peer_holds_at_most_its_share_of_the_promises() {
+    let (mut gs, peers, receivers, topics) = inject_nodes1()
+        .peer_no(2)
+        .topics(vec!["test".into()])
+        .to_subscribe(true)
+        .create_network();
+    let receivers = flush_events(&mut gs, receivers);
+
+    let advertised = hk_message_ids("from the first peer", 2 * MAX_GOSSIP_PROMISES_PER_PEER);
+    gs.handle_ihave(&peers[0], vec![(topics[0].clone(), advertised)]);
+    assert_eq!(
+        gs.gossip_promises.tracked_for(&peers[0]),
+        MAX_GOSSIP_PROMISES_PER_PEER
+    );
+    assert_eq!(gs.gossip_promises.tracked(), MAX_GOSSIP_PROMISES_PER_PEER);
+
+    let advertised = hk_message_ids("from the second peer", 10);
+    gs.handle_ihave(&peers[1], vec![(topics[0].clone(), advertised)]);
+    assert_eq!(gs.gossip_promises.tracked_for(&peers[1]), 10);
+    assert_eq!(
+        gs.gossip_promises.tracked_for(&peers[0]),
+        MAX_GOSSIP_PROMISES_PER_PEER
+    );
+    assert_eq!(
+        gs.gossip_promises.tracked(),
+        MAX_GOSSIP_PROMISES_PER_PEER + 10
+    );
+
+    let requested = hk_requested(receivers);
+    assert_eq!(
+        requested.get(&peers[0]),
+        Some(&(2 * MAX_GOSSIP_PROMISES_PER_PEER)),
+        "the messages beyond the share are requested all the same"
+    );
+    assert_eq!(requested.get(&peers[1]), Some(&10));
+}
+
+/// The counts of the tracked promises follow every promise that is met, rejected or expired.
+#[test]
+fn hk_promise_counts_follow_the_map() {
+    let mut promises = GossipPromises::default();
+    let (first, second) = (PeerId::random(), PeerId::random());
+    let soon = Instant::now() + Duration::from_millis(5);
+    let later = Instant::now() + Duration::from_secs(60);
+
+    let ids = hk_message_ids("id", 6);
+    promises.add_promise(first, &ids, later);
+    promises.add_promise(second, &ids[..3], soon);
+    assert_eq!(promises.tracked(), 9);
+    assert_eq!(promises.tracked_for(&first), 6);
+    assert_eq!(promises.tracked_for(&second), 3);
+
+    // A promise for the same message and peer is tracked once.
+    promises.add_promise(first, &ids, later);
+    assert_eq!(promises.tracked(), 9);
+
+    // A delivered message: its promises are dropped for every peer.
+    promises.message_delivered(&ids[0]);
+    assert_eq!(promises.tracked(), 7);
+
+    // A rejected message: the same.
+    promises.reject_message(&ids[1], &RejectReason::ValidationFailed);
+    assert_eq!(promises.tracked(), 5);
+
+    // A message rejected for its signature keeps its promises, as before.
+    promises.reject_message(
+        &ids[2],
+        &RejectReason::ValidationError(ValidationError::InvalidSignature),
+    );
+    assert_eq!(promises.tracked(), 5);
+
+    // Expired promises.
+    sleep(Duration::from_millis(20));
+    let broken = promises.get_broken_promises();
+    assert_eq!(broken.get(&second), Some(&1));
+    assert_eq!(broken.get(&first), None);
+    assert_eq!(promises.tracked(), 4);
+    assert_eq!(promises.tracked_for(&first), 4);
+    assert_eq!(promises.tracked_for(&second), 0);
+}
+
+/// An IHAVE is answered while at most `MAX_QUEUED_BEFORE_IWANT` gossip messages wait for the
+/// peer. Beyond that no IWANT is queued for it.
+#[test]
+fn hk_ihave_is_answered_only_while_the_peer_takes_its_messages() {
+    let (mut gs, peers, receivers, topics) = inject_nodes1()
+        .peer_no(1)
+        .topics(vec!["test".into()])
+        .to_subscribe(true)
+        .create_network();
+    let receivers = flush_events(&mut gs, receivers);
+
+    for _ in 0..MAX_QUEUED_BEFORE_IWANT {
+        assert!(gs.send_message(
+            peers[0],
+            RpcOut::IHave(IHave {
+                topic_hash: topics[0].clone(),
+                message_ids: Vec::new(),
+            }),
+        ));
+    }
+    // At the bound the IHAVE is answered; its IWANT then waits with the others.
+    gs.handle_ihave(
+        &peers[0],
+        vec![(topics[0].clone(), vec![MessageId::new(b"first")])],
+    );
+    // Above the bound it is not answered.
+    gs.handle_ihave(
+        &peers[0],
+        vec![(topics[0].clone(), vec![MessageId::new(b"second")])],
+    );
+
+    let requested = hk_requested(receivers);
+    assert_eq!(requested.get(&peers[0]), Some(&1));
+}
+
+/// At most `MAX_PENDING_CONTROL` control messages wait for one peer. The count follows the
+/// messages that a handler takes, and published and gossip messages are queued as before.
+#[test]
+fn hk_control_messages_waiting_for_a_peer_are_bounded() {
+    use futures::StreamExt;
+
+    let sender = Sender::new(100);
+    let mut receiver = sender.new_receiver();
+    let topic = TopicHash::from_raw("test");
+    let control = |kind: usize| match kind % 4 {
+        0 => RpcOut::Subscribe(topic.clone()),
+        1 => RpcOut::Unsubscribe(topic.clone()),
+        2 => RpcOut::Graft(Graft {
+            topic_hash: topic.clone(),
+        }),
+        _ => RpcOut::Prune(Prune {
+            topic_hash: topic.clone(),
+            peers: Vec::new(),
+            backoff: None,
+        }),
+    };
+
+    for kind in 0..MAX_PENDING_CONTROL {
+        assert!(sender.send_message(control(kind)).is_ok());
+    }
+    assert_eq!(sender.pending_control(), MAX_PENDING_CONTROL);
+    for kind in 0..4 {
+        assert!(
+            sender.send_message(control(kind)).is_err(),
+            "at the bound a further control message is not queued"
+        );
+    }
+    assert_eq!(sender.pending_control(), MAX_PENDING_CONTROL);
+
+    // A published message and a gossip message are queued as before.
+    let message = RawMessage {
+        source: None,
+        data: vec![1, 2, 3],
+        sequence_number: None,
+        topic: topic.clone(),
+        signature: None,
+        key: None,
+        validated: true,
+    };
+    assert!(sender
+        .send_message(RpcOut::Publish {
+            message,
+            timeout: Delay::new(Duration::from_secs(60)),
+        })
+        .is_ok());
+    assert!(sender
+        .send_message(RpcOut::IWant(IWant {
+            message_ids: Vec::new(),
+        }))
+        .is_ok());
+
+    // The count returns to zero as a handler takes the messages.
+    let mut taken = 0;
+    while let Some(Some(_)) = receiver.next().now_or_never() {
+        taken += 1;
+    }
+    assert_eq!(taken, MAX_PENDING_CONTROL + 2);
+    assert_eq!(sender.pending_control(), 0);
+    assert!(sender.send_message(control(0)).is_ok());
+    assert_eq!(sender.pending_control(), 1);
+}
+
+/// On an additional connection to a known peer this node announces its subscriptions again.
+#[test]
+fn hk_subscriptions_are_announced_again_on_an_additional_connection() {
+    let (mut gs, peers, receivers, mut topics) = inject_nodes1()
+        .peer_no(1)
+        .topics(vec!["first".into(), "second".into()])
+        .to_subscribe(true)
+        .create_network();
+    topics.sort();
+    let receivers = flush_events(&mut gs, receivers);
+
+    let additional = ConnectionId::new_unchecked(1);
+    gs.connected_peers
+        .get_mut(&peers[0])
+        .unwrap()
+        .connections
+        .push(additional);
+    let endpoint = ConnectedPoint::Dialer {
+        address: Multiaddr::empty(),
+        role_override: Endpoint::Dialer,
+        port_use: PortUse::Reuse,
+    };
+    gs.on_swarm_event(FromSwarm::ConnectionEstablished(ConnectionEstablished {
+        peer_id: peers[0],
+        connection_id: additional,
+        endpoint: &endpoint,
+        failed_addresses: &[],
+        other_established: 1,
+    }));
+
+    assert_eq!(hk_announced(receivers, &peers[0]), topics);
+}
+
+/// When a connection to a peer closes while another remains, this node announces its
+/// subscriptions again.
+#[test]
+fn hk_subscriptions_are_announced_again_when_one_of_two_connections_closes() {
+    let (mut gs, peers, receivers, mut topics) = inject_nodes1()
+        .peer_no(1)
+        .topics(vec!["first".into(), "second".into()])
+        .to_subscribe(true)
+        .create_network();
+    topics.sort();
+
+    // The peer has the connection it was added with and one more.
+    let closing = ConnectionId::new_unchecked(0);
+    let remaining = ConnectionId::new_unchecked(1);
+    gs.connected_peers
+        .get_mut(&peers[0])
+        .unwrap()
+        .connections
+        .push(remaining);
+    let receivers = flush_events(&mut gs, receivers);
+
+    let endpoint = ConnectedPoint::Dialer {
+        address: Multiaddr::empty(),
+        role_override: Endpoint::Dialer,
+        port_use: PortUse::Reuse,
+    };
+    gs.on_swarm_event(FromSwarm::ConnectionClosed(ConnectionClosed {
+        peer_id: peers[0],
+        connection_id: closing,
+        endpoint: &endpoint,
+        remaining_established: 1,
+        cause: None,
+    }));
+
+    assert_eq!(
+        gs.connected_peers.get(&peers[0]).unwrap().connections,
+        vec![remaining]
+    );
+    assert_eq!(hk_announced(receivers, &peers[0]), topics);
+}
+
+/// A limited log line is written at most once per interval and carries the number of times it
+/// was held back.
+#[test]
+fn hk_log_line_is_written_once_per_interval() {
+    let limit = LogLimit::new();
+    let start = Instant::now();
+    assert_eq!(limit.admit_at(start), Some(0));
+    for _ in 0..5 {
+        assert_eq!(limit.admit_at(start + Duration::from_secs(1)), None);
+    }
+    assert_eq!(limit.admit_at(start + LOG_LIMIT_INTERVAL), Some(5));
+    assert_eq!(limit.admit_at(start + LOG_LIMIT_INTERVAL), None);
+    assert_eq!(limit.admit_at(start + 2 * LOG_LIMIT_INTERVAL), Some(1));
+}

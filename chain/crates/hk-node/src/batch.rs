@@ -167,6 +167,23 @@ impl Batch {
         out
     }
 
+    /// v0.19.13: the length of what `encode` writes for this batch, computed without building
+    /// it: the same two framings, measured with `bincode::serialized_size`. `decode` reads a
+    /// batch from the front of the bytes it is given, so a caller that wants the bytes to be
+    /// one batch and nothing else compares their length with this (state.rs `vote_verdict`).
+    pub fn encoded_len(&self) -> usize {
+        if self.set_changes.is_empty() {
+            let v1 = BatchV1Ref {
+                parent_app_hash: &self.parent_app_hash,
+                txs: &self.txs,
+                rotations: &self.rotations,
+                agg_proof: &self.agg_proof,
+            };
+            return bincode::serialized_size(&v1).expect("Batch v1 is bincode-safe") as usize;
+        }
+        BATCH_V2_MAGIC.len() + bincode::serialized_size(self).expect("Batch v2 is bincode-safe") as usize
+    }
+
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         if bytes.is_empty() {
             // Genesis / degenerate empty value — treat as no batch.
@@ -305,5 +322,62 @@ mod tests {
         assert_eq!(back2.parent_app_hash, plain.parent_app_hash);
         assert_eq!(txid(&back2.txs[0]), txid(&plain.txs[0]));
         assert_eq!(back2.agg_proof, plain.agg_proof);
+    }
+
+    /// v0.19.13: `encoded_len` is the length of `encode`'s output in both framings (without
+    /// set changes: the v1 bytes; with one: the magic prefix), for an empty batch too, and a
+    /// decoded batch gives the length of the bytes it was encoded to. Bytes with one more byte
+    /// behind the encoding still decode, to a batch whose own encoding is one byte shorter:
+    /// the difference a caller reads to know the bytes are not one batch and nothing else.
+    #[test]
+    fn batch_encoded_len_is_the_length_of_the_encoding_in_both_framings() {
+        use hk_consensus::{Approval, SetChange, SetChangeBody, SetChangeCert};
+        let plain = Batch {
+            parent_app_hash: [0x22; 32],
+            txs: vec![fat_tx(1024), fat_tx(0)],
+            rotations: vec![],
+            agg_proof: vec![1, 2, 3],
+            set_changes: vec![],
+        };
+        let bytes = plain.encode();
+        assert!(!bytes.starts_with(BATCH_V2_MAGIC));
+        assert_eq!(plain.encoded_len(), bytes.len());
+        assert_eq!(Batch::decode(&bytes).unwrap().encoded_len(), bytes.len());
+
+        let empty = Batch {
+            parent_app_hash: [0; 32],
+            txs: vec![],
+            rotations: vec![],
+            agg_proof: vec![],
+            set_changes: vec![],
+        };
+        assert_eq!(empty.encoded_len(), empty.encode().len());
+
+        let cert = SetChangeCert {
+            body: SetChangeBody {
+                chain_id: "hashkinetics-devnet-1".into(),
+                change: SetChange::Admit {
+                    root_pk: vec![7u8; 48],
+                    public_key: hk_consensus::HkPub(vec![9u8; 60]),
+                    voting_power: 1,
+                },
+                not_before: 10,
+                not_after: 20,
+            },
+            approvals: vec![Approval { root_pk: vec![1u8; 48], root_sig: vec![0u8; 16224] }],
+        };
+        let with = Batch { set_changes: vec![cert], ..plain.clone() };
+        let bytes2 = with.encode();
+        assert!(bytes2.starts_with(BATCH_V2_MAGIC));
+        assert_eq!(with.encoded_len(), bytes2.len());
+        assert_eq!(Batch::decode(&bytes2).unwrap().encoded_len(), bytes2.len());
+
+        for encoding in [&bytes, &bytes2] {
+            let mut longer = encoding.clone();
+            longer.push(0);
+            let back = Batch::decode(&longer).expect("a batch is read from the front of the bytes");
+            assert_eq!(back.encoded_len(), encoding.len());
+            assert_eq!(back.encoded_len() + 1, longer.len());
+        }
     }
 }

@@ -340,11 +340,87 @@ pub enum RpcOut {
     IDontWant(IDontWant),
 }
 
+// HK v0.19.13: a limit for a log line that a remote peer can cause.
+//
+// A line behind a `LogLimit` is written at most once per `LOG_LIMIT_INTERVAL` for the whole
+// process, however often its cause occurs. The line carries the number of times it was held
+// back since it was last written.
+pub(crate) const LOG_LIMIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// HK v0.19.13: the state of one limited log line. Each such line has a `static` of its own.
+pub(crate) struct LogLimit {
+    /// When the line was last written, and how often it was held back since then.
+    state: std::sync::Mutex<(Option<Instant>, u64)>,
+}
+
+impl LogLimit {
+    pub(crate) const fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new((None, 0)),
+        }
+    }
+
+    /// Returns `Some` when the line may be written now, with the number of times it was held
+    /// back since it was last written, and `None` when it is held back.
+    pub(crate) fn admit(&self) -> Option<u64> {
+        self.admit_at(Instant::now())
+    }
+
+    /// `admit` for a given time.
+    pub(crate) fn admit_at(&self, now: Instant) -> Option<u64> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let due = match state.0 {
+            Some(last) => now.duration_since(last) >= LOG_LIMIT_INTERVAL,
+            None => true,
+        };
+        if due {
+            let held_back = state.1;
+            *state = (Some(now), 0);
+            Some(held_back)
+        } else {
+            state.1 = state.1.saturating_add(1);
+            None
+        }
+    }
+}
+
 impl RpcOut {
     /// Converts the GossipsubRPC into its protobuf format.
     // A convenience function to avoid explicitly specifying types.
     pub fn into_protobuf(self) -> proto::RPC {
         self.into()
+    }
+
+    /// HK v0.19.13: what a log line says about a message, never its content: its kind, its
+    /// topic when it has one, and the number of bytes of its data or of its message ids.
+    pub(crate) fn summary(&self) -> (&'static str, Option<&TopicHash>, usize) {
+        fn bytes_of(message_ids: &[MessageId]) -> usize {
+            message_ids.iter().map(|id| id.0.len()).sum()
+        }
+
+        match self {
+            RpcOut::Publish { message, .. } => {
+                ("publish", Some(&message.topic), message.data.len())
+            }
+            RpcOut::Forward { message, .. } => {
+                ("forward", Some(&message.topic), message.data.len())
+            }
+            RpcOut::Subscribe(topic) => ("subscribe", Some(topic), 0),
+            RpcOut::Unsubscribe(topic) => ("unsubscribe", Some(topic), 0),
+            RpcOut::Graft(Graft { topic_hash }) => ("graft", Some(topic_hash), 0),
+            RpcOut::Prune(Prune { topic_hash, .. }) => ("prune", Some(topic_hash), 0),
+            RpcOut::IHave(IHave {
+                topic_hash,
+                message_ids,
+            }) => ("ihave", Some(topic_hash), bytes_of(message_ids)),
+            RpcOut::IWant(IWant { message_ids }) => ("iwant", None, bytes_of(message_ids)),
+            RpcOut::IDontWant(IDontWant { message_ids }) => {
+                ("idontwant", None, bytes_of(message_ids))
+            }
+        }
     }
 }
 

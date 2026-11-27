@@ -357,6 +357,17 @@ where
                         if response_size_bytes + total_value_size_bytes
                             > self.sync_config.max_response_size
                         {
+                            // HK v0.19.13: a response carries at least one value; a first value
+                            // larger than the budget travels alone (the request-response frame
+                            // decides whether a peer can take it).
+                            if values.is_empty() {
+                                info!(
+                                    "First value of the range (height {}, {} bytes) is larger than the response budget ({} bytes): it travels alone",
+                                    height, total_value_size_bytes, self.sync_config.max_response_size
+                                );
+                                values.push(value);
+                                break;
+                            }
                             warn!("Maximum byte size limit ({} bytes) would be exceeded (current: {} + upcoming value: {}), stopping at height {}",
                               self.sync_config.max_response_size, response_size_bytes, total_value_size_bytes, height);
                             break;

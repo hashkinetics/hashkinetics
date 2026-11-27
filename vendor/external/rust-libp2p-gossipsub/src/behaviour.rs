@@ -70,8 +70,8 @@ use crate::{
     topic::{Hasher, Topic, TopicHash},
     transform::{DataTransform, IdentityTransform},
     types::{
-        ControlAction, Graft, IDontWant, IHave, IWant, Message, MessageAcceptance, MessageId,
-        PeerDetails, PeerInfo, PeerKind, Prune, RawMessage, RpcOut, Subscription,
+        ControlAction, Graft, IDontWant, IHave, IWant, LogLimit, Message, MessageAcceptance,
+        MessageId, PeerDetails, PeerInfo, PeerKind, Prune, RawMessage, RpcOut, Subscription,
         SubscriptionAction,
     },
     FailedMessages, PublishError, SubscriptionError, TopicScoreParams, ValidationError,
@@ -82,6 +82,10 @@ mod tests;
 
 /// IDONTWANT cache capacity.
 const IDONTWANT_CAP: usize = 10_000;
+
+/// HK v0.19.13: an IHAVE is answered with an IWANT only while at most this many gossip messages
+/// wait for that peer. A peer that takes its messages has few waiting.
+const MAX_QUEUED_BEFORE_IWANT: usize = 64;
 
 /// IDONTWANT timeout before removal.
 const IDONTWANT_TIMEOUT: Duration = Duration::new(3, 0);
@@ -1112,7 +1116,11 @@ where
 
         match self.connected_peers.get(peer).map(|v| &v.kind) {
             Some(PeerKind::Floodsub) => {
-                tracing::error!("Attempted to prune a Floodsub peer");
+                // HK v0.19.13: written at most once per interval.
+                static FLOODSUB_PRUNE: LogLimit = LogLimit::new();
+                if let Some(held_back) = FLOODSUB_PRUNE.admit() {
+                    tracing::error!(held_back, "Attempted to prune a Floodsub peer");
+                }
             }
             Some(PeerKind::Gossipsub) => {
                 // GossipSub v1.0 -- no peer exchange, the peer won't be able to parse it anyway
@@ -1123,7 +1131,11 @@ where
                 };
             }
             None => {
-                tracing::error!("Attempted to Prune an unknown peer");
+                // HK v0.19.13: written at most once per interval.
+                static UNKNOWN_PEER_PRUNE: LogLimit = LogLimit::new();
+                if let Some(held_back) = UNKNOWN_PEER_PRUNE.admit() {
+                    tracing::error!(held_back, "Attempted to Prune an unknown peer");
+                }
             }
             _ => {} // Gossipsub 1.1 peer perform the `Prune`
         }
@@ -1243,6 +1255,18 @@ where
         }
 
         tracing::trace!(peer=%peer_id, "Handling IHAVE for peer");
+
+        // HK v0.19.13: an IHAVE is answered while few gossip messages wait for the peer. No
+        // IWANT is queued for a peer that does not take its messages.
+        if self.connected_peers.get(peer_id).is_some_and(|peer| {
+            peer.sender.non_priority_queue_len() > MAX_QUEUED_BEFORE_IWANT
+        }) {
+            tracing::debug!(
+                peer=%peer_id,
+                "IHAVE: the peer does not take its messages; ignoring"
+            );
+            return;
+        }
 
         let mut iwant_ids = HashSet::new();
 
@@ -1391,9 +1415,20 @@ where
         // Needs to be here to comply with the borrow checker.
         let is_outbound = connected_peer.outbound;
 
+        // HK v0.19.13: the GRAFT entries of this frame that came within a backoff time.
+        let mut grafts_in_backoff = 0usize;
+
         // we don't GRAFT to/from explicit peers; complain loudly if this happens
         if self.explicit_peers.contains(peer_id) {
-            tracing::warn!(peer=%peer_id, "GRAFT: ignoring request from direct peer");
+            // HK v0.19.13: written at most once per interval.
+            static DIRECT_PEER_GRAFT: LogLimit = LogLimit::new();
+            if let Some(held_back) = DIRECT_PEER_GRAFT.admit() {
+                tracing::warn!(
+                    peer=%peer_id,
+                    held_back,
+                    "GRAFT: ignoring request from direct peer"
+                );
+            }
             // this is possibly a bug from non-reciprocal configuration; send a PRUNE for all topics
             to_prune_topics = topics.into_iter().collect();
             // but don't PX
@@ -1417,8 +1452,12 @@ where
                     if let Some(backoff_time) = self.backoffs.get_backoff_time(&topic_hash, peer_id)
                     {
                         if backoff_time > now {
-                            tracing::warn!(
+                            // HK v0.19.13: each such GRAFT is logged at debug level; their
+                            // number is reported once for the frame, below.
+                            grafts_in_backoff += 1;
+                            tracing::debug!(
                                 peer=%peer_id,
+                                topic=%topic_hash,
                                 "[Penalty] Peer attempted graft within backoff time, penalizing"
                             );
                             // add behavioural penalty
@@ -1533,6 +1572,20 @@ where
             }
         }
 
+        // HK v0.19.13: one line for the GRAFT entries of this frame that came within a backoff
+        // time, with their number, at most once per interval.
+        if grafts_in_backoff > 0 {
+            static GRAFT_IN_BACKOFF: LogLimit = LogLimit::new();
+            if let Some(held_back) = GRAFT_IN_BACKOFF.admit() {
+                tracing::warn!(
+                    peer=%peer_id,
+                    count = grafts_in_backoff,
+                    held_back,
+                    "[Penalty] Peer attempted graft within backoff time, penalizing"
+                );
+            }
+        }
+
         if !to_prune_topics.is_empty() {
             // build the prune messages to send
             let on_unsubscribe = false;
@@ -1589,7 +1642,18 @@ where
         if always_update_backoff || peer_removed {
             let time = match backoff {
                 Some(backoff) => {
-                    Duration::from_secs(std::cmp::min(backoff, MAX_REMOTE_PRUNE_BACKOFF_SECONDS))
+                    let requested = Duration::from_secs(std::cmp::min(
+                        backoff,
+                        MAX_REMOTE_PRUNE_BACKOFF_SECONDS,
+                    ));
+                    // HK v0.19.13: the backoff a peer asks for is kept as asked only when that
+                    // peer was in our mesh for the topic. From any other peer it is never
+                    // longer than our own prune backoff.
+                    if peer_removed {
+                        requested
+                    } else {
+                        std::cmp::min(requested, self.config.prune_backoff())
+                    }
                 }
                 None => self.config.prune_backoff(),
             };
@@ -1610,6 +1674,17 @@ where
             .peer_score
             .below_threshold(peer_id, |ts| ts.accept_px_threshold);
         for (topic_hash, px, backoff) in prune_data {
+            // HK v0.19.13: a PRUNE acts only on a topic this node has joined. For any other
+            // topic it records no backoff and starts no peer exchange.
+            if !self.mesh.contains_key(&topic_hash) {
+                tracing::debug!(
+                    peer=%peer_id,
+                    topic=%topic_hash,
+                    "PRUNE: ignoring a topic that is not joined"
+                );
+                continue;
+            }
+
             if self.remove_peer_from_mesh(peer_id, &topic_hash, backoff, true) {
                 #[cfg(feature = "metrics")]
                 if let Some(m) = self.metrics.as_mut() {
@@ -1954,11 +2029,16 @@ where
         {
             Ok(topics) => topics,
             Err(s) => {
-                tracing::error!(
-                    peer=%propagation_source,
-                    "Subscription filter error: {}; ignoring RPC from peer",
-                    s
-                );
+                // HK v0.19.13: written at most once per interval.
+                static FILTER_ERROR: LogLimit = LogLimit::new();
+                if let Some(held_back) = FILTER_ERROR.admit() {
+                    tracing::error!(
+                        peer=%propagation_source,
+                        held_back,
+                        "Subscription filter error: {}; ignoring RPC from peer",
+                        s
+                    );
+                }
                 return;
             }
         };
@@ -2093,8 +2173,11 @@ where
 
     /// Applies penalties to peers that did not respond to our IWANT requests.
     fn apply_iwant_penalties(&mut self) {
+        // HK v0.19.13: promises that were not met in time are dropped at every heartbeat, with
+        // or without peer scoring. The score penalty is applied only with peer scoring.
+        let broken_promises = self.gossip_promises.get_broken_promises();
         if let PeerScoreState::Active(peer_score) = &mut self.peer_score {
-            for (peer, count) in self.gossip_promises.get_broken_promises() {
+            for (peer, count) in broken_promises {
                 peer_score.add_penalty(&peer, count);
                 #[cfg(feature = "metrics")]
                 if let Some(metrics) = self.metrics.as_mut() {
@@ -2912,7 +2995,20 @@ where
             Ok(()) => true,
             Err(rpc) => {
                 // Sending failed because the channel is full.
-                tracing::warn!(peer=%peer_id, "Send Queue full. Could not send {:?}.", rpc);
+                // HK v0.19.13: the line names the kind of the message, its topic and its size,
+                // never its content, and is written at most once per interval.
+                static QUEUE_FULL: LogLimit = LogLimit::new();
+                if let Some(held_back) = QUEUE_FULL.admit() {
+                    let (kind, topic, bytes) = rpc.summary();
+                    tracing::warn!(
+                        peer=%peer_id,
+                        kind,
+                        ?topic,
+                        bytes,
+                        held_back,
+                        "Send Queue full. Could not send a message."
+                    );
+                }
 
                 // Update failed message counter.
                 let failed_messages = self.failed_messages.entry(peer_id).or_default();
@@ -2928,11 +3024,13 @@ where
                     RpcOut::IWant(_) | RpcOut::IHave(_) | RpcOut::IDontWant(_) => {
                         failed_messages.non_priority += 1;
                     }
+                    // HK v0.19.13: the control messages that wait for one peer are bounded. One
+                    // that is not queued counts as a priority message that could not be sent.
                     RpcOut::Graft(_)
                     | RpcOut::Prune(_)
                     | RpcOut::Subscribe(_)
                     | RpcOut::Unsubscribe(_) => {
-                        unreachable!("Channel for highpriority control messages is unbounded and should always be open.")
+                        failed_messages.priority += 1;
                     }
                 }
 
@@ -3338,8 +3436,23 @@ where
                     }
                 } else {
                     // log the invalid messages
+                    // HK v0.19.13: the invalid messages of a frame are reported with their number,
+                    // at most once per interval. Each message is logged with its reason at
+                    // debug level.
+                    if let Some((_, first_error)) = invalid_messages.first() {
+                        static INVALID_MESSAGES: LogLimit = LogLimit::new();
+                        if let Some(held_back) = INVALID_MESSAGES.admit() {
+                            tracing::warn!(
+                                peer=%propagation_source,
+                                count=invalid_messages.len(),
+                                held_back,
+                                "Invalid messages from peer. First reason: {:?}",
+                                first_error,
+                            );
+                        }
+                    }
                     for (message, validation_error) in invalid_messages {
-                        tracing::warn!(
+                        tracing::debug!(
                             peer=%propagation_source,
                             source=?message.source,
                             "Invalid message from peer. Reason: {:?}",
@@ -3356,7 +3469,11 @@ where
                         .max_messages_per_rpc()
                         .is_some_and(|max_msg| count >= max_msg)
                     {
-                        tracing::warn!("Received more messages than permitted. Ignoring further messages. Processed: {}", count);
+                        // HK v0.19.13: written at most once per interval.
+                        static TOO_MANY_MESSAGES: LogLimit = LogLimit::new();
+                        if let Some(held_back) = TOO_MANY_MESSAGES.admit() {
+                            tracing::warn!(held_back, "Received more messages than permitted. Ignoring further messages. Processed: {}", count);
+                        }
                         break;
                     }
                     self.handle_received_message(raw_message, &propagation_source);
@@ -3375,7 +3492,11 @@ where
                         .max_messages_per_rpc()
                         .is_some_and(|max_msg| count >= max_msg)
                     {
-                        tracing::warn!("Received more control messages than permitted. Ignoring further messages. Processed: {}", count);
+                        // HK v0.19.13: written at most once per interval.
+                        static TOO_MANY_CONTROL_MESSAGES: LogLimit = LogLimit::new();
+                        if let Some(held_back) = TOO_MANY_CONTROL_MESSAGES.admit() {
+                            tracing::warn!(held_back, "Received more control messages than permitted. Ignoring further messages. Processed: {}", count);
+                        }
                         break;
                     }
 

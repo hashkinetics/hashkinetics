@@ -205,6 +205,28 @@
 //!     (`get_account_txs`); the answer is unchanged, row for row.
 //!   * `hk_getMempool` answers from the txids the pool stored when each tx entered it
 //!     (`get_mempool`); the response is unchanged.
+//!
+//! v0.19.13 (client-side, no gate; the rules are the pool's, mempool.rs):
+//!   * `hk_submitTx` / `hk_gossipTxs` do not take back, for 16 blocks, a transaction that a
+//!     block refused after the envelope checks: `this transaction was refused in a block — the
+//!     same signed bytes are admitted again once the chain is at height H`. Nothing follows for
+//!     its sender, whoever sends the bytes: its other transactions are admitted as usual.
+//!   * They refuse a transfer or a shield of amount zero by the tx's own bytes (`zero amount`),
+//!     and — for the sender's next transaction only, the one at the account's current nonce —
+//!     a transaction whose sender cannot pay the envelope fee charged at the next height and a
+//!     transfer or a shield whose amount the balance does not cover, in hk-state's receipt
+//!     wording.
+//!   * A pool tx's proof is verified before the tx enters the pool when the node has a verifier
+//!     (`door_proof_check`): after the checks above, against the tx's own public values, with
+//!     no lock held, `POOL_PROOF_VERIFY_SLOTS` verification at a time (`busy: … retry later`
+//!     beyond, nothing queued). A proof that does not verify is refused (`pool proof rejected
+//!     (it does not verify)`); the same bytes sent again get that answer at once, with no
+//!     verification and no further effect; and the sender's transactions that carry a pool
+//!     proof — only those — wait (`a pool transaction of this sender was refused — … height H`),
+//!     longer with each further transaction of that sender whose proof fails. A verification
+//!     that gives no answer refuses the tx and counts the wait, and the txid is not remembered.
+//!     Without a verifier the pool holds one such tx per sender and 8 MiB of them in all, and
+//!     the door answers `… retry later` beyond that.
 
 use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
@@ -263,6 +285,18 @@ static BUNDLE_ADMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(
 /// wallet needs one path per spend; two slots are plenty.
 const POOL_PATH_SLOTS: usize = 2;
 static POOL_PATH: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(POOL_PATH_SLOTS);
+
+/// v0.19.13: at most this many pool-proof verifications of the door (`door_proof_check`,
+/// behind `hk_submitTx` and `hk_gossipTxs`) run at once in the process, `try_acquire` like
+/// `CERT_VERIFY`: past them a pool tx is answered "busy … retry later" at once and nothing
+/// queues. A verification runs with no lock held and only for a tx that passed every check of
+/// admission, and once a proof of a sender does not verify, that sender's transactions that
+/// carry a pool proof wait before the next one is looked at (`Mempool::note_refused_proof`).
+/// One slot: the verification runs on the runtime worker that serves the request; one in
+/// flight leaves the node's other tasks the other workers; a second caller is answered busy at
+/// once.
+const POOL_PROOF_VERIFY_SLOTS: usize = 1;
+static POOL_PROOF_VERIFY: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(POOL_PROOF_VERIFY_SLOTS);
 
 /// HR-4 (v0.19.12): `hk_getAssets` is paged — at most this
 /// many registry entries per call (`limit`, the default and the cap; `from` is the index of
@@ -396,17 +430,42 @@ fn bundles_open(h: &SharedHandles) -> bool {
 /// both a hash-free check and one of the pool checks (full, a byte cap, duplicate, slot
 /// taken, an R18 settle cap) hears the hash-free one, the first the verdict reached; a bad
 /// signature is still judged at the end of the account walk.
+///
+/// v0.19.13: a `Transfer` or `MintToPool` of amount zero is one more refusal by the tx's own
+/// bytes. The pool's checks (mempool.rs `check_gated`) gain, after the nonce window, the memory
+/// of txids a block refused and — for a tx that carries a pool proof — its sender's proof
+/// wait; after the signature, at the account's current nonce only, the fee and the amount, as
+/// apply orders them; and, last, the quota of pool txs with an unverified proof. Before the tx
+/// enters the pool, a pool tx's proof is verified when the node has a verifier
+/// (`door_proof_check`): the pool's checks run once with nothing indexed, the proof is verified
+/// with no lock held on the door's verification slot (`POOL_PROOF_VERIFY_SLOTS`), and the
+/// checks run again with the push. Both doors come through here, so both refuse the same
+/// frames for the same reasons.
 fn admit_one(h: &SharedHandles, tx: &SignedTx) -> Result<[u8; 32], String> {
+    admit_one_with(h, tx, &POOL_PROOF_VERIFY)
+}
+
+/// v0.19.13: `admit_one` on the given proof-verification slot — the node's is
+/// `POOL_PROOF_VERIFY`; a test brings its own, so no test waits on another's.
+fn admit_one_with(h: &SharedHandles, tx: &SignedTx, verify_slots: &tokio::sync::Semaphore) -> Result<[u8; 32], String> {
     refuse_proof_less_pool_tx(tx)?;
     let verdict = Mempool::envelope_verdict(tx);
     if let Some(e) = verdict.hash_free_refusal() {
         return Err(e.as_str());
     }
     let id = txid(tx);
+    let proof_checked = match door_proof_check(h, tx, &id, &verdict, verify_slots) {
+        Ok(checked) => checked,
+        Err(e) => return Err(e.as_str()),
+    };
     let admitted = {
         let chain = h.chain.lock().unwrap_or_else(|e| e.into_inner());
         let mut mp = h.mempool.lock().unwrap_or_else(|e| e.into_inner());
-        mp.try_admit_verified_with_id(tx.clone(), id, &chain, &verdict)
+        if proof_checked {
+            mp.try_admit_proof_checked_with_id(tx.clone(), id, &chain, &verdict)
+        } else {
+            mp.try_admit_verified_with_id(tx.clone(), id, &chain, &verdict)
+        }
     };
     match admitted {
         Ok(id) => {
@@ -419,6 +478,59 @@ fn admit_one(h: &SharedHandles, tx: &SignedTx) -> Result<[u8; 32], String> {
         }
         Err(e) => Err(e.as_str()),
     }
+}
+
+/// v0.19.13: the door's check of a pool tx's proof, before the tx enters the pool. `Ok(true)`:
+/// the node has a verifier and the proof verifies against the tx's own public values.
+/// `Ok(false)`: nothing was verified — the tx carries no proof of its own, or the node has no
+/// verifier (the pool then holds the tx to its quota of unverified ones). In order:
+///   1. under the locks (chain before mempool): the verifier, then `Mempool::precheck_with_id`
+///      — a txid remembered at step 4 is answered `pool proof rejected` at
+///      once, and so is, with its own reason, a frame the pool refuses anyway (not the
+///      account's key, a bad signature, a zero amount, a value the balance does not cover, the
+///      sender's proof wait, a full pool): none of them costs a verification;
+///   2. the slot (`POOL_PROOF_VERIFY_SLOTS` in the process), or "busy" at once;
+///   3. no lock held: the verification (`mempool::pool_proof_verifies`), behind a panic
+///      boundary;
+///   4. a proof that does not verify: the txid is remembered, so the same bytes are answered
+///      in step 1 from now on, and the sender's transactions that carry a pool proof wait —
+///      longer with each new txid of that sender that fails here
+///      (`Mempool::note_refused_proof`). A verification that gives no answer refuses the tx
+///      and counts the wait, and the txid is not remembered.
+/// What apply checks against its state (the anchor, the nullifier) stays at apply.
+fn door_proof_check(
+    h: &SharedHandles,
+    tx: &SignedTx,
+    id: &[u8; 32],
+    verdict: &crate::mempool::EnvelopeVerdict,
+    slots: &tokio::sync::Semaphore,
+) -> Result<bool, crate::mempool::AdmitError> {
+    if !crate::mempool::carries_pool_proof(tx) {
+        return Ok(false);
+    }
+    let verifier = {
+        let chain = h.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let mp = h.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(verifier) = mp.proof_verifier() else {
+            return Ok(false);
+        };
+        mp.precheck_with_id(tx, id, &chain, verdict)?;
+        verifier
+    };
+    let Ok(_permit) = slots.try_acquire() else {
+        return Err(crate::mempool::AdmitError::ProofVerifyBusy);
+    };
+    // `Ok(verdict)`: the verifier's own answer; `Err`: the verification gave no answer
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::mempool::pool_proof_verifies(&*verifier, tx)
+    }));
+    if matches!(outcome, Ok(true)) {
+        return Ok(true);
+    }
+    let chain = h.chain.lock().unwrap_or_else(|e| e.into_inner());
+    let mut mp = h.mempool.lock().unwrap_or_else(|e| e.into_inner());
+    mp.note_refused_proof(tx.sender, *id, outcome.is_ok(), chain.height);
+    Err(crate::mempool::AdmitError::PoolProofRejected)
 }
 
 async fn handle_conn(sock: &mut tokio::net::TcpStream, h: &SharedHandles) -> eyre::Result<()> {
@@ -637,8 +749,11 @@ fn bundle_queue_verdict(q: &[(Vec<SignedTx>, Vec<u8>)], txs: &[SignedTx], agg: &
 ///      as it is NOW (it may have changed since step 2), then the push.
 /// The dry run judges a bundle against the CHAIN, not the live pool: whole from each sender's
 /// current nonce (one outstanding bundle per account; at most `mempool::NONCE_WINDOW` txs per
-/// sender), and no balance is checked — an unfunded account's bundle is refused at apply, as
-/// its hk_submitTx twin would be. Takes the handles it touches rather than `SharedHandles` so
+/// sender). v0.19.13: for each sender's first tx — the one at its current nonce — the dry run
+/// asks what hk_submitTx asks: the envelope fee, and a shield's value against the balance; a
+/// shield of value zero is refused by its own bytes; behind that first tx no balance is
+/// judged. The live pool's txid memories and proof waits are not read: the scratch pool has
+/// none. Takes the handles it touches rather than `SharedHandles` so
 /// `hr1_tests` drives it without a node; `dispatch` passes `bundles_open(h)`, `&h.chain`,
 /// `&h.bundles`, `&BUNDLE_ADMIT`. Not in this release: verifying the aggregate at submit — a
 /// queued bundle whose aggregate is invalid still rides one of this node's blocks and its txs
@@ -4095,5 +4210,235 @@ mod hr1_tests {
         assert!(accepted(&r), "{r}");
         assert_eq!(slots.available_permits(), 1);
         assert_eq!(q.lock().unwrap().len(), 1);
+    }
+}
+
+/// v0.19.13: the door (`admit_one`, behind `hk_submitTx` and `hk_gossipTxs`) — a transaction a
+/// block refused, a pool tx's proof verified before the tx enters the pool, the memory of
+/// failed proofs and the proof wait, the verification slot, the quota without a verifier —
+/// and the bundle door's fee check. The pool's own rules are tested in mempool.rs
+/// `v0_19_13_tests`. A test that verifies a proof brings its own slot (`admit_one_with`), so
+/// no test waits on another's.
+///
+/// Run: `cargo test --offline -p hk-node v0_19_13 -- --nocapture`
+#[cfg(test)]
+mod v0_19_13_tests {
+    use super::*;
+    use crate::mempool::test_fixtures::*;
+    use crate::mempool::AdmitError;
+    use tokio::sync::Semaphore;
+
+    /// Handles over `mini_chain(n)` whose pool has the stand-in verifier (`EchoVerifier`: a
+    /// proof verifies exactly when it is the bincode of the tx's own public values).
+    fn handles_with_verifier(n: u8) -> (SharedHandles, Arc<EchoVerifier>) {
+        let h = SharedHandles::for_tests(mini_chain(n));
+        let verifier = Arc::new(EchoVerifier::default());
+        h.mempool.lock().unwrap().set_proof_verifier(verifier.clone());
+        (h, verifier)
+    }
+
+    /// Both doors refuse, for 16 blocks, a transaction that a block refused, with the one
+    /// message that names the height, whoever sends it. Nobody waits: another transaction of
+    /// the same sender is admitted at once. At that height the same signed bytes are admitted.
+    /// Caught mutant: drop the memory's check from the pool's `check_gated` — both doors take the
+    /// refused bytes back at once.
+    #[test]
+    #[allow(non_snake_case)]
+    fn a_transaction_a_block_refused_is_refused_at_hk_submitTx_and_hk_gossipTxs_for_sixteen_blocks() {
+        let h = SharedHandles::for_tests(mini_chain(2));
+        let t = sign_at(1, 0, transfer_payload(2));
+        // the block at height 1 refused `t` after the envelope checks
+        {
+            let mut chain = h.chain.lock().unwrap();
+            chain.height = 1;
+            let refused = crate::mempool::RefusedTx { sender: acct(1), nonce: 0, id: txid(&t), pool_proof: false };
+            assert_eq!(h.mempool.lock().unwrap().note_block(1, &chain, &[refused], &[]), 0);
+        }
+        let reason = AdmitError::RefusedRecently { until: 17 }.as_str();
+        assert!(reason.ends_with("height 17"), "{reason}");
+        let r = dispatch("hk_submitTx", &json!({"tx": t}), &h);
+        assert_eq!(r["result"]["accepted"], json!(false), "{r}");
+        assert_eq!(r["result"]["reason"], json!(reason), "{r}");
+        // the gossip door drops it too; another tx of the same sender, at the same nonce, is
+        // admitted beside it: nobody waits
+        let r = dispatch("hk_gossipTxs", &json!({"txs": [t, transfer(1, 0)]}), &h);
+        assert_eq!(r["result"]["admitted"], json!(1), "{r}");
+        assert_eq!(r["result"]["dropped"], json!(1), "{r}");
+        assert_eq!(h.mempool.lock().unwrap().remove_included(&[(acct(1), 0)]), 1);
+        // one block short of the height: still refused; at it: admitted, the same signed bytes
+        h.chain.lock().unwrap().height = 16;
+        let r = dispatch("hk_submitTx", &json!({"tx": t}), &h);
+        assert_eq!(r["result"]["reason"], json!(reason), "{r}");
+        h.chain.lock().unwrap().height = 17;
+        let r = dispatch("hk_submitTx", &json!({"tx": t}), &h);
+        assert_eq!(r["result"]["accepted"], json!(true), "{r}");
+        assert_eq!(r["result"]["txid"], json!(hex::encode(txid(&t))));
+    }
+
+    /// With a verifier, the door verifies a pool tx's proof against the tx's own public values
+    /// before the tx enters the pool, after its cheap checks. One that verifies is admitted and
+    /// is not held to the quota of unverified ones. One that does not is refused, and nothing
+    /// enters the pool; the same bytes sent again are answered at once, without the verifier
+    /// and with no further effect; the sender's transactions that carry a pool proof wait and
+    /// its other transactions do not; and only a new transaction of that sender whose proof
+    /// fails lengthens the wait.
+    /// Caught mutant: skip `door_proof_check` (the failing proof is admitted), verify before the pool's
+    /// checks (the frame under another account's key, or the shield above the balance, is
+    /// verified), drop the memory of failed proofs (the repeat is verified again and doubles
+    /// the wait), or hold every tx of the sender (its transfer is refused).
+    #[test]
+    fn with_a_verifier_a_proof_that_does_not_verify_is_refused_once_and_only_its_senders_pool_txs_wait() {
+        let (h, verifier) = handles_with_verifier(3);
+        let slots = Semaphore::new(POOL_PROOF_VERIFY_SLOTS);
+        let pool_len = || h.mempool.lock().unwrap().len();
+        let wait_of = |i: u8, height: u64| h.mempool.lock().unwrap().proof_wait_until(&acct(i), height);
+        // a shield whose proof speaks of another value (6) than the shield does (5)
+        let failing = |sender: u8, nonce: u64, c: u8| {
+            let mut payload = echo_mint_payload(6, c);
+            if let Tx::MintToPool { value, .. } = &mut payload {
+                *value = 5;
+            }
+            sign_at(sender, nonce, payload)
+        };
+        // two shields of account 1 whose proofs verify: each verified once and admitted — a
+        // verified pool tx is not held to "one unverified pool tx per sender"
+        let first = sign_at(1, 0, echo_mint_payload(1, 0x71));
+        let second = sign_at(1, 1, echo_mint_payload(2, 0x72));
+        assert_eq!(admit_one_with(&h, &first, &slots), Ok(txid(&first)));
+        assert_eq!(admit_one_with(&h, &second, &slots), Ok(txid(&second)));
+        assert_eq!((verifier.calls(), pool_len()), (2, 2));
+        // a spend is verified the same way, against its own anchor, nullifier and outputs
+        let a = anchor(&h.chain.lock().unwrap());
+        let spend = sign_at(3, 0, echo_spend_payload(a, 0x51));
+        assert_eq!(admit_one_with(&h, &spend, &slots), Ok(txid(&spend)));
+        assert_eq!((verifier.calls(), pool_len()), (3, 3));
+        // a frame the pool refuses anyway is answered without a verification: not the
+        // account's key, a duplicate, a shield of more than the balance
+        let not_its_key = sign_as(2, 3, 0, echo_mint_payload(1, 0x73));
+        assert_eq!(admit_one_with(&h, &not_its_key, &slots), Err(AdmitError::AuthMismatch.as_str()));
+        assert_eq!(admit_one_with(&h, &first, &slots), Err(AdmitError::DuplicateTx.as_str()));
+        let above = sign_at(2, 0, echo_mint_payload(1_001, 0x77));
+        assert_eq!(
+            admit_one_with(&h, &above, &slots),
+            Err(AdmitError::InsufficientBalance { have: 1_000, need: 1_001 }.as_str())
+        );
+        assert_eq!(verifier.calls(), 3);
+        // a proof that does not verify: refused, nothing enters the pool, the slot comes back,
+        // and account 2's proof wait runs to height 2
+        let rejected = AdmitError::PoolProofRejected.as_str();
+        assert_eq!(rejected, "pool proof rejected (it does not verify)");
+        let junk = failing(2, 0, 0x74);
+        assert_eq!(admit_one_with(&h, &junk, &slots), Err(rejected.clone()));
+        assert_eq!((verifier.calls(), pool_len(), slots.available_permits()), (4, 3, POOL_PROOF_VERIFY_SLOTS));
+        assert_eq!(wait_of(2, 0), Some(2));
+        // the same bytes again, through either door: the same answer at once — no verification,
+        // and the wait as it was
+        assert_eq!(admit_one_with(&h, &junk, &slots), Err(rejected.clone()));
+        let r = dispatch("hk_gossipTxs", &json!({"txs": [junk]}), &h);
+        assert_eq!(r["result"]["dropped"], json!(1), "{r}");
+        assert_eq!((verifier.calls(), wait_of(2, 0)), (4, Some(2)));
+        // the wait holds account 2's txs that carry a pool proof — also one whose proof would
+        // verify — and not its transfer
+        let good = sign_at(2, 0, echo_mint_payload(1, 0x75));
+        assert_eq!(admit_one_with(&h, &good, &slots), Err(AdmitError::ProofWait { until: 2 }.as_str()));
+        let plain = transfer(2, 0);
+        assert_eq!(admit_one_with(&h, &plain, &slots), Ok(txid(&plain)));
+        assert_eq!((verifier.calls(), pool_len()), (4, 4));
+        // at the height the door named the remembered bytes are still answered at once: the
+        // wait is over and is not renewed …
+        h.chain.lock().unwrap().height = 2;
+        assert_eq!(admit_one_with(&h, &junk, &slots), Err(rejected.clone()));
+        assert_eq!((verifier.calls(), wait_of(2, 2)), (4, None));
+        // … a NEW tx of account 2 whose proof fails is verified, and the wait doubles …
+        let another = failing(2, 1, 0x78);
+        assert_eq!(admit_one_with(&h, &another, &slots), Err(rejected));
+        assert_eq!((verifier.calls(), wait_of(2, 2)), (5, Some(6)));
+        // … and after it a pool tx of account 2 whose proof verifies is admitted
+        h.chain.lock().unwrap().height = 6;
+        let good = sign_at(2, 1, echo_mint_payload(1, 0x75));
+        assert_eq!(admit_one_with(&h, &good, &slots), Ok(txid(&good)));
+        assert_eq!((verifier.calls(), pool_len()), (6, 5));
+    }
+
+    /// At most `POOL_PROOF_VERIFY_SLOTS` (one) verification is in flight: with the slot taken the
+    /// door answers "busy" at once — nothing verified, nothing admitted, no one made to wait —
+    /// and admits the same tx once the slot is free. A tx that carries no proof needs no slot.
+    /// Caught mutant: drop the `try_acquire` from `door_proof_check` — a verification runs beside the
+    /// one in flight.
+    #[test]
+    fn a_verification_beyond_the_slot_in_flight_is_answered_busy() {
+        assert_eq!(POOL_PROOF_VERIFY_SLOTS, 1);
+        let (h, verifier) = handles_with_verifier(2);
+        let slots = Semaphore::new(POOL_PROOF_VERIFY_SLOTS);
+        let shield = sign_at(1, 0, echo_mint_payload(1, 0x71));
+        // a verification in flight holds the slot
+        let in_flight = slots.try_acquire().unwrap();
+        let busy = AdmitError::ProofVerifyBusy.as_str();
+        assert!(busy.starts_with("busy") && busy.ends_with("retry later"), "{busy}");
+        assert_eq!(admit_one_with(&h, &shield, &slots), Err(busy));
+        assert_eq!(verifier.calls(), 0);
+        assert_eq!(h.mempool.lock().unwrap().len(), 0);
+        assert_eq!(h.mempool.lock().unwrap().proof_wait_until(&acct(1), 0), None);
+        // a tx that carries no proof needs no slot
+        let plain = transfer(2, 0);
+        assert_eq!(admit_one_with(&h, &plain, &slots), Ok(txid(&plain)));
+        // the slot free again: verified and admitted, and the slot comes back
+        drop(in_flight);
+        assert_eq!(admit_one_with(&h, &shield, &slots), Ok(txid(&shield)));
+        assert_eq!((verifier.calls(), slots.available_permits()), (1, POOL_PROOF_VERIFY_SLOTS));
+    }
+
+    /// Without a verifier both doors hold pool txs that carry a proof to the pool's quota: a
+    /// sender's second one is answered "retry later"; another sender's first is admitted.
+    /// Caught mutant: drop the quota from the pool's `check_gated` — the second one is admitted.
+    #[test]
+    #[allow(non_snake_case)]
+    fn without_a_verifier_a_senders_second_unverified_pool_tx_is_answered_retry_later_at_hk_submitTx_and_hk_gossipTxs() {
+        let h = SharedHandles::for_tests(mini_chain(2));
+        let shield = |sender: u8, nonce: u64, c: u8| {
+            let mut payload = proven_mint_payload(vec![0x5c; LEGIT_CT]);
+            if let Tx::MintToPool { commitment, .. } = &mut payload {
+                *commitment = H256([c; 32]);
+            }
+            sign_at(sender, nonce, payload)
+        };
+        let first = shield(1, 0, 0x61);
+        assert_eq!(dispatch("hk_submitTx", &json!({"tx": first}), &h)["result"]["accepted"], json!(true));
+        let second = shield(1, 1, 0x62);
+        let reason = AdmitError::UncheckedProofPending.as_str();
+        assert!(reason.contains("retry later"), "{reason}");
+        let r = dispatch("hk_submitTx", &json!({"tx": second}), &h);
+        assert_eq!(r["result"]["accepted"], json!(false), "{r}");
+        assert_eq!(r["result"]["reason"], json!(reason), "{r}");
+        let r = dispatch("hk_gossipTxs", &json!({"txs": [second, shield(2, 0, 0x63)]}), &h);
+        assert_eq!(r["result"]["admitted"], json!(1), "{r}");
+        assert_eq!(r["result"]["dropped"], json!(1), "{r}");
+        assert_eq!(h.mempool.lock().unwrap().len(), 2);
+    }
+
+    /// The bundle door's dry run asks the envelope fee of a sender's first tx: a bundle whose
+    /// sender cannot pay it is refused with hk_submitTx's reason and nothing is queued; the
+    /// same bundle queues once the sender can pay.
+    /// Caught mutant: drop `fee_and_amount_cover` from the pool's `check_gated` — the bundle of the
+    /// sender that cannot pay queues.
+    #[test]
+    fn a_bundle_whose_sender_cannot_pay_the_fee_is_refused_at_the_bundle_door() {
+        let chain = Mutex::new(mini_chain_with_fee(1, 100));
+        chain.lock().unwrap().balances.insert((acct(1), hk_state::FEE_ASSET), 99);
+        let queue: Mutex<Vec<(Vec<SignedTx>, Vec<u8>)>> = Mutex::new(Vec::new());
+        let slot = Semaphore::new(1);
+        let bundle = demo_bundle(&chain.lock().unwrap(), 1, 0x10);
+        let params = json!({"txs": serde_json::to_value(&bundle).unwrap(), "agg_proof": hex::encode([0xA6u8; 64])});
+        let r = submit_bundle(&params, true, &chain, &queue, &slot);
+        let want =
+            format!("bad txs: tx 0 would not apply: {}", AdmitError::InsufficientFee { have: 99, need: 100 }.as_str());
+        assert_eq!(r["error"], json!(want), "{r}");
+        assert!(queue.lock().unwrap().is_empty());
+        assert_eq!(slot.available_permits(), 1);
+        // with the fee in its balance the same bundle queues
+        chain.lock().unwrap().balances.insert((acct(1), hk_state::FEE_ASSET), 100);
+        let r = submit_bundle(&params, true, &chain, &queue, &slot);
+        assert_eq!(r["result"]["accepted"], json!(true), "{r}");
+        assert_eq!(queue.lock().unwrap().len(), 1);
     }
 }

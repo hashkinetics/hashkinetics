@@ -52,6 +52,9 @@ ml-kem = { path = "../vendor/external/rustcrypto-kems/ml-kem" }    # ML-KEM-768 
 # (vendor/external/PINS.md); the patch applies to the `libp2p` facade's copy too.
 [patch.crates-io]
 libp2p-gossipsub = { path = "../vendor/external/rust-libp2p-gossipsub" }
+# v0.19.13: quick-protobuf 0.8.1 from crates.io, vendored with changes marked HK v0.19.13
+# (vendor/external/PINS.md).
+quick-protobuf = { path = "../vendor/external/quick-protobuf" }
 
 [profile.release]
 lto = "thin"

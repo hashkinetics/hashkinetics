@@ -673,12 +673,17 @@ impl PeerScore {
 
         // this should be the first delivery trace
         if record.status != DeliveryStatus::Unknown {
-            tracing::warn!(
-                peer=%from,
-                status=?record.status,
-                first_seen=?record.first_seen.elapsed().as_secs(),
-                "Unexpected delivery trace"
-            );
+            // HK v0.19.13: written at most once per interval.
+            static UNEXPECTED_TRACE: crate::types::LogLimit = crate::types::LogLimit::new();
+            if let Some(held_back) = UNEXPECTED_TRACE.admit() {
+                tracing::warn!(
+                    peer=%from,
+                    status=?record.status,
+                    first_seen=?record.first_seen.elapsed().as_secs(),
+                    held_back,
+                    "Unexpected delivery trace"
+                );
+            }
             return;
         }
 

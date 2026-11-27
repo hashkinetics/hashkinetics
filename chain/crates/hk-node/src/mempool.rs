@@ -170,6 +170,50 @@
 //!   * every other field of every variant is fixed-size: 32-byte ids, integers, bools, an
 //!     `Option` of an id, the four-flag `AssetPolicy`.
 //!
+//! v0.19.13 (client-side, no gate) adds what this node keeps of a block's refusals, a share of
+//! a block per sender in what it proposes, and checks at the door. None of these rules charges
+//! an account for something another account sent:
+//!   * A transaction that a block refused after the envelope checks — one its sender's own key
+//!     signed ([`refused_after_the_envelope`]) — is not admitted and not proposed again for
+//!     [`REFUSED_TXID_BLOCKS`] blocks. Its txid is remembered (at most [`REFUSED_TXID_CAP`]
+//!     txids; fed by the live commit, a block another node proposed like this node's own), and
+//!     the door names the height from which the same signed bytes are admitted again
+//!     (`RefusedRecently`). Nothing follows for the sender, whoever sends those bytes meanwhile.
+//!   * At that commit the sender's pending transactions at higher nonces leave the pool: they
+//!     cannot apply before a transaction at the refused nonce does; they can be submitted
+//!     again after it ([`Mempool::note_block`]).
+//!   * The view the proposer selects from ([`Mempool::selectable`]) offers at most
+//!     [`SENDER_TXS_PER_BLOCK`] transactions and [`SENDER_BYTES_PER_BLOCK`] bytes of one sender
+//!     per block; the rest stay pending for later blocks. This bounds what one sender puts into
+//!     one block that this node proposes (16 transactions, 4 MiB), and nothing more.
+//!   * The door refuses a `Transfer` or a `MintToPool` of amount zero by its own bytes
+//!     (`ZeroAmount`, at any nonce). For the sender's next transaction — the one at the
+//!     account's current nonce, and only that one — it refuses a transaction whose sender
+//!     cannot pay the envelope fee apply charges at the next height (`InsufficientFee`) and a
+//!     `Transfer` or `MintToPool` whose amount the balance, after that fee, does not cover
+//!     (`InsufficientBalance`): hk-state's own arithmetic and receipt wording. At a higher
+//!     nonce the sender's own pending transactions can still change the balance, so nothing
+//!     is refused there.
+//!   * A pool transaction that carries a proof enters the pool verified or under a quota. When
+//!     the node has a verifier ([`Mempool::proof_verifier`]) the RPC door verifies the proof
+//!     against the transaction's own public values, after the checks above (rpc.rs
+//!     `door_proof_check`). A proof that does not verify is refused, and its txid is
+//!     remembered ([`FAILED_PROOF_TXID_CAP`] txids): the same bytes are answered at once from
+//!     then on, without another verification and with no further effect. The sender's
+//!     transactions that carry a pool proof — only those — then wait:
+//!     [`PROOF_WAIT_FIRST_BLOCKS`] blocks, twice as long with each further transaction of that
+//!     sender whose proof fails, up to [`PROOF_WAIT_MAX_BLOCKS`], and from the start again once
+//!     a pool transaction of that sender applies (`ProofWait`). A remembered txid never counts
+//!     again. A verification that gives no answer refuses the transaction and counts the wait,
+//!     and its txid is not remembered. Without a verifier, and for every pool
+//!     transaction a restart puts back (the restore paths verify nothing), the pool holds one
+//!     such transaction per sender and [`MAX_UNCHECKED_PROOF_BYTES`] of them in all ("retry
+//!     later" beyond that), and a new one that a block refuses starts or lengthens the same
+//!     wait.
+//! The two memories and the proof waits are this node's own, live in memory and are empty
+//! after a restart. Like the nonce window they are admission rules: apply knows none of them,
+//! and none changes what a block does.
+//!
 //! Lock discipline: callers that need both locks take `chain` BEFORE `mempool`
 //! (the commit path in state.rs already does; rpc.rs follows the same order).
 
@@ -257,6 +301,71 @@ const _: () = assert!(
         <= crate::state::MAX_PROPOSAL_BYTES
 );
 
+/// v0.19.13: for how many blocks a transaction that a block refused after the envelope checks
+/// is not admitted and not proposed again ([`Mempool::note_block`]): refused in block h, the
+/// same signed bytes are admitted again once the chain is at height h + 16.
+pub const REFUSED_TXID_BLOCKS: u64 = 16;
+
+/// v0.19.13: the most refused txids remembered at once; the oldest make room.
+pub const REFUSED_TXID_CAP: usize = 65_536;
+
+/// v0.19.13: the most txids of pool transactions remembered as already judged — one whose proof
+/// did not verify at this door, or (on a node without a verifier) an unverified one that a
+/// block refused. A repeat of one of them is answered at once and changes nothing for its
+/// sender. The oldest make room.
+pub const FAILED_PROOF_TXID_CAP: usize = 4_096;
+
+/// v0.19.13: at most this many transactions of one sender are offered to one block this node
+/// builds ([`Mempool::selectable`]); the rest stay pending for later blocks.
+pub const SENDER_TXS_PER_BLOCK: usize = 16;
+
+/// v0.19.13: at most this many encoded bytes ([`tx_encoded_len`]) of one sender are offered to
+/// one block this node builds — one transaction at [`MAX_TX_BYTES`]. With
+/// [`SENDER_TXS_PER_BLOCK`] it bounds what one sender puts into one block that this node
+/// proposes (16 transactions, 4 MiB), and nothing more.
+pub const SENDER_BYTES_PER_BLOCK: usize = 4 * 1024 * 1024;
+
+/// v0.19.13: how many blocks a sender's transactions that carry a pool proof wait after the
+/// first new transaction of that sender whose proof did not verify.
+pub const PROOF_WAIT_FIRST_BLOCKS: u64 = 2;
+
+/// v0.19.13: the longest proof wait. Each further new transaction of the sender whose proof
+/// does not verify doubles the wait — 2, 4, 8, … — up to this many blocks.
+pub const PROOF_WAIT_MAX_BLOCKS: u64 = 1_024;
+
+/// v0.19.13: a sender whose last such transaction is this many blocks behind the chain is
+/// forgotten: its next one starts at [`PROOF_WAIT_FIRST_BLOCKS`] again. Longer than the
+/// longest wait (checked at compile time below), so no sender is forgotten while it waits.
+pub const PROOF_WAIT_FORGET_BLOCKS: u64 = 2_048;
+
+/// v0.19.13: the most senders the proof-wait table holds. When it is full, the entry whose
+/// wait ends first makes room for a new one.
+pub const PROOF_WAIT_TABLE_CAP: usize = 65_536;
+
+/// v0.19.13: how often, in blocks, the proof-wait table drops the entries it has forgotten.
+/// The rule itself is exact at every height (`ProofWait::forgotten_at`); the sweep frees the
+/// memory.
+const PROOF_WAIT_SWEEP_BLOCKS: u64 = 256;
+
+/// v0.19.13: the most encoded bytes ([`tx_encoded_len`]) of pool transactions whose proof
+/// nothing has verified that the pool holds at once, beside one such transaction per sender:
+/// two transactions at [`MAX_TX_BYTES`] (an honest pool transaction is about 2.73 MB). A pool
+/// transaction past the quota is refused with "retry later" (`UncheckedProofPending`,
+/// `UncheckedProofBytesFull`).
+pub const MAX_UNCHECKED_PROOF_BYTES: usize = 8 * 1024 * 1024;
+
+// v0.19.13: no sender is forgotten while it waits; every admissible pool tx fits an empty
+// quota; and every admissible tx fits one sender's share of an empty block.
+const _: () = assert!(
+    PROOF_WAIT_FIRST_BLOCKS <= PROOF_WAIT_MAX_BLOCKS && PROOF_WAIT_MAX_BLOCKS < PROOF_WAIT_FORGET_BLOCKS
+);
+const _: () = assert!(MAX_TX_BYTES <= MAX_UNCHECKED_PROOF_BYTES);
+const _: () = assert!(MAX_TX_BYTES <= SENDER_BYTES_PER_BLOCK && SENDER_TXS_PER_BLOCK >= 1);
+
+/// v0.19.13: the verifier the door checks a pool transaction's proof with — the one the state
+/// machine applies by (`hk_state::State::verifier`).
+pub type DoorProofVerifier = std::sync::Arc<dyn hk_state::pool::ProofVerifier>;
+
 fn nonce_window() -> u64 {
     static W: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *W.get_or_init(|| {
@@ -339,6 +448,38 @@ pub enum AdmitError {
     /// v0.19.12: this sender's pending bytes plus this tx's would pass its quota
     /// ([`MAX_SENDER_PENDING_BYTES`]) — refused until some of its pending txs are included.
     SenderBytesFull { pending: usize, size: usize, max: usize },
+    /// v0.19.13: a block refused this very transaction after the envelope checks and its txid
+    /// is still remembered — refused for now, not for good: `until` is the chain height from
+    /// which the same signed bytes are admitted again. Nothing follows for the sender.
+    RefusedRecently { until: u64 },
+    /// v0.19.13: a pool transaction of this sender was refused — its proof did not verify at the
+    /// door, or, on a node without a verifier, a block refused it — and its proof wait is not
+    /// over. It concerns only the sender's transactions that carry a pool proof; `until` is the
+    /// chain height from which those are admitted again.
+    ProofWait { until: u64 },
+    /// v0.19.13: the sender cannot pay the envelope fee apply charges at the next height —
+    /// apply's `InsufficientFee`, by the same arithmetic.
+    InsufficientFee { have: hk_primitives::Amount, need: hk_primitives::Amount },
+    /// v0.19.13: a `Transfer` whose amount the sender's balance, after the envelope fee, does
+    /// not cover — apply's `InsufficientBalance`, by the same arithmetic.
+    InsufficientBalance { have: hk_primitives::Amount, need: hk_primitives::Amount },
+    /// v0.19.13: a `Transfer` of amount zero or a `MintToPool` of value zero — apply's
+    /// `ZeroAmount` — refused by the tx's own bytes, before any hash, at any nonce.
+    ZeroAmount,
+    /// v0.19.13: the door verified this pool tx's proof against the tx's own public values and
+    /// it does not verify, or the verification gave no answer (rpc.rs `door_proof_check`) —
+    /// now, or on an earlier try whose txid the pool remembers. The sender's next transactions
+    /// that carry a pool proof wait (`ProofWait`); a repeat of remembered bytes changes nothing.
+    PoolProofRejected,
+    /// v0.19.13: the door's proof-verification slot is taken (rpc.rs `POOL_PROOF_VERIFY_SLOTS`,
+    /// one) — answered at once, nothing queued.
+    ProofVerifyBusy,
+    /// v0.19.13: this sender already has a pool tx pending whose proof nothing has verified
+    /// (one per sender) — refused until that one is included.
+    UncheckedProofPending,
+    /// v0.19.13: the pending pool txs whose proof nothing has verified, plus this one, would
+    /// pass [`MAX_UNCHECKED_PROOF_BYTES`] — refused for now: the pool drains as blocks commit.
+    UncheckedProofBytesFull { pending: usize, size: usize, max: usize },
 }
 
 impl AdmitError {
@@ -410,13 +551,49 @@ impl AdmitError {
             AdmitError::SenderBytesFull { pending, size, max } => {
                 format!("too many bytes pending for this sender ({pending} B pending + {size} B, max {max} B) — retry later, once some are included")
             }
+            // v0.19.13: admission wording — no receipt says these; the height is the chain
+            // height from which the door admits again what it names.
+            AdmitError::RefusedRecently { until } => {
+                format!("this transaction was refused in a block — the same signed bytes are admitted again once the chain is at height {until}")
+            }
+            AdmitError::ProofWait { until } => {
+                format!("a pool transaction of this sender was refused — its transactions that carry a pool proof are admitted again once the chain is at height {until}")
+            }
+            // v0.19.13: hk-state's receipt wording, byte for byte (its Display) — the two
+            // refusals read the same at the door and in a receipt.
+            AdmitError::InsufficientFee { have, need } => {
+                hk_state::StateError::InsufficientFee { have: *have, need: *need }.to_string()
+            }
+            AdmitError::InsufficientBalance { have, need } => {
+                hk_state::StateError::InsufficientBalance { have: *have, need: *need }.to_string()
+            }
+            AdmitError::ZeroAmount => hk_state::StateError::ZeroAmount.to_string(),
+            // v0.19.13: the door's own verdict on a proof — it opens as the receipt does.
+            AdmitError::PoolProofRejected => "pool proof rejected (it does not verify)".into(),
+            // Capacity, not the tx's fault — "retry later".
+            AdmitError::ProofVerifyBusy => "busy: the node is verifying another pool proof — retry later".into(),
+            AdmitError::UncheckedProofPending => {
+                "an unverified pool transaction of this sender is already pending — retry later, once it is included".into()
+            }
+            AdmitError::UncheckedProofBytesFull { pending, size, max } => {
+                format!("too many bytes of unverified pool transactions pending ({pending} B pending + {size} B, max {max} B) — retry later")
+            }
         }
     }
 
     /// v0.19.12: a refusal by the pool's capacity — its count cap, its byte cap or the
-    /// sender's pending bytes — rather than by anything in the tx itself.
+    /// sender's pending bytes — rather than by anything in the tx itself. v0.19.13: the quota
+    /// of pool txs with an unverified proof and the door's verification slot are capacity too.
     pub fn is_capacity(&self) -> bool {
-        matches!(self, AdmitError::Full | AdmitError::PoolBytesFull { .. } | AdmitError::SenderBytesFull { .. })
+        matches!(
+            self,
+            AdmitError::Full
+                | AdmitError::PoolBytesFull { .. }
+                | AdmitError::SenderBytesFull { .. }
+                | AdmitError::ProofVerifyBusy
+                | AdmitError::UncheckedProofPending
+                | AdmitError::UncheckedProofBytesFull { .. }
+        )
     }
 }
 
@@ -464,6 +641,175 @@ struct Pending {
     tx: SignedTx,
     id: [u8; 32],
     size: usize,
+    /// v0.19.13: a pool tx that carries a proof nothing verified before it entered the pool
+    /// — counted in the pool's quota of such txs while it is pending.
+    unchecked_proof: bool,
+}
+
+/// v0.19.13: a refused block tx as the pool's commit rules read it ([`Mempool::note_block`]).
+/// state.rs `commit_prune_sets` lists the block's txs that were refused after the envelope
+/// checks ([`refused_after_the_envelope`]) — the ones their sender's own key signed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RefusedTx {
+    pub sender: AccountId,
+    pub nonce: u64,
+    pub id: [u8; 32],
+    /// The tx is a `MintToPool` / `ShieldedSpend` that carries a proof of its own.
+    pub pool_proof: bool,
+}
+
+/// v0.19.13: a bounded memory of txids, each kept until the chain reaches a height. This
+/// node's own, in memory only. `order` holds the entries as they were put — the heights never
+/// fall — so the oldest is found without a pass over the map.
+struct TxidMemory {
+    until: HashMap<[u8; 32], u64>,
+    order: VecDeque<([u8; 32], u64)>,
+    cap: usize,
+}
+
+impl TxidMemory {
+    fn new(cap: usize) -> Self {
+        Self { until: HashMap::new(), order: VecDeque::new(), cap: cap.max(1) }
+    }
+
+    /// While `id` is remembered with the chain at `height`: the height from which it is not.
+    fn until(&self, id: &[u8; 32], height: u64) -> Option<u64> {
+        self.until.get(id).copied().filter(|until| *until > height)
+    }
+
+    /// `id` was put and is still held, whatever the chain's height.
+    fn holds(&self, id: &[u8; 32]) -> bool {
+        self.until.contains_key(id)
+    }
+
+    /// Remember `id` until the chain is at `until` (a later call for the same txid renews
+    /// it). In a full memory the oldest entries make room.
+    fn remember(&mut self, id: [u8; 32], until: u64) {
+        if self.until.insert(id, until) == Some(until) {
+            return; // remembered until that very height already: `order` has the entry
+        }
+        self.order.push_back((id, until));
+        while self.until.len() > self.cap || self.order.len() > 2 * self.cap {
+            if !self.forget_oldest() {
+                break;
+            }
+        }
+    }
+
+    /// Drop the oldest entry of `order`, and its txid unless a later entry renewed it.
+    fn forget_oldest(&mut self) -> bool {
+        let Some((id, until)) = self.order.pop_front() else {
+            return false;
+        };
+        if self.until.get(&id) == Some(&until) {
+            self.until.remove(&id);
+        }
+        true
+    }
+
+    /// Forget every txid whose height the chain, at `height`, has reached.
+    fn expire(&mut self, height: u64) {
+        while self.order.front().is_some_and(|(_, until)| *until <= height) {
+            self.forget_oldest();
+        }
+    }
+}
+
+/// v0.19.13: one sender's entry in the proof-wait table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProofWait {
+    /// The wait, in blocks, that the sender's last counted transaction gave it.
+    blocks: u64,
+    /// The chain height from which the sender's proof-carrying txs are admitted and proposed
+    /// again.
+    until: u64,
+    /// The chain height at which that transaction was counted.
+    refused_at: u64,
+}
+
+impl ProofWait {
+    /// The wait is over and the sender's last counted transaction is
+    /// [`PROOF_WAIT_FORGET_BLOCKS`] or more behind `height`: the sender starts again.
+    fn forgotten_at(&self, height: u64) -> bool {
+        self.until <= height && height.saturating_sub(self.refused_at) >= PROOF_WAIT_FORGET_BLOCKS
+    }
+}
+
+/// v0.19.13: the senders whose transactions that carry a pool proof wait, after a proof of
+/// their own that did not verify — this node's own table, in memory only (a restarted node
+/// starts with none), at most `cap` senders. `by_end` orders the same entries by the height
+/// their wait ends at, so the entry whose wait ends first is found without a pass over the
+/// table; every change goes through `refused` or `forget`, which keep the two in step.
+struct ProofWaits {
+    by_sender: HashMap<AccountId, ProofWait>,
+    by_end: std::collections::BTreeSet<(u64, AccountId)>,
+    cap: usize,
+    /// The height from which the next commit drops the forgotten entries.
+    next_sweep: u64,
+}
+
+impl ProofWaits {
+    fn new(cap: usize) -> Self {
+        Self { by_sender: HashMap::new(), by_end: Default::default(), cap: cap.max(1), next_sweep: 0 }
+    }
+
+    /// While `sender`'s proof wait lasts at chain height `height`: the height from which its
+    /// proof-carrying txs are admitted and proposed again.
+    fn until(&self, sender: &AccountId, height: u64) -> Option<u64> {
+        self.by_sender.get(sender).map(|w| w.until).filter(|until| *until > height)
+    }
+
+    /// With the chain at `height`, a new transaction of `sender` that carries a pool proof
+    /// was counted (its proof did not verify at the door, or — on a node without a verifier —
+    /// a block refused it): the wait is [`PROOF_WAIT_FIRST_BLOCKS`] blocks, or twice the
+    /// sender's last wait up to [`PROOF_WAIT_MAX_BLOCKS`] when the table still knows it.
+    /// A new sender in a full table takes the place of the entry whose wait ends first.
+    /// Returns the height from which the sender's proof-carrying txs are admitted again.
+    fn refused(&mut self, sender: AccountId, height: u64) -> u64 {
+        let blocks = match self.by_sender.get(&sender) {
+            Some(w) if !w.forgotten_at(height) => w.blocks.saturating_mul(2).min(PROOF_WAIT_MAX_BLOCKS),
+            _ => PROOF_WAIT_FIRST_BLOCKS,
+        };
+        let wait = ProofWait { blocks, until: height.saturating_add(blocks), refused_at: height };
+        match self.by_sender.insert(sender, wait) {
+            Some(old) => {
+                self.by_end.remove(&(old.until, sender));
+            }
+            None => {
+                // `by_end` does not hold the new entry yet: it is never the one that makes room
+                while self.by_sender.len() > self.cap {
+                    let Some(first) = self.by_end.iter().next().copied() else {
+                        break;
+                    };
+                    self.by_end.remove(&first);
+                    self.by_sender.remove(&first.1);
+                }
+            }
+        }
+        self.by_end.insert((wait.until, sender));
+        wait.until
+    }
+
+    /// `sender` leaves the table: a pool transaction of its own applied, or the entry is
+    /// forgotten.
+    fn forget(&mut self, sender: &AccountId) {
+        if let Some(old) = self.by_sender.remove(sender) {
+            self.by_end.remove(&(old.until, *sender));
+        }
+    }
+
+    /// Every [`PROOF_WAIT_SWEEP_BLOCKS`] blocks: drop the entries forgotten at `height`.
+    fn sweep(&mut self, height: u64) {
+        if height < self.next_sweep {
+            return;
+        }
+        self.next_sweep = height.saturating_add(PROOF_WAIT_SWEEP_BLOCKS);
+        let gone: Vec<AccountId> =
+            self.by_sender.iter().filter(|(_, w)| w.forgotten_at(height)).map(|(sender, _)| *sender).collect();
+        for sender in gone {
+            self.forget(&sender);
+        }
+    }
 }
 
 pub struct Mempool {
@@ -481,6 +827,23 @@ pub struct Mempool {
     /// ([`MAX_SENDER_PENDING_BYTES`]).
     byte_cap: usize,
     sender_cap: usize,
+    /// v0.19.13: the txids a block refused after the envelope checks, each for
+    /// [`REFUSED_TXID_BLOCKS`] blocks ([`Mempool::note_block`]): not admitted, not proposed.
+    refused: TxidMemory,
+    /// v0.19.13: the txids of pool txs already judged — a proof that did not verify at the
+    /// door, or (without a verifier) an unverified pool tx a block refused. A repeat of one is
+    /// answered at once and counts for nothing ([`FAILED_PROOF_TXID_CAP`]).
+    failed_proofs: TxidMemory,
+    /// v0.19.13: the senders whose transactions that carry a pool proof wait
+    /// ([`Mempool::note_refused_proof`], [`Mempool::note_block`]).
+    proof_waits: ProofWaits,
+    /// v0.19.13: Σ `size` over the pending pool txs whose proof nothing has verified, and
+    /// their senders — one such tx per sender, [`MAX_UNCHECKED_PROOF_BYTES`] in all.
+    unchecked_proof_bytes: usize,
+    unchecked_proof_senders: HashSet<AccountId>,
+    /// v0.19.13: the verifier the RPC door checks a pool tx's proof with before the tx enters
+    /// the pool; `None` when the node has none (`HkApp::new` sets it beside the chain's).
+    proof_verifier: Option<DoorProofVerifier>,
 }
 
 impl Default for Mempool {
@@ -516,6 +879,12 @@ impl Mempool {
             cap,
             byte_cap,
             sender_cap,
+            refused: TxidMemory::new(REFUSED_TXID_CAP),
+            failed_proofs: TxidMemory::new(FAILED_PROOF_TXID_CAP),
+            proof_waits: ProofWaits::new(PROOF_WAIT_TABLE_CAP),
+            unchecked_proof_bytes: 0,
+            unchecked_proof_senders: HashSet::new(),
+            proof_verifier: None,
         }
     }
 
@@ -539,6 +908,155 @@ impl Mempool {
         self.q.iter().map(|p| &p.id)
     }
 
+    /// v0.19.13: the FIFO view the proposer selects from (state.rs `build_batch`), with the
+    /// chain at `chain_height`. It leaves out, each together with its sender's later txs (a
+    /// sender's txs apply in nonce order, so those wait behind it):
+    ///   * a tx that a block refused and that is still remembered ([`REFUSED_TXID_BLOCKS`]);
+    ///   * a tx that carries a pool proof while its sender's proof wait lasts;
+    ///   * what passes one sender's share of a block — [`SENDER_TXS_PER_BLOCK`] txs and
+    ///     [`SENDER_BYTES_PER_BLOCK`] bytes. The share bounds what one sender puts into one block
+    ///     that this node proposes (16 txs, 4 MiB), and nothing more.
+    /// Everything left out stays in the pool, in order, for a later block.
+    pub fn selectable(&self, chain_height: u64) -> impl Iterator<Item = &SignedTx> {
+        let mut offered: HashMap<AccountId, (usize, usize)> = HashMap::new();
+        let mut behind: HashSet<AccountId> = HashSet::new();
+        self.q
+            .iter()
+            .filter(move |p| {
+                let sender = p.tx.sender;
+                if behind.contains(&sender) {
+                    return false;
+                }
+                let (txs, bytes) = offered.get(&sender).copied().unwrap_or((0, 0));
+                let left_out = self.refused.until(&p.id, chain_height).is_some()
+                    || (carries_pool_proof(&p.tx) && self.proof_waits.until(&sender, chain_height).is_some())
+                    || txs >= SENDER_TXS_PER_BLOCK
+                    || bytes.saturating_add(p.size) > SENDER_BYTES_PER_BLOCK;
+                if left_out {
+                    behind.insert(sender);
+                    return false;
+                }
+                offered.insert(sender, (txs + 1, bytes.saturating_add(p.size)));
+                true
+            })
+            .map(|p| &p.tx)
+    }
+
+    /// v0.19.13: while `sender`'s proof wait lasts with the chain at `chain_height`, the chain
+    /// height from which its txs that carry a pool proof are admitted and proposed again.
+    #[cfg(test)]
+    pub fn proof_wait_until(&self, sender: &AccountId, chain_height: u64) -> Option<u64> {
+        self.proof_waits.until(sender, chain_height)
+    }
+
+    /// v0.19.13: while the txid `id` is remembered as refused in a block, with the chain at
+    /// `chain_height`: the chain height from which the same signed bytes are admitted again.
+    #[cfg(test)]
+    pub fn refused_until(&self, id: &[u8; 32], chain_height: u64) -> Option<u64> {
+        self.refused.until(id, chain_height)
+    }
+
+    /// v0.19.13: what the block committed at `height` leaves in the pool's memory (the live
+    /// commit, after the two prunes: state.rs `CommitPrune::note_pool`; a block another node
+    /// proposed counts like this node's own). `chain` is the chain after the block; `refused`
+    /// lists the block's txs refused after the envelope checks; `applied_pool` names the sender
+    /// of each applied pool tx (`MintToPool`, `ShieldedSpend`).
+    ///   * Each refused txid is remembered for [`REFUSED_TXID_BLOCKS`] blocks: not admitted and
+    ///     not proposed until the chain is at `height` + that many. Nothing follows for its
+    ///     sender, however often and by whomever the same bytes are sent.
+    ///   * The refused sender's pending txs at higher nonces leave the pool: they cannot apply
+    ///     before a tx at the refused nonce does. They stay when the block applied another tx
+    ///     at that nonce, or when the pool still holds a tx there (they follow that one).
+    ///   * On a node without a verifier, a refused tx that carries a pool proof and was not
+    ///     counted before starts or doubles its sender's proof wait — once per block and
+    ///     sender, and once per txid: a repeat of the same bytes counts for nothing. A sender
+    ///     with an applied pool tx and no such refusal in the block starts again.
+    /// Returns how many pending txs left the pool.
+    pub fn note_block(
+        &mut self,
+        height: u64,
+        chain: &hk_state::State,
+        refused: &[RefusedTx],
+        applied_pool: &[AccountId],
+    ) -> usize {
+        self.refused.expire(height);
+        let until = height.saturating_add(REFUSED_TXID_BLOCKS);
+        for tx in refused {
+            self.refused.remember(tx.id, until);
+        }
+        let mut counted: HashSet<AccountId> = HashSet::new();
+        if self.proof_verifier.is_none() {
+            for tx in refused.iter().filter(|tx| tx.pool_proof) {
+                if !self.failed_proofs.holds(&tx.id) {
+                    self.failed_proofs.remember(tx.id, u64::MAX);
+                    if counted.insert(tx.sender) {
+                        self.proof_waits.refused(tx.sender, height);
+                    }
+                }
+            }
+        }
+        for sender in applied_pool {
+            if !counted.contains(sender) {
+                self.proof_waits.forget(sender);
+            }
+        }
+        self.proof_waits.sweep(height);
+        let mut behind: HashMap<AccountId, u64> = HashMap::new();
+        for tx in refused {
+            let still_next = chain.accounts.get(&tx.sender).is_some_and(|acc| acc.nonce == tx.nonce);
+            if still_next && !self.keys.contains_key(&(tx.sender, tx.nonce)) {
+                behind.insert(tx.sender, tx.nonce);
+            }
+        }
+        self.drop_runs(&behind, false)
+    }
+
+    /// Drop, for each sender in `from`, its pending txs above the nonce given (and the tx at
+    /// that nonce too when `inclusive`). One pass; returns how many left the pool.
+    fn drop_runs(&mut self, from: &HashMap<AccountId, u64>, inclusive: bool) -> usize {
+        if from.is_empty() {
+            return 0;
+        }
+        let before = self.q.len();
+        let mut kept = VecDeque::with_capacity(before);
+        for p in std::mem::take(&mut self.q) {
+            let gone = from
+                .get(&p.tx.sender)
+                .is_some_and(|nonce| p.tx.nonce > *nonce || (inclusive && p.tx.nonce == *nonce));
+            if gone {
+                self.unindex(&p);
+            } else {
+                kept.push_back(p);
+            }
+        }
+        self.q = kept;
+        before - self.q.len()
+    }
+
+    /// v0.19.13: the door verified the proof of `sender`'s pool tx `id` and it does not verify
+    /// (rpc.rs `door_proof_check`), with the chain at `chain_height`. The sender's proof wait
+    /// starts or doubles, and — when `verdict` is true, the verifier's own answer — the txid
+    /// is remembered, so that the same bytes are answered at once from now on and never
+    /// counted again. (`verdict` false: the verification gave no answer; the txid is not
+    /// remembered.)
+    /// Returns the chain height from which the sender's proof-carrying txs are admitted again.
+    pub fn note_refused_proof(&mut self, sender: AccountId, id: [u8; 32], verdict: bool, chain_height: u64) -> u64 {
+        if verdict {
+            self.failed_proofs.remember(id, u64::MAX);
+        }
+        self.proof_waits.refused(sender, chain_height)
+    }
+
+    /// v0.19.13: give the door the node's proof verifier (`HkApp::new`, beside the chain's).
+    pub fn set_proof_verifier(&mut self, verifier: DoorProofVerifier) {
+        self.proof_verifier = Some(verifier);
+    }
+
+    /// v0.19.13: the verifier the door checks a pool tx's proof with, when the node has one.
+    pub fn proof_verifier(&self) -> Option<DoorProofVerifier> {
+        self.proof_verifier.clone()
+    }
+
     /// C2.1 + M-2: the admission pre-check. Refuses what apply would certainly refuse
     /// now — including, since M-2, anything the account's key did not sign — admits
     /// everything else and maintains the indexes. Returns the txid on success.
@@ -558,7 +1076,7 @@ impl Mempool {
         let (id, size) = self.gate(&tx)?;
         Self::channel_settle_cap(&tx, chain)?;
         let verdict = Self::envelope_verdict(&tx);
-        self.admit_gated(tx, id, size, chain, &verdict)
+        self.admit_gated(tx, id, size, chain, &verdict, false)
     }
 
     /// The map checks every admission starts with — the count cap, the pool's byte cap, the
@@ -676,7 +1194,9 @@ impl Mempool {
     /// [`tx_encoded_len`], a walk that counts a byte field by its length), no hash.
     /// `envelope_verdict` runs it after the stealth cap; the two restore paths run it on every
     /// pending tx they put back ([`restore_unchecked`](Self::restore_unchecked),
-    /// [`restore_admitted`](Self::restore_admitted)).
+    /// [`restore_admitted`](Self::restore_admitted)). v0.19.13: a `Transfer` or a `MintToPool`
+    /// of amount zero is one more of these rules (`ZeroAmount`, apply's own refusal and
+    /// wording).
     pub fn field_bounds(tx: &SignedTx) -> Result<(), AdmitError> {
         match &tx.payload {
             Tx::AssetRegister { symbol, .. } if !valid_symbol(symbol) => {
@@ -685,6 +1205,11 @@ impl Mempool {
             Tx::AssetBurn { destination, .. } if destination.len() > MAX_BURN_DESTINATION => {
                 return Err(AdmitError::BurnDestinationTooLong { len: destination.len() });
             }
+            // v0.19.13: an amount of zero — apply's `do_transfer` and `do_mint_to_pool` refuse
+            // it by the payload alone, so it is refused here at any nonce and, for a pool tx,
+            // before its proof is looked at.
+            Tx::Transfer { amount, .. } if *amount == 0 => return Err(AdmitError::ZeroAmount),
+            Tx::MintToPool { value, .. } if *value == 0 => return Err(AdmitError::ZeroAmount),
             _ => {}
         }
         let len = tx_encoded_len(tx);
@@ -744,7 +1269,7 @@ impl Mempool {
     ) -> Result<[u8; 32], AdmitError> {
         let (id, size) = self.gate(&tx)?;
         Self::channel_settle_cap(&tx, chain)?;
-        self.admit_gated(tx, id, size, chain, verdict)
+        self.admit_gated(tx, id, size, chain, verdict, false)
     }
 
     /// HR-1 (v0.19.11, review item S1): `try_admit_verified` on a txid the caller already
@@ -763,11 +1288,55 @@ impl Mempool {
         let size = tx_encoded_len(&tx);
         self.gate_with_id(&tx, &id, size)?;
         Self::channel_settle_cap(&tx, chain)?;
-        self.admit_gated(tx, id, size, chain, verdict)
+        self.admit_gated(tx, id, size, chain, verdict, false)
     }
 
-    /// Everything after the gate and the settle cap, shared by both entry points (each
-    /// runs the two cheap steps exactly once, in the same order).
+    /// v0.19.13: `try_admit_verified_with_id` for a pool tx whose proof the caller verified
+    /// against the tx's own public values (rpc.rs `door_proof_check`, on a node that has a
+    /// verifier) — the same checks, order and reasons, and the tx is not held to the quota of
+    /// pool txs with an unverified proof. `id` MUST be `txid(&tx)`.
+    pub fn try_admit_proof_checked_with_id(
+        &mut self,
+        tx: SignedTx,
+        id: [u8; 32],
+        chain: &hk_state::State,
+        verdict: &EnvelopeVerdict,
+    ) -> Result<[u8; 32], AdmitError> {
+        debug_assert_eq!(id, txid(&tx), "try_admit_proof_checked_with_id: `id` is not this tx's txid");
+        let size = tx_encoded_len(&tx);
+        self.gate_with_id(&tx, &id, size)?;
+        Self::channel_settle_cap(&tx, chain)?;
+        self.admit_gated(tx, id, size, chain, verdict, true)
+    }
+
+    /// v0.19.13: what the door asks before it verifies a pool tx's proof, under the locks and
+    /// with nothing indexed. First the memory of proofs that did not verify here: a repeat of
+    /// such a txid is answered `PoolProofRejected` at once — no slot, no verification, nothing
+    /// counted. Then every check `try_admit_proof_checked_with_id` makes, so a frame the pool
+    /// would refuse anyway (not the account's key, a bad signature, a stale nonce, a value the
+    /// balance does not cover, the sender's proof wait, a full pool) costs no verification.
+    /// `id` MUST be `txid(tx)`.
+    pub fn precheck_with_id(
+        &self,
+        tx: &SignedTx,
+        id: &[u8; 32],
+        chain: &hk_state::State,
+        verdict: &EnvelopeVerdict,
+    ) -> Result<(), AdmitError> {
+        if self.failed_proofs.holds(id) {
+            return Err(AdmitError::PoolProofRejected);
+        }
+        let size = tx_encoded_len(tx);
+        self.gate_with_id(tx, id, size)?;
+        Self::channel_settle_cap(tx, chain)?;
+        self.check_gated(tx, id, size, chain, verdict, true)
+    }
+
+    /// Everything after the gate and the settle cap, shared by every entry point (each runs
+    /// the two cheap steps exactly once, in the same order): the checks
+    /// ([`check_gated`](Self::check_gated)), then the push. `proof_checked`: the caller
+    /// verified this pool tx's proof (v0.19.13); a pool tx that carries a proof nothing
+    /// verified is held to the quota and counted in it while it is pending.
     fn admit_gated(
         &mut self,
         tx: SignedTx,
@@ -775,7 +1344,28 @@ impl Mempool {
         size: usize,
         chain: &hk_state::State,
         verdict: &EnvelopeVerdict,
+        proof_checked: bool,
     ) -> Result<[u8; 32], AdmitError> {
+        self.check_gated(&tx, &id, size, chain, verdict, proof_checked)?;
+        let unchecked_proof = !proof_checked && carries_pool_proof(&tx);
+        self.push(tx, id, size, unchecked_proof);
+        Ok(id)
+    }
+
+    /// The checks of [`admit_gated`](Self::admit_gated), with nothing indexed: the envelope's
+    /// hash-free refusal, the account and the nonce window, then (v0.19.13) the memory of
+    /// refused txids and the sender's proof wait, the pool lookups, the key binding, the
+    /// signature, then (v0.19.13) the fee and the amount at the account's current nonce and
+    /// the quota of pool txs with an unverified proof. `id` is the tx's txid.
+    fn check_gated(
+        &self,
+        tx: &SignedTx,
+        id: &[u8; 32],
+        size: usize,
+        chain: &hk_state::State,
+        verdict: &EnvelopeVerdict,
+        proof_checked: bool,
+    ) -> Result<(), AdmitError> {
         // M-2 (a) / R18: refused before any hash was computed — wrong lengths
         // (`BadEnvelope`) or an over-cap ChannelOpen (`ChannelTooLong`); the verdict says which.
         let Some(pk_commit) = verdict.pk_commit else {
@@ -792,6 +1382,20 @@ impl Mempool {
         }
         if tx.nonce >= current + nonce_window() {
             return Err(AdmitError::FutureNonce { current, got: tx.nonce });
+        }
+        // v0.19.13: a tx that a block refused is not admitted again while its txid is
+        // remembered — refused for now, with the height from which the same bytes are admitted
+        // again, whoever sends them (one map lookup; an unknown sender and a nonce outside the
+        // window keep their own reasons, just above).
+        if let Some(until) = self.refused.until(id, chain.height) {
+            return Err(AdmitError::RefusedRecently { until });
+        }
+        // v0.19.13: the proof wait holds the sender's txs that carry a pool proof, and no
+        // other tx of that sender.
+        if carries_pool_proof(tx) {
+            if let Some(until) = self.proof_waits.until(&tx.sender, chain.height) {
+                return Err(AdmitError::ProofWait { until });
+            }
         }
         // Pool preconditions (set lookups — still cheap, so still before the hashes).
         if let Tx::ShieldedSpend { anchor, nullifier, out_commitment, out2_commitment, .. } = &tx.payload {
@@ -836,8 +1440,82 @@ impl Mempool {
         // Same function as the commit path (state.rs `par_bools(.., verify_envelope)`),
         // so a tx admitted here cannot fail the signature at apply, and vice versa.
         verdict.signature.clone()?;
-        self.push(tx, id, size);
-        Ok(id)
+        // v0.19.13: after the envelope, as apply orders them — the fee, then the amount — and
+        // only for the sender's next tx: at a higher nonce the sender's own pending txs can
+        // still change the balance, so the refusal would not be certain.
+        if tx.nonce == current {
+            Self::fee_and_amount_cover(tx, chain)?;
+        }
+        // v0.19.13: last, for a tx that passed everything else — the quota of pool txs
+        // whose proof nothing has verified ("retry later").
+        if !proof_checked && carries_pool_proof(tx) {
+            self.unchecked_proof_room(&tx.sender, size)?;
+        }
+        Ok(())
+    }
+
+    /// v0.19.13: the money checks of apply that cost the door one balance read each
+    /// (`State::apply_tx_at`, `do_transfer`, `do_mint_to_pool`), for a tx at its account's
+    /// current nonce (the callers ask for no other): the envelope fee apply charges at the next
+    /// height — `fee_micro` of `fee_asset` from `fee_from` on — and, for a `Transfer` or a
+    /// `MintToPool`, the amount against the balance of its asset, less that fee when the asset
+    /// is the fee asset. hk-state's arithmetic, numbers and wording. Every other refusal of the
+    /// payload stays apply's.
+    fn fee_and_amount_cover(tx: &SignedTx, chain: &hk_state::State) -> Result<(), AdmitError> {
+        let fee = if chain.height.saturating_add(1) >= chain.fee_from { chain.fee_micro } else { 0 };
+        if fee > 0 {
+            let have = chain.balance(&tx.sender, &chain.fee_asset);
+            if have < fee {
+                return Err(AdmitError::InsufficientFee { have, need: fee });
+            }
+        }
+        let (asset, amount) = match &tx.payload {
+            Tx::Transfer { asset, amount, .. } => (asset, *amount),
+            Tx::MintToPool { asset, value, .. } => (asset, *value),
+            _ => return Ok(()),
+        };
+        let mut have = chain.balance(&tx.sender, asset);
+        if *asset == chain.fee_asset {
+            // apply debits the fee first: the amount is taken from the balance it leaves
+            have = have.saturating_sub(fee);
+        }
+        if have < amount {
+            return Err(AdmitError::InsufficientBalance { have, need: amount });
+        }
+        Ok(())
+    }
+
+    /// v0.19.13: at start, before the WAL replay: the pending txs the snapshot put back are
+    /// judged by [`fee_and_amount_cover`](Self::fee_and_amount_cover) against the restored
+    /// chain (the snapshot path itself reads no chain). A tx at its account's current nonce
+    /// that the door would refuse leaves the pool, with its sender's later txs (they cannot
+    /// apply before it). Returns how many left.
+    fn drop_restored_the_chain_cannot_pay(&mut self, chain: &hk_state::State) -> usize {
+        let mut from: HashMap<AccountId, u64> = HashMap::new();
+        for p in &self.q {
+            let next = chain.accounts.get(&p.tx.sender).is_some_and(|acc| acc.nonce == p.tx.nonce);
+            if next && Self::fee_and_amount_cover(&p.tx, chain).is_err() {
+                from.insert(p.tx.sender, p.tx.nonce);
+            }
+        }
+        self.drop_runs(&from, true)
+    }
+
+    /// v0.19.13: room in the quota of pool txs whose proof nothing has verified, for one more
+    /// of `size` encoded bytes from `sender`: one per sender, [`MAX_UNCHECKED_PROOF_BYTES`] in
+    /// all.
+    fn unchecked_proof_room(&self, sender: &AccountId, size: usize) -> Result<(), AdmitError> {
+        if self.unchecked_proof_senders.contains(sender) {
+            return Err(AdmitError::UncheckedProofPending);
+        }
+        if self.unchecked_proof_bytes.saturating_add(size) > MAX_UNCHECKED_PROOF_BYTES {
+            return Err(AdmitError::UncheckedProofBytesFull {
+                pending: self.unchecked_proof_bytes,
+                size,
+                max: MAX_UNCHECKED_PROOF_BYTES,
+            });
+        }
+        Ok(())
     }
 
     /// Tests: [`insert_restored`](Self::insert_restored) as a yes/no — false if suppressed (a
@@ -850,7 +1528,9 @@ impl Mempool {
     /// Restore path (the snapshot's pool): insert WITHOUT chain checks but WITH index maintenance,
     /// duplicate suppression and (v0.19.12) the caps admission applies — the count, the
     /// pool's bytes and the sender's pending bytes. `Ok(true)` inserted, `Ok(false)` a duplicate
-    /// (suppressed), `Err` the cap that refused it.
+    /// (suppressed), `Err` the cap that refused it. v0.19.13: a restored pool tx that carries
+    /// a proof counts as unverified (no restore path verifies a proof) and is held to the quota
+    /// of such txs — one per sender, [`MAX_UNCHECKED_PROOF_BYTES`] in all.
     fn insert_restored(&mut self, tx: SignedTx) -> Result<bool, AdmitError> {
         if self.q.len() >= self.cap {
             return Err(AdmitError::Full);
@@ -862,7 +1542,13 @@ impl Mempool {
             return Ok(false);
         }
         self.sender_room(&tx.sender, size)?;
-        self.push(tx, id, size);
+        // v0.19.13: a restored pool tx's proof is unverified — held to the quota, and counted
+        // in it.
+        let unchecked_proof = carries_pool_proof(&tx);
+        if unchecked_proof {
+            self.unchecked_proof_room(&tx.sender, size)?;
+        }
+        self.push(tx, id, size, unchecked_proof);
         Ok(true)
     }
 
@@ -894,13 +1580,22 @@ impl Mempool {
     /// applies. The frames those rules or one of the pool's caps refuse
     /// ([`AdmitError::is_capacity`]) are counted apart from the routine refusals (a stale nonce,
     /// a duplicate), so the caller reports them once. Returns (restored, dropped by those rules
-    /// and caps).
+    /// and caps). v0.19.13: the replay admits by the door's rules of this version too — a zero
+    /// amount, and the fee and the amount at the account's current nonce against the restored
+    /// chain (the two txid memories and the proof waits are empty right after a start: they
+    /// are memory) — with one difference: it verifies no proof, so a replayed pool tx is held
+    /// to the quota of pool txs with an unverified proof, also on a node that has a verifier; a
+    /// frame that quota refuses is counted with the caps' drops. Before the replay, the pending
+    /// txs the snapshot put back are judged by the same fee and amount checks
+    /// ([`drop_restored_the_chain_cannot_pay`](Self::drop_restored_the_chain_cannot_pay)); what
+    /// leaves the pool there is counted with the drops too.
     pub fn restore_admitted(
         &mut self,
         txs: impl IntoIterator<Item = SignedTx>,
         chain: &hk_state::State,
     ) -> (usize, usize) {
         let (mut restored, mut dropped) = (0usize, 0usize);
+        dropped += self.drop_restored_the_chain_cannot_pay(chain);
         for tx in txs {
             if Self::field_bounds(&tx).is_err() {
                 dropped += 1;
@@ -916,8 +1611,9 @@ impl Mempool {
     }
 
     /// Index and queue an admitted or restored tx, with its txid and encoded size; the byte
-    /// totals grow by `size`.
-    fn push(&mut self, tx: SignedTx, id: [u8; 32], size: usize) {
+    /// totals grow by `size`. v0.19.13: `unchecked_proof` — a pool tx that carries a proof
+    /// nothing verified — also enters the quota of such txs.
+    fn push(&mut self, tx: SignedTx, id: [u8; 32], size: usize, unchecked_proof: bool) {
         self.ids.insert(id);
         self.keys.insert((tx.sender, tx.nonce), tx.next_auth);
         if let Tx::ShieldedSpend { nullifier, .. } = &tx.payload {
@@ -926,7 +1622,11 @@ impl Mempool {
         self.bytes = self.bytes.saturating_add(size);
         let sender = self.sender_bytes.entry(tx.sender).or_insert(0);
         *sender = sender.saturating_add(size);
-        self.q.push_back(Pending { tx, id, size });
+        if unchecked_proof {
+            self.unchecked_proof_bytes = self.unchecked_proof_bytes.saturating_add(size);
+            self.unchecked_proof_senders.insert(tx.sender);
+        }
+        self.q.push_back(Pending { tx, id, size, unchecked_proof });
     }
 
     /// Unindex a tx leaving the queue: its stored txid and size; the byte totals shrink
@@ -943,6 +1643,11 @@ impl Mempool {
             if *sender == 0 {
                 self.sender_bytes.remove(&p.tx.sender);
             }
+        }
+        // v0.19.13: its place in the quota of pool txs with an unverified proof comes back
+        if p.unchecked_proof {
+            self.unchecked_proof_bytes = self.unchecked_proof_bytes.saturating_sub(p.size);
+            self.unchecked_proof_senders.remove(&p.tx.sender);
         }
     }
 
@@ -1000,6 +1705,98 @@ pub fn stealth_ct_over_cap(tx: &SignedTx) -> Option<usize> {
         _ => &[],
     };
     fields.iter().map(|f| f.len()).find(|len| *len > MAX_STEALTH_CT_BYTES)
+}
+
+/// v0.19.13: a `MintToPool` / `ShieldedSpend` that carries a proof of its own. (A proof-less
+/// one is covered by a bundle's aggregate; it reaches a pool only through the bundle door's
+/// dry run and is not held to the quota of pool txs with an unverified proof.)
+pub(crate) fn carries_pool_proof(tx: &SignedTx) -> bool {
+    matches!(&tx.payload, Tx::MintToPool { proof, .. } | Tx::ShieldedSpend { proof, .. } if !proof.is_empty())
+}
+
+/// v0.19.13: whether `tx`'s proof verifies against the public values the chain derives from
+/// the tx's own fields — `hk_state::expected_mint_public` / `expected_spend_public`, the
+/// statements apply verifies against (`do_mint_to_pool`, `do_shielded_spend`). True for a tx
+/// that is not a pool tx. What apply checks against its state (the anchor, the nullifier, the
+/// balance) is not checked here.
+pub(crate) fn pool_proof_verifies(verifier: &dyn hk_state::pool::ProofVerifier, tx: &SignedTx) -> bool {
+    match &tx.payload {
+        Tx::MintToPool { value, commitment, proof, .. } => {
+            verifier.verify_mint(proof, &hk_state::expected_mint_public(commitment, *value))
+        }
+        Tx::ShieldedSpend { anchor, nullifier, out_commitment, out2_commitment, fee, credit, proof, .. } => verifier
+            .verify_spend(
+                proof,
+                &hk_state::expected_spend_public(anchor, nullifier, out_commitment, out2_commitment, *fee, credit),
+            ),
+        _ => true,
+    }
+}
+
+/// v0.19.13: whether a refused block tx's receipt (the reason in `hk_state::Receipt::result`)
+/// is one that `State::apply_tx_at` gives AFTER the envelope checks — the fee, or the payload.
+/// Apply judges the envelope first (the account, the nonce, the key's binding to the account,
+/// the encoding, the signature), so a tx refused later was signed by its account's own key
+/// for the position it names; the pool's commit rules ([`Mempool::note_block`]) read only
+/// those. The reasons that count are named here, one by one, in hk-state's own wording
+/// (`StateError`'s Display, compared, not copied): a reason this list does not name — an
+/// envelope check, or one a later hk-state adds — does not count.
+pub(crate) fn refused_after_the_envelope(reason: &str) -> bool {
+    static COUNTED: std::sync::OnceLock<(Vec<String>, Vec<String>)> = std::sync::OnceLock::new();
+    let (whole, opening) = COUNTED.get_or_init(|| {
+        use hk_state::StateError as E;
+        // the fee step and every refusal of a payload, whole
+        let whole: Vec<String> = [
+            E::UnknownMandate,
+            E::DuplicateMandate,
+            E::NotHolder,
+            E::MandateAssetMismatch,
+            E::UnknownChannel,
+            E::DuplicateChannel,
+            E::ChannelIdMismatch,
+            E::ChannelRefunded,
+            E::NotExpired,
+            E::BadSettlement,
+            E::BadStep,
+            E::Overflow,
+            E::ZeroAmount,
+            E::PoolProofInvalid,
+            E::PoolUnknownAnchor,
+            E::PoolDoubleSpend,
+            E::PoolAssetMismatch,
+            E::PoolValueRange,
+            E::PoolFeeNeedsCredit,
+            E::PoolFull,
+            E::AccountExists,
+            E::AccountIdMismatch,
+            E::UnknownAsset,
+            E::AssetExists,
+            E::AssetIdMismatch,
+            E::BadSymbol,
+            E::BadDecimals,
+            E::NotIssuer,
+            E::PolicyForbids,
+            E::AssetPaused,
+            E::AccountFrozen,
+            E::NotPoolEligible,
+            E::BurnDestinationTooLong,
+        ]
+        .iter()
+        .map(|e| e.to_string())
+        .collect();
+        // a reason that carries numbers: its wording up to the first of them
+        let up_to_its_numbers = |e: E| e.to_string().split('0').next().unwrap_or_default().to_string();
+        let opening = vec![
+            up_to_its_numbers(E::InsufficientFee { have: 0, need: 0 }),
+            up_to_its_numbers(E::InsufficientBalance { have: 0, need: 0 }),
+            up_to_its_numbers(E::SettleDeltaTooLarge { delta: 0, max: 0 }),
+            up_to_its_numbers(E::ChannelTooLong { max_steps: 0, max: 0 }),
+            // `StateError::Mandate`: this opening, then the mandate tree's own reason
+            "mandate: ".to_string(),
+        ];
+        (whole, opening)
+    });
+    whole.iter().any(|w| w == reason) || opening.iter().any(|o| !o.is_empty() && reason.starts_with(o.as_str()))
 }
 
 /// v0.19.12: the bytes `tx` takes in a block. `Batch::encode` writes every tx with
@@ -1133,6 +1930,58 @@ pub(crate) mod test_fixtures {
     /// proof; `rpc::admit_one` is where a proof-less one is refused).
     pub(crate) fn proven_mint_payload(stealth_ct: Vec<u8>) -> Tx {
         Tx::MintToPool { asset: ASSET, value: 1, commitment: H256([0x5a; 32]), proof: vec![1, 2, 3], stealth_ct }
+    }
+
+    /// v0.19.13: a stand-in verifier for the door tests. A proof verifies exactly when it is
+    /// the bincode of the public values the caller derived from the tx — so a test sees which
+    /// values a proof was verified against — and every call is counted.
+    #[derive(Default)]
+    pub(crate) struct EchoVerifier {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl EchoVerifier {
+        /// How many proofs this verifier was asked about.
+        pub(crate) fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn echo<T: serde::Serialize>(&self, proof: &[u8], expected: &T) -> bool {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            bincode::serialize(expected).map(|b| b.as_slice() == proof).unwrap_or(false)
+        }
+    }
+
+    impl hk_state::pool::ProofVerifier for EchoVerifier {
+        fn verify_spend(&self, proof: &[u8], expected: &hk_spend_circuit::SpendPublic) -> bool {
+            self.echo(proof, expected)
+        }
+        fn verify_mint(&self, proof: &[u8], expected: &hk_spend_circuit::MintPublic) -> bool {
+            self.echo(proof, expected)
+        }
+    }
+
+    /// A shield of `value` whose proof the [`EchoVerifier`] accepts: the bincode of the shield's
+    /// own public values. The commitment is `c` in every byte.
+    pub(crate) fn echo_mint_payload(value: Amount, c: u8) -> Tx {
+        let commitment = H256([c; 32]);
+        let proof = bincode::serialize(&hk_state::expected_mint_public(&commitment, value))
+            .expect("the public values encode");
+        Tx::MintToPool { asset: ASSET, value, commitment, proof, stealth_ct: vec![] }
+    }
+
+    /// `spend_payload` with a proof the [`EchoVerifier`] accepts: the bincode of the spend's own
+    /// public values.
+    pub(crate) fn echo_spend_payload(anchor: H256, nf: u8) -> Tx {
+        let mut payload = spend_payload(anchor, nf);
+        if let Tx::ShieldedSpend { anchor, nullifier, out_commitment, out2_commitment, fee, credit, proof, .. } =
+            &mut payload
+        {
+            let expected =
+                hk_state::expected_spend_public(anchor, nullifier, out_commitment, out2_commitment, *fee, credit);
+            *proof = bincode::serialize(&expected).expect("the public values encode");
+        }
+        payload
     }
 
     /// What `demo_agg` builds: one account, three proof-less spends at consecutive nonces
@@ -1766,7 +2615,10 @@ mod tests {
         // admitted can park. Frames of every settle shape the door sees, on a channel ten
         // links in, through both doors; the admitted ones are then offered to the proposer
         // one at a time.
-        let (chain, id, words) = channel_chain(10);
+        let (mut chain, id, words) = channel_chain(10);
+        // v0.19.13: the channel's escrow took account 1's whole genesis balance, and the door
+        // admits a transfer only if the balance covers it — the one unit the last frame moves.
+        chain.balances.insert((acct(1), ASSET), 1);
         let cap = MAX_SETTLE_DELTA as u32;
         let unknown = H256([0xEE; 32]);
         let frames = vec![
@@ -1900,7 +2752,7 @@ mod tests {
     /// stops a megabyte of advisory bytes per envelope.
     #[test]
     fn hr1_a_stealth_ciphertext_over_the_cap_is_refused_before_any_hash() {
-        let chain = mini_chain(1);
+        let chain = mini_chain(2);
         let anchor = genesis_anchor(&chain);
         let mut mp = Mempool::new(16);
         let over = MAX_STEALTH_CT_BYTES + 1;
@@ -1958,7 +2810,9 @@ mod tests {
         assert_eq!(with_memo.stealth_ct.len(), LEGIT_CT + 6);
         assert!(MAX_STEALTH_CT_BYTES >= 2 * sealed.stealth_ct.len());
         mp.try_admit(sign_at(1, 0, proven_mint_payload(vec![0x5c; MAX_STEALTH_CT_BYTES])), &chain).expect("a ciphertext at the cap admits");
-        mp.try_admit(sign_at(1, 1, proven_mint_payload(with_memo.stealth_ct)), &chain).expect("a legitimate note admits");
+        // (v0.19.13: from a second account — a pool without a verifier holds one pool tx with
+        // an unverified proof per sender)
+        mp.try_admit(sign_at(2, 0, proven_mint_payload(with_memo.stealth_ct)), &chain).expect("a legitimate note admits");
         assert_eq!(stealth_ct_over_cap(&sign_at(1, 2, mint_payload(sealed.stealth_ct))), None);
         assert_eq!(stealth_ct_over_cap(&transfer(1, 2)), None);
         assert_eq!(mp.len(), 2);
@@ -2067,7 +2921,7 @@ mod tests {
     /// block encoding (the at-cap shield, ≈ 8 MiB as JSON, is refused).
     #[test]
     fn a_tx_over_the_byte_cap_is_refused_and_an_honest_pool_tx_admits() {
-        let chain = mini_chain(1);
+        let chain = mini_chain(2);
         let shield = |proof_len: usize| Tx::MintToPool {
             asset: ASSET,
             value: 1,
@@ -2094,8 +2948,9 @@ mod tests {
         mp.try_admit(at.clone(), &chain).expect("a tx at the cap admits");
         let (picked, held) = crate::state::select_batch_txs(&chain, [at].iter(), 1, 0);
         assert_eq!((picked.len(), held), (1, 0), "admitted but not proposable");
-        // an honest pool tx, queued behind it
-        let honest = sign_at(1, 1, shield(2_831_156));
+        // an honest pool tx, queued behind it (v0.19.13: from a second account — a pool
+        // without a verifier holds one pool tx with an unverified proof per sender)
+        let honest = sign_at(2, 0, shield(2_831_156));
         assert!(tx_encoded_len(&honest) * 4 < MAX_TX_BYTES * 3, "{} B", tx_encoded_len(&honest));
         mp.try_admit(honest, &chain).expect("an honest pool tx admits");
         assert_eq!(mp.len(), 2);
@@ -2342,6 +3197,684 @@ mod tests {
         assert_eq!(mp.pending_ids().next(), Some(&txid(&a)));
         assert_eq!(mp.remove_included(&[(acct(1), 0)]), 1);
         assert_eq!(mp.pending_ids().copied().collect::<Vec<_>>(), hashed(&mp));
+        assert_eq!(mp.len(), 3);
+    }
+}
+
+/// v0.19.13: the memory of refused txids, the run behind a refused tx, one sender's share of a
+/// block, the door's fee and amount checks, the proof wait, the quota of pool txs with an
+/// unverified proof, and the restore paths. The commit path's part is driven as state.rs
+/// tests of the commit prune drive it — blocks applied through `State::apply_block` on the shared fixture,
+/// then `commit_prune_sets` and `CommitPrune::{prune_mempool, note_pool}`, the code
+/// `apply_batch_to_chain` calls — and the proposer's through `Mempool::selectable` and
+/// `select_batch_txs_sized`, the pair `build_batch` calls. The commit path itself (live and
+/// replayed) is driven in state.rs `v0_19_13_pool_commit_tests`; the RPC door's part (a
+/// verifier, the verification slot, both doors, a bundle) in rpc.rs `v0_19_13_tests`.
+///
+/// Run: `cargo test --offline -p hk-node v0_19_13 -- --nocapture`
+#[cfg(test)]
+mod v0_19_13_tests {
+    use super::test_fixtures::*;
+    use super::*;
+    use crate::state::{commit_prune_sets, select_batch_txs_sized};
+    use hk_primitives::Amount;
+
+    /// `block` applied as the chain's next block and noted in `mp` as the live commit notes
+    /// it: the two prunes, then the pool's commit rules. Returns each tx's refusal reason
+    /// (`None`: it applied).
+    fn commit_live(chain: &mut hk_state::State, mp: &mut Mempool, block: &[SignedTx]) -> Vec<Option<String>> {
+        let height = chain.height + 1;
+        let receipts = chain.apply_block(height, 0, block).expect("block applies");
+        let p = commit_prune_sets(block, &receipts);
+        p.prune_mempool(mp);
+        p.note_pool(mp, chain, height);
+        receipts.into_iter().map(|r| r.result.err()).collect()
+    }
+
+    /// `payload` (a pool tx) carrying `bytes` as its proof.
+    fn with_proof(mut payload: Tx, bytes: Vec<u8>) -> Tx {
+        if let Tx::MintToPool { proof, .. } | Tx::ShieldedSpend { proof, .. } = &mut payload {
+            *proof = bytes;
+        }
+        payload
+    }
+
+    /// A shield of account `sender` at `nonce` carrying `proof_len` bytes of proof.
+    fn shield(sender: u8, nonce: u64, proof_len: usize) -> SignedTx {
+        sign_at(
+            sender,
+            nonce,
+            Tx::MintToPool {
+                asset: ASSET,
+                value: 1,
+                commitment: H256([0x60 + sender; 32]),
+                proof: vec![0xA5; proof_len],
+                stealth_ct: vec![],
+            },
+        )
+    }
+
+    /// A transaction that a block refused after the envelope checks is not admitted and not
+    /// offered to the proposer again for `REFUSED_TXID_BLOCKS` blocks, whoever sends it; the
+    /// door names the height, and from that height the same signed bytes are admitted and
+    /// apply. Nobody waits: another transaction of the same sender is admitted at once.
+    /// Caught mutant: drop the memory's check from `check_gated` (the refused bytes are admitted in the
+    /// next block), remember nothing in `note_block`, or make the sender wait (its other
+    /// transaction is refused).
+    #[test]
+    fn a_refused_transaction_is_not_admitted_again_for_sixteen_blocks_and_nobody_waits() {
+        assert_eq!((REFUSED_TXID_BLOCKS, REFUSED_TXID_CAP), (16, 65_536));
+        let mut chain = mini_chain(2);
+        let mut mp = Mempool::new(16);
+        // a transfer its balance covers at the door; the balance moves; the block refuses it
+        let t = sign_at(1, 0, transfer_payload(800));
+        mp.try_admit(t.clone(), &chain).expect("the balance covers it at the door");
+        chain.balances.insert((acct(1), ASSET), 500);
+        let reasons = commit_live(&mut chain, &mut mp, &[t.clone()]);
+        assert!(reasons[0].as_deref().is_some_and(|r| r.contains("insufficient balance")), "{reasons:?}");
+        assert_eq!(mp.len(), 0);
+        chain.balances.insert((acct(1), ASSET), 1_000);
+        // refused in block 1: remembered until the chain is at height 17, at either entry point
+        assert_eq!(mp.refused_until(&txid(&t), chain.height), Some(1 + REFUSED_TXID_BLOCKS));
+        let again: Result<[u8; 32], AdmitError> = Err(AdmitError::RefusedRecently { until: 17 });
+        assert_eq!(mp.try_admit(t.clone(), &chain), again);
+        assert_eq!(mp.try_admit_verified_with_id(t.clone(), txid(&t), &chain, &Mempool::envelope_verdict(&t)), again);
+        assert_eq!(
+            AdmitError::RefusedRecently { until: 17 }.as_str(),
+            "this transaction was refused in a block — the same signed bytes are admitted again once the chain is at height 17"
+        );
+        // nobody waits: another tx of the same sender, at the same nonce, is admitted at once
+        // and offered to the proposer
+        mp.try_admit(sign_at(1, 0, transfer_payload(1)), &chain).expect("the sender does not wait");
+        assert_eq!(mp.selectable(chain.height).count(), 1);
+        assert_eq!(mp.remove_included(&[(acct(1), 0)]), 1);
+        // a remembered tx is not offered to the proposer either, nor its sender's txs behind
+        // it (put back here without the door, as the snapshot's pool is)
+        assert!(mp.insert_unchecked(t.clone()) && mp.insert_unchecked(transfer(1, 1)) && mp.insert_unchecked(transfer(2, 0)));
+        assert_eq!(mp.selectable(chain.height).map(|t| (t.sender, t.nonce)).collect::<Vec<_>>(), vec![(acct(2), 0)]);
+        assert_eq!(select_batch_txs_sized(&chain, mp.selectable(chain.height), 1024, 0, 0).picked.len(), 1);
+        assert_eq!(mp.remove_included(&[(acct(1), 0), (acct(1), 1), (acct(2), 0)]), 3);
+        // one block short of the height the door named: still refused; at it: admitted, the
+        // same signed bytes, and they apply
+        for height in 2..=16 {
+            chain.apply_block(height, 0, &[]).expect("an empty block applies");
+        }
+        assert_eq!(mp.try_admit(t.clone(), &chain), again);
+        chain.apply_block(17, 0, &[]).expect("an empty block applies");
+        mp.try_admit(t.clone(), &chain).expect("the same signed bytes, sixteen blocks later");
+        assert_eq!(commit_live(&mut chain, &mut mp, &[t]), vec![None]);
+        assert_eq!(mp.len(), 0);
+    }
+
+    /// At a live commit the pending transactions behind a refused one — the same sender's
+    /// higher nonces — leave the pool; another sender's stay. They stay too when the pool still
+    /// holds a transaction at the refused nonce (they follow that one), and when the block
+    /// applied a transaction at that nonce.
+    /// Caught mutant: drop the `drop_runs` call from `note_block` (the run stays pending), or drop what
+    /// is above the refused nonce without looking at the slot and the chain (the second and
+    /// third pools lose their runs).
+    #[test]
+    fn the_higher_nonces_behind_a_refused_transaction_leave_the_pool_at_the_commit() {
+        let slots = |mp: &Mempool| mp.iter().map(|t| (t.sender, t.nonce)).collect::<Vec<_>>();
+        let mut chain = mini_chain(2);
+        let head = sign_at(1, 0, transfer_payload(800));
+        // this pool holds the head and a run behind it, and another sender's tx beside them
+        let mut mp = Mempool::new(16);
+        for tx in [head.clone(), transfer(1, 1), transfer(1, 2), transfer(2, 0)] {
+            mp.try_admit(tx, &chain).expect("admits");
+        }
+        // a second pool holds ANOTHER tx at the head's nonce, and a run behind that one
+        let mut second = Mempool::new(16);
+        for tx in [sign_at(1, 0, transfer_payload(1)), transfer(1, 1), transfer(1, 2)] {
+            second.try_admit(tx, &chain).expect("admits");
+        }
+        // the balance moves and the block refuses the head
+        chain.balances.insert((acct(1), ASSET), 500);
+        let block = vec![head];
+        let receipts = chain.apply_block(1, 0, &block).expect("block applies");
+        assert!(receipts[0].result.is_err(), "{:?}", receipts[0].result);
+        let p = commit_prune_sets(&block, &receipts);
+        assert_eq!(p.refused_signed.len(), 1);
+        // the first pool: the head's copy goes with the prune, the run behind it with the
+        // commit rules; the other sender's tx stays, and the indexes follow
+        assert_eq!(p.prune_mempool(&mut mp), (0, 1));
+        assert_eq!(p.note_pool(&mut mp, &chain, 1), 2);
+        assert_eq!(slots(&mp), vec![(acct(2), 0)]);
+        assert_eq!((mp.keys.len(), mp.ids.len(), mp.sender_bytes.len()), (1, 1, 1));
+        // the second pool: its own tx still holds the nonce, so its run stays
+        assert_eq!(p.prune_mempool(&mut second), (0, 0));
+        assert_eq!(p.note_pool(&mut second, &chain, 1), 0);
+        assert_eq!(slots(&second), vec![(acct(1), 0), (acct(1), 1), (acct(1), 2)]);
+        // a block that refuses one tx at a nonce and applies another at it: the account moved
+        // on, and the run behind the applied tx stays
+        let mut chain = mini_chain(2);
+        let (refused, applied) = (sign_at(1, 0, transfer_payload(5_000)), sign_at(1, 0, transfer_payload(1)));
+        let mut third = Mempool::new(16);
+        for tx in [applied.clone(), transfer(1, 1)] {
+            third.try_admit(tx, &chain).expect("admits");
+        }
+        let block = vec![refused, applied];
+        let receipts = chain.apply_block(1, 0, &block).expect("block applies");
+        assert!(receipts[0].result.is_err() && receipts[1].result.is_ok(), "{receipts:?}");
+        let p = commit_prune_sets(&block, &receipts);
+        assert_eq!(p.prune_mempool(&mut third), (1, 0));
+        assert_eq!(p.note_pool(&mut third, &chain, 1), 0);
+        assert_eq!(slots(&third), vec![(acct(1), 1)]);
+    }
+
+    /// The view offered to the proposer holds one sender's share of a block: at most
+    /// `SENDER_TXS_PER_BLOCK` transactions and `SENDER_BYTES_PER_BLOCK` bytes of one sender, in
+    /// nonce order. The rest stay pending and are offered for the next block; another sender is
+    /// not held back by it.
+    /// Caught mutant: offer every pending tx — the first view has all twenty, and both large ones.
+    #[test]
+    fn the_view_offered_to_the_proposer_holds_one_senders_share_of_a_block() {
+        assert_eq!((SENDER_TXS_PER_BLOCK, SENDER_BYTES_PER_BLOCK), (16, 4 * 1024 * 1024));
+        let chain = mini_chain(3);
+        let offered = |mp: &Mempool| mp.selectable(chain.height).map(|t| (t.sender, t.nonce)).collect::<Vec<_>>();
+        // twenty txs of account 1, and one of account 2 behind them
+        let mut mp = Mempool::new(64);
+        for nonce in 0..20u64 {
+            mp.try_admit(transfer(1, nonce), &chain).expect("admits");
+        }
+        mp.try_admit(transfer(2, 0), &chain).expect("admits");
+        let first = offered(&mp);
+        let mut want: Vec<(AccountId, u64)> = (0..16u64).map(|nonce| (acct(1), nonce)).collect();
+        want.push((acct(2), 0));
+        assert_eq!(first, want);
+        // the selection takes what is offered, and the pool keeps the rest
+        assert_eq!(select_batch_txs_sized(&chain, mp.selectable(chain.height), 1024, 0, 0).picked.len(), 17);
+        assert_eq!(mp.len(), 21);
+        // the next block: the sender's next four
+        assert_eq!(mp.remove_included(&first), 17);
+        assert_eq!(offered(&mp), (16..20u64).map(|nonce| (acct(1), nonce)).collect::<Vec<_>>());
+        // by bytes: two pool txs of 3 MiB of one sender (admitted as verified, so the quota of
+        // unverified ones does not hold the second): one per block
+        let mut mp = Mempool::new(16);
+        for tx in [shield(3, 0, 3 * 1024 * 1024), shield(3, 1, 3 * 1024 * 1024)] {
+            let verdict = Mempool::envelope_verdict(&tx);
+            mp.try_admit_proof_checked_with_id(tx.clone(), txid(&tx), &chain, &verdict).expect("admits");
+        }
+        assert_eq!(offered(&mp), vec![(acct(3), 0)]);
+        assert_eq!(mp.remove_included(&[(acct(3), 0)]), 1);
+        assert_eq!(offered(&mp), vec![(acct(3), 1)]);
+    }
+
+    /// A txid for the memories: `n` in its first two bytes.
+    fn an_id(n: u16) -> [u8; 32] {
+        let mut bytes = [0xD0; 32];
+        bytes[..2].copy_from_slice(&n.to_le_bytes());
+        bytes
+    }
+
+    /// The proof wait holds only the sender's transactions that carry a pool proof — at the
+    /// door, with the height, and in the view offered to the proposer. Its other transactions
+    /// are admitted and offered as usual (one queued behind a held pool tx waits behind it:
+    /// nonce order), and so is every other sender's. When the wait is over all of it is offered.
+    /// Caught mutant: hold every tx of the sender (its transfer is refused at the door), or leave the
+    /// held pool tx in the view.
+    #[test]
+    fn the_proof_wait_holds_only_a_senders_transactions_that_carry_a_pool_proof() {
+        let chain = mini_chain(2);
+        let offered = |mp: &Mempool, height: u64| mp.selectable(height).map(|t| (t.sender, t.nonce)).collect::<Vec<_>>();
+        let mut mp = Mempool::new(16);
+        // pending: a transfer of account 1, a pool tx behind it, a transfer behind that, and a
+        // tx of account 2
+        for tx in [transfer(1, 0), shield(1, 1, 3), transfer(1, 2), transfer(2, 0)] {
+            mp.try_admit(tx, &chain).expect("admits");
+        }
+        // a proof of account 1 does not verify at the door: its proof wait runs to height 2
+        assert_eq!(mp.note_refused_proof(acct(1), an_id(1), true, chain.height), 2);
+        assert_eq!(mp.proof_wait_until(&acct(1), 0), Some(2));
+        // the door: a tx of account 1 that carries a pool proof waits, with the height …
+        let waits = AdmitError::ProofWait { until: 2 };
+        assert_eq!(mp.try_admit(shield(1, 3, 3), &chain), Err(waits.clone()));
+        assert_eq!(
+            waits.as_str(),
+            "a pool transaction of this sender was refused — its transactions that carry a pool proof are admitted again once the chain is at height 2"
+        );
+        // … its other txs do not, and no other sender's pool tx does
+        mp.try_admit(transfer(1, 3), &chain).expect("a transfer of that sender is admitted");
+        mp.try_admit(shield(2, 1, 3), &chain).expect("another sender's pool tx is admitted");
+        // the view: account 1's transfer ahead of its pool tx is offered; the pool tx is held,
+        // and the txs queued behind it wait with it
+        let during = vec![(acct(1), 0), (acct(2), 0), (acct(2), 1)];
+        assert_eq!(offered(&mp, 0), during);
+        assert_eq!(offered(&mp, 1), during);
+        assert_eq!(mp.len(), 6, "nothing left the pool");
+        // at the height the door named, all of it is offered
+        assert_eq!(offered(&mp, 2).len(), 6);
+    }
+
+    /// The proof wait doubles with each new counted transaction of the sender and is capped. It
+    /// starts again once a pool transaction of that sender applies, and
+    /// `PROOF_WAIT_FORGET_BLOCKS` after the last counted one. On a node without a verifier the
+    /// live commit counts a new unverified pool transaction that the block refused — once per
+    /// txid, so the same bytes refused again lengthen nothing — and never an ordinary refused
+    /// transaction; on a node with a verifier the commit counts none (its door does).
+    /// Caught mutant: keep the first wait for every counted tx, lift the cap, never reset, count a
+    /// repeated txid again, or count an ordinary refused tx.
+    #[test]
+    fn the_proof_wait_doubles_is_capped_and_a_pool_transaction_that_applies_resets_it() {
+        assert_eq!((PROOF_WAIT_FIRST_BLOCKS, PROOF_WAIT_MAX_BLOCKS, PROOF_WAIT_FORGET_BLOCKS), (2, 1_024, 2_048));
+        let chain = mini_chain(2);
+        let s = acct(1);
+        // each new txid whose proof fails at the door, sent as soon as the wait before it ends
+        let mut mp = Mempool::new(4);
+        let mut h = 10u64;
+        let mut want = PROOF_WAIT_FIRST_BLOCKS;
+        let mut waited = Vec::new();
+        for n in 0..12u16 {
+            assert_eq!(mp.note_refused_proof(s, an_id(n), true, h), h + want, "at height {h}");
+            assert_eq!(mp.proof_wait_until(&s, h + want - 1), Some(h + want), "at height {h}");
+            assert_eq!(mp.proof_wait_until(&s, h + want), None, "at height {h}");
+            waited.push(want);
+            h += want;
+            want = (want * 2).min(PROOF_WAIT_MAX_BLOCKS);
+        }
+        assert_eq!(waited, vec![2, 4, 8, 16, 32, 64, 128, 256, 512, 1_024, 1_024, 1_024]);
+        // a block that applies a pool tx of the sender: no wait, and the next counted tx waits
+        // the first wait
+        mp.note_block(h, &chain, &[], &[s]);
+        assert_eq!(mp.proof_wait_until(&s, h), None);
+        assert_eq!(mp.note_refused_proof(s, an_id(100), true, h), h + PROOF_WAIT_FIRST_BLOCKS);
+        // another sender's applied pool tx changes nothing for this one
+        mp.note_block(h + 1, &chain, &[], &[acct(2)]);
+        assert_eq!(mp.proof_wait_until(&s, h + 1), Some(h + PROOF_WAIT_FIRST_BLOCKS));
+        // one block short of the forget distance the wait still doubles …
+        let last = 100 + PROOF_WAIT_FORGET_BLOCKS - 1;
+        let mut mp = Mempool::new(4);
+        mp.note_refused_proof(s, an_id(1), true, 100);
+        assert_eq!(mp.note_refused_proof(s, an_id(2), true, last), last + 4);
+        // … and at it the sender starts again
+        let mut mp = Mempool::new(4);
+        mp.note_refused_proof(s, an_id(1), true, 100);
+        assert_eq!(mp.note_refused_proof(s, an_id(2), true, last + 1), last + 1 + PROOF_WAIT_FIRST_BLOCKS);
+        // without a verifier, the live commit counts a new unverified pool tx the block refused …
+        let pool_tx = |n: u16| RefusedTx { sender: s, nonce: 7, id: an_id(n), pool_proof: true };
+        let mut mp = Mempool::new(4);
+        mp.note_block(20, &chain, &[pool_tx(1)], &[]);
+        assert_eq!(mp.proof_wait_until(&s, 20), Some(22));
+        // … once per txid: the same bytes refused again, in whatever later block, lengthen
+        // nothing …
+        mp.note_block(21, &chain, &[pool_tx(1)], &[]);
+        mp.note_block(40, &chain, &[pool_tx(1)], &[]);
+        assert_eq!((mp.proof_wait_until(&s, 21), mp.proof_wait_until(&s, 40)), (Some(22), None));
+        // … a new txid doubles it, and two new ones in one block count once …
+        mp.note_block(41, &chain, &[pool_tx(2), pool_tx(3)], &[]);
+        assert_eq!(mp.proof_wait_until(&s, 41), Some(45));
+        // … and an ordinary refused tx starts no wait
+        let mut mp = Mempool::new(4);
+        mp.note_block(20, &chain, &[RefusedTx { sender: s, nonce: 7, id: an_id(9), pool_proof: false }], &[]);
+        assert!(mp.proof_waits.by_sender.is_empty() && mp.proof_waits.by_end.is_empty());
+        // with a verifier the commit counts none: the door does
+        let mut mp = Mempool::new(4);
+        mp.set_proof_verifier(std::sync::Arc::new(EchoVerifier::default()));
+        mp.note_block(20, &chain, &[pool_tx(1)], &[]);
+        assert_eq!(mp.proof_wait_until(&s, 20), None);
+        // a verifier that gave no answer on the bytes: the wait is counted, the txid is not
+        // remembered
+        let mut mp = Mempool::new(4);
+        assert_eq!(mp.note_refused_proof(s, an_id(5), false, 20), 22);
+        assert!(!mp.failed_proofs.holds(&an_id(5)));
+        assert_eq!(mp.note_refused_proof(s, an_id(6), true, 20), 24);
+        assert!(mp.failed_proofs.holds(&an_id(6)));
+    }
+
+    /// The proof-wait table and the two txid memories hold their bounds. In a full table the
+    /// entry whose wait ends first makes room for a new sender, both indexes stay in step, and
+    /// forgotten entries leave at a sweep. In a full memory the oldest txid makes room, a
+    /// renewed txid counts as new, and a txid is forgotten at the height it was kept until.
+    /// Caught mutant: insert without making room (a table or a memory grows past its cap), or evict
+    /// another entry than the one whose wait ends first.
+    #[test]
+    fn the_proof_wait_table_and_the_txid_memories_hold_their_bounds() {
+        let mut mp = Mempool::new(4);
+        assert_eq!(
+            (mp.proof_waits.cap, mp.refused.cap, mp.failed_proofs.cap),
+            (PROOF_WAIT_TABLE_CAP, REFUSED_TXID_CAP, FAILED_PROOF_TXID_CAP)
+        );
+        assert_eq!((PROOF_WAIT_TABLE_CAP, FAILED_PROOF_TXID_CAP), (65_536, 4_096));
+        mp.proof_waits = ProofWaits::new(3);
+        let in_step = |mp: &Mempool| {
+            assert_eq!(mp.proof_waits.by_sender.len(), mp.proof_waits.by_end.len());
+            assert!(mp.proof_waits.by_sender.iter().all(|(s, w)| mp.proof_waits.by_end.contains(&(w.until, *s))));
+            mp.proof_waits.by_sender.len()
+        };
+        // three senders wait until height 12; account 2 is counted again and waits until 15
+        for i in 1..=3u8 {
+            mp.note_refused_proof(acct(i), an_id(u16::from(i)), true, 10);
+        }
+        mp.note_refused_proof(acct(2), an_id(12), true, 11);
+        assert_eq!(in_step(&mp), 3);
+        assert_eq!(mp.proof_wait_until(&acct(2), 11), Some(15));
+        // a fourth sender: account 1's wait ends first (height 12, the smaller id of the two)
+        mp.note_refused_proof(acct(4), an_id(4), true, 11);
+        assert_eq!(in_step(&mp), 3);
+        assert_eq!(mp.proof_wait_until(&acct(1), 11), None);
+        assert_eq!(mp.proof_wait_until(&acct(3), 11), Some(12));
+        assert_eq!(mp.proof_wait_until(&acct(4), 11), Some(13));
+        // forgotten entries leave the table at a sweep (a commit runs it)
+        mp.note_block(11 + PROOF_WAIT_FORGET_BLOCKS + PROOF_WAIT_SWEEP_BLOCKS, &mini_chain(1), &[], &[]);
+        assert_eq!(in_step(&mp), 0);
+        // a txid memory of three: a renewed txid is the youngest again, and the oldest that
+        // was not renewed makes room for a fourth
+        let mut memory = TxidMemory::new(3);
+        for (n, until) in [(1u16, 20u64), (2, 20), (3, 21)] {
+            memory.remember(an_id(n), until);
+        }
+        memory.remember(an_id(1), 22);
+        memory.remember(an_id(4), 22);
+        assert_eq!(memory.until.len(), 3);
+        let kept = |memory: &TxidMemory, height: u64| [1u16, 2, 3, 4].map(|n| memory.until(&an_id(n), height));
+        assert_eq!(kept(&memory, 0), [Some(22), None, Some(21), Some(22)]);
+        // kept until height 21 means: not at height 21
+        assert_eq!((memory.until(&an_id(3), 20), memory.until(&an_id(3), 21)), (Some(21), None));
+        memory.expire(21);
+        assert!(!memory.holds(&an_id(3)) && memory.holds(&an_id(1)) && memory.holds(&an_id(4)));
+        memory.expire(22);
+        assert!(memory.until.is_empty() && memory.order.is_empty());
+        // the same txid kept until the same height takes one place, however often it is put
+        for _ in 0..10 {
+            memory.remember(an_id(7), 30);
+        }
+        assert_eq!((memory.until.len(), memory.order.len()), (1, 1));
+    }
+
+    /// The door refuses, with apply's own receipt wording and numbers, a tx whose sender cannot
+    /// pay the envelope fee apply charges at the next height and a transfer the balance does
+    /// not cover after that fee; what the balance covers is admitted and applies.
+    /// Caught mutant: drop `fee_and_amount_cover` from `check_gated` (all four refused frames admit),
+    /// read the fee at the chain's own height instead of the next one, or forget the fee when
+    /// the transfer is in the fee asset.
+    #[test]
+    fn a_transfer_the_balance_cannot_cover_and_a_fee_that_cannot_be_paid_are_refused_at_the_door() {
+        // account i: 1,000 of ASSET and 1,000 of the fee asset; the fee is 100 from height 1
+        let fresh = || mini_chain_with_fee(2, 100);
+        // what apply says about `tx` as the next block of `chain`
+        let receipt = |mut chain: hk_state::State, tx: &SignedTx| -> String {
+            let height = chain.height + 1;
+            let receipts = chain.apply_block(height, 0, std::slice::from_ref(tx)).expect("block applies");
+            receipts[0].result.clone().unwrap_err()
+        };
+        let mut mp = Mempool::new(16);
+        // a transfer above the balance (the fee is paid in another asset)
+        let over = sign_at(1, 0, transfer_payload(1_001));
+        let want = AdmitError::InsufficientBalance { have: 1_000, need: 1_001 };
+        assert_eq!(mp.try_admit(over.clone(), &fresh()), Err(want.clone()));
+        assert_eq!(
+            mp.try_admit_verified_with_id(over.clone(), txid(&over), &fresh(), &Mempool::envelope_verdict(&over)),
+            Err(want.clone())
+        );
+        assert_eq!(receipt(fresh(), &over), want.as_str());
+        // a transfer of the fee asset sees the balance the fee leaves
+        let of_fee_asset =
+            |amount: Amount| sign_at(1, 0, Tx::Transfer { to: acct(99), asset: hk_state::FEE_ASSET, amount });
+        let over = of_fee_asset(901);
+        let want = AdmitError::InsufficientBalance { have: 900, need: 901 };
+        assert_eq!(mp.try_admit(over.clone(), &fresh()), Err(want.clone()));
+        assert_eq!(receipt(fresh(), &over), want.as_str());
+        // a sender that cannot pay the fee, whatever the tx
+        let poor = || {
+            let mut chain = fresh();
+            chain.balances.insert((acct(2), hk_state::FEE_ASSET), 99);
+            chain
+        };
+        let any = transfer(2, 0);
+        let want = AdmitError::InsufficientFee { have: 99, need: 100 };
+        assert_eq!(mp.try_admit(any.clone(), &poor()), Err(want.clone()));
+        assert_eq!(receipt(poor(), &any), want.as_str());
+        assert_eq!(mp.len(), 0);
+        // the fee is the one apply charges at the NEXT height: nothing is asked while the next
+        // block is before the fee's first height, and it is asked for the block at that height
+        let mut early = poor();
+        early.fee_from = 3;
+        Mempool::new(4).try_admit(any.clone(), &early).expect("no fee is charged at height 1");
+        early.height = 2;
+        assert_eq!(Mempool::new(4).try_admit(any.clone(), &early), Err(want));
+        // what the balance covers is admitted and applies: the amount plus the fee, exactly
+        let exact = of_fee_asset(900);
+        mp.try_admit(exact.clone(), &fresh()).expect("amount plus fee is the whole balance");
+        let mut chain = fresh();
+        let receipts = chain.apply_block(1, 0, &[exact]).expect("block applies");
+        assert!(receipts[0].result.is_ok(), "{:?}", receipts[0].result);
+        assert_eq!(chain.balance(&acct(1), &hk_state::FEE_ASSET), 0);
+        // only the sender's next tx is judged: behind a pending tx of its own nothing is asked
+        // (the amount checks at a higher nonce have their own test below)
+        let (chain, mut mp) = (fresh(), Mempool::new(16));
+        mp.try_admit(sign_at(1, 0, transfer_payload(600)), &chain).expect("600 of 1,000");
+        mp.try_admit(sign_at(1, 1, transfer_payload(600)), &chain).expect("not judged at a higher nonce");
+    }
+
+    /// Without a verifier the pool holds one pool tx with an unverified proof per sender and
+    /// `MAX_UNCHECKED_PROOF_BYTES` of them in all, answers "retry later" beyond that, and gives
+    /// the room back when one leaves. A proof-less pool tx (a bundle's shape) and every other
+    /// tx are not held to it.
+    /// Caught mutant: drop the `unchecked_proof_room` call from `check_gated` (a sender's second and the
+    /// tx past 8 MiB admit), or give nothing back in `unindex` (no room after the prunes).
+    #[test]
+    fn without_a_verifier_the_pool_holds_one_unverified_pool_tx_per_sender_and_eight_mebibytes_in_all() {
+        assert_eq!(MAX_UNCHECKED_PROOF_BYTES, 8 * 1024 * 1024);
+        let chain = mini_chain(4);
+        let a = anchor(&chain);
+        let mut mp = Mempool::new(16);
+        assert!(mp.proof_verifier().is_none());
+        let first = shield(1, 0, 3);
+        mp.try_admit(first.clone(), &chain).expect("the sender's first");
+        assert_eq!((mp.unchecked_proof_bytes, mp.unchecked_proof_senders.len()), (tx_encoded_len(&first), 1));
+        // a second one of the same sender is refused for now (`UncheckedProofPending`), through
+        // either entry point …
+        let second = sign_at(1, 1, with_proof(spend_payload(a, 0x31), vec![1, 2, 3]));
+        let want: Result<[u8; 32], AdmitError> = Err(AdmitError::UncheckedProofPending);
+        assert_eq!(mp.try_admit(second.clone(), &chain), want);
+        assert_eq!(
+            mp.try_admit_verified_with_id(second.clone(), txid(&second), &chain, &Mempool::envelope_verdict(&second)),
+            want
+        );
+        assert!(!mp.keys.contains_key(&(acct(1), 1)));
+        // … its other txs are not: a transfer, and proof-less pool txs
+        mp.try_admit(transfer(1, 1), &chain).expect("a transfer is not held to the quota");
+        mp.try_admit(spend(1, 2, 0x32, a), &chain).expect("a proof-less pool tx is not held to the quota");
+        mp.try_admit(spend(1, 3, 0x33, a), &chain).expect("nor is a second one");
+        // eight mebibytes in all: two of 3 MiB fit beside the small one, a third is refused for
+        // now (`UncheckedProofBytesFull`)
+        let big = 3 * 1024 * 1024;
+        let (b2, b3, b4) = (shield(2, 0, big), shield(3, 0, big), shield(4, 0, big));
+        mp.try_admit(b2, &chain).expect("3 MiB");
+        mp.try_admit(b3, &chain).expect("6 MiB");
+        let (pending, size) = (mp.unchecked_proof_bytes, tx_encoded_len(&b4));
+        assert!(pending <= MAX_UNCHECKED_PROOF_BYTES && pending + size > MAX_UNCHECKED_PROOF_BYTES);
+        let full = AdmitError::UncheckedProofBytesFull { pending, size, max: MAX_UNCHECKED_PROOF_BYTES };
+        assert_eq!(mp.try_admit(b4.clone(), &chain), Err(full.clone()));
+        assert!(!mp.keys.contains_key(&(acct(4), 0)));
+        // both answers are the pool's capacity and say "retry later"
+        assert!(full.is_capacity() && AdmitError::UncheckedProofPending.is_capacity());
+        assert!(full.as_str().ends_with("retry later"), "{}", full.as_str());
+        assert!(AdmitError::UncheckedProofPending.as_str().contains("retry later"));
+        // the room comes back when one leaves the pool: an applied slot …
+        assert_eq!(mp.remove_included(&[(acct(2), 0)]), 1);
+        mp.try_admit(b4, &chain).expect("room again");
+        // … and a refused tx's identical copy
+        assert_eq!(mp.remove_refused(&[((acct(1), 0), txid(&first))]), 1);
+        assert!(!mp.unchecked_proof_senders.contains(&acct(1)));
+        let counted: usize = mp.q.iter().filter(|p| p.unchecked_proof).map(|p| p.size).sum();
+        assert_eq!((mp.unchecked_proof_bytes, mp.unchecked_proof_senders.len()), (counted, 2));
+    }
+
+    /// Both restore paths hold a restored pool tx to the quota of unverified proofs and verify
+    /// nothing, also on a node that has a verifier; the WAL replay refuses what the door
+    /// refuses (here a transfer the balance does not cover) and counts the quota's drop with
+    /// the caps'.
+    /// Caught mutant: let `insert_restored` skip the quota (the snapshot path keeps the sender's second
+    /// pool tx), or verify at restore (the verifier is called).
+    #[test]
+    fn restore_admits_by_the_doors_rules_and_verifies_no_proof() {
+        let chain = mini_chain(3);
+        let a = anchor(&chain);
+        let first = shield(1, 0, 3);
+        let second = sign_at(1, 1, with_proof(spend_payload(a, 0x41), vec![9; 8]));
+        let uncovered = sign_at(2, 0, transfer_payload(5_000));
+        let good = transfer(3, 0);
+        let frames = vec![first.clone(), second, uncovered, good];
+        let verifier = std::sync::Arc::new(EchoVerifier::default());
+        // the WAL: replayed through the door's rules
+        let mut wal = Mempool::new(16);
+        wal.set_proof_verifier(verifier.clone());
+        assert_eq!(wal.restore_admitted(frames.clone(), &chain), (2, 1));
+        assert_eq!(wal.iter().map(|t| (t.sender, t.nonce)).collect::<Vec<_>>(), vec![(acct(1), 0), (acct(3), 0)]);
+        assert_eq!((wal.unchecked_proof_bytes, wal.unchecked_proof_senders.len()), (tx_encoded_len(&first), 1));
+        // the snapshot's pool: no chain checks, the same quota
+        let mut snap = Mempool::new(16);
+        snap.set_proof_verifier(verifier.clone());
+        assert_eq!(snap.restore_unchecked(frames), (3, 1));
+        assert_eq!((snap.unchecked_proof_bytes, snap.unchecked_proof_senders.len()), (tx_encoded_len(&first), 1));
+        // neither path verified anything
+        assert_eq!(verifier.calls(), 0);
+        // the snapshot path reads no chain; the WAL replay that follows it at start judges
+        // what it put back by the door's fee and amount checks: the uncovered transfer leaves
+        assert_eq!(snap.restore_admitted(Vec::<SignedTx>::new(), &chain), (0, 1));
+        assert_eq!(snap.iter().map(|t| (t.sender, t.nonce)).collect::<Vec<_>>(), vec![(acct(1), 0), (acct(3), 0)]);
+        // the replay goes through the door's memory as well: a pool that noted a live commit
+        // and a failed proof takes neither the refused txid nor that sender's pool tx back
+        let mut noted = Mempool::new(16);
+        let refused = RefusedTx { sender: acct(3), nonce: 0, id: txid(&transfer(3, 0)), pool_proof: false };
+        assert_eq!(noted.note_block(1, &chain, &[refused], &[]), 0);
+        noted.note_refused_proof(acct(1), [0xF1; 32], true, chain.height);
+        assert_eq!(noted.restore_admitted(vec![first, transfer(3, 0), transfer(2, 0)], &chain), (1, 0));
+        assert_eq!(noted.iter().map(|t| (t.sender, t.nonce)).collect::<Vec<_>>(), vec![(acct(2), 0)]);
+    }
+
+    /// The pool's commit rules read only a refusal that apply gives after the envelope checks.
+    /// A block's receipts for an unknown account, another nonce, a key that is not the
+    /// account's and a bad signature are not read: nothing is remembered for such a frame. A
+    /// refusal by the fee or by the payload is read. The reasons that count are named one by
+    /// one, so a reason the list does not know is not read.
+    /// Caught mutant: read every refused tx (the four frames that no key of their account signed are
+    /// remembered too), or take a name off the list (its tx is not remembered).
+    #[test]
+    fn only_a_refusal_after_the_envelope_checks_is_read_by_the_pools_commit_rules() {
+        let mut chain = mini_chain_with_fee(5, 100);
+        chain.balances.insert((acct(5), hk_state::FEE_ASSET), 99);
+        let mut bad_signature = transfer(3, 0);
+        bad_signature.sig[0] ^= 1;
+        let mandate = H256([0x4D; 32]);
+        let block = vec![
+            transfer(77, 0),                       // an account the chain does not know
+            transfer(1, 5),                        // not the account's nonce
+            sign_as(2, 1, 0, transfer_payload(1)), // not the account's key
+            bad_signature,                         // the account's key, not its signature
+            sign_at(4, 0, transfer_payload(0)),    // signed; refused by the payload (a zero amount)
+            transfer(5, 0),                        // signed; refused by the fee
+            sign_at(
+                1,
+                0,
+                Tx::MandateCreate {
+                    id: mandate,
+                    parent: None,
+                    holder: acct(1),
+                    asset: ASSET,
+                    rate_per_sec: 0,
+                    buffer_max: 10,
+                    per_tx_max: 10,
+                    initial_buffer: 10,
+                    expiry: 1_000_000,
+                    tier: 0,
+                },
+            ), // applies
+            sign_at(1, 1, Tx::MandateSpend { leaf: mandate, to: acct(2), amount: 11 }), // signed; refused by the mandate tree
+        ];
+        let receipts = chain.apply_block(1, 0, &block).expect("block applies");
+        assert!(receipts[6].result.is_ok(), "{:?}", receipts[6].result);
+        let reason = |i: usize| receipts[i].result.clone().unwrap_err();
+        for i in 0..4 {
+            assert!(!refused_after_the_envelope(&reason(i)), "{}", reason(i));
+        }
+        for i in [4, 5, 7] {
+            assert!(refused_after_the_envelope(&reason(i)), "{}", reason(i));
+        }
+        assert!(reason(7).starts_with("mandate: "), "{}", reason(7));
+        // the fifth envelope refusal, a refusal by a pool tx's proof, and a reason hk-state
+        // does not have
+        assert!(!refused_after_the_envelope(&hk_state::StateError::Encode.to_string()));
+        assert!(refused_after_the_envelope(&hk_state::StateError::PoolProofInvalid.to_string()));
+        assert!(!refused_after_the_envelope("a reason that a later version adds"));
+        // the split: the three signed refusals, in block order
+        let p = commit_prune_sets(&block, &receipts);
+        assert_eq!(p.refused.len(), 7);
+        let signed: Vec<(AccountId, u64, [u8; 32])> =
+            p.refused_signed.iter().map(|r| (r.sender, r.nonce, r.id)).collect();
+        assert_eq!(
+            signed,
+            vec![(acct(4), 0, txid(&block[4])), (acct(5), 0, txid(&block[5])), (acct(1), 1, txid(&block[7]))]
+        );
+        assert!(p.refused_signed.iter().all(|r| !r.pool_proof) && p.applied_pool.is_empty());
+        // the pool remembers those three, and none of the others
+        let mut mp = Mempool::new(16);
+        assert_eq!(p.note_pool(&mut mp, &chain, 1), 0);
+        for (i, tx) in block.iter().enumerate() {
+            assert_eq!(mp.refused_until(&txid(tx), 1).is_some(), [4, 5, 7].contains(&i), "tx {i}");
+        }
+    }
+
+    /// The door's amount checks. A zero amount — a `Transfer`'s or a `MintToPool`'s — is refused
+    /// by the tx's own bytes, before any hash, at any nonce, in apply's words, and both restore
+    /// paths drop one. A `MintToPool` whose value the balance does not cover is refused like a
+    /// `Transfer`, as the sender's next tx. At a higher nonce no amount is judged: a mint to
+    /// itself followed by a transfer of what it mints is admitted, and that transfer alone, as
+    /// the sender's next tx, is not.
+    /// Caught mutant: drop the zero arms from `field_bounds`, the `MintToPool` arm from
+    /// `fee_and_amount_cover`, or the nonce condition from `check_gated` (the transfer behind
+    /// the mint is refused).
+    #[test]
+    fn the_door_refuses_a_zero_amount_at_any_nonce_and_judges_an_amount_only_at_the_current_nonce() {
+        let chain = mini_chain_with_fee(2, 100);
+        let mut mp = Mempool::new(16);
+        let mint = |asset: H256, value: Amount, nonce: u64| {
+            sign_at(
+                1,
+                nonce,
+                Tx::MintToPool { asset, value, commitment: H256([0x67; 32]), proof: vec![7; 4], stealth_ct: vec![] },
+            )
+        };
+        // zero, by the tx's own bytes: before any hash, whatever the nonce, in apply's words
+        let zeros = [
+            sign_at(1, 0, transfer_payload(0)),
+            sign_at(1, 5, transfer_payload(0)),
+            mint(ASSET, 0, 0),
+            mint(ASSET, 0, 5),
+        ];
+        for zero in zeros {
+            let verdict = Mempool::envelope_verdict(&zero);
+            assert_eq!(verdict.hash_free_refusal(), Some(AdmitError::ZeroAmount));
+            assert_eq!(mp.try_admit(zero.clone(), &chain), Err(AdmitError::ZeroAmount));
+            assert_eq!(mp.try_admit_verified_with_id(zero.clone(), txid(&zero), &chain, &verdict), Err(AdmitError::ZeroAmount));
+        }
+        assert_eq!(AdmitError::ZeroAmount.as_str(), hk_state::StateError::ZeroAmount.to_string());
+        assert_eq!(AdmitError::ZeroAmount.as_str(), "zero amount");
+        // both restore paths drop one
+        let zero = sign_at(1, 0, transfer_payload(0));
+        assert_eq!(Mempool::new(4).restore_unchecked(vec![zero.clone()]), (0, 1));
+        assert_eq!(Mempool::new(4).restore_admitted(vec![zero], &chain), (0, 1));
+        // a shield above the balance, as the sender's next tx: refused in apply's words — and of
+        // the fee asset, above what the fee leaves
+        assert_eq!(
+            mp.try_admit(mint(ASSET, 1_001, 0), &chain),
+            Err(AdmitError::InsufficientBalance { have: 1_000, need: 1_001 })
+        );
+        assert_eq!(
+            mp.try_admit(mint(hk_state::FEE_ASSET, 901, 0), &chain),
+            Err(AdmitError::InsufficientBalance { have: 900, need: 901 })
+        );
+        // a transfer of an asset the sender holds none of, as its next tx: refused
+        let minted = H256([0x4D; 32]);
+        let spend_it = |nonce: u64| sign_at(1, nonce, Tx::Transfer { to: acct(2), asset: minted, amount: 100 });
+        assert_eq!(mp.try_admit(spend_it(0), &chain), Err(AdmitError::InsufficientBalance { have: 0, need: 100 }));
+        assert_eq!(mp.len(), 0);
+        // behind a mint to itself — the sender's own pending tx, which changes that balance —
+        // the same transfer is admitted, and so is a shield of any value behind both
+        mp.try_admit(sign_at(1, 0, Tx::AssetMint { asset: minted, to: acct(1), amount: 100 }), &chain).expect("admits");
+        mp.try_admit(spend_it(1), &chain).expect("at a higher nonce the balance is not judged");
+        mp.try_admit(mint(ASSET, 5_000, 2), &chain).expect("nor a shield's value");
         assert_eq!(mp.len(), 3);
     }
 }

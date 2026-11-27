@@ -102,7 +102,7 @@ From v0.19.1 the CLI wallet binds to the account directory `account-new` made:
 hk-node wallet init ~/my-wallet ~/my-account https://rpc.hashkinetics.org
 hk-node wallet shield ~/my-wallet 2 https://rpc.hashkinetics.org https://prover.hashkinetics.org --asset 0c3c3f40884ef40aee41d2ae2b823c8cc1e2c0859172ef20ff899f015442c0f1
 hk-node wallet scan ~/my-wallet https://rpc.hashkinetics.org --asset 0c3c3f40884ef40aee41d2ae2b823c8cc1e2c0859172ef20ff899f015442c0f1        # LIVE $2 @ index …
-hk-node wallet pay ~/my-wallet hkaddr:<their stealth address> 0.5 https://rpc.hashkinetics.org https://prover.hashkinetics.org --asset 0c3c3f40…   # fee 0, zero transparent trace
+hk-node wallet pay ~/my-wallet hkaddr:<their stealth address> 0.5 https://rpc.hashkinetics.org https://prover.hashkinetics.org --asset 0c3c3f40…   # fee 0; no amount, recipient or memo on the chain
 hk-node wallet unshield ~/my-wallet 1 https://rpc.hashkinetics.org https://prover.hashkinetics.org --asset 0c3c3f40…
 ```
 

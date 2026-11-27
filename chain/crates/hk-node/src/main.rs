@@ -13,7 +13,7 @@
 
 /// The release label this binary reports (`hk-node --version`, the usage banner).
 /// Bump with every node release; the crate version is workspace-wide and not it.
-pub const NODE_VERSION: &str = "v0.19.12";
+pub const NODE_VERSION: &str = "v0.19.13";
 
 mod account;
 mod app;
@@ -695,7 +695,9 @@ status_update_interval = "10s"
 request_timeout = "10s"
 max_request_size = "1 MiB"
 # Sync responses carry whole decided values (batched) — proof blocks are MB-scale raw.
-max_response_size = "64 MiB"
+# v0.19.13: the budget fits the request-response frame (rpc_max_size above, less 1 MiB). The node
+# holds a larger number in an older config.toml to that bound when it loads the file.
+max_response_size = "31 MiB"
 parallel_requests = 5
 scoring_strategy = "ema"
 inactive_threshold = "60s"
@@ -1289,6 +1291,6 @@ mod hr1_tests {
         let cfg: Config = toml::from_str(&closed).expect("the config-gen template parses");
         assert!(!cfg.hk_rpc.accept_bundles);
         assert_eq!(cfg.moniker, "hk-test");
-        assert_eq!(crate::NODE_VERSION, "v0.19.12");
+        assert_eq!(crate::NODE_VERSION, "v0.19.13");
     }
 }

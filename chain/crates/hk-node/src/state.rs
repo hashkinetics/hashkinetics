@@ -314,6 +314,13 @@ pub(crate) struct CommitPrune {
     /// applied ones, and a refused bundle tx naming a victim's pending slot evicted the victim's
     /// honest tx on every node (HR-1's eviction axis).
     pub refused: Vec<((hk_primitives::AccountId, u64), [u8; 32])>,
+    /// v0.19.13: every REFUSED tx that its sender's own key signed — one refused after the
+    /// envelope checks (`crate::mempool::refused_after_the_envelope`) — in block order.
+    /// `note_pool` hands them to the pool's commit rules.
+    pub refused_signed: Vec<crate::mempool::RefusedTx>,
+    /// v0.19.13: the sender of every APPLIED pool tx (`MintToPool`, `ShieldedSpend`), in block
+    /// order — a pool tx that applies ends its sender's proof wait.
+    pub applied_pool: Vec<hk_primitives::AccountId>,
     /// (txid, "ok: N event(s)" / "rejected: <reason>") per block tx, in order — the receipt
     /// log's rows.
     pub log: Vec<([u8; 32], String)>,
@@ -324,6 +331,16 @@ impl CommitPrune {
     /// REFUSED (slot, txid) pairs. Returns (pruned by slot, pruned as identical copies).
     pub(crate) fn prune_mempool(&self, mp: &mut crate::mempool::Mempool) -> (usize, usize) {
         (mp.remove_included(&self.applied), mp.remove_refused(&self.refused))
+    }
+
+    /// v0.19.13: what the block at `height` leaves in the pool's memory (`Mempool::note_block`),
+    /// with `chain` the chain after the block: each tx refused after the envelope checks is not
+    /// admitted or proposed again for 16 blocks, and its sender's pending txs at higher nonces
+    /// leave the pool (they cannot apply before a tx at that nonce does); no account is charged
+    /// for it. The live commit calls it after the prunes; a block another node proposed counts
+    /// like this node's own. Returns how many pending txs left the pool.
+    pub(crate) fn note_pool(&self, mp: &mut crate::mempool::Mempool, chain: &hk_state::State, height: u64) -> usize {
+        mp.note_block(height, chain, &self.refused_signed, &self.applied_pool)
     }
 }
 
@@ -479,6 +496,350 @@ pub(crate) fn find_value_in_height(
         .find(|v| v.value.id() == value_id)
 }
 
+// ---------------------------------------------------------------------------------------
+// v0.19.13: the vote verdict. A value that `admit_signed_value` keeps is judged before this
+// node votes for it. The verdict decides this node's own vote and nothing else. A value it
+// refuses stays in the store and is not handed to the engine: the engine then holds the
+// proposal without a value and does not vote for it, and when the network decides that value
+// the sync arm hands it over as a decided one. A value the network decides is committed
+// exactly as before (the live commit, the sync arm and replay do not come through here).
+// ---------------------------------------------------------------------------------------
+
+/// v0.19.13: the most bytes a value may carry for this node to vote for it: what ONE
+/// value-sync response carries beside the value's commit certificate (the request-response
+/// frame of the fleet's config template, 32 MiB, less 1 MiB). With the config template's frame
+/// and budget, the sync response budget (config.rs `effective_sync_response_bytes`) is this same
+/// number, so every value this node votes for is one that a single response can hand to a node
+/// that joins later.
+pub(crate) const MAX_SYNC_SERVABLE_VALUE_BYTES: usize = 31 * 1024 * 1024;
+
+// v0.19.13: a value this node votes for is one the store takes, and the budgets of a block this
+// node builds (its transactions, the largest aggregate the bundle door takes, the allowance
+// beside them) fit inside the bound.
+const _: () = assert!(MAX_SYNC_SERVABLE_VALUE_BYTES <= MAX_PROPOSAL_BYTES);
+const _: () = assert!(
+    crate::batch::MAX_BATCH_TX_BYTES + crate::rpc::MAX_BUNDLE_AGG_BYTES + crate::batch::PROPOSAL_HEADROOM
+        <= MAX_SYNC_SERVABLE_VALUE_BYTES
+);
+
+/// v0.19.13: the most rotation certificates a block carries for this node to vote for it:
+/// two for each seat of the validator set, and eight more. A proposer carries at most one for
+/// each seated root from its peers (the queue keeps the newest of a root) and its own.
+pub(crate) fn max_rotations_per_block(seats: usize) -> usize {
+    seats.saturating_mul(2).saturating_add(8)
+}
+
+/// v0.19.13: the most set-change certificates a block carries for this node to vote for it.
+/// Each one is a change that more than two thirds of the voting power approved; a block this
+/// node builds carries at most this many of those open at its height, and the rest stay queued
+/// (`build_batch`).
+pub(crate) const MAX_SET_CHANGES_PER_BLOCK: usize = 16;
+
+/// v0.19.13: why this node does not vote for a value it keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VoteRefusal {
+    /// The value is larger than `MAX_SYNC_SERVABLE_VALUE_BYTES`.
+    TooLargeToServe,
+    /// The bytes are not a `Batch`.
+    NotABatch,
+    /// The batch carries more than `MAX_TXS_PER_BLOCK` transactions.
+    TooManyTxs,
+    /// The batch carries more rotation certificates than `max_rotations_per_block`.
+    TooManyRotations,
+    /// The batch carries more than `MAX_SET_CHANGES_PER_BLOCK` set-change certificates.
+    TooManySetChanges,
+    /// The value's bytes are not exactly the batch's own encoding (`Batch::encoded_len`).
+    TrailingBytes,
+    /// The batch is built on a state commitment that is not this node's.
+    ParentMismatch,
+    /// The batch carries one signed transaction more than once.
+    RepeatedTx,
+    /// The batch's settlements cost more links than `MAX_SETTLE_LINKS_PER_BLOCK`.
+    SettleLinks,
+    /// The value was refused earlier at this height (`RefusedValueIds`).
+    Remembered,
+}
+
+impl VoteRefusal {
+    /// The reason word of the log line.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            VoteRefusal::TooLargeToServe => "size",
+            VoteRefusal::NotABatch => "decode",
+            VoteRefusal::TooManyTxs => "count",
+            VoteRefusal::TooManyRotations => "rotations",
+            VoteRefusal::TooManySetChanges => "setchanges",
+            VoteRefusal::TrailingBytes => "trailing",
+            VoteRefusal::ParentMismatch => "parent",
+            VoteRefusal::RepeatedTx => "repeat",
+            VoteRefusal::SettleLinks => "links",
+            VoteRefusal::Remembered => "remembered",
+        }
+    }
+}
+
+/// v0.19.13: does the batch carry one signed transaction more than once?
+///
+/// Two transactions are the same one when they have the same `txid`: the identity the receipt
+/// log, the search index and the mempool go by. The txid hashes the JSON form, so it is
+/// computed only for transactions that already agree on what is cheap to read (sender, nonce
+/// and signature bytes); a block of distinct transactions has none of those, and the pass
+/// then costs one hash-map entry per transaction. A different transaction at the same sender
+/// and nonce is not a repeat.
+pub(crate) fn carries_a_repeated_tx(txs: &[SignedTx]) -> bool {
+    use std::collections::hash_map::Entry;
+    // (sender, nonce, signature bytes) → (the first tx seen with them, whether its txid is in `ids`)
+    let mut first: HashMap<(hk_primitives::AccountId, u64, &[u8]), (usize, bool)> =
+        HashMap::with_capacity(txs.len());
+    // The txids of the txs that agree on all three with another tx of the batch.
+    let mut ids: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    for (i, tx) in txs.iter().enumerate() {
+        match first.entry((tx.sender, tx.nonce, tx.sig.as_slice())) {
+            Entry::Vacant(slot) => {
+                slot.insert((i, false));
+            }
+            Entry::Occupied(mut slot) => {
+                let (j, hashed) = slot.get_mut();
+                if !*hashed {
+                    ids.insert(txid(&txs[*j]));
+                    *hashed = true;
+                }
+                if !ids.insert(txid(tx)) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// v0.19.13: the rules a kept value passes for this node to vote for it, in the order they are
+/// checked. The cheapest come first, and the first rule a value breaks is the reason given:
+///
+///   1. size: the value is at most `MAX_SYNC_SERVABLE_VALUE_BYTES`;
+///   2. decode: its bytes are a `Batch`;
+///   3. count: the batch carries at most `MAX_TXS_PER_BLOCK` transactions;
+///   4. rotations: it carries at most `max_rotations_per_block(seats)` rotation certificates,
+///      where `seats` is the size of the validator set this node holds for the height;
+///   5. setchanges: it carries at most `MAX_SET_CHANGES_PER_BLOCK` set-change certificates;
+///   6. trailing: the value's bytes are exactly the batch's own encoding
+///      (`Batch::encoded_len`): the framing `Batch::encode` writes, and nothing behind it;
+///   7. parent: its `parent_app_hash` is this node's state commitment, the comparison `commit`
+///      makes before it applies a block;
+///   8. repeat: no signed transaction is carried twice (`carries_a_repeated_tx`);
+///   9. links: its settlements' links, summed with the proposer's own cost function
+///      (`settle_cost`) against the state the block is built on, are at most
+///      `MAX_SETTLE_LINKS_PER_BLOCK`.
+///
+/// The order is the same whether the caller holds this node's state commitment or it is
+/// computed here.
+///
+/// A block that `build_batch` builds passes: it is one `Batch::encode`, it is built on this
+/// node's own state, the selection holds its count and its links to these same caps, the pool
+/// holds a transaction once and takes none of the kind a bundle carries, its certificates are
+/// those of the node's own queues (a rotation of its own, one for a seated root from its
+/// peers, and at most `MAX_SET_CHANGES_PER_BLOCK` of the set changes open at the height, the
+/// rest staying queued), and its budgets fit the size (the compile-time check above). The
+/// framing, the count cap, the link budget and the cost function are the ones every release
+/// since v0.19.8 builds its own blocks with.
+///
+/// `parent` is this node's state commitment when the caller holds it. When it is `None` the
+/// commitment is computed here, under the chain lock, and written back for the caller to keep.
+/// The chain lock is taken for that read and for the settle costs only, and released between
+/// them: every other rule runs without it, and a batch without a settlement judged against a
+/// commitment the caller holds never takes it. (The caller is the task that commits, so the
+/// chain does not move between the two reads.)
+pub(crate) fn vote_verdict(
+    value_bytes: &[u8],
+    chain: &Mutex<hk_state::State>,
+    parent: &mut Option<[u8; 32]>,
+    seats: usize,
+) -> std::result::Result<(), VoteRefusal> {
+    if value_bytes.len() > MAX_SYNC_SERVABLE_VALUE_BYTES {
+        return Err(VoteRefusal::TooLargeToServe);
+    }
+    let batch = match Batch::decode(value_bytes) {
+        Some(batch) => batch,
+        None => return Err(VoteRefusal::NotABatch),
+    };
+    if batch.txs.len() > MAX_TXS_PER_BLOCK {
+        return Err(VoteRefusal::TooManyTxs);
+    }
+    if batch.rotations.len() > max_rotations_per_block(seats) {
+        return Err(VoteRefusal::TooManyRotations);
+    }
+    if batch.set_changes.len() > MAX_SET_CHANGES_PER_BLOCK {
+        return Err(VoteRefusal::TooManySetChanges);
+    }
+    if batch.encoded_len() != value_bytes.len() {
+        return Err(VoteRefusal::TrailingBytes);
+    }
+    let ours = match *parent {
+        Some(ours) => ours,
+        None => {
+            let ours = chain.lock().unwrap().state_commitment().0;
+            *parent = Some(ours);
+            ours
+        }
+    };
+    if batch.parent_app_hash != ours {
+        return Err(VoteRefusal::ParentMismatch);
+    }
+    if carries_a_repeated_tx(&batch.txs) {
+        return Err(VoteRefusal::RepeatedTx);
+    }
+    if batch.txs.iter().any(|t| matches!(&t.payload, Tx::ChannelSettle { .. })) {
+        let chain = chain.lock().unwrap();
+        // The proposer's own sum (`build_batch`, `select_batch_txs_sized`): `settle_cost` of
+        // every settlement against the chain as it stands before the block, in block order.
+        let links: u64 = batch
+            .txs
+            .iter()
+            .filter_map(|t| match &t.payload {
+                Tx::ChannelSettle { id, step, .. } => Some(settle_cost(&chain, id, *step)),
+                _ => None,
+            })
+            .fold(0u64, u64::saturating_add);
+        if links > MAX_SETTLE_LINKS_PER_BLOCK {
+            return Err(VoteRefusal::SettleLinks);
+        }
+    }
+    Ok(())
+}
+
+/// v0.19.13: the ids of the values this node does not vote for at the height it is on: a
+/// value the vote verdict refused, and a decided value whose commit did not complete. For a
+/// remembered id the engine gets no value when its proposal arrives again
+/// (`judge_kept_value`) and none when a round starts (`values_for_round`), and the stored copy
+/// is not served again as this node's own proposal (`own_value_for_round`). The set holds one
+/// height and is emptied when that height is committed. Every id in it names a value the
+/// store holds, so the store bounds it.
+#[derive(Debug, Default)]
+pub(crate) struct RefusedValueIds {
+    height: u64,
+    ids: std::collections::BTreeSet<hk_consensus::HkValueId>,
+}
+
+impl RefusedValueIds {
+    /// Remember `id` at `height`; true when it was not remembered yet. The first id of a later
+    /// height drops the ids of the earlier one, and an id of an earlier height is not taken.
+    pub(crate) fn note(&mut self, height: u64, id: hk_consensus::HkValueId) -> bool {
+        if height < self.height {
+            return false;
+        }
+        if height > self.height {
+            self.ids.clear();
+            self.height = height;
+        }
+        self.ids.insert(id)
+    }
+
+    /// Is `id` remembered at `height`?
+    pub(crate) fn contains(&self, height: u64, id: hk_consensus::HkValueId) -> bool {
+        self.height == height && self.ids.contains(&id)
+    }
+
+    /// The height is committed: nothing of it is remembered.
+    pub(crate) fn clear(&mut self) {
+        self.ids.clear();
+    }
+}
+
+/// v0.19.13: the vote verdict for a value the store keeps, with this height's memory. `None`:
+/// this node votes for the value. `Some`: it does not (the caller hands the engine no value),
+/// with the reason and whether the id is refused for the first time (the caller logs that
+/// once). An id remembered at this height is judged from the memory, without reading the
+/// value again; a value the rules refuse is remembered. `seats` is the size of the validator
+/// set this node holds for the height (`vote_verdict`).
+pub(crate) fn judge_kept_value(
+    refused: &mut RefusedValueIds,
+    chain: &Mutex<hk_state::State>,
+    parent: &mut Option<[u8; 32]>,
+    height: u64,
+    value: &HkValue,
+    seats: usize,
+) -> Option<(VoteRefusal, bool)> {
+    let id = value.id();
+    if refused.contains(height, id) {
+        return Some((VoteRefusal::Remembered, false));
+    }
+    match vote_verdict(&value.txs, chain, parent, seats) {
+        Ok(()) => None,
+        Err(why) => Some((why, refused.note(height, id))),
+    }
+}
+
+/// v0.19.13: the value this node built for (height, round) and serves again when it is asked
+/// to propose for that round: its own, and not one it remembers as refused. For a remembered
+/// one the caller builds a value anew. A value built anew on the same parent from the same
+/// pool has the same bytes and the same id, and is then proposed again under that id: this
+/// lookup keeps the stored copy from being served, and what the build gives is the build's.
+pub(crate) fn own_value_for_round<'a>(
+    undecided: &'a BTreeMap<(u64, i64), Vec<ProposedValue<HkContext>>>,
+    refused: &RefusedValueIds,
+    height: u64,
+    round: i64,
+    address: &HkAddress,
+) -> Option<&'a ProposedValue<HkContext>> {
+    undecided
+        .get(&(height, round))
+        .and_then(|vs| vs.iter().find(|v| v.proposer == *address && !refused.contains(height, v.value.id())))
+}
+
+/// v0.19.13: the values held for (height, round), as the engine is told them when the round
+/// starts: every value but the ones this node remembers as refused. A remembered value stays
+/// in the store and is left out here, so the engine is told nothing about it and holds no
+/// validity for it; when the network decides that value, the sync arm hands it over as a
+/// decided one and `commit` finds it in the store.
+pub(crate) fn values_for_round(
+    undecided: &BTreeMap<(u64, i64), Vec<ProposedValue<HkContext>>>,
+    refused: &RefusedValueIds,
+    height: u64,
+    round: i64,
+) -> Vec<ProposedValue<HkContext>> {
+    undecided
+        .get(&(height, round))
+        .map(|vs| vs.iter().filter(|v| !refused.contains(height, v.value.id())).cloned().collect::<Vec<_>>())
+        .unwrap_or_default()
+}
+
+/// v0.19.13: when a decided value does not commit, the height restarts after a wait: this much
+/// for each consecutive failure at the height ...
+pub(crate) const RESTART_WAIT_STEP: std::time::Duration = std::time::Duration::from_millis(250);
+/// ... and never longer than this.
+pub(crate) const RESTART_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// v0.19.13: the wait before the height restarts after its `failures`-th consecutive commit
+/// failure: `RESTART_WAIT_STEP` each, at most `RESTART_WAIT_MAX`.
+pub(crate) fn restart_wait(failures: u32) -> std::time::Duration {
+    RESTART_WAIT_STEP.saturating_mul(failures).min(RESTART_WAIT_MAX)
+}
+
+/// v0.19.13: the consecutive commit failures at one height. The count starts again at another
+/// height and after a commit that completes.
+#[derive(Debug, Default)]
+pub(crate) struct CommitRetries {
+    height: u64,
+    failures: u32,
+}
+
+impl CommitRetries {
+    /// One more failure at `height`: the count at that height and the wait before the restart.
+    pub(crate) fn note_failure(&mut self, height: u64) -> (u32, std::time::Duration) {
+        if self.height != height {
+            self.height = height;
+            self.failures = 0;
+        }
+        self.failures = self.failures.saturating_add(1);
+        (self.failures, restart_wait(self.failures))
+    }
+
+    /// A commit completed: the next failure counts from one.
+    pub(crate) fn reset(&mut self) {
+        self.failures = 0;
+    }
+}
+
 /// The part stream of one proposal: an Init, the batch, a Fin that carries the value id, and
 /// the end of the stream. `proposer` is the address the Init names: this node's own when it
 /// proposes, and the signer of the proposal when it restreams one (v0.19.12; for a re-proposal
@@ -525,6 +886,8 @@ pub(crate) fn commit_prune_sets(txs: &[SignedTx], receipts: &[hk_state::Receipt]
         included: Vec::with_capacity(txs.len()),
         applied: Vec::new(),
         refused: Vec::new(),
+        refused_signed: Vec::new(),
+        applied_pool: Vec::new(),
         log: Vec::with_capacity(txs.len()),
     };
     for (tx, r) in txs.iter().zip(receipts.iter()) {
@@ -533,10 +896,24 @@ pub(crate) fn commit_prune_sets(txs: &[SignedTx], receipts: &[hk_state::Receipt]
         let detail = match &r.result {
             Ok(events) => {
                 p.applied.push(slot);
+                // v0.19.13: an applied pool tx ends its sender's proof wait
+                if matches!(&tx.payload, Tx::MintToPool { .. } | Tx::ShieldedSpend { .. }) {
+                    p.applied_pool.push(tx.sender);
+                }
                 format!("ok: {} event(s)", events.len())
             }
             Err(e) => {
                 p.refused.push((slot, id));
+                // v0.19.13: a refusal after the envelope checks is of a tx the sender's own
+                // key signed — the only ones the pool's commit rules read.
+                if crate::mempool::refused_after_the_envelope(e) {
+                    p.refused_signed.push(crate::mempool::RefusedTx {
+                        sender: tx.sender,
+                        nonce: tx.nonce,
+                        id,
+                        pool_proof: crate::mempool::carries_pool_proof(tx),
+                    });
+                }
                 format!("rejected: {e}")
             }
         };
@@ -752,6 +1129,16 @@ pub struct HkApp {
     /// v0.19.12: values of signed proposals refused so far for a reason that is not routine
     /// (`ValueRefusal::is_routine`); it thins the warn line out.
     values_refused: u64,
+    /// v0.19.13: the ids of the values this node does not vote for at the height it is on
+    /// (`RefusedValueIds`).
+    refused_ids: RefusedValueIds,
+    /// v0.19.13: this node's state commitment as the vote verdict computed it while
+    /// `last_app_hash` was empty. Only the vote verdict reads it, and `commit` drops it before
+    /// it touches the chain.
+    vote_parent: Option<[u8; 32]>,
+    /// v0.19.13: the consecutive commit failures at the height this node is on
+    /// (`CommitRetries`).
+    commit_retries: CommitRetries,
     /// R10 v2: a bounded RAM cache of the newest decided heights (`decided_window()`
     /// entries; 0 = unbounded). Value-sync requests below the window are served from
     /// the block log on disk. Restore no longer rehydrates history into this map —
@@ -895,7 +1282,12 @@ impl HkApp {
         // WS2: inject the real STARK verifier. None ⇒ hk-state's RejectAll default stays —
         // this node refuses shielded traffic rather than trusting anything.
         let agg = verifiers.as_ref().map(|v| (v.agg.clone(), v.spend_vk_hash, v.mint_vk_hash));
+        // v0.19.13: the admission door verifies a pool tx's proof with this same verifier
+        // before the tx enters the pool (`Mempool::proof_verifier`, rpc.rs `door_proof_check`);
+        // with none, the pool holds such txs to its quota of unverified ones.
+        let mut mempool = crate::mempool::Mempool::default();
         if let Some(v) = verifiers {
+            mempool.set_proof_verifier(v.pool.clone());
             chain.verifier = v.pool;
         }
         let root = RootSecret::from_seed(&master_seed);
@@ -919,7 +1311,7 @@ impl HkApp {
             address,
             validators: Arc::new(Mutex::new(validators)),
             chain: Arc::new(Mutex::new(chain)),
-            mempool: Arc::new(Mutex::new(crate::mempool::Mempool::default())),
+            mempool: Arc::new(Mutex::new(mempool)),
             receipts: Arc::new(Mutex::new(ReceiptLog::new(4096))),
             pool_notes: Arc::new(Mutex::new(Vec::new())),
             pool_notes_by_asset: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
@@ -934,6 +1326,9 @@ impl HkApp {
             current_proposer: None,
             undecided: BTreeMap::new(),
             values_refused: 0,
+            refused_ids: RefusedValueIds::default(),
+            vote_parent: None,
+            commit_retries: CommitRetries::default(),
             decided: BTreeMap::new(),
             history_min: 0,
             index_floor: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
@@ -1225,7 +1620,10 @@ impl HkApp {
     /// into a block this node builds is uncosted). v0.19.12: the block's transaction
     /// bytes are budgeted the same way — the bundle's first, then the pool's
     /// (`select_batch_txs_sized`) — under `crate::batch::MAX_BATCH_TX_BYTES`, so the batch
-    /// fits the one pubsub frame the signed proposal travels in.
+    /// fits the one pubsub frame the signed proposal travels in. v0.19.13: the pending txs
+    /// are offered to the selection through `Mempool::selectable` — one sender's share of a
+    /// block (16 txs, 4 MiB), no tx refused in the last 16 blocks, no pool tx of a sender whose
+    /// proof wait lasts; the rest stay in the pool.
     fn build_batch(&self, height: u64) -> Bytes {
         let parent_app_hash = self.chain.lock().unwrap().state_commitment().0;
         // P2.3: a pending aggregation bundle rides whole (proof-less txs + ONE aggregate).
@@ -1274,7 +1672,15 @@ impl HkApp {
                 warn!(height, bundle_links, "R18: the pending bundle carries ChannelSettles — costed into this block's settle-link budget");
             }
             let mut mp = self.mempool.lock().unwrap();
-            let pick = select_batch_txs_sized(&chain, mp.iter(), room, bundle_links, bundle_bytes);
+            // v0.19.13: the selection reads the view the pool offers for one block
+            // (`Mempool::selectable`, judged at the chain's height as the door judges it): at
+            // most 16 txs and 4 MiB of one sender — this bounds what one sender puts into one
+            // block this node proposes, and nothing more — without a tx that a block refused in
+            // the last 16 blocks, and without a tx that carries a pool proof while its sender's
+            // proof wait lasts. What the view leaves out stays in the pool, in order, for a later
+            // block.
+            // Every cap below is kept as it is.
+            let pick = select_batch_txs_sized(&chain, mp.selectable(chain.height), room, bundle_links, bundle_bytes);
             if pick.held > 0 {
                 info!(
                     height,
@@ -1341,7 +1747,12 @@ impl HkApp {
                 }
                 match hk_consensus::apply_set_change(&validators, cert, height, &self.chain_id) {
                     Ok(Some(_)) => {
-                        include.push(cert.clone());
+                        // v0.19.13: a cert rides only while fewer than `MAX_SET_CHANGES_PER_BLOCK`
+                        // are taken, the count `vote_verdict` holds a block to; a valid cert past
+                        // that count stays queued, in order, for a later block.
+                        if include.len() < MAX_SET_CHANGES_PER_BLOCK {
+                            include.push(cert.clone());
+                        }
                         true // keep until we SEE it committed (a lost round must not lose it)
                     }
                     Ok(None) => false, // already applied
@@ -1361,12 +1772,10 @@ impl HkApp {
         height: HkHeight,
         round: Round,
     ) -> Option<LocallyProposedValue<HkContext>> {
-        let key = (height.as_u64(), round.as_i64());
-        self.undecided.get(&key).and_then(|vs| {
-            vs.iter()
-                .find(|v| v.proposer == self.address)
-                .map(|v| LocallyProposedValue { height: v.height, round: v.round, value: v.value.clone() })
-        })
+        // v0.19.13: this node's own value for the round, unless it remembers that value as
+        // refused (`own_value_for_round`); the caller then builds a new one.
+        own_value_for_round(&self.undecided, &self.refused_ids, height.as_u64(), round.as_i64(), &self.address)
+            .map(|v| LocallyProposedValue { height: v.height, round: v.round, value: v.value.clone() })
     }
 
     pub fn propose_value(&mut self, height: HkHeight, round: Round) -> LocallyProposedValue<HkContext> {
@@ -1392,7 +1801,9 @@ impl HkApp {
     }
 
     pub fn undecided_at(&self, height: HkHeight, round: Round) -> Vec<ProposedValue<HkContext>> {
-        self.undecided.get(&(height.as_u64(), round.as_i64())).cloned().unwrap_or_default()
+        // v0.19.13: a value this node remembers as refused is left out: the engine is told
+        // nothing about it (`values_for_round`).
+        values_for_round(&self.undecided, &self.refused_ids, height.as_u64(), round.as_i64())
     }
 
     /// v0.19.12: the value with this id held under any round of the height (see
@@ -1421,6 +1832,14 @@ impl HkApp {
     /// and the reasons). While a height is open this is the door for a value that is not
     /// decided yet; the sync arm of `app.rs` is the other door, for a value the network
     /// has already decided.
+    ///
+    /// v0.19.13: a kept value is judged before this node votes for it (`judge_kept_value`,
+    /// `vote_verdict`). A value the verdict refuses stays kept, so that a decision of the
+    /// network on it can be committed; its id is remembered for the height, and the answer is
+    /// `None`. The engine is never handed a value as `Validity::Invalid`: it then holds the
+    /// proposal without a value, does not vote for it, votes nil when its propose timeout
+    /// ends, and takes the value as a decided one from the sync arm if the network decides it.
+    /// The sync arm is not judged: a decided value is applied as it is.
     pub fn received_verified_proposal(
         &mut self,
         height: HkHeight,
@@ -1432,7 +1851,38 @@ impl HkApp {
         let candidate =
             ProposedValue { height, round, valid_round, proposer, value, validity: Validity::Valid };
         match admit_signed_value(&mut self.undecided, self.current_height.as_u64(), candidate) {
-            Ok(proposed) => Some(proposed),
+            Ok(proposed) => {
+                // v0.19.13: the vote verdict. This node's state commitment is the cached
+                // post-apply hash when there is one, else the one an earlier verdict computed
+                // since the last commit attempt, else it is computed now and kept. The seats
+                // are those of the validator set this node holds for the height.
+                let seats = self.validators.lock().unwrap_or_else(|e| e.into_inner()).len();
+                let mut ours = self.last_app_hash.or(self.vote_parent);
+                let refusal = judge_kept_value(
+                    &mut self.refused_ids,
+                    &self.chain,
+                    &mut ours,
+                    height.as_u64(),
+                    &proposed.value,
+                    seats,
+                );
+                if self.last_app_hash.is_none() {
+                    self.vote_parent = ours;
+                }
+                match refusal {
+                    None => Some(proposed),
+                    Some((why, first)) => {
+                        // The value stays in the store and the engine gets no answer for it.
+                        // One WARN per refused value; the same value again is a debug line.
+                        if first {
+                            warn!(%height, %round, %proposer, value = %proposed.value.id(), why = why.as_str(), "value of a signed proposal kept and not handed to the engine: this node does not vote for it");
+                        } else {
+                            debug!(%height, %round, %proposer, value = %proposed.value.id(), why = why.as_str(), "value of a signed proposal not handed to the engine again");
+                        }
+                        None
+                    }
+                }
+            }
             Err(why) if why.is_routine() => {
                 debug!(%height, %round, %proposer, why = why.as_str(), "value of a signed proposal not kept");
                 None
@@ -1448,6 +1898,25 @@ impl HkApp {
                 None
             }
         }
+    }
+
+    /// v0.19.13: a decided value did not commit. When the store holds the value (the block
+    /// was found and was not applied), its id is remembered for the height: this node does not
+    /// hand it to the engine again when a round starts or when its proposal arrives, and does
+    /// not serve the stored copy as its own proposal (`RefusedValueIds`). The value stays in
+    /// the store: the sync arm hands it to the engine again as a decided value when the
+    /// network holds to it, and the commit is tried again. Returns how many commits in a row have
+    /// failed at this height and how long to wait before the height restarts (`restart_wait`).
+    pub fn note_commit_failed(
+        &mut self,
+        height: HkHeight,
+        value_id: hk_consensus::HkValueId,
+    ) -> (u32, std::time::Duration) {
+        let h = height.as_u64();
+        if find_value_in_height(&self.undecided, h, value_id).is_some() {
+            self.refused_ids.note(h, value_id);
+        }
+        self.commit_retries.note_failure(h)
     }
 
     // ---- committing ----
@@ -1626,7 +2095,25 @@ impl HkApp {
             self.index_txs(height, &txs);
             if !prune.included.is_empty() {
                 // C2.2: indexed prune — one O(mempool) pass each, O(1) membership tests.
-                prune.prune_mempool(&mut self.mempool.lock().unwrap());
+                {
+                    let mut mp = self.mempool.lock().unwrap();
+                    prune.prune_mempool(&mut mp);
+                    // v0.19.13: what the block leaves in the pool's memory
+                    // (`CommitPrune::note_pool`): its refused txs are not taken back for 16
+                    // blocks, and the pending txs behind them leave the pool. On the live commit
+                    // only: that memory starts empty, and the blocks replayed at start do not
+                    // fill it.
+                    if live_agg {
+                        let left = prune.note_pool(&mut mp, &chain, height);
+                        if left > 0 {
+                            info!(
+                                height,
+                                left,
+                                "pending txs behind a refused tx left the mempool — they cannot apply before a tx at its nonce does"
+                            );
+                        }
+                    }
+                }
                 // P2.3: a bundle is spent once any of its txs committed (applied or refused —
                 // it rode, so it leaves the queue).
                 let gone: std::collections::HashSet<(hk_primitives::AccountId, u64)> =
@@ -1981,6 +2468,9 @@ impl HkApp {
 
         let batch = Batch::decode(&value.txs);
 
+        // v0.19.13: the vote verdict's own copy of this node's state commitment ends here,
+        // before the chain is touched; the next verdict reads the chain again.
+        self.vote_parent = None;
         let agg_valid = self.apply_batch_to_chain(height, &batch, true, false)?;
         self.apply_rotations(height, &batch, false);
         self.apply_set_changes(height, &batch, false);
@@ -1999,6 +2489,10 @@ impl HkApp {
             }
         }
         self.undecided.retain(|(h, _), _| *h > height);
+        // v0.19.13: the height is committed. Nothing of it is remembered as refused, and the
+        // count of commit failures starts again.
+        self.refused_ids.clear();
+        self.commit_retries.reset();
         self.current_height = HkHeight::new(height + 1);
 
         // ---- SCMS rotation triggers (R1) + leaf-budget gauge (R4) ----------------------
@@ -3341,6 +3835,106 @@ mod hr1_tests {
     }
 }
 
+/// v0.19.13: the pool's commit rules on the commit path itself. `apply_batch_to_chain` is the
+/// one function behind the live commit (`live_agg` true) and behind the replay of stored blocks
+/// at start (`live_agg` false); it is driven here on an `HkApp` over the shared fixture's
+/// chain (`mempool::test_fixtures`). The rules themselves are tested in mempool.rs
+/// `v0_19_13_tests`.
+///
+/// Run: `cargo test --offline -p hk-node v0_19_13_pool_commit -- --nocapture`
+#[cfg(test)]
+mod v0_19_13_pool_commit_tests {
+    use super::HkApp;
+    use crate::batch::{txid, Batch};
+    use crate::genesis::{GenesisValidator, HkGenesis};
+    use crate::mempool::test_fixtures::*;
+    use hk_consensus::{HkAddress, HkPriv};
+    use hk_state::tx::SignedTx;
+
+    /// The node's app on a one-seat test genesis (no store, no verifier), with `chain` as its
+    /// chain. A consensus key is made on a large stack (hbs-lms builds its trees on stack
+    /// arrays), so the caller runs on one, as the node does.
+    fn app_on(chain: hk_state::State) -> HkApp {
+        let seed = [0x52u8; 32];
+        let op = HkPriv::from_seed(seed);
+        let genesis = HkGenesis {
+            chain_start_time: 1,
+            validators: vec![GenesisValidator { root_pk: vec![7u8; 48], public_key: op.public(), voting_power: 1 }],
+            chain: None,
+            vk_pins: None,
+        };
+        let app = HkApp::new(HkAddress::new([7; 20]), &genesis, seed, op, std::env::temp_dir(), Default::default(), None)
+            .expect("the test genesis starts an app");
+        *app.chain.lock().unwrap() = chain;
+        app
+    }
+
+    /// `txs` as the next block of the app's chain, through `apply_batch_to_chain`: `live` as
+    /// the commit of a decided block passes it, or not, as the replay at start does.
+    fn apply(app: &mut HkApp, txs: Vec<SignedTx>, live: bool) {
+        let (height, parent_app_hash) = {
+            let chain = app.chain.lock().unwrap();
+            (chain.height + 1, chain.state_commitment().0)
+        };
+        let batch = Batch { parent_app_hash, txs, rotations: vec![], agg_proof: vec![], set_changes: vec![] };
+        app.apply_batch_to_chain(height, &Some(batch), live, false).expect("the block applies");
+    }
+
+    /// A live commit of a block with a refused tx feeds the pool's memory — the txid is not
+    /// taken back for 16 blocks — and drops the sender's pending txs at higher nonces. The
+    /// replay of a stored block at start runs the prunes and nothing else: nothing is
+    /// remembered, and the run behind the refused tx stays.
+    /// Caught mutant: drop the `note_pool` call from `apply_batch_to_chain` (the live commit remembers
+    /// nothing and the run stays), or its `live_agg` condition (the replayed block is
+    /// remembered and its run dropped).
+    #[test]
+    fn a_live_commit_remembers_a_refused_tx_and_drops_the_run_behind_it_and_a_replayed_block_does_neither() {
+        let on_a_large_stack = || {
+            let mut app = app_on(mini_chain(3));
+            let pending =
+                |app: &HkApp| app.mempool.lock().unwrap().iter().map(|t| (t.sender, t.nonce)).collect::<Vec<_>>();
+            // pending: accounts 1 and 2 each have a transfer the balance covers at the door,
+            // and a run of two behind it
+            let (head1, head2) = (sign_at(1, 0, transfer_payload(800)), sign_at(2, 0, transfer_payload(800)));
+            {
+                let chain = app.chain.lock().unwrap();
+                let mut mp = app.mempool.lock().unwrap();
+                for tx in [head1.clone(), transfer(1, 1), transfer(1, 2), head2.clone(), transfer(2, 1), transfer(2, 2)] {
+                    mp.try_admit(tx, &chain).expect("admits");
+                }
+            }
+            // both balances move: a block will refuse each head
+            for i in [1u8, 2] {
+                app.chain.lock().unwrap().balances.insert((acct(i), ASSET), 500);
+            }
+            // block 1, committed live: account 1's head is refused, account 3's tx applies
+            apply(&mut app, vec![head1.clone(), transfer(3, 0)], true);
+            {
+                let chain = app.chain.lock().unwrap();
+                let mp = app.mempool.lock().unwrap();
+                assert_eq!((chain.height, chain.accounts[&acct(1)].nonce, chain.accounts[&acct(3)].nonce), (1, 0, 1));
+                // the refused txid is remembered for 16 blocks; the applied one is not
+                assert_eq!(mp.refused_until(&txid(&head1), chain.height), Some(17));
+                assert_eq!(mp.refused_until(&txid(&transfer(3, 0)), chain.height), None);
+            }
+            // the run behind the refused head left the pool; account 2's txs are untouched
+            assert_eq!(pending(&app), vec![(acct(2), 0), (acct(2), 1), (acct(2), 2)]);
+            // block 2, replayed as at start: account 2's head is refused
+            apply(&mut app, vec![head2.clone()], false);
+            {
+                let chain = app.chain.lock().unwrap();
+                let mp = app.mempool.lock().unwrap();
+                assert_eq!((chain.height, chain.accounts[&acct(2)].nonce), (2, 0));
+                // nothing is remembered of a replayed block …
+                assert_eq!(mp.refused_until(&txid(&head2), chain.height), None);
+            }
+            // … and only the prunes ran: the refused head's copy is gone, the run behind it stays
+            assert_eq!(pending(&app), vec![(acct(2), 1), (acct(2), 2)]);
+        };
+        std::thread::Builder::new().stack_size(32 * 1024 * 1024).spawn(on_a_large_stack).unwrap().join().unwrap();
+    }
+}
+
 /// v0.19.12: another node's value enters the store of undecided values from a proposal whose
 /// signature the engine verified. `admit_signed_value` is the whole rule and is pure, so it is
 /// driven here on a plain map, with `find_value_in_height` (the restream's lookup) and
@@ -3624,5 +4218,620 @@ mod signed_value_tests {
         }
         assert!(matches!(msgs[3].content, StreamContent::Fin));
         assert!(msgs.iter().all(|m| m.stream_id == msgs[0].stream_id));
+    }
+}
+
+/// v0.19.13: the vote verdict, the memory of refused values and the restart wait. Each part
+/// is pure and is driven here on plain values: `vote_verdict` and `judge_kept_value` on a bare
+/// chain, `RefusedValueIds` with the two lookups that read it (`own_value_for_round`,
+/// `values_for_round`), `restart_wait` and `CommitRetries` on numbers. The last test drives
+/// the same through the app, built with `HkApp::new` on a one-seat test genesis: what the
+/// engine is answered, what the store and the memory hold, and what a commit clears. The
+/// signatures this node reuses within a height are tested in hk-consensus (`src/provider.rs`),
+/// the length of a batch's encoding in `batch.rs`.
+///
+/// Run: `cargo test --offline -p hk-node v0_19_13 -- --nocapture`
+#[cfg(test)]
+mod v0_19_13_tests {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use hk_consensus::{
+        HkAddress, HkContext, HkHeight, HkPriv, HkPub, HkValue, RotationCert, SetChange, SetChangeBody,
+        SetChangeCert,
+    };
+    use hk_primitives::{ChannelState, H256};
+    use hk_state::tx::{SignedTx, Tx};
+    use hk_state::{Channel, State, MAX_CHANNEL_STEPS, MAX_SETTLE_DELTA};
+    use malachitebft_app_channel::app::types::core::{CommitCertificate, Round, Validity, VoteExtensions};
+    use malachitebft_app_channel::app::types::ProposedValue;
+
+    use super::{
+        carries_a_repeated_tx, judge_kept_value, max_rotations_per_block, own_value_for_round, restart_wait,
+        select_batch_txs_sized, values_for_round, vote_verdict, CommitRetries, HkApp, RefusedValueIds,
+        VoteRefusal, MAX_SETTLE_LINKS_PER_BLOCK, MAX_SET_CHANGES_PER_BLOCK, MAX_SYNC_SERVABLE_VALUE_BYTES,
+        RESTART_WAIT_MAX, RESTART_WAIT_STEP,
+    };
+    use crate::batch::{Batch, MAX_TXS_PER_BLOCK};
+    use crate::genesis::{GenesisValidator, HkGenesis};
+
+    type Store = BTreeMap<(u64, i64), Vec<ProposedValue<HkContext>>>;
+
+    /// The seats of the validator set the verdicts here are given: one.
+    const SEATS: usize = 1;
+
+    /// The height the node under test is at.
+    const H: u64 = 41;
+
+    fn h(b: u8) -> H256 {
+        H256([b; 32])
+    }
+
+    fn addr(b: u8) -> HkAddress {
+        HkAddress::new([b; 20])
+    }
+
+    /// A bare chain with `n` open channels (ids 1..=n) at the consensus cap, nothing settled:
+    /// the settle costs read the channel map only.
+    fn chain_with_channels(n: u8) -> State {
+        let mut st = State::default();
+        for i in 1..=n {
+            st.channels.insert(
+                h(i),
+                Channel {
+                    state: ChannelState {
+                        id: h(i),
+                        payer: h(0xA0),
+                        payee: h(0xB0),
+                        asset: h(9),
+                        mandate: h(0xC0),
+                        tip: h(0xD0),
+                        unit_price: 1,
+                        max_steps: MAX_CHANNEL_STEPS,
+                        highest_step_settled: 0,
+                        expiry: u64::MAX,
+                    },
+                    escrow_remaining: MAX_CHANNEL_STEPS as u128,
+                    refunded: false,
+                },
+            );
+        }
+        st
+    }
+
+    /// Unsigned frames: the verdict reads a transaction's fields and verifies no signature.
+    fn tx(sender: u8, nonce: u64, payload: Tx) -> SignedTx {
+        SignedTx { sender: h(sender), nonce, payload, next_auth: h(0), lamport_pk: vec![], sig: vec![] }
+    }
+    fn settle(sender: u8, nonce: u64, ch: u8, step: u32) -> SignedTx {
+        tx(sender, nonce, Tx::ChannelSettle { id: h(ch), word: h(0), step })
+    }
+    fn transfer(sender: u8, nonce: u64) -> SignedTx {
+        tx(sender, nonce, Tx::Transfer { to: h(0xB0), asset: h(9), amount: 1 })
+    }
+    /// Another transaction for the same slot: the same transfer with another amount.
+    fn transfer_of_two(sender: u8, nonce: u64) -> SignedTx {
+        tx(sender, nonce, Tx::Transfer { to: h(0xB0), asset: h(9), amount: 2 })
+    }
+
+    /// The bytes of a batch that carries `txs` on `parent`.
+    fn batch_bytes(parent: [u8; 32], txs: Vec<SignedTx>) -> Vec<u8> {
+        Batch { parent_app_hash: parent, txs, rotations: vec![], agg_proof: vec![], set_changes: vec![] }.encode()
+    }
+
+    /// A rotation certificate for the count rule, which reads none of its fields.
+    fn rotation(i: u8) -> RotationCert {
+        RotationCert {
+            root_pk: vec![i; 48],
+            new_op_pk: HkPub(vec![i; 60]),
+            epoch: 1,
+            valid_from_height: 1,
+            root_sig: vec![],
+        }
+    }
+
+    /// A set-change certificate for the count rule, which reads none of its fields.
+    fn set_change(i: u8) -> SetChangeCert {
+        SetChangeCert {
+            body: SetChangeBody {
+                chain_id: "test".into(),
+                change: SetChange::Remove { root_pk: vec![i; 48] },
+                not_before: 1,
+                not_after: 2,
+            },
+            approvals: vec![],
+        }
+    }
+
+    /// The bytes of a batch that carries these certificates and no transaction on `parent`.
+    fn cert_batch_bytes(
+        parent: [u8; 32],
+        rotations: Vec<RotationCert>,
+        set_changes: Vec<SetChangeCert>,
+    ) -> Vec<u8> {
+        Batch { parent_app_hash: parent, txs: vec![], rotations, agg_proof: vec![], set_changes }.encode()
+    }
+
+    /// The verdict with the state commitment given, as the node holds it between two commits.
+    fn judged(chain: &Mutex<State>, parent: [u8; 32], bytes: &[u8]) -> Result<(), VoteRefusal> {
+        vote_verdict(bytes, chain, &mut Some(parent), SEATS)
+    }
+
+    /// The ids of these values, in order.
+    fn ids_of(values: &[ProposedValue<HkContext>]) -> Vec<hk_consensus::HkValueId> {
+        values.iter().map(|v| v.value.id()).collect()
+    }
+
+    /// hbs-lms builds its trees on large stack arrays: a consensus key is made on a 32 MiB
+    /// stack, as the node makes it.
+    fn on_big_stack<F: FnOnce() + Send + 'static>(f: F) {
+        std::thread::Builder::new().stack_size(32 * 1024 * 1024).spawn(f).unwrap().join().unwrap();
+    }
+
+    /// The node's app on a one-seat test genesis: no store, no verifier, an empty chain, and
+    /// the app at the chain's next height (as the engine's first round sets it).
+    fn test_app() -> HkApp {
+        let seed = [0x51u8; 32];
+        let op = HkPriv::from_seed(seed);
+        let genesis = HkGenesis {
+            chain_start_time: 1,
+            validators: vec![GenesisValidator { root_pk: vec![7u8; 48], public_key: op.public(), voting_power: 1 }],
+            chain: None,
+            vk_pins: None,
+        };
+        let mut app = HkApp::new(addr(7), &genesis, seed, op, std::env::temp_dir(), Default::default(), None)
+            .expect("the test genesis starts an app");
+        let next = app.chain.lock().unwrap().height + 1;
+        app.current_height = HkHeight::new(next);
+        app
+    }
+
+    /// A value the store keeps for (height, round) from `proposer`.
+    fn kept(height: u64, round: u32, proposer: HkAddress, txs: &'static [u8]) -> ProposedValue<HkContext> {
+        ProposedValue {
+            height: HkHeight::new(height),
+            round: Round::new(round),
+            valid_round: Round::Nil,
+            proposer,
+            value: HkValue::new(Bytes::from_static(txs)),
+            validity: Validity::Valid,
+        }
+    }
+
+    /// A block as this node builds it under load passes every rule. The selection that
+    /// `build_batch` runs fills the block from a pool that holds more settlements than a
+    /// block's link budget and more transactions than a block holds; the batch it gives is
+    /// voted for, and nothing is remembered. Caught mutant: sum the links with another cost than the
+    /// selection's, or count below the selection's room, and this block is refused.
+    #[test]
+    fn v0_19_13_a_block_built_under_load_is_voted_for() {
+        let st = chain_with_channels(5);
+        let parent = st.state_commitment().0;
+        // Five full-width settlements of one sender, then 1,500 transfers of a hundred senders.
+        let mut pool: Vec<SignedTx> =
+            (0..5u8).map(|i| settle(1, u64::from(i), i + 1, MAX_SETTLE_DELTA as u32)).collect();
+        for nonce in 0..15u64 {
+            for sender in 10..110u8 {
+                pool.push(transfer(sender, nonce));
+            }
+        }
+        let pick = select_batch_txs_sized(&st, pool.iter(), MAX_TXS_PER_BLOCK, 0, 0);
+        assert_eq!(pick.picked.len(), MAX_TXS_PER_BLOCK, "the block is full");
+        assert!(pick.held > 0, "the link budget held settlements back");
+        let bytes = batch_bytes(parent, pick.picked);
+        let chain = Mutex::new(st);
+
+        // With the commitment the node holds between two commits ...
+        assert_eq!(judged(&chain, parent, &bytes), Ok(()));
+        // ... and when it has to be computed: the same answer, and the commitment handed back.
+        let mut ours = None;
+        assert_eq!(vote_verdict(&bytes, &chain, &mut ours, SEATS), Ok(()));
+        assert_eq!(ours, Some(parent));
+
+        let mut refused = RefusedValueIds::default();
+        let value = HkValue::new(Bytes::from(bytes));
+        assert_eq!(judge_kept_value(&mut refused, &chain, &mut Some(parent), H, &value, SEATS), None);
+        assert!(!refused.contains(H, value.id()));
+    }
+
+    /// Each rule of the verdict refuses with its own reason, and the value just inside each
+    /// bound passes.
+    #[test]
+    fn v0_19_13_each_rule_of_the_verdict_refuses_with_its_reason() {
+        let st = chain_with_channels(3);
+        let parent = st.state_commitment().0;
+        let chain = Mutex::new(st);
+
+        // size: one byte past what one sync response carries, refused before it is decoded
+        let over = vec![0u8; MAX_SYNC_SERVABLE_VALUE_BYTES + 1];
+        assert_eq!(judged(&chain, parent, &over), Err(VoteRefusal::TooLargeToServe));
+        assert_eq!(
+            judged(&chain, parent, &over[..MAX_SYNC_SERVABLE_VALUE_BYTES]),
+            Err(VoteRefusal::TrailingBytes),
+            "a value of exactly the bound is judged by the next rules: these bytes are an empty batch and more"
+        );
+
+        // decode: bytes that are not a batch, and no bytes at all
+        assert_eq!(judged(&chain, parent, b"not a batch"), Err(VoteRefusal::NotABatch));
+        assert_eq!(judged(&chain, parent, &[]), Err(VoteRefusal::NotABatch));
+
+        // count: one transaction more than a block holds
+        let many: Vec<SignedTx> =
+            (0..=MAX_TXS_PER_BLOCK).map(|i| transfer((i % 200) as u8, (i / 200) as u64)).collect();
+        assert_eq!(judged(&chain, parent, &batch_bytes(parent, many.clone())), Err(VoteRefusal::TooManyTxs));
+        assert_eq!(judged(&chain, parent, &batch_bytes(parent, many[..MAX_TXS_PER_BLOCK].to_vec())), Ok(()));
+
+        // parent: a batch built on another state, with the commitment held and computed
+        let other = [0x11u8; 32];
+        assert_ne!(other, parent);
+        assert_eq!(
+            judged(&chain, parent, &batch_bytes(other, vec![transfer(1, 0)])),
+            Err(VoteRefusal::ParentMismatch)
+        );
+        let mut ours = None;
+        assert_eq!(
+            vote_verdict(&batch_bytes(other, vec![]), &chain, &mut ours, SEATS),
+            Err(VoteRefusal::ParentMismatch)
+        );
+        assert_eq!(ours, Some(parent), "the computed commitment is handed back with a refusal too");
+        assert_eq!(judged(&chain, parent, &batch_bytes(parent, vec![])), Ok(()), "an empty block on this state");
+
+        // repeat: one signed transaction twice
+        let twice = vec![transfer(1, 0), transfer(2, 0), transfer(1, 0)];
+        assert_eq!(judged(&chain, parent, &batch_bytes(parent, twice)), Err(VoteRefusal::RepeatedTx));
+
+        // links: three full-width settlements are past a block's budget, two fill it exactly
+        let three: Vec<SignedTx> = (0..3u8).map(|i| settle(i + 1, 0, i + 1, MAX_SETTLE_DELTA as u32)).collect();
+        assert!(3 * MAX_SETTLE_DELTA > MAX_SETTLE_LINKS_PER_BLOCK);
+        assert_eq!(2 * MAX_SETTLE_DELTA, MAX_SETTLE_LINKS_PER_BLOCK);
+        assert_eq!(judged(&chain, parent, &batch_bytes(parent, three.clone())), Err(VoteRefusal::SettleLinks));
+        assert_eq!(judged(&chain, parent, &batch_bytes(parent, three[..2].to_vec())), Ok(()));
+
+        // rotations: two for each seat and eight more are carried, one more is not; a set of
+        // more seats carries more
+        let most = max_rotations_per_block(SEATS);
+        assert_eq!(most, 10, "one seat: two and eight");
+        assert_eq!(max_rotations_per_block(23), 54);
+        assert_eq!(max_rotations_per_block(usize::MAX), usize::MAX, "the bound does not wrap");
+        let rotations = |n: usize| (0..n).map(|i| rotation(i as u8)).collect::<Vec<_>>();
+        assert_eq!(judged(&chain, parent, &cert_batch_bytes(parent, rotations(most), vec![])), Ok(()));
+        let one_more = cert_batch_bytes(parent, rotations(most + 1), vec![]);
+        assert_eq!(judged(&chain, parent, &one_more), Err(VoteRefusal::TooManyRotations));
+        assert_eq!(vote_verdict(&one_more, &chain, &mut Some(parent), SEATS + 1), Ok(()));
+
+        // setchanges: sixteen are carried, one more is not
+        assert_eq!(MAX_SET_CHANGES_PER_BLOCK, 16);
+        let set_changes = |n: usize| (0..n).map(|i| set_change(i as u8)).collect::<Vec<_>>();
+        assert_eq!(judged(&chain, parent, &cert_batch_bytes(parent, vec![], set_changes(16))), Ok(()));
+        assert_eq!(
+            judged(&chain, parent, &cert_batch_bytes(parent, vec![], set_changes(17))),
+            Err(VoteRefusal::TooManySetChanges)
+        );
+
+        // trailing: one byte behind the batch's own encoding, in either framing, and the
+        // prefixed framing around a batch that `encode` writes without the prefix
+        let mut longer = batch_bytes(parent, vec![transfer(1, 0)]);
+        longer.push(0);
+        assert_eq!(judged(&chain, parent, &longer), Err(VoteRefusal::TrailingBytes));
+        let mut longer = cert_batch_bytes(parent, vec![], set_changes(1));
+        longer.push(0);
+        assert_eq!(judged(&chain, parent, &longer), Err(VoteRefusal::TrailingBytes));
+        let plain = Batch {
+            parent_app_hash: parent,
+            txs: vec![],
+            rotations: vec![],
+            agg_proof: vec![],
+            set_changes: vec![],
+        };
+        let mut prefixed = b"HK-BLK-2".to_vec();
+        prefixed.extend_from_slice(&bincode::serialize(&plain).unwrap());
+        assert!(Batch::decode(&prefixed).is_some(), "these bytes are read as a batch");
+        assert_eq!(judged(&chain, parent, &prefixed), Err(VoteRefusal::TrailingBytes));
+        assert_eq!(judged(&chain, parent, &plain.encode()), Ok(()));
+
+        // The first rule a value breaks is the reason given, and it is the same reason
+        // whether the node's commitment is held or has to be computed.
+        let reason = |bytes: &[u8]| {
+            let held = judged(&chain, parent, bytes);
+            assert_eq!(vote_verdict(bytes, &chain, &mut None, SEATS), held, "the same reason when computed");
+            held
+        };
+        // too many transactions, on another state, with a byte behind: count
+        let mut two = batch_bytes(other, many.clone());
+        two.push(0);
+        assert_eq!(reason(&two), Err(VoteRefusal::TooManyTxs));
+        // too many certificates of both kinds, on another state, with a byte behind: rotations
+        let mut two = cert_batch_bytes(other, rotations(most + 1), set_changes(17));
+        two.push(0);
+        assert_eq!(reason(&two), Err(VoteRefusal::TooManyRotations));
+        // too many set changes, on another state, with a byte behind: setchanges
+        let mut two = cert_batch_bytes(other, vec![], set_changes(17));
+        two.push(0);
+        assert_eq!(reason(&two), Err(VoteRefusal::TooManySetChanges));
+        // a byte behind a batch on another state that repeats a transaction: trailing
+        let mut two = batch_bytes(other, vec![transfer(1, 0), transfer(1, 0)]);
+        two.push(0);
+        assert_eq!(reason(&two), Err(VoteRefusal::TrailingBytes));
+        // another state and a repeat: parent
+        assert_eq!(
+            reason(&batch_bytes(other, vec![transfer(1, 0), transfer(1, 0)])),
+            Err(VoteRefusal::ParentMismatch)
+        );
+        // a repeat among settlements past the link budget: repeat
+        let mut two = three.clone();
+        two.push(three[0].clone());
+        assert_eq!(reason(&batch_bytes(parent, two)), Err(VoteRefusal::RepeatedTx));
+
+        // the reason words of the log line
+        let words: Vec<&str> = [
+            VoteRefusal::TooLargeToServe,
+            VoteRefusal::NotABatch,
+            VoteRefusal::TooManyTxs,
+            VoteRefusal::TooManyRotations,
+            VoteRefusal::TooManySetChanges,
+            VoteRefusal::TrailingBytes,
+            VoteRefusal::ParentMismatch,
+            VoteRefusal::RepeatedTx,
+            VoteRefusal::SettleLinks,
+            VoteRefusal::Remembered,
+        ]
+        .iter()
+        .map(|why| why.as_str())
+        .collect();
+        assert_eq!(
+            words,
+            vec![
+                "size",
+                "decode",
+                "count",
+                "rotations",
+                "setchanges",
+                "trailing",
+                "parent",
+                "repeat",
+                "links",
+                "remembered"
+            ]
+        );
+    }
+
+    /// A different transaction at the same sender and nonce is not a repeat, under the same
+    /// signature bytes or under others; the same transaction again is one, wherever it stands
+    /// in the batch.
+    #[test]
+    fn v0_19_13_a_different_tx_at_the_same_sender_and_nonce_is_not_a_repeat() {
+        // The same slot and the same (empty) signature bytes, another payload.
+        assert!(!carries_a_repeated_tx(&[transfer(1, 0), transfer_of_two(1, 0)]));
+        // The same slot and payload under different signature bytes.
+        let mut a = transfer(1, 0);
+        a.sig = vec![0xAA; 64];
+        let mut b = transfer(1, 0);
+        b.sig = vec![0xBB; 64];
+        assert!(!carries_a_repeated_tx(&[a.clone(), b.clone()]));
+        // The same transaction again.
+        assert!(carries_a_repeated_tx(&[a.clone(), b, a]));
+        assert!(carries_a_repeated_tx(&[
+            transfer(1, 0),
+            transfer_of_two(1, 0),
+            transfer(2, 0),
+            transfer_of_two(1, 0),
+        ]));
+        let none: [SignedTx; 0] = [];
+        assert!(!carries_a_repeated_tx(&none));
+
+        // Through the verdict: the two transactions of one slot pass, a copy of one does not.
+        let st = State::default();
+        let parent = st.state_commitment().0;
+        let chain = Mutex::new(st);
+        let slot = vec![transfer(1, 0), transfer_of_two(1, 0)];
+        assert_eq!(judged(&chain, parent, &batch_bytes(parent, slot.clone())), Ok(()));
+        let mut copy = slot;
+        copy.push(transfer_of_two(1, 0));
+        assert_eq!(judged(&chain, parent, &batch_bytes(parent, copy)), Err(VoteRefusal::RepeatedTx));
+    }
+
+    /// A value this node refused is remembered for its height: its proposal is judged from the
+    /// memory, the stored copy is not served again as this node's own proposal, and the engine
+    /// is told nothing about it when a round starts (it is left out, and no value is handed
+    /// over as Invalid). Another height remembers nothing of it. Caught mutant: hand a remembered value
+    /// over with the others and the list told to the engine holds it.
+    #[test]
+    fn v0_19_13_a_refused_value_is_remembered_for_its_height_and_not_served_again() {
+        let st = State::default();
+        let parent = st.state_commitment().0;
+        let chain = Mutex::new(st);
+        let me = addr(7);
+
+        // The verdict with the memory.
+        let mut refused = RefusedValueIds::default();
+        let good = HkValue::new(Bytes::from(batch_bytes(parent, vec![transfer(1, 0)])));
+        let bad = HkValue::new(Bytes::from(batch_bytes([0x11; 32], vec![transfer(1, 0)])));
+        assert_eq!(judge_kept_value(&mut refused, &chain, &mut Some(parent), H, &good, SEATS), None);
+        assert_eq!(
+            judge_kept_value(&mut refused, &chain, &mut Some(parent), H, &bad, SEATS),
+            Some((VoteRefusal::ParentMismatch, true)),
+            "refused by the rules, for the first time"
+        );
+        assert_eq!(
+            judge_kept_value(&mut refused, &chain, &mut Some(parent), H, &bad, SEATS),
+            Some((VoteRefusal::Remembered, false)),
+            "then answered from the memory"
+        );
+        assert!(refused.contains(H, bad.id()));
+        assert!(!refused.contains(H, good.id()));
+        assert!(!refused.contains(H + 1, bad.id()), "another height remembers nothing of it");
+
+        // A decided value whose commit did not complete is remembered the same way: a value
+        // the rules pass is then answered from the memory.
+        assert!(refused.note(H, good.id()));
+        assert!(!refused.note(H, good.id()), "remembered once");
+        assert_eq!(
+            judge_kept_value(&mut refused, &chain, &mut Some(parent), H, &good, SEATS),
+            Some((VoteRefusal::Remembered, false))
+        );
+
+        // The two lookups that read the memory.
+        let mut store = Store::new();
+        let mine = kept(H, 0, me, b"built here");
+        let theirs = kept(H, 0, addr(8), b"built elsewhere");
+        store.insert((H, 0), vec![mine.clone(), theirs.clone()]);
+        let mut refused = RefusedValueIds::default();
+        assert_eq!(
+            own_value_for_round(&store, &refused, H, 0, &me).map(|v| v.value.id()),
+            Some(mine.value.id()),
+            "this node's own value for the round"
+        );
+        assert_eq!(
+            ids_of(&values_for_round(&store, &refused, H, 0)),
+            vec![mine.value.id(), theirs.value.id()],
+            "with nothing remembered the engine is told every value of the round"
+        );
+
+        assert!(refused.note(H, mine.value.id()));
+        assert!(
+            own_value_for_round(&store, &refused, H, 0, &me).is_none(),
+            "the stored copy is not served again"
+        );
+        let told = values_for_round(&store, &refused, H, 0);
+        assert_eq!(ids_of(&told), vec![theirs.value.id()], "the remembered value is left out");
+        assert!(told.iter().all(|v| v.validity == Validity::Valid), "and nothing is handed over as Invalid");
+
+        // A value this node builds afterwards for the round is the one it serves, and the
+        // engine is told it.
+        let fresh = kept(H, 0, me, b"built again");
+        store.get_mut(&(H, 0)).unwrap().push(fresh.clone());
+        assert_eq!(
+            own_value_for_round(&store, &refused, H, 0, &me).map(|v| v.value.id()),
+            Some(fresh.value.id())
+        );
+        assert_eq!(ids_of(&values_for_round(&store, &refused, H, 0)), vec![theirs.value.id(), fresh.value.id()]);
+
+        // With every value of the round remembered the engine is told none; a round that
+        // holds nothing gives none either.
+        assert!(refused.note(H, theirs.value.id()));
+        assert!(refused.note(H, fresh.value.id()));
+        assert!(values_for_round(&store, &refused, H, 0).is_empty());
+        assert!(values_for_round(&store, &refused, H, 1).is_empty());
+
+        // The memory holds one height: the first id of a later height drops the earlier
+        // height's ids, so that height's values are all told again; an id of an earlier height
+        // is not taken; a committed height remembers nothing.
+        assert!(refused.note(H + 1, theirs.value.id()));
+        assert!(!refused.contains(H, mine.value.id()), "the earlier height's ids are dropped");
+        assert_eq!(values_for_round(&store, &refused, H, 0).len(), 3);
+        assert!(!refused.note(H, mine.value.id()), "an id of an earlier height is not taken");
+        assert!(!refused.contains(H, mine.value.id()));
+        refused.clear();
+        assert!(!refused.contains(H + 1, theirs.value.id()));
+    }
+
+    /// The wait before a height restarts grows by one step with each consecutive commit failure
+    /// at that height and never passes the cap; the count starts again at another height and
+    /// after a commit that completes.
+    #[test]
+    fn v0_19_13_the_restart_wait_grows_with_each_failure_and_is_capped() {
+        assert_eq!(RESTART_WAIT_STEP, Duration::from_millis(250));
+        assert_eq!(RESTART_WAIT_MAX, Duration::from_secs(5));
+        assert_eq!(restart_wait(1), Duration::from_millis(250));
+        assert_eq!(restart_wait(2), Duration::from_millis(500));
+        assert_eq!(restart_wait(19), Duration::from_millis(4_750));
+        assert_eq!(restart_wait(20), Duration::from_secs(5));
+        assert_eq!(restart_wait(21), Duration::from_secs(5), "capped");
+        assert_eq!(restart_wait(u32::MAX), RESTART_WAIT_MAX, "capped for any count");
+
+        let mut retries = CommitRetries::default();
+        assert_eq!(retries.note_failure(H), (1, Duration::from_millis(250)));
+        assert_eq!(retries.note_failure(H), (2, Duration::from_millis(500)));
+        assert_eq!(retries.note_failure(H), (3, Duration::from_millis(750)));
+        // Another height counts from one.
+        assert_eq!(retries.note_failure(H + 1), (1, Duration::from_millis(250)));
+        assert_eq!(retries.note_failure(H + 1), (2, Duration::from_millis(500)));
+        // So does the first failure after a commit that completed.
+        retries.reset();
+        assert_eq!(retries.note_failure(H + 1), (1, Duration::from_millis(250)));
+        // A height that keeps failing waits the cap, each time.
+        for _ in 0..40 {
+            retries.note_failure(H + 1);
+        }
+        assert_eq!(retries.note_failure(H + 1), (42, RESTART_WAIT_MAX));
+        assert_eq!(retries.note_failure(H + 1), (43, RESTART_WAIT_MAX));
+    }
+
+    /// The same through the app (`HkApp::new` on a one-seat test genesis). A proposal the
+    /// verdict refuses is kept in the store, its id is remembered, and the engine gets no
+    /// answer for it, the first time and again; a proposal on this node's state is handed over
+    /// as Valid; when a round starts the engine is told the values this node votes for and no
+    /// remembered one. A decided value that does not commit is remembered when the store holds
+    /// it, and the failures of the height are counted either way. The commit of the height
+    /// empties the memory, starts the count again and drops the verdict's own copy of the
+    /// state commitment. Caught mutant: answer a refused value with `Some`, hand a remembered value
+    /// over when a round starts, or leave the memory in place after the commit.
+    #[test]
+    fn v0_19_13_the_app_keeps_a_refused_value_and_hands_the_engine_nothing_for_it() {
+        on_big_stack(|| {
+            let mut app = test_app();
+            let height = app.current_height;
+            let h = height.as_u64();
+            let round = Round::new(0);
+            let parent = app.chain.lock().unwrap().state_commitment().0;
+            assert!(app.last_app_hash.is_none() && app.vote_parent.is_none(), "nothing applied yet");
+
+            // A proposal built on another state: kept, remembered, no answer.
+            let bad = HkValue::new(Bytes::from(batch_bytes([0x11; 32], vec![transfer(1, 0)])));
+            let answer = app.received_verified_proposal(height, round, Round::Nil, addr(8), bad.clone());
+            assert!(answer.is_none(), "the engine is handed no value for it");
+            assert!(app.find_undecided_in_height(height, bad.id()).is_some(), "the store keeps it");
+            assert!(app.refused_ids.contains(h, bad.id()), "its id is remembered");
+            assert_eq!(app.vote_parent, Some(parent), "the commitment computed for the verdict is kept");
+            // The same proposal again: no answer, from the memory, and still one stored copy.
+            let again = app.received_verified_proposal(height, round, Round::Nil, addr(8), bad.clone());
+            assert!(again.is_none());
+            assert_eq!(app.undecided.get(&(h, 0)).map_or(0, |vs| vs.len()), 1);
+            // When the round starts the engine is told nothing about it.
+            assert!(app.undecided_at(height, round).is_empty());
+
+            // A proposal built on this node's state: handed over as Valid.
+            let good = HkValue::new(Bytes::from(batch_bytes(parent, vec![])));
+            let answer = app
+                .received_verified_proposal(height, round, Round::Nil, addr(8), good.clone())
+                .expect("a value this node votes for is handed to the engine");
+            assert_eq!(answer.validity, Validity::Valid);
+            assert_eq!(answer.value.id(), good.id());
+            assert!(!app.refused_ids.contains(h, good.id()));
+            assert_eq!(
+                ids_of(&app.undecided_at(height, round)),
+                vec![good.id()],
+                "when the round starts: the value this node votes for, and not the refused one"
+            );
+
+            // A decided value that does not commit is remembered when the store holds it ...
+            assert_eq!(app.note_commit_failed(height, good.id()), (1, RESTART_WAIT_STEP));
+            assert!(app.refused_ids.contains(h, good.id()));
+            assert!(app.undecided_at(height, round).is_empty(), "and is not handed over when the round starts again");
+            assert!(app.received_verified_proposal(height, round, Round::Nil, addr(8), good.clone()).is_none());
+            assert!(app.find_undecided_in_height(height, good.id()).is_some(), "the store keeps it for the commit");
+            // ... and is not when the store does not hold it; the failure is counted either way.
+            let unknown = HkValue::new(Bytes::from_static(b"never received")).id();
+            assert_eq!(app.note_commit_failed(height, unknown), (2, RESTART_WAIT_STEP * 2));
+            assert!(!app.refused_ids.contains(h, unknown));
+
+            // The commit of the height: the memory is emptied, the count starts again, and the
+            // verdict's own copy of the commitment is dropped.
+            let certificate: CommitCertificate<HkContext> =
+                CommitCertificate { height, round, value_id: good.id(), commit_signatures: vec![] };
+            app.commit(certificate, VoteExtensions::default()).expect("the decided value commits");
+            assert_eq!(app.current_height.as_u64(), h + 1);
+            assert!(!app.refused_ids.contains(h, good.id()) && !app.refused_ids.contains(h, bad.id()));
+            assert!(app.vote_parent.is_none());
+            assert!(app.last_app_hash.is_some(), "the applied block left its commitment");
+            assert!(app.find_undecided_in_height(height, bad.id()).is_none(), "the height's store is pruned");
+            assert_eq!(
+                app.note_commit_failed(HkHeight::new(h + 1), unknown),
+                (1, RESTART_WAIT_STEP),
+                "the count starts again"
+            );
+        });
     }
 }

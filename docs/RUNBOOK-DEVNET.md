@@ -28,7 +28,7 @@ $HK wallet init $W org                 # bind to a devnet demo account; since v0
 $HK wallet shield $W 3                 # transparent → hidden (mint proof ~1.3 s)
 $HK wallet scan $W                     # discover your notes (LIVE/SPENT, full commitments)
 ADDR=$($HK wallet address $W 2>/dev/null)
-$HK wallet pay $W "$ADDR" 1 "memo"     # stealth payment (zero transparent trace; the 100-micro envelope fee is paid transparently)
+$HK wallet pay $W "$ADDR" 1 "memo"     # stealth payment (no amount, recipient or memo on the chain; the 100-micro envelope fee is paid transparently by the submitting account)
 $HK wallet unshield $W 1               # hidden → transparent
 $HK wallet disclose $W <COMMITMENT> d.json && $HK verify-disclosure d.json
 ```

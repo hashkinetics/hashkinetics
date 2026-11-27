@@ -126,7 +126,7 @@ Type an amount next to **Pool → me** and click it. The wallet picks one note t
 
 *Screenshots: `pay_fields.jpg`, `pay_receipt.jpg`, `notes_after_pay.jpg`*
 
-Paste the recipient's `hkaddr:…`, an amount and an optional memo, click **Pay shielded**. The chain sees a nullifier and two new commitments — not who paid whom, not how much. The recipient finds the note on their next scan, memo intact. Example: `22082712…` (2026-09-02, memo delivered).
+Paste the recipient's `hkaddr:…`, an amount and an optional memo, click **Pay shielded**. The chain sees a nullifier and two new commitments — not how much, not to whom, not the memo. The account that submitted the payment is visible. The recipient finds the note on their next scan, memo intact. Example: `22082712…` (2026-09-02, memo delivered).
 
 ## 11 · Receive privately
 

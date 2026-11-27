@@ -32,6 +32,15 @@ use web_time::Instant;
 
 use crate::topic::TopicHash;
 
+// HK v0.19.13: the store holds at most this many (topic, peer) backoffs. A backoff is kept per
+// joined topic and peer that was pruned or sent a PRUNE, so a node with a few topics and some
+// hundreds of peers stays far below the bound.
+pub(crate) const MAX_BACKOFF_ENTRIES: usize = 16_384;
+
+// HK v0.19.13: while backoffs are not recorded because the store is at its bound, that is
+// reported at most once per this interval.
+const BOUND_REPORT_INTERVAL: Duration = Duration::from_secs(60);
+
 #[derive(Copy, Clone)]
 struct HeartbeatIndex(usize);
 
@@ -48,6 +57,13 @@ pub(crate) struct BackoffStorage {
     heartbeat_interval: Duration,
     /// Backoff slack from the config.
     backoff_slack: u32,
+    /// HK v0.19.13: the number of (topic, peer) backoffs held, never above
+    /// `MAX_BACKOFF_ENTRIES`.
+    entries: usize,
+    /// HK v0.19.13: when the bound was last reported.
+    last_bound_report: Option<Instant>,
+    /// HK v0.19.13: the backoffs not recorded since the last report.
+    unrecorded: usize,
 }
 
 impl BackoffStorage {
@@ -69,6 +85,9 @@ impl BackoffStorage {
             heartbeat_index: HeartbeatIndex(0),
             heartbeat_interval,
             backoff_slack,
+            entries: 0,
+            last_bound_report: None,
+            unrecorded: 0,
         }
     }
 
@@ -79,6 +98,18 @@ impl BackoffStorage {
             tracing::warn!("ignoring oversized prune backoff");
             return;
         };
+
+        // HK v0.19.13: the store never holds more than `MAX_BACKOFF_ENTRIES` entries. At the
+        // bound a new (topic, peer) pair is not recorded; a pair already held is still updated.
+        if self.entries >= MAX_BACKOFF_ENTRIES
+            && !self
+                .backoffs
+                .get(topic)
+                .is_some_and(|peers| peers.contains_key(peer))
+        {
+            self.note_unrecorded();
+            return;
+        }
 
         let insert_into_backoffs_by_heartbeat =
             |heartbeat_index: HeartbeatIndex,
@@ -118,8 +149,44 @@ impl BackoffStorage {
                     self.backoff_slack,
                 );
                 v.insert((instant, index));
+                self.entries += 1;
             }
         };
+    }
+
+    /// HK v0.19.13: the number of (topic, peer) backoffs held, counted from the maps. The count
+    /// kept beside the maps is checked against it.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        let held: usize = self.backoffs.values().map(|peers| peers.len()).sum();
+        assert_eq!(held, self.entries, "the count of entries equals the map");
+        let slotted: usize = self
+            .backoffs_by_heartbeat
+            .iter()
+            .map(|slot| slot.len())
+            .sum();
+        assert_eq!(slotted, held, "every entry is in one heartbeat slot");
+        held
+    }
+
+    /// HK v0.19.13: counts a backoff that was not recorded because the store is at its bound,
+    /// and reports that at most once per `BOUND_REPORT_INTERVAL`.
+    fn note_unrecorded(&mut self) {
+        self.unrecorded = self.unrecorded.saturating_add(1);
+        let now = Instant::now();
+        let report_due = match self.last_bound_report {
+            Some(last) => now.duration_since(last) >= BOUND_REPORT_INTERVAL,
+            None => true,
+        };
+        if report_due {
+            tracing::warn!(
+                limit = MAX_BACKOFF_ENTRIES,
+                unrecorded = self.unrecorded,
+                "The backoff store is at its entry limit; new backoffs are not recorded until entries expire"
+            );
+            self.last_bound_report = Some(now);
+            self.unrecorded = 0;
+        }
     }
 
     /// Checks if a given peer is backoffed for the given topic. This method respects the
@@ -155,6 +222,8 @@ impl BackoffStorage {
         // Clean up backoffs_by_heartbeat
         if let Some(s) = self.backoffs_by_heartbeat.get_mut(self.heartbeat_index.0) {
             let backoffs = &mut self.backoffs;
+            // HK v0.19.13: the count of entries follows every removal.
+            let entries = &mut self.entries;
             let slack = self.heartbeat_interval * self.backoff_slack;
             let now = Instant::now();
             s.retain(|(topic, peer)| {
@@ -168,8 +237,11 @@ impl BackoffStorage {
                 if !keep {
                     // remove from backoffs
                     if let Entry::Occupied(mut m) = backoffs.entry(topic.clone()) {
-                        if m.get_mut().remove(peer).is_some() && m.get().is_empty() {
-                            m.remove();
+                        if m.get_mut().remove(peer).is_some() {
+                            *entries = entries.saturating_sub(1);
+                            if m.get().is_empty() {
+                                m.remove();
+                            }
                         }
                     }
                 }

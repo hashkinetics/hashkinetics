@@ -180,7 +180,8 @@ owner/rho/rcm never touch the chain). Effects: debit sender, append commitment,
 **ShieldedSpend { anchor, nullifier, out_commitment, out2_commitment, fee, credit, proof,
 stealth_ct, stealth_ct2 }** — proof-carrying: ANY account may relay; authority is the
 STARK. Rules: fee ≤ u64::MAX; fee > 0 ⇒ credit is Some (the unshield channel; fee = 0 ⇒
-fully shielded transfer, zero transparent trace); anchor ∈ recent window; nullifier fresh;
+fully shielded transfer, with no amount, recipient or memo on the chain; the envelope
+names the account that submits it and pays the envelope fee); anchor ∈ recent window; nullifier fresh;
 tree capacity ≥ 2. The proof must verify for
 
 ```
